@@ -149,10 +149,51 @@ fn roster_maintenance_submission_outcome<T, E>(
     })
 }
 
+type RosterLeadership = Option<(Option<SessionConsensusNodeId>, u64)>;
+
+/// Share the production fixed-deadline wait with controlled-time tests.
+async fn wait_roster_maintenance(
+    delay: Duration,
+    mut stop: tokio::sync::watch::Receiver<bool>,
+    mut metrics: tokio::sync::watch::Receiver<
+        opc_consensus::engine::RaftMetrics<SessionConsensusNodeId, EmptyNode>,
+    >,
+    leadership: &std::sync::Mutex<RosterLeadership>,
+) -> bool {
+    let deadline = tokio::time::Instant::now() + delay;
+    loop {
+        if *stop.borrow_and_update() {
+            return false;
+        }
+        let changed = {
+            let status = metrics.borrow_and_update();
+            if status.running_state.is_err() {
+                return false;
+            }
+            let current = (status.current_leader, status.vote.leader_id.term);
+            let mut previous = leadership.lock().expect("roster leadership observation");
+            previous
+                .replace(current)
+                .is_some_and(|previous| previous != current)
+        };
+        if changed {
+            return true;
+        }
+        tokio::select! {
+            biased;
+            _ = stop.changed() => return false,
+            () = tokio::time::sleep_until(deadline) => return true,
+            changed = metrics.changed() => if changed.is_err() { return false; },
+        }
+        // Commit/heartbeat publications do not restart the fixed sleep or
+        // cause another observation. Only leadership or term wakes early.
+    }
+}
+
 struct ConsensusStoreRosterMaintenanceLane {
     inner: Weak<ConsensusSessionStoreInner>,
     stop: tokio::sync::watch::Receiver<bool>,
-    leadership: std::sync::Mutex<Option<(Option<SessionConsensusNodeId>, u64)>>,
+    leadership: std::sync::Mutex<RosterLeadership>,
 }
 
 #[async_trait::async_trait]
@@ -173,40 +214,9 @@ impl RosterMaintenanceLane for ConsensusStoreRosterMaintenanceLane {
         if *self.stop.borrow() || inner.retirement.is_started() {
             return false;
         }
-        let mut metrics = inner.raft.metrics();
+        let metrics = inner.raft.metrics();
         drop(inner);
-        let mut stop = self.stop.clone();
-        let deadline = tokio::time::Instant::now() + delay;
-        loop {
-            if *stop.borrow_and_update() {
-                return false;
-            }
-            let changed = {
-                let status = metrics.borrow_and_update();
-                if status.running_state.is_err() {
-                    return false;
-                }
-                let current = (status.current_leader, status.vote.leader_id.term);
-                let mut previous = self
-                    .leadership
-                    .lock()
-                    .expect("roster leadership observation");
-                previous
-                    .replace(current)
-                    .is_some_and(|previous| previous != current)
-            };
-            if changed {
-                return true;
-            }
-            tokio::select! {
-                biased;
-                _ = stop.changed() => return false,
-                () = tokio::time::sleep_until(deadline) => return true,
-                changed = metrics.changed() => if changed.is_err() { return false; },
-            }
-            // Commit/heartbeat publications do not restart the fixed sleep or
-            // cause another observation. Only leadership or term wakes early.
-        }
+        wait_roster_maintenance(delay, self.stop.clone(), metrics, &self.leadership).await
     }
 
     async fn propose(&self) -> Option<RosterMaintenanceOutcome> {
@@ -1009,3 +1019,6 @@ mod tests {
         let _ = tokio::time::timeout(std::time::Duration::from_secs(1), task).await;
     }
 }
+
+#[cfg(test)]
+mod wait_tests;

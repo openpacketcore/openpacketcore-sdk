@@ -384,6 +384,24 @@
       "kind": "fixture-setup-changed",
       "reason": "The format-five invariant requires the roster witness from initialization. The old inactive-namespace setup omitted it; provision the same canonical initial witness as production. Every test assertion is retained. Missing-witness rejection, legacy format-four compatibility, atomic initialization and upgrade are covered separately.",
       "issue": 1307
+    },
+    {
+      "test": "rust:crates/opc-session-store::lib=lib::recovery::tests::format5_protected_roster_v2_partial_or_extra_namespace_is_corrupt",
+      "kind": "fixture-setup-changed",
+      "reason": "The shared inactive format-five setup now provisions the mandatory initial roster witness before each namespace corruption mutation. Every corruption assertion remains unchanged and now isolates the intended malformed table or index instead of an already-missing witness.",
+      "issue": 1307
+    },
+    {
+      "test": "rust:crates/opc-session-store::lib=lib::sqlite::consensus::tests::native::roster::export::native_roster_snapshot_signed_v1_and_v2_share_exact_history_across_cold_reopen",
+      "kind": "fixture-setup-changed",
+      "reason": "Update the intermediate retirement checkpoint to the bounded multi-epoch contract: both eligible profiles retire in one command, their shared floor and cursor are released, and the canonical witness covers the exact terminal prefix. Keep all shared-history, native/SQLite parity, mutation combinations and cold-reopen assertions, including the following idle maintenance command.",
+      "issue": 1307
+    },
+    {
+      "test": "rust:crates/opc-session-store::test=dynamic_membership::root_preserving_three_to_five_reactivates_profile_and_accepts_successor_signed_roster",
+      "kind": "fixture-setup-changed",
+      "reason": "Keep autonomous maintenance enabled and wait within the existing operation budget for durable retirement of the expired D5 terminal. Require its canonical witness frontier and original admission fence before accepting row absence. Observe retirement on both the leader and snapshot target before isolating the target, so the snapshot tests retired-to-retired history. The separately tracked lagging-follower recovery design is outside this fixture. After real snapshot installation and cold reopen, require the same retirement authority and authenticated non-definitive status/terminal refusal. Preserve predecessor and successor scope checks, stale ingress rejection, all topology assertions, and fresh successor signed-roster acceptance.",
+      "issue": 1307
     }
   ]
 }

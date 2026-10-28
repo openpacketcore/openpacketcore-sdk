@@ -170,6 +170,11 @@ impl ConsensusSessionStore {
         timeout_reason: &mut PlannedShutdownFallback,
     ) -> RetirementResult {
         use PlannedShutdownFallback as Reason;
+        // An expired timeout can still poll a ready inner future. Classify the
+        // exhausted budget before admission checks or engine preparation run.
+        if tokio::time::Instant::now() >= deadline {
+            return Err(Reason::DeadlineElapsed);
+        }
         // Shared with ordinary operations, exclusive only against a topology
         // transition. No unrelated session is put behind a shutdown write lock.
         let _scope_guard = tokio::time::timeout_at(

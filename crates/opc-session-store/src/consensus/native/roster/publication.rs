@@ -184,6 +184,8 @@ impl NativeState {
         use crate::fenced_mutation_roster::TERMINAL_RETENTION;
         use crate::fenced_mutation_roster_storage::ConsensusMaintenanceTimestamp;
 
+        #[cfg(test)]
+        let _work = crate::sqlite::consensus::roster_work_observer::native_probe(self.identity);
         self.require_business_proof()?;
         let witness = self
             .roster

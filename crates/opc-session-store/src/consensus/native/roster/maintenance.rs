@@ -118,6 +118,9 @@ impl Store<'_, '_> {
         &mut self,
         logical_time: Timestamp,
     ) -> io::Result<bool> {
+        #[cfg(test)]
+        let _work =
+            crate::sqlite::consensus::roster_work_observer::native_turn(self.base.base.identity);
         let maintenance = ConsensusMaintenanceTimestamp::from_consensus_timestamp(logical_time)
             .map_err(corrupt)?;
         let retention = i128::try_from(TERMINAL_RETENTION.as_nanos())

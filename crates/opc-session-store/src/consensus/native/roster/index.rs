@@ -246,6 +246,10 @@ impl Index {
     ) -> usize {
         self.partitions.get(&key).map_or(0, |rows| {
             rows.iter()
+                .inspect(|_| {
+                    #[cfg(test)]
+                    crate::sqlite::consensus::roster_work_observer::native_index_entry();
+                })
                 .take_while(|(binding, _)| binding.history_epoch() <= epoch)
                 .take(limit)
                 .count()
@@ -291,6 +295,10 @@ impl Index {
     pub(crate) fn reclaim_prefix(&self, cutoff: i128) -> Vec<(i128, RequestBindingKey)> {
         self.retained
             .iter()
+            .inspect(|_| {
+                #[cfg(test)]
+                crate::sqlite::consensus::roster_work_observer::native_index_entry();
+            })
             .take_while(|(at, _)| *at <= cutoff)
             .take(RECLAIM_BATCH)
             .copied()
@@ -300,6 +308,10 @@ impl Index {
     pub(crate) fn has_due_retained(&self, cutoff: i128) -> bool {
         self.retained
             .iter()
+            .inspect(|_| {
+                #[cfg(test)]
+                crate::sqlite::consensus::roster_work_observer::native_index_entry();
+            })
             .next()
             .is_some_and(|(at, _)| *at <= cutoff)
     }
@@ -308,6 +320,10 @@ impl Index {
         let Some((sequence, binding)) = self
             .terminals
             .range((Excluded(retired_through), Unbounded))
+            .inspect(|_| {
+                #[cfg(test)]
+                crate::sqlite::consensus::roster_work_observer::native_index_entry();
+            })
             .next()
         else {
             return Ok(None);
@@ -328,6 +344,10 @@ impl Index {
     ) -> io::Result<Vec<(u64, RequestBindingKey, State)>> {
         self.terminals
             .range((Excluded(retired_through), Unbounded))
+            .inspect(|_| {
+                #[cfg(test)]
+                crate::sqlite::consensus::roster_work_observer::native_index_entry();
+            })
             .take(RECLAIM_BATCH + 1)
             .map(|(sequence, binding)| {
                 let row = self

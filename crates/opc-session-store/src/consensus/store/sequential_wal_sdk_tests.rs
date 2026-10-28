@@ -1678,21 +1678,43 @@ async fn assert_signed_roster_steady_retirement(native: bool) {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn roster_maintenance_sqlite_keeps_up_with_ten_due_rows_per_second() {
+async fn roster_maintenance_sqlite_measures_ten_due_rows_per_second() {
     assert_signed_roster_sustained_retirement(false).await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn roster_maintenance_native_keeps_up_with_ten_due_rows_per_second() {
+async fn roster_maintenance_native_measures_ten_due_rows_per_second() {
     assert_signed_roster_sustained_retirement(true).await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn maintenance_join_does_not_restart_shutdown_preparation_budget() {
+    assert_maintenance_join_uses_original_shutdown_deadline(true, false).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn maintenance_join_reports_expired_shutdown_deadline_on_sqlite() {
+    assert_maintenance_join_uses_original_shutdown_deadline(false, false).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn expired_shutdown_preparation_precedes_eager_admission_refusal_on_native() {
+    assert_maintenance_join_uses_original_shutdown_deadline(true, true).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn expired_shutdown_preparation_precedes_eager_admission_refusal_on_sqlite() {
+    assert_maintenance_join_uses_original_shutdown_deadline(false, true).await;
+}
+
+async fn assert_maintenance_join_uses_original_shutdown_deadline(
+    native: bool,
+    admission_closed: bool,
+) {
     let _timing_permit = crate::acquire_consensus_timing_test_permit().await;
     let mut fleet = Fleet::new_roster_production(
         "roster-shutdown-budget",
-        true,
+        native,
         super::membership_tests::roster_ingress_test_root(),
     );
     fleet.open().await;
@@ -1705,9 +1727,24 @@ async fn maintenance_join_does_not_restart_shutdown_preparation_budget() {
             .delay_join_for_test(Duration::from_secs(8))
             .await;
     }
+    if admission_closed {
+        // A ready refusal distinguishes entering expired preparation from
+        // timing out at its first pending I/O. Only this voter loses local
+        // application admission; replication and the original budget remain.
+        fleet.stores[0]
+            .inner
+            .admitted
+            .store(false, Ordering::Release);
+    }
     // The unchanged ten-second operation deadline includes this owned join.
     // Starting a fresh five-second handoff afterwards exceeds that budget.
-    let results = join_all(fleet.stores.iter().map(ConsensusSessionStore::shutdown)).await;
+    let results = join_all(
+        fleet
+            .stores
+            .iter()
+            .map(ConsensusSessionStore::shutdown_with_report),
+    )
+    .await;
     // Reap the same owned drain on the failing implementation as well. This
     // later observation cannot turn the first operation's timeout into success.
     fleet.close().await;
@@ -1715,12 +1752,20 @@ async fn maintenance_join_does_not_restart_shutdown_preparation_budget() {
         results.iter().all(Result::is_ok),
         "the maintenance join must consume the original preparation budget: {results:?}",
     );
+    assert!(
+        results.iter().all(|result| matches!(
+            result,
+            Ok(opc_consensus::PlannedShutdownOutcome::Fallback {
+                reason: opc_consensus::PlannedShutdownFallback::DeadlineElapsed,
+            })
+        )),
+        "preparation must not start after its original deadline: {results:?}"
+    );
 }
 
 async fn assert_signed_roster_sustained_retirement(native: bool) {
     use super::membership_tests::{
-        assert_roster_maintenance_keeps_up_with_ten_due_rows_per_second, roster_ingress_test_root,
-        MutableClock,
+        measure_roster_maintenance_independent_arrivals, roster_ingress_test_root, MutableClock,
     };
     use std::str::FromStr;
     let _timing_permit = crate::acquire_consensus_timing_test_permit().await;
@@ -1742,27 +1787,29 @@ async fn assert_signed_roster_sustained_retirement(native: bool) {
                     == Some(store.inner.local_node_id)
             })
             .unwrap();
-        assert_roster_maintenance_keeps_up_with_ten_due_rows_per_second(leader, &clock, start)
-            .await;
+        measure_roster_maintenance_independent_arrivals(leader, &clock, start).await;
     })
     .catch_unwind()
     .await;
     fleet.close_after_test(result).await;
 }
 
+// Keep the historical test identifiers for the controlled-turn regressions.
+// They check signed per-turn progress; independent physical arrivals are
+// measured separately and the conditional timing bound uses paused time.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn roster_maintenance_sqlite_controlled_turn_reclaims_and_retires_each_epoch() {
+async fn roster_maintenance_sqlite_keeps_up_with_ten_due_rows_per_second() {
     assert_signed_roster_controlled_turn_retirement(false).await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn roster_maintenance_native_controlled_turn_reclaims_and_retires_each_epoch() {
+async fn roster_maintenance_native_keeps_up_with_ten_due_rows_per_second() {
     assert_signed_roster_controlled_turn_retirement(true).await;
 }
 
 async fn assert_signed_roster_controlled_turn_retirement(native: bool) {
     use super::membership_tests::{
-        assert_roster_maintenance_progress_per_controlled_turn, roster_ingress_test_root,
+        assert_roster_maintenance_keeps_up_with_ten_due_rows_per_second, roster_ingress_test_root,
         MutableClock,
     };
     use std::str::FromStr;
@@ -1792,9 +1839,14 @@ async fn assert_signed_roster_controlled_turn_retirement(native: bool) {
                     == Some(store.inner.local_node_id)
             })
             .unwrap();
-        assert_roster_maintenance_progress_per_controlled_turn(leader, &clock, start, &ticks).await;
+        assert_roster_maintenance_keeps_up_with_ten_due_rows_per_second(
+            leader, &clock, start, &ticks,
+        )
+        .await;
     })
     .catch_unwind()
     .await;
     fleet.close_after_test(result).await;
 }
+
+mod roster_work_bound;

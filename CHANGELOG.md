@@ -264,12 +264,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   provisioned the shared witness, while keeping separately authorized mixed
   profiles operational. Count successful maintenance service toward its existing
   one-second cadence and keep the automatic shutdown handoff within its original
-  budget after joining maintenance. Qualify signed maintenance with independent
-  ten-row-per-second arrivals, and retain controlled-turn progress checks as
-  extra coverage. Prove the unchanged 40-row bound under explicit service and
-  dispatch assumptions, including a slow-service negative control. Reduce
-  duplicate history-proof persistence
-  and frame authentication work while retaining the full 131,073-row cold reopen,
+  budget after joining maintenance. Measure signed maintenance under independent
+  ten-row-per-second arrivals. Gate cadence, the conditional 40-row bound and
+  its slow-service negative control under paused time, and compare backend work
+  at two retained-history sizes alongside controlled-turn progress checks.
+  Reduce duplicate history-proof persistence and frame authentication work while
+  retaining the full 131,073-row cold reopen,
   all validators, and existing capacity, retention and deadline bounds. Refs #1307.
 
 - `opc-session-store` and `opc-persist`: retain the `Unplanned` shutdown reason

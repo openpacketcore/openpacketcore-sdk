@@ -227,8 +227,9 @@ pub(crate) use tests::{
 pub(crate) use tests::{
     roster_v2_aborted_persistence_fixture_for_history,
     roster_v2_aborted_single_member_persistence_fixture_for_history,
-    roster_v2_fresh_wal_persistence_fixture, roster_v2_persistence_fixture_for_class,
-    roster_v2_persistence_fixture_for_store, roster_v2_persistence_fixture_for_store_request,
+    roster_v2_fresh_wal_persistence_fixture, roster_v2_fresh_wal_work_history_fixture,
+    roster_v2_persistence_fixture_for_class, roster_v2_persistence_fixture_for_store,
+    roster_v2_persistence_fixture_for_store_request,
 };
 
 /// Bind the exact voter scope to the immutable protected-roster profile.
@@ -3587,6 +3588,22 @@ pub(crate) mod tests {
     ) -> RosterV2PersistenceFixture {
         // Formation, the first real lease, and profile activation precede Q1.
         roster_v2_persistence_fixture_for_authority(phase, [0x91; 16], 3, FenceToken::new(1), 1)
+    }
+
+    #[cfg(target_os = "linux")]
+    pub(crate) fn roster_v2_fresh_wal_work_history_fixture(
+        roster_id: [u8; 16],
+        epoch: u64,
+    ) -> RosterV2PersistenceFixture {
+        roster_v2_persistence_fixture_for_authority_and_class(
+            Phase::Aborted,
+            roster_id,
+            epoch,
+            FenceToken::new(1),
+            1,
+            crate::fenced_mutation_roster::AdmissionClass::Ordinary,
+            1,
+        )
     }
 
     #[cfg(target_os = "linux")]

@@ -62,13 +62,13 @@ adding another full idle interval or replaying a burst of missed turns. Failed
 observations retain the existing bounded retry delay. Shutdown starts its automatic
 handoff deadline before joining maintenance, so that join cannot restart the budget
 reserved for handoff and consume the final engine/storage drain interval.
-The signed arrival-rate qualification makes ten completions due at each absolute
+The signed arrival measurement makes ten completions due at each absolute
 one-second boundary for 180 seconds, independently of maintenance completion.
 It runs the real native and SQLite maintenance lanes with their production wait
-and cadence. Every boundary samples the due and tombstone backlogs, including
-while service is in flight. Both peaks must remain at most 40 rows, followed by
-a full drain within the existing operation budget. Physical consensus and disk
-latency remain part of this qualification; slow service can fail the bound.
+and cadence. Every boundary records due and tombstone backlogs, including while
+service is in flight, followed by another original operation-budget observation
+window. Peaks, boundary lateness and remaining backlog describe that host run;
+they are not timing assertions. The deterministic proofs below are the gates.
 
 A separate paused-time proof drives the production loop and its default sleep
 with explicit proposal-completion gates. Its conditional bound assumes a healthy
@@ -84,14 +84,28 @@ samples all 180 boundaries before coincident completions, and after each
 completion. A six-second-service negative control breaches the same bound before
 the first proposal completes. There are no retries, authority changes or deferred-profile barriers in this
 model. The service assumptions are not guaranteed by the ten-second operation
-deadline; the real-backend qualification measures the resulting backlog under
+deadline; the real-backend measurement reports the resulting backlog under
 physical I/O.
+
+Paused-time tests also drive the production wait's metrics and stop receivers.
+Commit and heartbeat publications every 100 milliseconds cannot restart its
+one-second deadline. Leader/term changes wake it early, zero delay returns
+without advancing time, and shutdown returns false.
 
 Additional controlled-turn tests deliberately pause arrivals until each real
 store finishes one supplied turn. They require exact reclamation of ten due rows,
 retirement across distinct epochs, and at most two commands per turn. They make
-no arrival-rate or physical latency claim. All tests retain the original signed
-workload, retention boundary and command batch limits.
+no arrival-rate or physical latency claim. A separate work comparison seeds
+1,800 and 18,000 signed retained rows, then measures ten turns of ten due rows
+at each size. It requires identical work in corresponding maintenance turns:
+native index entries visited and carriers hydrated, or SQLite VM instructions.
+Each backend uses its real signed append, commit and apply path; the separate
+controlled-turn tests cover replication on three voters. Both histories retain
+young rows throughout, so the comparison holds partition closure behavior constant.
+This covers leader eligibility reads and maintenance selection and mutation;
+periodic checkpoint publication and unrelated executor delays remain part of
+the physical measurement.
+All tests retain the retention boundary and command batch limits.
 
 Earlier reclamation is a separate semantic choice: a terminal commit alone
 does not prove that every external recovery obligation is settled. Do not

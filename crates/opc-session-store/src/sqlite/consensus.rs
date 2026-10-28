@@ -15,6 +15,8 @@ pub(crate) mod roster_reads;
 pub(crate) mod roster_rows;
 #[cfg(target_os = "linux")]
 pub(crate) mod roster_snapshot;
+#[cfg(all(test, target_os = "linux"))]
+pub(crate) mod roster_work_observer;
 pub(crate) mod scope_authority;
 pub(crate) mod scope_batch;
 mod scope_continuity;
@@ -13171,6 +13173,8 @@ fn protected_roster_maintenance_due_sync(
     identity: SessionConsensusIdentity,
     now: Timestamp,
 ) -> io::Result<(ProtectedRosterLedgerOccupancy, bool)> {
+    #[cfg(all(test, target_os = "linux"))]
+    let _work = roster_work_observer::sqlite_probe(conn, identity);
     match protected_roster_layout_in_sync(conn, false)? {
         ProtectedRosterLayout::Legacy | ProtectedRosterLayout::Prepared => {
             return Ok((ProtectedRosterLedgerOccupancy::default(), false));
@@ -16195,6 +16199,8 @@ fn maintain_due_protected_roster_reclaim_sync(
     identity: SessionConsensusIdentity,
     logical_time: Timestamp,
 ) -> Result<bool, StoreError> {
+    #[cfg(all(test, target_os = "linux"))]
+    let _work = roster_work_observer::sqlite_turn(conn, identity);
     // The prepared namespace is intentionally inert.  Avoid probing roster
     // tables for legacy/prepared databases on every unrelated command while
     // still rejecting any unknown persisted schema revision fail-closed.
@@ -16252,20 +16258,36 @@ fn maintain_due_protected_roster_reclaim_sync(
         .map_err(|_| {
             StoreError::BackendUnavailable("protected roster maintenance unavailable".into())
         })?;
-    let due_retirement: bool = conn
-        .query_row(
-            if v2_present {
-                "SELECT EXISTS(SELECT 1 FROM consensus_protected_roster_rows WHERE state=3 LIMIT 1) \
-                 OR EXISTS(SELECT 1 FROM consensus_protected_roster_v2_admissions WHERE state=3 LIMIT 1)"
-            } else {
-                "SELECT EXISTS(SELECT 1 FROM consensus_protected_roster_rows WHERE state=3 LIMIT 1)"
-            },
-            [],
-            |row| row.get(0),
-        )
-        .map_err(|_| {
-            StoreError::BackendUnavailable("protected roster maintenance unavailable".into())
-        })?;
+    // The fixed witness authenticates the aggregate across both profiles and
+    // is updated atomically with every row transition. Checking that aggregate
+    // preserves policy validation even when a retained row blocks a later
+    // tombstone, without scanning all retained history on every clock tick.
+    // Keep the legacy missing-witness path: format four may have no witness,
+    // while the shared accessor rejects a missing mandatory format-five row.
+    let due_retirement = match roster_engine::RosterCommandStore::witness(&conn, identity)
+        .map_err(ProtectedRosterApplyError::store_error)?
+    {
+        Some(witness) => witness
+            .diagnostic_occupancy()
+            .map_err(|_| {
+                StoreError::BackendUnavailable("protected roster maintenance unavailable".into())
+            })?
+            .tombstone_reservations != 0,
+        None => conn
+            .query_row(
+                if v2_present {
+                    "SELECT EXISTS(SELECT 1 FROM consensus_protected_roster_rows WHERE state=3 LIMIT 1) \
+                     OR EXISTS(SELECT 1 FROM consensus_protected_roster_v2_admissions WHERE state=3 LIMIT 1)"
+                } else {
+                    "SELECT EXISTS(SELECT 1 FROM consensus_protected_roster_rows WHERE state=3 LIMIT 1)"
+                },
+                [],
+                |row| row.get(0),
+            )
+            .map_err(|_| {
+                StoreError::BackendUnavailable("protected roster maintenance unavailable".into())
+            })?,
+    };
     if !v1_due_reclaim && !v2_due_reclaim && !due_retirement {
         return Ok(false);
     }
@@ -16404,6 +16426,33 @@ pub(crate) async fn compact_and_validate_protected_roster_for_test(
     validate_protected_roster_state_sync(&conn, identity).map_err(|_| {
         StoreError::BackendUnavailable("protected roster test hydration rejected".into())
     })
+}
+
+/// Read the canonical retirement authority for the SQLite dynamic-membership
+/// fixture. This observes production state without performing maintenance or
+/// changing the lane, clock, retention policy, or row contents.
+#[cfg(feature = "test-control")]
+pub(crate) async fn protected_roster_retirement_authority_for_test(
+    backend: &SqliteSessionBackend,
+    identity: SessionConsensusIdentity,
+) -> Result<(u64, u64), StoreError> {
+    let conn = backend.conn.lock().await;
+    backend
+        .with_application_cache_read(&conn, || -> io::Result<(u64, u64)> {
+            validate_protected_roster_state_sync(&conn, identity)
+                .map_err(|_| invalid_data("test retirement state is invalid"))?;
+            let witness = protected_roster_read_witness_sync(&conn, identity)
+                .map_err(|_| invalid_data("test retirement witness is invalid"))?
+                .ok_or_else(|| invalid_data("test retirement witness is missing"))?;
+            Ok((
+                witness.retired_terminal_sequence(),
+                witness.highest_retired_admission_fence(),
+            ))
+        })
+        .map_err(|_| {
+            StoreError::BackendUnavailable("test retirement authority read failed".into())
+        })?
+        .map_err(|_| StoreError::BackendUnavailable("test retirement authority is invalid".into()))
 }
 
 /// The immutable authority projection recorded beside every protected binding.
@@ -48570,6 +48619,64 @@ mod tests {
             .expect("decode witness")
             .roster
             .durable_epoch_bindings
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn protected_roster_idle_turn_work_is_independent_of_retained_history() {
+        let mut measured = Vec::new();
+        for rows in [1_800_u16, 18_000] {
+            let backend = SqliteSessionBackend::in_memory().unwrap();
+            let conn = backend.conn.blocking_lock();
+            initialize_schema(&conn, identity(), &expected_members()).unwrap();
+            activate_protected_roster_schema_sync(&conn).unwrap();
+            let retained_at = Timestamp::from_str("2026-01-01T00:00:00Z").unwrap();
+            let records = (0..rows)
+                .map(|roster| {
+                    retirement_fixture_retained_with_terminal_sequence(
+                        0x32,
+                        roster,
+                        u64::from(roster) + 1,
+                        retained_at,
+                        u64::from(roster) + 1,
+                    )
+                })
+                .collect::<Vec<_>>();
+            for record in &records {
+                write_retirement_fixture_record(&conn, record, retained_at);
+            }
+            write_retirement_fixture_floor(&conn, records[0].binding());
+            let witness = write_retirement_fixture_witness(&conn, &records);
+            let occupancy = witness.diagnostic_occupancy().unwrap();
+            assert_eq!(occupancy.retained_reservations, u64::from(rows));
+            assert_eq!(occupancy.tombstone_reservations, 0);
+            let before = conn.total_changes();
+            let observation = roster_work_observer::WorkObservation::new(identity());
+            // A no-op turn must not scan every young retained row to discover
+            // that no tombstone exists. This isolates the query cost from Raft,
+            // filesystem service and shutdown; signed fleet proofs cover them.
+            assert!(!maintain_due_protected_roster_reclaim_sync(
+                &conn,
+                identity(),
+                retained_at.add_seconds(24 * 60 * 60 - 1).unwrap(),
+            )
+            .unwrap());
+            let work = observation.counts();
+            assert_eq!(work.turns, 1);
+            assert!(work.sqlite_vm_steps > 0);
+            assert_eq!(
+                conn.total_changes(),
+                before,
+                "idle maintenance writes nothing"
+            );
+            eprintln!("roster SQLite idle work: history={rows}, work={work:?}");
+            measured.push(work);
+        }
+        assert_eq!(measured.len(), 2);
+        assert_eq!(
+            measured[0], measured[1],
+            "idle maintenance work must not grow with retained history"
+        );
     }
 
     #[test]

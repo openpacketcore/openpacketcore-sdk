@@ -12,7 +12,7 @@ mod install;
 mod install_base;
 mod public_reads;
 
-fn setup(signed: &RosterV2PersistenceFixture) -> Vec<Entry<SessionRaftTypeConfig>> {
+pub(super) fn setup(signed: &RosterV2PersistenceFixture) -> Vec<Entry<SessionRaftTypeConfig>> {
     let mut lease = ordinary(
         signed,
         1,
@@ -144,7 +144,7 @@ fn state(conn: &Connection, table: &str) -> i64 {
         .unwrap()
 }
 
-fn tick(
+pub(super) fn tick(
     signed: &RosterV2PersistenceFixture,
     index: u64,
     time: Timestamp,
@@ -351,21 +351,34 @@ fn native_roster_snapshot_signed_v1_and_v2_share_exact_history_across_cold_reope
                 count(&partial, "consensus_protected_roster_v2_admissions"),
                 0
             );
-            assert_eq!(count(&partial, "consensus_protected_roster_rows"), 1);
-            let bytes: Vec<u8> = partial
-                .query_row(
-                    "SELECT canonical_floor FROM consensus_protected_roster_floors",
-                    [],
-                    |row| row.get(0),
+            assert_eq!(
+                count(&partial, "consensus_protected_roster_rows"),
+                0,
+                "one bounded retirement command covers both eligible admission epochs"
+            );
+            assert_eq!(
+                count(&partial, "consensus_protected_roster_floors"),
+                0,
+                "the shared floor is released only after every eligible epoch retires"
+            );
+            assert_eq!(count(&partial, "consensus_protected_roster_admissions"), 0);
+            assert_eq!(
+                count(&partial, "consensus_protected_roster_retirement_cursors"),
+                0
+            );
+            let witness_bytes: Vec<u8> = partial.query_row(
+                "SELECT canonical_witness FROM consensus_protected_roster_witness WHERE singleton=1",
+                [], |row| row.get(0),
+            ).unwrap();
+            let retired_witness =
+                crate::fenced_mutation_roster_storage::GlobalChargeWitness::from_canonical_bytes(
+                    &witness_bytes,
                 )
                 .unwrap();
             assert_eq!(
-                crate::fenced_mutation_roster::IrreversibleHistoryFloor::from_canonical_bytes(
-                    &bytes
-                )
-                .unwrap()
-                .retired_through(),
-                3
+                retired_witness.retired_terminal_sequence(),
+                7,
+                "the durable terminal prefix covers both committed epochs"
             );
             wal = reopen(&wal, directory.path(), &signed);
             exported(&wal, &backend, &signed);
