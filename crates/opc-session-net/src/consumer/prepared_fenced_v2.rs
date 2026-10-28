@@ -4524,11 +4524,11 @@ mod tests {
         assert_eq!(
             token.status_until_terminal(deadline).await,
             Err(SessionConsumerPreparedFencedTransitionStatusError::Unavailable),
-            "the cached local failure is returned, not the caller's deadline"
+            "a local failure returns Unavailable at once, not the caller's deadline"
         );
         assert!(
             tokio::time::Instant::now() < deadline,
-            "a cached terminal receipt ends the loop at once"
+            "a local failure ends the polling loop at once"
         );
     }
     #[derive(Clone, Copy, PartialEq, Eq)]
