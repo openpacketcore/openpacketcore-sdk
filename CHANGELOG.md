@@ -242,9 +242,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Exact binding/scoped readback and durable object/roster authentication include
   the target; disabled TFC retains its previous encoding and seals.
   `rekey_sa` verifies GETSA even when clearing TFC and reports indeterminate
-  state if Linux acknowledges an ignored update. `esp_dummy_payload` builds
-  aligned dummy plaintext with Next Header 59 (RFC 4303 §§2.6–2.7), leaving
-  encryption, sequencing, transmission and peer capability policy to the caller.
+  state if Linux acknowledges an ignored update.
   Stored records with enabled TFC from builds that omitted it from authentication
   require a fresh install when crossing this format change. Refs #1344.
 
