@@ -5,11 +5,14 @@ import hashlib
 import http.server
 import os
 from pathlib import Path
+import re
+import runpy
 import subprocess
 import sys
 import tempfile
 import textwrap
 import threading
+import time
 import unittest
 from unittest.mock import patch
 
@@ -70,7 +73,8 @@ def local_download_block(site, local_url, digest):
 
 class DownloadTests(unittest.TestCase):
     def run_download(self, site, replies, expected_status, expected_ranges,
-                     seed=b"", expected_errors=(), profile="el9"):
+                     seed=b"", expected_errors=(), profile="el9",
+                     expected_delays=None, cache_hit=False, real_backoff=False):
         requests = []
         cache_snapshots = []
 
@@ -87,8 +91,12 @@ class DownloadTests(unittest.TestCase):
                     cache_snapshots.append(target.read_bytes() if target.exists() else None)
                 action = replies[min(len(requests) - 1, len(replies) - 1)]
                 self.close_connection = True
-                if action in ("404", "429"):
-                    self.send_error(int(action))
+                if action.isdigit() or action.startswith("retry-after:"):
+                    self.send_response(429 if action.startswith("retry-after:") else int(action))
+                    if action.startswith("retry-after:"):
+                        self.send_header("Retry-After", action.split(":", 1)[1])
+                    self.send_header("Content-Length", "0")
+                    self.end_headers()
                     return
                 if action == "empty":
                     return
@@ -142,12 +150,46 @@ class DownloadTests(unittest.TestCase):
                     # Execute the callers' actual blocks, including their
                     # checksum gates; replace only the external image inputs.
                     script = local_download_block(site, local_url, digest)
+                    # Real curl and HTTP faults; only backoff time is virtual.
+                    # The stalled-transfer test still exercises curl's real timeout.
+                    clock = Path(tmp) / "clock"
+                    clock.write_text("0")
+                    delays = Path(tmp) / "delays"
+                    delays.write_text("")
+                    tools = Path(tmp) / "tools"
+                    tools.mkdir()
+                    for name, source in {
+                        "sleep": '''\
+                            #!/usr/bin/env python3
+                            import os, pathlib, sys
+                            clock = pathlib.Path(os.environ["DOWNLOAD_CLOCK"])
+                            delay = int(sys.argv[1])
+                            clock.write_text(str(int(clock.read_text()) + delay))
+                            with open(os.environ["DOWNLOAD_DELAYS"], "a") as output:
+                                output.write(str(delay) + "\\n")
+                            ''',
+                        "date": '''\
+                            #!/usr/bin/env python3
+                            import os, pathlib, sys
+                            if sys.argv[1:] == ["+%s"]:
+                                print(pathlib.Path(os.environ["DOWNLOAD_CLOCK"]).read_text())
+                            else:
+                                os.execv("/usr/bin/date", ["date", *sys.argv[1:]])
+                            ''',
+                    }.items():
+                        tool = tools / name
+                        tool.write_text(textwrap.dedent(source))
+                        tool.chmod(0o755)
                     env = {
                         **os.environ, "RUNNER_TEMP": tmp, "private": tmp,
                         "repository": str(ROOT), "profile": profile,
                         "NO_PROXY": "127.0.0.1",
                         "no_proxy": "127.0.0.1",
                         "CURL_HOME": tmp, "HOME": tmp, "XDG_CONFIG_HOME": tmp,
+                        "PATH": (os.environ["PATH"] if real_backoff else
+                                 str(tools) + os.pathsep + os.environ["PATH"]),
+                        "DOWNLOAD_CLOCK": str(clock), "DOWNLOAD_DELAYS": str(delays),
+                        "CI_IMAGE_CACHE_HIT": "true" if cache_hit else "false",
                     }
                     command = ["bash", "-c", "set -euo pipefail\n" + script]
                     if site == "mobike":
@@ -160,6 +202,7 @@ class DownloadTests(unittest.TestCase):
                             "driver.update(cache=Path(os.environ['private']))\n"
                             f"exec({script!r}, driver)\n"
                         )]
+                    started = time.monotonic()
                     result = subprocess.run(
                         command,
                         cwd=ROOT,
@@ -167,9 +210,16 @@ class DownloadTests(unittest.TestCase):
                         text=True, capture_output=True, timeout=100,
                     )
                     detail = f"{site}: {result.stdout}\n{result.stderr}"
+                    if real_backoff:
+                        elapsed = time.monotonic() - started
+                        self.assertGreaterEqual(elapsed, 29, detail)
+                        print(f"real 429 backoff elapsed={elapsed:.3f}s", flush=True)
                     status = 1 if site == "mobike" and expected_status else expected_status
                     self.assertEqual(result.returncode, status, detail)
                     self.assertEqual(requests, expected_ranges, detail)
+                    actual_delays = [int(n) for n in delays.read_text().splitlines()]
+                    if expected_delays is not None:
+                        self.assertEqual(actual_delays, expected_delays, detail)
                     for error in expected_errors:
                         self.assertIn(f"({error})", result.stderr, detail)
                     if expected_status == 0:
@@ -208,13 +258,13 @@ class DownloadTests(unittest.TestCase):
              [None, "bytes=65536-", "bytes=131072-"], b"", (18,)),
             # Bytes left by an earlier invocation/profile cannot seed this one.
             (["ok"], 0, [None], b"stale image prefix", ()),
-            (["404", "ok"], 0, [None, None], b"", (22,)),
+            (["404", "ok"], 22, [None], b"", (22,)),
             (["429", "ok"], 0, [None, None], b"", (22,)),
             (["empty", "ok"], 0, [None, None], b"", (52,)),
             (["partial"] * 4, 18,
              [None, "bytes=65536-", "bytes=131072-", "bytes=196608-"], b"", (18,)),
-            (["404"] * 4, 22, [None] * 4, b"", (22,)),
-            (["429"] * 4, 22, [None] * 4, b"", (22,)),
+            (["404"] * 4, 22, [None], b"", (22,)),
+            (["429"] * 5, 22, [None] * 5, b"", (22,)),
             (["corrupt"], 1, [None], b"", ()),
             (["partial", "corrupt"], 1, [None, "bytes=65536-"], b"", (18,)),
             (["partial", "ignore-range", "ok"], 0,
@@ -238,9 +288,81 @@ class DownloadTests(unittest.TestCase):
         self.run_download("mobike", ["partial", "ok"], 0,
                           [None, "bytes=65536-"], seed=None, expected_errors=(18,))
         self.run_download("mobike", ["corrupt"], 1, [None], seed=b"old invalid cache")
-        self.run_download("mobike", ["404"] * 4, 22, [None] * 4,
+        self.run_download("mobike", ["404"] * 4, 22, [None],
                           seed=b"old invalid cache", expected_errors=(22,))
         self.run_download("mobike", ["corrupt"], 1, [None], seed=None)
+
+    def test_http_backoff_budget_and_retry_after(self):
+        self.run_download("mobike", ["429", "ok"], 0, [None, None],
+                          expected_delays=[30])
+        self.run_download("mobike", ["503"] * 5, 22, [None] * 5,
+                          expected_delays=[30, 60, 120, 90])
+        self.run_download("mobike", ["retry-after:45", "ok"], 0, [None, None],
+                          expected_delays=[45])
+        self.run_download("mobike", ["retry-after:Thu, 01 Jan 1970 00:00:45 GMT", "ok"],
+                          0, [None, None], expected_delays=[45])
+        self.run_download("mobike", ["retry-after:301", "ok"], 22, [None],
+                          expected_delays=[])
+        self.run_download("mobike", ["retry-after:invalid", "ok"], 0, [None, None],
+                          expected_delays=[30])
+        for status in ("500", "502", "504"):
+            self.run_download("mobike", [status, "ok"], 0, [None, None],
+                              expected_delays=[30])
+        for status in ("400", "401", "403", "404", "410"):
+            self.run_download("mobike", [status, "ok"], 22, [None],
+                              expected_delays=[])
+        self.run_download("mobike", ["partial", "429", "ok"], 0,
+                          [None, "bytes=65536-", "bytes=65536-"],
+                          expected_errors=(18, 22), expected_delays=[1, 30])
+
+    def test_real_http_429_then_200(self):
+        self.run_download("mobike", ["429", "ok"], 0, [None, None], real_backoff=True)
+
+    def test_restored_images_are_verified_without_downloading(self):
+        for site in SITES:
+            with self.subTest(site=site):
+                self.run_download(site, ["404"], 0, [], seed=DATA, cache_hit=True)
+                # A restored corrupt file must still fail the original gate.
+                requests = [None] if site == "mobike" else []
+                self.run_download(site, ["corrupt"], 1, requests,
+                                  seed=b"corrupt cached image", cache_hit=True)
+
+    def test_workflow_caches_cover_every_pinned_download(self):
+        pins = runpy.run_path(str(ROOT / "ci/qualify-n3-mobike-kernel.py"))
+        self.assertEqual(pins["IMAGE_SHA"], UBUNTU_SHA)
+        gtpu = (ROOT / ".github/workflows/gtpu-privileged.yml").read_text()
+        ipsec = (ROOT / ".github/workflows/ipsec-xfrm.yml").read_text()
+        cache_pattern = (r'uses: actions/cache@v5\n        with:\n'
+                         r'          path: (.+)\n          key: (.+)\n')
+        caches = dict(re.findall(cache_pattern, gtpu + ipsec))
+        self.assertEqual(len(caches), 6)
+        for filename, sha in (("ubuntu-24.04-linux68.img", UBUNTU_SHA),
+                              ("rocky94-el9.qcow2", SHA)):
+            self.assertEqual(caches['${{ runner.temp }}/' + filename],
+                             'qualification-image-' + sha)
+        nohz_key = caches['${{ runner.temp }}/gtpu-nohz/private/guest.qcow2']
+        self.assertIn("matrix.profile == 'linux68' && '" + UBUNTU_SHA + "'", nohz_key)
+        self.assertIn("|| '" + SHA + "'", nohz_key)
+        for prefix in ("tfc-cache", "n3-mobike-kernel"):
+            self.assertEqual(caches['${{ runner.temp }}/' + prefix + '/linux-n3-mobike.tar.gz'],
+                             'qualification-image-${{ steps.image-pins.outputs.source }}')
+        self.assertEqual(caches['${{ runner.temp }}/n3-mobike-kernel/ubuntu-24.04.img'],
+                         'qualification-image-${{ steps.image-pins.outputs.image }}')
+        # Execute the workflow's actual pin-reading steps, rather than duplicating
+        # their checksum literals in the cache keys.
+        blocks = re.findall(r"          python3 - <<'PY'\n(.*?)          PY\n", ipsec, re.S)
+        pin_blocks = [block for block in blocks if 'pins = runpy.run_path' in block]
+        self.assertEqual(len(pin_blocks), 2)
+        for block in pin_blocks:
+            with tempfile.TemporaryDirectory() as tmp:
+                output = Path(tmp) / 'outputs'
+                subprocess.run([sys.executable, '-c', textwrap.dedent(block)],
+                               cwd=ROOT, env={**os.environ, 'GITHUB_OUTPUT': str(output)},
+                               check=True)
+                actual = dict(line.split('=', 1) for line in output.read_text().splitlines())
+                self.assertEqual(actual['source'], pins['SOURCE_SHA'])
+                if 'image' in actual:
+                    self.assertEqual(actual['image'], pins['IMAGE_SHA'])
 
     def test_inherited_curl_config_and_proxies_cannot_change_downloads(self):
         with tempfile.TemporaryDirectory(prefix="inherited-curl-config-") as inherited:

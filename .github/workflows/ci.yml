@@ -1067,9 +1067,7 @@ jobs:
   session-net-i686-tests:
     name: opc-session-net i686 (${{ matrix.slice }})
     runs-on: ubuntu-24.04
-    # The serial library slice takes about 29 minutes including a cold build;
-    # leave runner headroom without changing individual contract deadlines.
-    timeout-minutes: 45
+    timeout-minutes: 30
     strategy:
       fail-fast: false
       matrix:
