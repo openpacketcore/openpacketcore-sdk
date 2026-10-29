@@ -11237,12 +11237,12 @@ impl ConsensusSessionStore {
         // Same phase rule as the primary restore scan: a fence-phase timeout is
         // slow consensus progress (retryable availability), not fixed
         // work-budget exhaustion.
-        let fence = self.logical_read_time_before(Some(scope.consensus_identity()), deadline);
-        #[cfg(feature = "test-control")]
-        let fence = test_support::with_restore_scan_fence_delay_for_test(self, fence);
-        let logical_time = tokio::time::timeout_at(deadline, fence)
-            .await
-            .map_err(|_| restore_scan_availability())??;
+        let logical_time = tokio::time::timeout_at(
+            deadline,
+            self.logical_read_time_before(Some(scope.consensus_identity()), deadline),
+        )
+        .await
+        .map_err(|_| restore_scan_availability())??;
         let _admission = self
             .admit_consumer_scope(scope, deadline)
             .await
