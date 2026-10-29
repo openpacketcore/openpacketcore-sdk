@@ -369,27 +369,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   >1,048,576-distinct-key qualification remain open (PR2/PR3); a store still
   cannot pass the lifetime key cap, and #1252 stays partial until they land.
   Refs #1252.
-- `opc-session-store`: V2 fenced-transition history now has a bounded
-  leader-owned maintenance lane and preemptive epoch rotation. The lane schedules
-  the existing replicated `MaintainFencedTransitionV2History` command every
-  250 ms (one proposal in flight, exponential back-off to two seconds while a
-  turn changes no lifecycle counter), and the applied maintenance path opens a
-  successor epoch once the active epoch reaches
-  `MAX_HISTORY_ENTRIES - PREEMPTIVE_ROTATION_HEADROOM` bound entries
-  (122,880 of 131,072) instead of waiting until it is physically full. A
-  continuous healthy bind stream therefore no longer receives
-  `FencedTransitionHistoryFull` merely because external maintenance has not
-  run. Closed epochs stay exactly replayable and reclaim batches still advance
-  only after the oldest epoch's exact retention boundary; when every retained
-  epoch is still inside its replay window the turn is a typed no-op and
-  bindings keep the existing typed fail-closed outcome. No durable schema,
-  profile, epoch capacity or 24-hour replay window changes. Remaining
-  qualification-scale acceptance: removing the fixed eight-epoch
-  (~1,048,576-binding per 24 h) capacity ceiling requires a schema/profile
-  migration and a three-voter continuous-bind qualification (leader
-  replacement, restart, cancellation, competing maintainers); burst backpressure
-  beyond the preemptive headroom and full consumer/batch backpressure coverage
-  remain in that qualification. Refs #1377.
 
 - `opc-session-store` / `opc-session-testkit`: consensus restore-scan caller
   deadlines remain retryable across logical-time fencing, worker and connection
@@ -519,20 +498,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   opening, verification, metadata reads and rewind in both Dynamic and Fixed
   profiles. Snapshot bytes, integrity checks and operation deadlines are
   unchanged. Refs #1371.
-
-- `opc-session-net`: prepared protected V2 transition status no longer caches
-  a transient local recovery-preflight failure as the handle's final
-  `Unavailable`. A transient journal, backing, key-provider or
-  operation-outcome failure leaves the exact retained binding re-checkable
-  until the caller's deadline (or a later status call). The cached definitive
-  cases are an exactly missing retained row, a caller ID now naming a
-  different canonical request (`FencedTransitionRequestConflict`), and a
-  missing or unsupported protected-V2 backend contract
-  (`CapabilityNotSupported`). Corrupt or unreadable local journal state is
-  reported by the store as retryable journal unavailability, so it is retried
-  fail-closed and never granted authority rather than being claimed final.
-  The public error stays `Unavailable`, and no failure class restores dispatch
-  authority. Refs #1378.
 
 - `opc-proto-pfcp`: align Cause codes, UE IP Address flags and IPv6 prefix
   fields, and F-TEID CHOOSE encoding with TS 29.244. Reject inconsistent
@@ -1095,17 +1060,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `TIME_OOP` and kernel/PPS faults. Unsupported platforms fail explicitly with
   no wall-clock fallback. Refs #1244.
 
-- `opc-session-net`: prepared V2 fenced-transition handles expose
-  `execute_once_with_failure_diagnostic`, an additive diagnostic wrapper around
-  the unchanged `execute_once` effect classification. A `NotTransmitted` or
-  `OutcomeUnknown` failure now carries a value-free
-  `SessionConsumerPreparedFencedTransitionV2FailureDiagnostic` with a closed
-  `setup`/`send`/`awaiting_reply`/`reply_lost` stage and the remaining original
-  caller budget in milliseconds, so a cold setup expiry, a held refusal and
-  reply loss can be told apart in logs and metrics. Dispatch authority,
-  ownership, effect classification, request identity and wire format are
-  unchanged; `into_error` recovers exactly the previous error. Resolved
-  rejections and lease deferrals carry no diagnostic. Refs #1129.
 - `opc-gtpu-dataplane`: expose `control_port::GtpuControlPort::downlink_readiness`,
   an SDK-owned readiness source for the backend-owned downlink queues. The
   returned `GtpuControlReadiness` owns a private epoll instance in which the
@@ -8957,7 +8911,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   response, and server request minima so it covers both directions.
   The advertised value is executable across unequal client/server frame limits,
   but remains descriptive rather than readiness. It is zero at the exact 8 KiB
-  minimum, 122,880 bytes at the 1 MiB default, and 2,096,128 bytes at the
+  minimum, 130,048 bytes at the 1 MiB default, and 2,096,128 bytes at the
   16 MiB ceiling. Advertising SQLite's full 1 MiB value limit requires a frame
   of at least 8,396,800 bytes; 16 MiB is the recommended setting. This is a
   per-frame bound: at the default 128 connection slots, simultaneous
