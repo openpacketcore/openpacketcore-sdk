@@ -1129,6 +1129,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   total starts from the new outcome slots; earlier raw-slot history cannot be
   attributed to either outcome. (#1184)
 
+- `opc-session-net`: prepared V2 handles expose value-free failure diagnostics:
+  an extensible setup/send/reply stage and the remaining original caller budget.
+  Execution outcomes, receipt ownership and release rules are unchanged.
+  Refs #1129.
+
 - `opc-identity`: `WorkloadIdentity::from_cert_der_at` accepts an explicit
   verification time for certificate validity checks while preserving SPIFFE ID,
   trust-domain and workload-path validation. `from_cert_der` continues to use
@@ -1891,6 +1896,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   original timeout, fencing and exactly-once assertions, reproduce stalled
   runtimes, and verify the exact acquire deadline and rejection of expired
   queued reads. (#1308, #1211)
+
+- `opc-session-net`: prepared V2 receipt handles can recover after a transient
+  local journal preflight failure by checking the exact original binding on
+  the next status call. Local failures still return immediately, and retries
+  cannot adopt a substituted row or restore mutation authority. (#1378)
 
 - Go operators now require Go 1.26.10 for the `crypto/x509` fix GO-2026-6809.
 

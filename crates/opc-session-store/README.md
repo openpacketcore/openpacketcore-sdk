@@ -620,7 +620,7 @@ independent HA placement.
   advertised `max_value_bytes` remains executable across unequal client/server
   limits. At the exact 8 KiB minimum it is zero; the minimum fits the bounded
   maximum-profile metadata/envelopes, not a non-zero application payload. The
-  1 MiB default advertises 122,880 bytes, while 16 MiB advertises 2,096,128;
+  1 MiB default advertises 130,048 bytes, while 16 MiB advertises 2,096,128;
   SQLite's complete 1 MiB limit requires at least 8,396,800 frame bytes. The
   ceiling is per frame: at the default 128 connection slots, concurrent
   ceiling-sized encodes can retain about 2 GiB before metadata/TLS/runtime
@@ -2741,37 +2741,3 @@ evicting request identities or fence floors. Restart loses all state and is
 the lab reset boundary; it is not HA recovery. This feature does not implement
 the protected-roster V2 protocol or qualify durable throughput. It is disabled
 by default and must not be selected as production persistence.
-
-
-## V2 fenced-transition history maintenance
-
-The V2 journal rotates its writable receipt epoch only through one replicated
-operator maintenance command. A leader-owned, weakly-referenced maintenance lane
-now schedules that existing command promptly: one observation per 250 ms tick,
-one proposal in flight at a time, and exponential back-off up to two seconds
-while a turn changes no replicated lifecycle counter. The lane changes no
-replay, idempotency, stale-fence or retirement semantics; it only schedules the
-pre-existing command earlier.
-
-The applied maintenance path rotates a successor epoch proactively once the
-active epoch reaches `FENCED_TRANSITION_V2_MAX_HISTORY_ENTRIES -
-FENCED_TRANSITION_V2_PREEMPTIVE_ROTATION_HEADROOM` (122,880 of 131,072
-bindings), so a continuous healthy bind stream no longer has to be refused with
-`FencedTransitionHistoryFull` merely because external maintenance has not run
-(folded #1112). The closed epoch remains exactly replayable above
-`retired_through` until its own retention window ends, and reclamation still
-advances in the existing bounded batches only after the oldest epoch's exact
-retention boundary. When every retained epoch is still inside its replay window
-and cannot be reclaimed, the command stays a typed no-effect turn and further
-bindings keep the existing typed `FencedTransitionHistoryFull` fail-closed
-outcome; it does not retire unexpired receipts or weaken replay. A test-only
-thread-local high-water override exercises the real applied rotation path with a
-reduced window.
-
-Qualification-scale remaining acceptance: removing the fixed eight-epoch /
-~1,048,576-binding per-24-hour design ceiling (so sustained higher rates are
-limited by bytes/IO rather than the epoch-count profile) requires a durable
-schema/profile migration and a three-voter continuous-bind qualification under
-leader replacement, restart, cancellation and competing maintainers. The
-preemptive rotation and lane in this change do not change the durable profile,
-schema, epoch bounds or replay window.

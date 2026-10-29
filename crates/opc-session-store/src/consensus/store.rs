@@ -163,7 +163,6 @@ pub fn validate_consensus_physical_fenced_transition_request(
 }
 
 mod async_persistence;
-mod fenced_transition_maintenance;
 mod membership;
 mod planned_shutdown;
 mod quorum_readiness;
@@ -4067,8 +4066,6 @@ impl ConsensusSessionStore {
             .inner
             .roster_maintenance
             .set(roster_maintenance::start(Arc::downgrade(&store.inner)));
-        #[cfg(not(any(test, feature = "test-control")))]
-        fenced_transition_maintenance::start(Arc::downgrade(&store.inner));
         voter_slots::start_coordinator(&store);
         Ok(store)
     }
