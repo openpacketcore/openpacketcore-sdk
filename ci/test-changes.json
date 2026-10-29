@@ -1282,38 +1282,26 @@
     {
       "test": "python:ci/test-test-inventory.py::AdvisoryWorkflowTests.test_additional_legacy_consumer_is_rejected_at_every_boundary",
       "kind": "fixture-setup-changed",
-      "reason": "P4 removes the RUSTSEC-2026-0387 legacy exception. Replace self.assertIn(f'unaccepted legacy crypto dependency: extra -> {target}', result.stderr) with self.assertIn('is not accepted for crypto-bigint 0.5.5', result.stderr). The version floor now refuses every 0.5.5 graph before the former consumer-confinement diagnostics. Preserve the same invalid graph fixtures and every other assertion; no vulnerable graph becomes accepted. The migrated-stack regression separately requires both advisory ignores to be absent.",
+      "reason": "Removing the RUSTSEC-2026-0387 legacy exception (#1532) changes the rejection diagnostic. Replace self.assertIn(f'unaccepted legacy crypto dependency: extra -> {target}', result.stderr) with self.assertIn('is not accepted for crypto-bigint 0.5.5', result.stderr). The version floor now refuses every 0.5.5 graph before the former consumer-confinement diagnostics. Preserve the same invalid graph fixtures and every other assertion; no vulnerable graph becomes accepted. The migrated-stack regression separately requires both advisory ignores to be absent.",
       "issue": 1532
     },
     {
       "test": "python:ci/test-test-inventory.py::AdvisoryWorkflowTests.test_optional_locked_consumer_cannot_hide_outside_enabled_metadata",
       "kind": "fixture-setup-changed",
-      "reason": "P4 removes the RUSTSEC-2026-0387 legacy exception. Replace self.assertIn('unaccepted legacy crypto dependency: optional -> crypto-bigint', result.stderr) with self.assertIn('is not accepted for crypto-bigint 0.5.5', result.stderr). The version floor now refuses every 0.5.5 graph before the former consumer-confinement diagnostics. Preserve the same invalid graph fixtures and every other assertion; no vulnerable graph becomes accepted. The migrated-stack regression separately requires both advisory ignores to be absent.",
+      "reason": "Removing the RUSTSEC-2026-0387 legacy exception (#1532) changes the rejection diagnostic. Replace self.assertIn('unaccepted legacy crypto dependency: optional -> crypto-bigint', result.stderr) with self.assertIn('is not accepted for crypto-bigint 0.5.5', result.stderr). The version floor now refuses every 0.5.5 graph before the former consumer-confinement diagnostics. Preserve the same invalid graph fixtures and every other assertion; no vulnerable graph becomes accepted. The migrated-stack regression separately requires both advisory ignores to be absent.",
       "issue": 1532
     },
     {
       "test": "python:ci/test-test-inventory.py::AdvisoryWorkflowTests.test_similarly_named_registry_or_unvendored_fork_is_rejected",
       "kind": "fixture-setup-changed",
-      "reason": "P4 removes the RUSTSEC-2026-0387 legacy exception. Replace self.assertIn(f'must use the checked-in {name}', result.stderr) with self.assertIn('is not accepted for crypto-bigint 0.5.5', result.stderr). The version floor now refuses every 0.5.5 graph before the former consumer-confinement diagnostics. Preserve the same invalid graph fixtures and every other assertion; no vulnerable graph becomes accepted. The migrated-stack regression separately requires both advisory ignores to be absent.",
+      "reason": "Removing the RUSTSEC-2026-0387 legacy exception (#1532) changes the rejection diagnostic. Replace self.assertIn(f'must use the checked-in {name}', result.stderr) with self.assertIn('is not accepted for crypto-bigint 0.5.5', result.stderr). The version floor now refuses every 0.5.5 graph before the former consumer-confinement diagnostics. Preserve the same invalid graph fixtures and every other assertion; no vulnerable graph becomes accepted. The migrated-stack regression separately requires both advisory ignores to be absent.",
       "issue": 1532
     },
     {
       "test": "python:ci/test-test-inventory.py::AdvisoryWorkflowTests.test_unresolved_or_disconnected_legacy_copy_is_rejected",
       "kind": "fixture-setup-changed",
-      "reason": "P4 removes the RUSTSEC-2026-0387 legacy exception. Replace self.assertIn('cannot verify the locked crypto-bigint 0.5.5 dependency path', result.stderr); self.assertIn('legacy crypto path ends before the vendored DTLS consumer', result.stderr) with self.assertIn('is not accepted for crypto-bigint 0.5.5', result.stderr). The version floor now refuses every 0.5.5 graph before the former consumer-confinement diagnostics. Preserve the same invalid graph fixtures and every other assertion; no vulnerable graph becomes accepted. The migrated-stack regression separately requires both advisory ignores to be absent.",
+      "reason": "Removing the RUSTSEC-2026-0387 legacy exception (#1532) changes the rejection diagnostic. Replace self.assertIn('cannot verify the locked crypto-bigint 0.5.5 dependency path', result.stderr); self.assertIn('legacy crypto path ends before the vendored DTLS consumer', result.stderr) with self.assertIn('is not accepted for crypto-bigint 0.5.5', result.stderr). The version floor now refuses every 0.5.5 graph before the former consumer-confinement diagnostics. Preserve the same invalid graph fixtures and every other assertion; no vulnerable graph becomes accepted. The migrated-stack regression separately requires both advisory ignores to be absent.",
       "issue": 1532
-    },
-    {
-      "test": "rust:crates/opc-session-store::lib=lib::sqlite::consensus::tests::native::roster::export::native_roster_snapshot_signed_v1_and_v2_share_exact_history_across_cold_reopen",
-      "kind": "fixture-setup-changed",
-      "reason": "Update the intermediate retirement checkpoint to the bounded multi-epoch contract: replace the expectation of one remaining V1 roster row with zero rows, because both eligible profiles retire in one command. Replace the retained floor with retired_through=3 by no floor and a canonical witness retired_terminal_sequence=7; also require no remaining admissions or retirement cursors. Keep all shared-history, native/SQLite parity, mutation combinations and cold-reopen assertions, including the following idle maintenance command.",
-      "issue": 1307
-    },
-    {
-      "test": "rust:crates/opc-session-store::test=dynamic_membership::root_preserving_three_to_five_reactivates_profile_and_accepts_successor_signed_roster",
-      "kind": "fixture-setup-changed",
-      "reason": "Keep autonomous maintenance enabled and wait within the existing operation budget for durable retirement of the expired D5 terminal. Replace the exact retained D5 compacted row with row absence backed by the canonical witness frontier and original admission fence. Replace authenticated Recorded(Compacted{..}) status with Rejected(RecoveryRequired), and terminalization Rejected(Conflict) with Rejected(RecoveryRequired); retired history remains non-definitive. Observe retirement on both leader and snapshot target before isolation, replacing the compacted target setup with retired-to-retired snapshot installation and cold reopen. The separately tracked lagging-follower recovery design is outside this fixture. Preserve predecessor and successor scope checks, stale ingress rejection, all topology assertions, and fresh successor signed-roster acceptance.",
-      "issue": 1307
     },
     {
       "test": "rust:crates/opc-peer-discovery::test=dns_contracts::every_failure_preserves_last_good_without_time_cutoff",
@@ -1365,18 +1353,64 @@
       "issue": 1241
     },
     {
-      "test": "rust:crates/opc-proto-ikev2::test=liveness_probes::wrong_id_wrong_class_nonempty_and_bad_mac_never_complete_a_probe",
-      "kind": "removed",
-      "renamed_to": "rust:crates/opc-proto-ikev2::test=liveness_probes::wrong_id_wrong_class_and_bad_mac_never_complete_a_probe",
-      "reason": "RFC 7296 section 1.4 permits payloads in an authenticated INFORMATIONAL response to an empty probe. Replace the nonempty-response refusal with positive completion and returned-payload coverage across all profiles, roles and recovery modes; retain wrong ID, direction, exchange, integrity and duplicate refusals with exact errors.",
-      "issue": 1241
+      "test": "rust:crates/opc-libsctp-sys::lib=lib::linux::tests::packed_address_sets_are_contiguous_and_bounded",
+      "kind": "fixture-setup-changed",
+      "reason": "Replace refusal of a mixed IPv4/IPv6 address set with successful packing and exact 16-byte/28-byte concatenation checks in both family orders. Keep empty, mixed-port, wildcard and count-limit refusals. Mixed-family static multihoming is now supported.",
+      "issue": 1351
     },
     {
-      "test": "rust:crates/opc-proto-ikev2::test=recovery_profile::liveness_tests::probes_are_fresh_zero_write_and_exactly_retransmitted_for_every_profile_role_and_mode",
-      "kind": "removed",
-      "renamed_to": "rust:crates/opc-proto-ikev2::test=recovery_profile::liveness_tests::probes_are_fresh_zero_write_exactly_retransmitted_and_require_authenticated_matching_responses",
-      "reason": "RFC 7296 section 1.4 permits payloads in an authenticated INFORMATIONAL response to an empty probe. Replace the nonempty-response refusal with positive completion and returned-payload coverage across all profiles, roles and recovery modes; retain wrong ID, direction, exchange, integrity and duplicate refusals with exact errors.",
-      "issue": 1241
+      "test": "rust:crates/opc-sctp::lib=lib::tests::endpoint_config_accepts_bounded_same_family_multihoming",
+      "kind": "fixture-setup-changed",
+      "reason": "Replace InvalidConfig(address_family) for adding [::1]:38412 to bounded IPv4 local addresses with successful validation of the mixed-family set. Retain successful same-family admission and the separate port, wildcard and count-limit refusal tests.",
+      "issue": 1351
+    },
+    {
+      "test": "rust:crates/opc-sctp::lib=lib::tests::connect_config_validates_every_local_and_remote_address",
+      "kind": "fixture-setup-changed",
+      "reason": "Replace the invalid-input setup that added [::1]:38412 and expected InvalidConfig(address_family) with [::1]:38413 and InvalidConfig(remote_addrs). Mixed-family peers are now valid; the new port deliberately differs from the existing remote port. Keep successful local/remote validation and the separate no-common-family refusal.",
+      "issue": 1351
+    },
+    {
+      "test": "rust:vendor/dimpl::lib=lib::crypto::validation::tests_aws_lc_rs::test_default_provider_has_cipher_suites",
+      "kind": "fixture-setup-changed",
+      "reason": "Replace the exact default-provider supported cipher-suite count of 4 with 7 after enabling modern ECDHE-RSA and DHE-RSA suites. Retain the ECDSA-specific suite membership assertions and executable-provider validation.",
+      "issue": 1353
+    },
+    {
+      "test": "rust:vendor/dimpl::lib=lib::crypto::validation::tests_aws_lc_rs::test_default_provider_has_kx_groups",
+      "kind": "fixture-setup-changed",
+      "reason": "Replace the exact default-provider key-exchange group count of 3 with 5: retain X25519, P-256 and P-384 and add FFDHE4096 and FFDHE2048. Retain provider validation and independent public/shared-secret vector checks.",
+      "issue": 1353
+    },
+    {
+      "test": "rust:vendor/dimpl::lib=lib::crypto::validation::tests_rust_crypto::test_default_provider_has_cipher_suites",
+      "kind": "fixture-setup-changed",
+      "reason": "Replace the exact default-provider supported cipher-suite count of 4 with 7 after enabling modern ECDHE-RSA and DHE-RSA suites. Retain the ECDSA-specific suite membership assertions and executable-provider validation.",
+      "issue": 1353
+    },
+    {
+      "test": "rust:vendor/dimpl::lib=lib::crypto::validation::tests_rust_crypto::test_default_provider_has_kx_groups",
+      "kind": "fixture-setup-changed",
+      "reason": "Replace the exact default-provider key-exchange group count of 3 with 5: retain X25519, P-256 and P-384 and add FFDHE4096 and FFDHE2048. Retain provider validation and independent public/shared-secret vector checks.",
+      "issue": 1353
+    },
+    {
+      "test": "rust:vendor/dimpl::lib=lib::dtls12::message::certificate_request::test::filters_unsupported_types",
+      "kind": "fixture-setup-changed",
+      "reason": "Replace the expectation that RSA_SIGN is filtered and only ECDSA_SIGN remains (length 1, ECDSA at index 0) with length 2, RSA_SIGN at index 0 and ECDSA_SIGN at index 1. Keep DSS_SIGN and unsupported MD5/RSA and SHA384/DSA input and refusal coverage; modern RSA certificate types are now supported.",
+      "issue": 1353
+    },
+    {
+      "test": "rust:vendor/dimpl::lib=lib::dtls12::message::extensions::signature_algorithms::tests::test_signature_algorithms_extension",
+      "kind": "fixture-setup-changed",
+      "reason": "Replace parsing only one ECDSA entry from the serialized ECDSA/SHA256 and RSA/SHA256 extension with parsing both entries and equality with the original algorithm list. Keep the exact serialized wire bytes and the ECDSA-first assertion; modern RSA algorithms are now supported.",
+      "issue": 1353
+    },
+    {
+      "test": "rust:vendor/dimpl::lib=lib::dtls12::message::extensions::supported_groups::tests::test_supported_groups_parse_provided_bytes",
+      "kind": "fixture-setup-changed",
+      "reason": "Replace the parsed group list [X25519, P-256, P-384] with [X25519, P-256, P-384, FFDHE2048] for the unchanged literal wire vector. The formerly filtered 0x0100 is now supported; unsupported 0x0101 remains filtered, with ordering and empty remainder checks retained.",
+      "issue": 1353
     }
   ]
 }

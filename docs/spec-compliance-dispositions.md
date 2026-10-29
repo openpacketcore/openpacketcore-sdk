@@ -124,6 +124,8 @@ qualify this disposition; it makes no PFCP runtime claim.
 
 Source: [TS 29.274 V19.6.0 §§7.7.1, 7.7.9](https://www.etsi.org/deliver/etsi_ts/129200_129299/129274/19.06.00_60/ts_129274v190600p.pdf).
 
+## SCTP, PKI/TLS and Diameter scope
+
 The following transport dispositions cover SCTP #1351, PKI/TLS #1353 and Diameter #1358 under
 [umbrella #1532](https://github.com/openpacketcore/openpacketcore-sdk/issues/1532).
 They describe implemented behavior and its limits. They are not a claim of
@@ -255,7 +257,7 @@ roles. One SPIFFE URI may coexist with other URIs; multiple SPIFFE identities
 fail with `SpiffeSanError::MultipleSpiffeIds`. Trust-domain anchors, complete
 path validation, validity and matching private key remain mandatory.
 
-This returns `LocalPkiIdentity`, not `IdentityState`. SVID reload sources,
+This returns `SpiffeId`, not `IdentityState`. SVID reload sources,
 `opc-tls` and Diameter transports retain strict X.509-SVID validation. A present
 EKU must contain both clientAuth and serverAuth, and the strict SAN profile
 requires exactly one URI. The [role/profile tests](../crates/opc-identity/tests/pki_profiles.rs)

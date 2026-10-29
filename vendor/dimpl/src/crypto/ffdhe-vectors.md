@@ -22,7 +22,7 @@ reassembled wire prime and generator with the binary parameters.
 | ffdhe4096.pem | 64852d6890ff9e62eecd1ee89c72af9af244dfef5b853bcedea3dfd7aade22b3 |
 
 `ffdhe-vectors.txt` preserves the two independent fixtures in
-`crates/opc-tls/tests/data/ffdhe.json` at commit `e3a6da95f` without a JSON
+`crates/opc-tls/tests/data/ffdhe.json` without a JSON
 parser dependency. Columns are bit length, fixed test exponent, public
 value, peer public value, and shared secret, with integers in hexadecimal.
 Python integer `pow` and LibreSSL 3.3.6 `pkeyutl -derive` independently
