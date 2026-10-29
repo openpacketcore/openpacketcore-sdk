@@ -341,11 +341,6 @@ jobs:
         shell: bash ci/setup-fsverity-tmp.sh -- bash --noprofile --norc -e -o pipefail {0}
         run: |
           set -euo pipefail
-          # /tmp may be tmpfs; durable selector fixtures must exercise disk-backed I/O.
-          umask 0077
-          TMPDIR="$(mktemp -d "${RUNNER_TEMP}/rust-tests.XXXXXX")"
-          export TMPDIR
-          trap 'rm -rf -- "$TMPDIR"' EXIT
           python3 ci/test-shards.py plan --shard '${{ matrix.shard }}' --split-libraries > shard-commands.txt
           test -s shard-commands.txt
           # The command list is read on fd 3, and each command gets its own
@@ -573,10 +568,6 @@ jobs:
           RUSTFLAGS: "--cfg opc_linux_gtpu_sys_force_unsupported"
         run: |
           set -euo pipefail
-          umask 0077
-          TMPDIR="$(mktemp -d "${RUNNER_TEMP}/gtpu-cfg.XXXXXX")"
-          export TMPDIR
-          trap 'rm -rf -- "$TMPDIR"' EXIT
           selector=ebpf::tests::remote_selector_regression::singleton_public_protected_flow_preserves_durable_state
           cargo test --locked -p opc-linux-gtpu-sys -p opc-gtpu-dataplane --no-default-features --quiet --lib -- --list --exact "$selector" > unsupported-selector-tests.txt
           python3 - "$selector" <<'PYCODE'

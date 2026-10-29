@@ -554,7 +554,7 @@ jobs:
           export CARGO_HOME="${CARGO_HOME:-${HOME}/.cargo}"
           export RUSTUP_HOME="${RUSTUP_HOME:-${HOME}/.rustup}"
           export CARGO_TARGET_DIR="${RUNNER_TEMP}/xfrm-target"
-          sudo env \
+          sudo env "TMPDIR=${TMPDIR}" \
             "PATH=${PATH}" \
             "CARGO_HOME=${CARGO_HOME}" \
             "RUSTUP_HOME=${RUSTUP_HOME}" \
