@@ -1357,7 +1357,8 @@ mod rfc4754_encoding_tests {
             .to_der()
             .unwrap();
             assert_eq!(decode_pss_identifier(&absent), Some(algorithm));
-            // Reject the extra context wrapper present in the original candidate.
+            // Reject an explicit [0] wrapper around the MGF1 hash AlgorithmIdentifier;
+            // RFC 4055 section 3.1 requires the bare AlgorithmIdentifier.
             let mut malformed_mgf = identifier.to_vec();
             malformed_mgf.splice(47..47, [0xa0, 0x0f]);
             for length in [1, 14, 33, 35] {

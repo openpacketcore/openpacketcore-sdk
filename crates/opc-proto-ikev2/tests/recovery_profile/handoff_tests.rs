@@ -52,7 +52,14 @@ fn assert_keys(actual: &Keys, expected: &Keys) {
     assert!(actual.sk_pr() == expected.sk_pr());
 }
 
-fn case(row: Row, local_initiated: bool, cut: Cut) {
+fn case(mut row: Row, local_initiated: bool, cut: Cut) {
+    if row.key.0.is_multiple_of(2) {
+        row.window.fragmentation = Some(
+            opc_proto_ikev2::recovery::Ikev2FragmentationParameters::from_persisted(
+                std::num::NonZeroU32::new(50).unwrap(),
+            ),
+        );
+    }
     let provider = Provider::new();
     let mut store = CasStore::new(7);
     let owners = EpochOwners::new(7);
@@ -209,6 +216,7 @@ fn case(row: Row, local_initiated: bool, cut: Cut) {
         }
     );
     assert_eq!(next.row.mode, row.mode);
+    assert_eq!(next.row.window.fragmentation, row.window.fragmentation);
     assert_eq!(next.row.agreement.mode(), row.mode);
     assert_eq!(next.row.window.next_send, Some(0));
     assert_eq!(next.row.window.next_receive, Some(0));

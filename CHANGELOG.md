@@ -9,6 +9,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `opc-proto-ikev2`: PKCS#1 v1.5 and PSS signing blind the RSA private operation
+  with OS randomness; this hardening does not resolve RUSTSEC-2023-0071.
+
+- `opc-proto-ikev2`: a probe completes on any authenticated INFORMATIONAL
+  response carrying its Message ID, and `complete_empty_probe` returns that
+  response's payloads (RFC 7296 §1.4). Refs #1241.
+
+- `opc-ipsec-xfrm`: `EspTfcDummySender` submits Next Header 59 dummies through
+  the same kernel SA as ordinary traffic. Transport mode uses stock Linux;
+  tunnel mode requires the included versioned kernel patch and rejects an
+  unsupported kernel before opening the sender. Caller-owned egress fencing
+  must stop the sender before recovery, relocation or SA replacement. (#1344)
+
 - `opc-consensus`: expose `DURABLE_CONSENSUS_FAILOVER_PATIENCE`, derived from the
   election lease plus stale-route grace; it schedules no election. Refs #1049.
 
@@ -648,6 +661,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Breaking
 
+- `opc-ipsec-xfrm`: remove the unused `esp_dummy_payload` plaintext builder,
+  which never shipped in a release.
+  Use `EspTfcDummySender` to transmit through an existing kernel ESP SA;
+  the kernel retains encryption, sequence allocation and lifetime ownership.
+  (#1344)
+
 - `opc-proto-ikev2`: added variants to the exhaustive DH, PRF, encryption,
   signature-method, signature-public-key and key-error enums require downstream matches to
   be updated.
@@ -689,6 +708,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   from initialization. Stores created by earlier pre-release builds without the
   witness are refused as corrupt and must be reinitialized. Formats up to four
   retain their existing empty-witness recovery behavior. Refs #1307.
+- `opc-proto-ikev2` recovery supports negotiated RFC 7383 fragmentation. Exchange
+  records retain ordered `Ikev2ProtectedMessage` packet collections; callers
+  must persist and replay every `packets()` entry. Single-packet accessors now
+  return a `Result`. Persist the explicit `fragmentation` option when rebuilding
+  window records; the strict test consumer row format is version 4. Negotiated
+  consumers use `receive_peer_packet`, with bounded reassembly, scheduled expiry,
+  and authenticated fragment-1 response replay. (#1242)
 
 - `opc-gtpu-dataplane`: the pinned family-tagged grouped-session ABI advances
   to schema marker `OPC-GROUP-IP-v7`. Family-tagged entries gain the versioned

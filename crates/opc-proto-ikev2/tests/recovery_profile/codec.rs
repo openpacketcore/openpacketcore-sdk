@@ -10,9 +10,9 @@ use bytes::Bytes;
 use opc_proto_ikev2::{
     recovery::{
         Ikev2CommittedExchangeRecord as Exchange, Ikev2LivenessRecord as LivenessRecord,
-        Ikev2ReservationRetryPolicy as RetryPolicy, Ikev2SyncClock as Clock,
-        Ikev2SyncDisposition as Disposition, Ikev2SyncRecoveryPolicy as Policy,
-        Ikev2SyncRecoveryStatus as Status,
+        Ikev2ProtectedMessage as ProtectedMessage, Ikev2ReservationRetryPolicy as RetryPolicy,
+        Ikev2SyncClock as Clock, Ikev2SyncDisposition as Disposition,
+        Ikev2SyncRecoveryPolicy as Policy, Ikev2SyncRecoveryStatus as Status,
     },
     Ikev2AesGcmIvLimits as Limits, Ikev2DhGroup as Group, Ikev2MessageIdSync as Notify,
     Ikev2MessageIdSyncAgreement as Agreement, Ikev2MessageIdSyncMode as Mode,
@@ -23,7 +23,7 @@ use opc_proto_ikev2::{
 use std::collections::BTreeMap;
 use zeroize::Zeroizing;
 
-const MAX_ROW: usize = 64 * 1024;
+const MAX_ROW: usize = 512 * 1024;
 
 struct Writer {
     bytes: Zeroizing<Vec<u8>>,
@@ -89,11 +89,15 @@ impl Writer {
         }
     }
     fn field(&mut self, tag: u8, write: impl FnOnce(&mut Writer)) -> Result<(), Error> {
-        let mut value = Self::new();
-        write(&mut value);
-        let value = value.finish()?;
+        let start = self.bytes.len();
         self.u8(tag);
-        self.bytes(&value);
+        self.u32(0);
+        write(self);
+        if self.failed {
+            return Err(Error::Format);
+        }
+        let length = u32::try_from(self.bytes.len() - start - 5).map_err(|_| Error::Format)?;
+        self.bytes[start + 1..start + 5].copy_from_slice(&length.to_be_bytes());
         Ok(())
     }
     fn finish(self) -> Result<Zeroizing<Vec<u8>>, Error> {
@@ -189,7 +193,7 @@ impl<'a> Fields<'a> {
             return Err(Error::Format);
         }
         let mut r = Reader::new(bytes);
-        if r.take(4)? != b"IKER" || r.u16()? != 2 {
+        if r.take(4)? != b"IKER" || r.u16()? != 4 {
             return Err(Error::Format);
         }
         let mut fields = BTreeMap::new();
@@ -231,11 +235,30 @@ fn agreement(w: &mut Writer, agreement: Agreement, expected: Sa) {
 fn read_agreement(r: &mut Reader<'_>, sa: Sa) -> Result<Agreement, Error> {
     Ok(Agreement::from_persisted(sa, read_mode(r)?))
 }
+fn message(w: &mut Writer, message: &ProtectedMessage) {
+    w.u16(u16::try_from(message.packets().len()).unwrap());
+    for packet in message.packets() {
+        w.bytes(packet);
+    }
+}
+fn read_message(r: &mut Reader<'_>) -> Result<ProtectedMessage, Error> {
+    let count = r.u16()?;
+    if count == 0 || count > 256 {
+        return Err(Error::Format);
+    }
+    let packets = (0..count)
+        .map(|_| r.bytes().map(Bytes::copy_from_slice))
+        .collect::<Result<_, _>>()?;
+    ProtectedMessage::from_persisted(packets).map_err(|_| Error::Format)
+}
 fn exchange(w: &mut Writer, exchange: Option<&Exchange>) {
     w.boolean(exchange.is_some());
     if let Some(e) = exchange {
-        w.bytes(e.request());
-        w.opt_bytes(e.response());
+        message(w, e.request());
+        w.boolean(e.response().is_some());
+        if let Some(response) = e.response() {
+            message(w, response);
+        }
         w.opt_bytes(e.outcome());
     }
 }
@@ -243,9 +266,13 @@ fn read_exchange(r: &mut Reader<'_>) -> Result<Option<Exchange>, Error> {
     if !r.boolean()? {
         return Ok(None);
     }
-    Exchange::from_persisted(
-        Bytes::copy_from_slice(r.bytes()?),
-        r.opt_bytes()?.map(Bytes::copy_from_slice),
+    Exchange::from_persisted_messages(
+        read_message(r)?,
+        if r.boolean()? {
+            Some(read_message(r)?)
+        } else {
+            None
+        },
         r.opt_bytes()?.map(Bytes::copy_from_slice),
     )
     .map(Some)
@@ -262,7 +289,7 @@ impl ProfileCodec {
         }
         let mut out = Writer::new();
         out.raw(b"IKER");
-        out.u16(2);
+        out.u16(4);
         out.field(1, |w| {
             w.u64(row.key.0);
             w.u64(row.version.birth);
@@ -316,6 +343,11 @@ impl ProfileCodec {
                 w.u32(state.max_unwritten());
                 w.opt_bytes(state.last_probe());
             }
+            w.opt32(
+                image
+                    .fragmentation
+                    .map(|value| value.reassembly_timeout_ms().get()),
+            );
             exchange(w, image.outbound.as_ref());
             exchange(w, image.inbound.as_ref());
         })?;
@@ -553,26 +585,35 @@ impl ProfileCodec {
         let mode = read_mode(&mut r)?;
         r.end()?;
         let mut r = fields.required(6)?;
-        let mut window = WindowImage {
-            generation: r.u64()?,
-            next_send: r.opt32()?,
-            next_receive: r.opt32()?,
-            liveness: if r.boolean()? {
-                Some(
-                    LivenessRecord::from_persisted(
-                        r.u32()?,
-                        r.opt_bytes()?.map(Bytes::copy_from_slice),
+        let mut window =
+            WindowImage {
+                generation: r.u64()?,
+                next_send: r.opt32()?,
+                next_receive: r.opt32()?,
+                liveness: if r.boolean()? {
+                    Some(
+                        LivenessRecord::from_persisted(
+                            r.u32()?,
+                            r.opt_bytes()?.map(Bytes::copy_from_slice),
+                        )
+                        .map_err(|_| Error::Format)?,
                     )
-                    .map_err(|_| Error::Format)?,
-                )
-            } else {
-                None
-            },
-            outbound: read_exchange(&mut r)?,
-            inbound: read_exchange(&mut r)?,
-            sync: None,
-            recovery: None,
-        };
+                } else {
+                    None
+                },
+                fragmentation: r
+                    .opt32()?
+                    .map(|value| {
+                        std::num::NonZeroU32::new(value)
+                    .map(opc_proto_ikev2::recovery::Ikev2FragmentationParameters::from_persisted)
+                    .ok_or(Error::Format)
+                    })
+                    .transpose()?,
+                outbound: read_exchange(&mut r)?,
+                inbound: read_exchange(&mut r)?,
+                sync: None,
+                recovery: None,
+            };
         r.end()?;
         let mut r = fields.required(7)?;
         if r.boolean()? {

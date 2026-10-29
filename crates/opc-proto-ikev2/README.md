@@ -344,11 +344,11 @@ still withholds the reply and never enables a fallback.
 
 ## Committed ordinary windows and exact replay
 
-`recovery::Ikev2CommittedWindow` is an opt-in window-one runtime for complete,
-unfragmented GCM or CBC `SK` packets through the admitted crypto module. The
+`recovery::Ikev2CommittedWindow` is an opt-in window-one runtime for GCM or CBC
+`SK` packets and bilaterally negotiated RFC 7383 `SKF` messages through the admitted crypto module. The
 default GCM profile binds both sending and receiving keys/salts plus the SPI pair
-and original role; the CBC profile uses the complete descriptor above. `SKF`
-recovery remains unsupported. Empty handling is opt-in and includes prefix
+and original role; the CBC profile uses the complete descriptor above.
+Empty handling is opt-in and includes prefix
 reconstruction after restore and current canonical qualification.
 Existing generic crypto and fragmentation APIs retain their separate contracts.
 
@@ -437,9 +437,10 @@ preparation remain burned. Completion tokens are single-use and must pass
 a later commit fences them. The consumer applies durable outcomes idempotently;
 restoration reads history and never manufactures a fresh completion.
 
-An authenticated encrypted fragment (`SKF`) outside this profile returns the
-typed `UnsupportedShape` reason. Preserve it for the scoped protocol exit in
-RFC 030; unauthenticated input remains a drop and cannot trigger that exit.
+The complete-packet `open_peer` API retains its authenticated `UnsupportedShape`
+refusal for SKF. Negotiated consumers must use `receive_peer_packet` instead;
+authenticated SKF without bilateral negotiation returns `FragmentationNotNegotiated`.
+Unauthenticated input remains `Drop` and cannot trigger protocol teardown.
 
 Retransmit only a pending committed request whose response has not committed;
 never use a settled request as a liveness probe. `replay_request` returns `None`
@@ -447,6 +448,60 @@ for settled exchanges, as specified in
 [RFC 030](../../docs/rfc/030-ike-recovery-profile.md). A live peer
 may have forgotten an old response, and replies to old bytes establish no fresh
 liveness; a settled exchange is never an artificial probe.
+
+### Negotiated RFC 7383 fragmentation
+
+Before IKE_AUTH, call `prepare_fragmentation` with the exact IKE_SA_INIT request
+and response retained for handshake authentication, plus a positive reassembly
+timeout. It verifies both support Notifies (16430), SPI/original-role binding and
+message framing; the consumer still validates SA_INIT and authenticates its
+transcripts. Commit this preparation atomically with the SA. Mint any RFC 6311
+`sync_readiness` before this commit. Rekey successors inherit the parameters in
+their atomic new-epoch record; they do not renegotiate SA_INIT.
+
+Use `receive_peer_packet(profile, keys, wire, now_ms)` for all ordinary packets
+on that SA. `Incomplete` exposes no plaintext. `Message` contains the complete
+authenticated chain and still requires ordinary admission and application
+validation. `Retransmit` borrows the committed response packets: hold that borrow
+and the consumer send fence through every datagram. After a completed request,
+only authenticated fragment 1 triggers replay; later fragments drop. An empty
+request replay must be fragment 1 of 1, empty and byte-identical to the cached
+single-packet request. It returns the prior complete empty request for
+`reply_empty`, preserving canonical replay and its freshness observation.
+
+Each direction holds at most 256 fragments, 65,536 cleartext bytes and 98,304
+wire bytes. The full-chain parser uses that explicit cleartext bound. A higher
+authenticated Total Fragments replaces an incomplete set without extending its
+original deadline; duplicates and lower totals drop. An unfragmented copy clears
+the matching incomplete set. Supply a monotone `now_ms` and schedule
+`expire_fragments` at `fragment_deadline_ms` even while idle. Expiry discards the
+partial set; ordinary retransmission/SA failure policy remains the consumer's.
+An authenticated resource-limit violation latches `FragmentationLimit`; durably
+retire the IKE SA and its Children rather than restarting that failed epoch.
+
+`prepare_fragmented_request` and `prepare_fragmented_response` seal all packets
+before exposing a prepared record. GCM consumes a committed IV for **each**
+fragment; CBC draws an admitted random IV for each. A partial sealing failure
+burns allocated IVs but releases no packet, outcome or Message ID. Persist the
+entire ordered `Ikev2ProtectedMessage` collection and the outcome before sending
+any packet. Replay uses `packets()` and sends each entry separately, including
+after restart. `bytes()`/`single_packet()` explicitly refuse multi-packet output.
+
+`Ikev2FragmentationSize::ipv4`/`ipv6` use known PMTU or defaults of 576/1280 bytes,
+subtracting IP, UDP and the optional Non-ESP Marker; the sender also accounts for
+SKF, IV, integrity and cipher padding. Reduce the supplied PMTU for tunnels or IP
+options. This profile does not perform optional PMTU probing/refragmentation of
+an already committed outbound message. Select a suitable threshold before
+preparation. Empty liveness probes remain unfragmented, and RFC 6311 sync Notify
+messages are refused by the ordinary fragmentation path.
+
+The packet collection and explicit optional `fragmentation` field are mandatory
+codec inputs. The strict example row format is version 4; it rejects old or
+incomplete rows, rather than defaulting missing negotiation state. A consumer
+migration must preserve known negotiation history and every cached fragment.
+Qualification includes all 51 cipher profiles in both roles and sync modes,
+actual process loss between datagrams, and independent Python/OpenSSL vectors.
+See [RFC 030](../../docs/rfc/030-ike-recovery-profile.md) for evidence and limits.
 
 ### Outbound empty INFORMATIONAL probes
 
@@ -484,9 +539,11 @@ node action is required.
 
 Open a peer packet through `open_peer`, then
 call `complete_empty_probe` with the complete authenticated response. Only the
-current ID, response direction, INFORMATIONAL exchange and empty body complete
-the probe, once. This provides liveness evidence, never a durable outcome. A
-bad MAC, wrong ID/class or nonempty reply cannot settle the probe. During a
+current ID, response direction and INFORMATIONAL exchange complete the probe,
+once. RFC 7296 §1.4 permits nonempty responses; the returned payload chain lets
+the caller perform semantic processing under its existing effect authority.
+This provides liveness evidence, never a durable outcome. A bad MAC or wrong
+ID/class cannot settle the probe. During a
 probe, peer requests remain independent; local rekey or Delete preparation
 waits for the outstanding request to complete. An empty acknowledgement of a
 nonempty durable request still belongs to `prepare_completion`.
@@ -631,7 +688,8 @@ packets through the admitted provider and
 requires negotiated mode, the matching SA/original direction, INFORMATIONAL
 request at ID zero, and exactly one sync Notify. Bad, unnegotiated and duplicate
 requests drop without freezing the window or allocating an IV. Both original
-roles can respond. `SKF` recovery remains unsupported.
+roles can respond. RFC 7383 §3 forbids fragmented synchronization messages;
+both sync handlers continue to require complete `SK`.
 
 Admission returns an exclusive capability and freezes ordinary work. For GCM,
 the caller must supply `prepare` a committed single-use **Ordinary** IV allocation

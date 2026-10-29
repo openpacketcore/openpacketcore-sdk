@@ -573,3 +573,51 @@ Sources: [TS 29.510 V18.6.0 §§5.2.2.3.2, 5.3.2.2.1 and 6.3.5.2.4](https://www.
 [TS 29.500 V18.6.0 §6.7.3](https://www.etsi.org/deliver/etsi_ts/129500_129599/129500/18.06.00_60/ts_129500v180600p.pdf),
 [RFC 6750 §3](https://www.rfc-editor.org/rfc/rfc6750.html#section-3), and
 [RFC 8414 §3](https://www.rfc-editor.org/rfc/rfc8414.html#section-3).
+
+## IKE fragmentation #1242
+
+RFC 7383 support is a durable bilateral IKE_SA_INIT agreement. Authenticated
+fragments enter bounded request/response queues; only complete messages enter
+ordinary admission. Exact packet collections, their boundaries and negotiated
+parameters belong to the same atomic row. The strict recovery-profile example
+codec is version 4 and preserves the liveness bound and last folded probe;
+older or incomplete encodings are rejected, with no inferred defaults.
+
+The profile retains the 256-fragment, 64-KiB cleartext and 96-KiB wire bounds,
+independent per-fragment IV accounting, fixed reassembly deadlines and
+all-fragment terminal submission checks. Process-loss tests reconstruct the
+complete encrypted row. Independent Python/OpenSSL vectors establish synthetic
+wire interoperability; third-party VPN captures and active PMTU probing remain
+outside this qualification. Consumers must schedule idle reassembly expiry and
+retain fenced send authority through every fragment.
+
+See [RFC 7383](https://www.rfc-editor.org/rfc/rfc7383.html),
+[the recovery contract](rfc/030-ike-recovery-profile.md), and
+[fragment provenance](../crates/opc-proto-ikev2/tests/vectors/ikev2_fragments.provenance.json).
+
+## ESP traffic flow confidentiality #1344
+
+`SaParameters::tfc_pad` retains its ESP-tunnel validation and exact install,
+rekey and binding readback. An acknowledged update whose effective padding
+differs is indeterminate. Authenticated identities retain the tagged extension
+and preserve pre-TFC bytes when padding is absent. There is no added 65,535-byte
+configuration limit. Callers own direction-specific peer negotiation, including
+`ESP_TFC_PADDING_NOT_SUPPORTED` (RFC 4303 section 2.7 and RFC 7296 section 1.3.1).
+
+`EspTfcDummySender` submits protocol-59 data through a mandatory kernel-SA
+socket policy; the plaintext-only helper is removed. Native encryption,
+sequence allocation and lifetimes remain shared with ordinary traffic.
+Transport mode uses stock Linux. Tunnel dummies are qualified only on the
+pinned patched Linux kernel, and other kernels need a separate port and
+qualification. The provisional OPCTFC01 ABI is not an upstream allocation.
+
+The matrix covers matching inner/outer families and Linux receiver discard.
+Mixed-family tunnels and non-Linux receivers are unqualified. Sender-namespace
+NAT must not rewrite protocol-59 flows, because rerouting can bypass the
+socket policy. Hardware offload, stacked transforms, GSO and scoped IPv6
+endpoints are outside the profile. Every captured tunnel packet must meet the
+configured TFC body length, capped by Linux's path-MTU calculation. Producers
+must share the caller's lifecycle fence; the socket is not durable SA identity.
+
+See [RFC 4303 sections 2.6–2.7](https://www.rfc-editor.org/rfc/rfc4303.html#section-2.6)
+and the [kernel sender qualification](../kernel/xfrm-tfc-dummy/README.md).

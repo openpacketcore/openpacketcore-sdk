@@ -28,6 +28,7 @@ the recorded parameters, not equality to a newly generated signature.
 independently with OpenSSL, including the expected negative cases. Set
 `OPENSSL` to an OpenSSL 3 executable where the platform default is LibreSSL.
 Run this checker alongside the crate tests.
+The same check runs in the CI gates.
 
 MODP 15–18 fixed-exponent vectors remain in `src/sa_init_crypto.rs`.
 The primes were compared byte-for-byte with RFC 3526 sections 4–7, then

@@ -83,6 +83,7 @@ impl<P: RecoveryProfile> Window<P> {
         pending_inbound: Option<&Ordinary<P>>,
     ) -> Result<Ikev2AdmittedSyncResponse<'_, P>, Error> {
         self.send.check_terminal()?;
+        self.fragments.ready()?;
         if self.quiescent {
             return Err(Error::CommitUncertain);
         }
@@ -281,6 +282,8 @@ impl<P: RecoveryProfile> Ikev2PreparedSyncResponse<'_, P> {
         let disposition = self.record.sync.ok_or(Error::InvalidRecord)?.disposition;
         self.window.record = self.record;
         self.window.send.adopt(&self.window.record, true);
+        self.window.fragments.cutover();
+        self.window.packet_evidence = P::SyncEvidence::default();
         self.window.observed_peer_request.set(None);
         self.window.quiescent = false;
         self.window.adopt_receive_boundary()?;

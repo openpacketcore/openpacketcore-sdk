@@ -429,6 +429,7 @@ impl<P: RecoveryProfile> Window<P> {
             header,
             PayloadChain::new(PayloadType::NoNext, &[]),
         )?;
+        P::retain_sealed(&mut self.packet_evidence, &sealed)?;
         let wire = sealed.into_wire();
         self.send.next = id.checked_add(1);
         self.send.highest_probe = Some(id);
@@ -486,28 +487,27 @@ impl<P: RecoveryProfile> Window<P> {
         self.borrow_probe()
     }
 
-    /// Complete the current probe once from a fully authenticated empty response.
+    /// Complete the current probe once from an authenticated INFORMATIONAL response.
     ///
     /// This is liveness evidence only, never an application outcome or durable
     /// completion. Opposite-direction peer traffic remains independent. An empty
     /// response to a nonempty durable request belongs to `prepare_completion`.
+    /// RFC 7296 §1.4 permits response payloads; return them for the caller's
+    /// semantic processing under its existing SA and effect authority.
     /// # Errors
-    /// Drops mismatched domain/ID/class, nonempty or duplicate responses. No packet
+    /// Drops mismatched domain/ID/class or duplicate responses. No packet
     /// can extend the fixed deadline or clear latched expiry/clock knowledge.
-    pub fn complete_empty_probe(
+    pub fn complete_empty_probe<'a>(
         &mut self,
-        response: &Ordinary<P>,
+        response: &'a Ordinary<P>,
         now_ms: u64,
-    ) -> Result<(), Error> {
+    ) -> Result<PayloadChain<'a>, Error> {
         self.check_empty_probe_deadline(now_ms)?;
-        if response.domain != self.record.domain
-            || !self.send.matches_response(&response.header)
-            || !response.payloads().is_empty()
-        {
+        if response.domain != self.record.domain || !self.send.matches_response(&response.header) {
             return Err(Error::Drop);
         }
         self.send.outstanding = None;
-        Ok(())
+        Ok(response.payloads())
     }
 }
 

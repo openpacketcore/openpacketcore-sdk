@@ -246,7 +246,7 @@ fn liveness_mode_is_mandatory_nonzero_and_survives_full_row_reconstruction() {
         let mut encoded = Codec::encode(&row).unwrap();
         encoded[4..6].copy_from_slice(&1u16.to_be_bytes());
         assert!(Codec::decode(&encoded, row.key, row.version, row.sealed_stamp).is_err());
-        encoded[4..6].copy_from_slice(&2u16.to_be_bytes());
+        encoded[4..6].copy_from_slice(&4u16.to_be_bytes());
         let mut offset = 6;
         while encoded[offset] != 6 {
             offset += 5 + u32::from_be_bytes(encoded[offset + 1..offset + 5].try_into().unwrap())
@@ -262,4 +262,47 @@ fn liveness_mode_is_mandatory_nonzero_and_survives_full_row_reconstruction() {
         encoded[offset + 1..offset + 5].copy_from_slice(&(length - 6).to_be_bytes());
         assert!(Codec::decode(&encoded, row.key, row.version, row.sealed_stamp).is_err());
     }
+}
+
+#[test]
+fn fragmentation_metadata_is_required_nonzero_and_versioned() {
+    let profile = inputs::profiles().next().unwrap();
+    let mut row = inputs::fresh(
+        12_424_000,
+        profile,
+        crate::canonical_fixtures::DIRECTIONS[0],
+        Mode::BaseFallback,
+    );
+    row.window.generation = 1;
+    row.window.fragmentation = Some(
+        opc_proto_ikev2::recovery::Ikev2FragmentationParameters::from_persisted(
+            std::num::NonZeroU32::new(50).unwrap(),
+        ),
+    );
+    assert_eq!(
+        round_trip(&row).window.fragmentation,
+        row.window.fragmentation
+    );
+    let original = Codec::encode(&row).unwrap();
+    assert_eq!(&original[4..6], &4u16.to_be_bytes());
+    for version in [1u16, 2, 3] {
+        let mut encoded = original.clone();
+        encoded[4..6].copy_from_slice(&version.to_be_bytes());
+        assert!(Codec::decode(&encoded, row.key, row.version, row.sealed_stamp).is_err());
+    }
+    let mut offset = 6;
+    while original[offset] != 6 {
+        offset +=
+            5 + u32::from_be_bytes(original[offset + 1..offset + 5].try_into().unwrap()) as usize;
+    }
+    let parameter = offset + 5 + 8 + 5 + 5 + 1;
+    assert_eq!(&original[parameter..parameter + 5], &[1, 0, 0, 0, 50]);
+    let mut encoded = original.clone();
+    encoded[parameter + 1..parameter + 5].fill(0);
+    assert!(Codec::decode(&encoded, row.key, row.version, row.sealed_stamp).is_err());
+    let mut encoded = original;
+    let length = u32::from_be_bytes(encoded[offset + 1..offset + 5].try_into().unwrap());
+    encoded.drain(parameter..parameter + 5);
+    encoded[offset + 1..offset + 5].copy_from_slice(&(length - 5).to_be_bytes());
+    assert!(Codec::decode(&encoded, row.key, row.version, row.sealed_stamp).is_err());
 }

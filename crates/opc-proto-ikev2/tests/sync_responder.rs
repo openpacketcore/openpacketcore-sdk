@@ -116,6 +116,8 @@ impl Fixture {
             Some(counters.next_receive),
             None,
             None,
+            None,
+            None,
         )
         .unwrap()
         .with_sync_state(
@@ -1046,10 +1048,19 @@ fn exhausted_counter_or_generation_never_becomes_a_successful_sync() {
         ));
         assert_eq!(window.record(), &original);
     }
-    let record = Record::from_persisted(f.domain.clone(), u64::MAX, Some(0), Some(0), None, None)
-        .unwrap()
-        .with_sync_state(*original.sync_state().unwrap())
-        .unwrap();
+    let record = Record::from_persisted(
+        f.domain.clone(),
+        u64::MAX,
+        Some(0),
+        Some(0),
+        None,
+        None,
+        None,
+        None,
+    )
+    .unwrap()
+    .with_sync_state(*original.sync_state().unwrap())
+    .unwrap();
     let mut exhausted = f.restore(&record, &f.iv_record(0));
     assert!(matches!(
         exhausted.begin_sync_response(
@@ -1221,6 +1232,8 @@ fn cutover_restore_retains_reply_and_retired_packet_iv_bounds() {
                         Some(3),
                         Some(outbound),
                         Some(inbound),
+                        None,
+                        None,
                     )
                     .unwrap()
                     .with_sync_state(
@@ -1255,6 +1268,8 @@ fn cutover_restore_retains_reply_and_retired_packet_iv_bounds() {
                     record.generation(),
                     record.next_send(),
                     record.next_receive(),
+                    None,
+                    None,
                     None,
                     None,
                 )
@@ -1360,10 +1375,19 @@ fn persisted_minimum_iv_end_must_fit_the_allocator_range_and_cover_empty_caches(
         128,
     )
     .unwrap();
-    let record = Record::from_persisted(f.domain.clone(), 1, Some(0), Some(0), None, None)
-        .unwrap()
-        .with_sync_state(state)
-        .unwrap();
+    let record = Record::from_persisted(
+        f.domain.clone(),
+        1,
+        Some(0),
+        Some(0),
+        None,
+        None,
+        None,
+        None,
+    )
+    .unwrap()
+    .with_sync_state(state)
+    .unwrap();
     assert!(matches!(
         Window::restore(&f.domain, f.profile, &f.keys, &record, &f.iv_record(127),),
         Err(Error::InvalidRecord)
@@ -1419,22 +1443,30 @@ fn exhausted_windows_drop_duplicate_sync_before_returning_fresh_exhaustion_inten
                     Some(u32::MAX),
                 )
             };
-            let record =
-                Record::from_persisted(f.domain.clone(), 1, send, receive, outbound, inbound)
-                    .unwrap()
-                    .with_sync_state(
-                        SyncRecord::from_persisted(
-                            f.agreement,
-                            local,
-                            peer,
-                            None,
-                            None,
-                            Disposition::Continue,
-                            0,
-                        )
-                        .unwrap(),
-                    )
-                    .unwrap();
+            let record = Record::from_persisted(
+                f.domain.clone(),
+                1,
+                send,
+                receive,
+                outbound,
+                inbound,
+                None,
+                None,
+            )
+            .unwrap()
+            .with_sync_state(
+                SyncRecord::from_persisted(
+                    f.agreement,
+                    local,
+                    peer,
+                    None,
+                    None,
+                    Disposition::Continue,
+                    0,
+                )
+                .unwrap(),
+            )
+            .unwrap();
             let mut window = f.restore(&record, &f.iv_record(1));
             for m1 in [0, peer.unwrap()] {
                 let duplicate = f.peer_sync(Sync::new(NONCE, m1, 0));

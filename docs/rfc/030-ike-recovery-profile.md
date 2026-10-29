@@ -26,7 +26,7 @@ execution ownership or effect fencing:
 | --- | --- |
 | `Ikev2CommittedWindow::replay_request` | Return only a committed request with no committed response. A settled exchange yields `None`. Record the behavior change in the CHANGELOG and reverse the settled-replay regression. |
 | Empty and cached-response admission | Permit the narrow outbound-only uncertain-write case for `reply_empty`, the cached branch of `request_disposition` and `replay_response`; retain receive, authority, revocation and sync checks. Only empty replies require current canonical-provider admission; committed ordinary replay needs no cryptography. Do not relax `ready()` for new work or other operations. |
-| `recovery/packet.rs::open` | Authenticate an otherwise applicable `SKF` before returning a typed `UnsupportedShape` reason. Unauthenticated input remains an ordinary drop and cannot trigger teardown. |
+| `receive_peer_packet` | Authenticate each negotiated SKF, enforce bounded reassembly and complete-message admission, and replay only on fragment 1. The legacy complete-SK `open_peer` retains typed `UnsupportedShape`. |
 | Profile record construction | Add a checked `from_profile_persisted` entry point with a mandatory, explicit base/negotiated synchronization-state argument, including explicit recovery-event presence or absence. Reuse existing records. The low-level optional `with_sync_state` sequence alone does not qualify a profile restore. |
 | `notify.rs` | Add the `INITIAL_CONTACT` constant and strict typed decoding; authentication, identity matching and cleanup remain composition responsibilities. |
 | Pending KE custody | Opt in through `require_dh_checkpoint(group)` and the optional `IkeDhCheckpoint` capability. Export an initiator's private value once into `Zeroizing` bytes; import recomputes and checks its public value. Persist the checkpoint inside the existing row envelope in the request's child CAS. A fixture-held handle surviving a simulated crash is insufficient. |
@@ -40,38 +40,65 @@ composition guarantees merely by remaining callable.
 
 | Dimension | Contract |
 | --- | --- |
-| Packet/profile | Complete, unfragmented `SK`; existing AES-GCM-16 with 128/192/256-bit keys, or the existing 48 CBC encryption/integrity/PRF combinations. Qualify every configured provider/profile and KE custody capability. |
+| Packet/profile | Complete `SK` or bilaterally negotiated `SKF`; existing AES-GCM-16 with 128/192/256-bit keys, or the existing 48 CBC encryption/integrity/PRF combinations. Qualify every configured provider/profile and KE custody capability. |
 | Exchange classes | Final IKE_AUTH seeding/replay, CREATE_CHILD_SA and INFORMATIONAL. Handshake authentication precedes established-SA effects. |
 | Request windows | One outstanding ordinary request in each independent direction, for both original roles. Never send `SET_WINDOW_SIZE`. Zero is a valid ID where that direction's history permits it; `None` means exhaustion. |
 | Empty receive | Canonical policy and preflight, checked restore, then `enable_empty_replies`. CBC uses `preflight_cbc`; sync readiness does not qualify canonical replies. |
-| Liveness probe (opt-in) | Durable positive unwritten-ID bound, then a volatile empty `INFORMATIONAL` request: no per-probe store command, exact-byte exponential retransmission, fixed deadline and matching empty response. Restart requires RFC 6311 synchronization beyond the bound or scoped SA retirement. Caller idleness covers authenticated IKE and Child-SA ESP traffic; NAT keepalives never count. |
+| Liveness probe (opt-in) | Durable positive unwritten-ID bound, then a volatile empty `INFORMATIONAL` request: no per-probe store command, exact-byte exponential retransmission, fixed deadline and a matching authenticated INFORMATIONAL response, with or without payloads. Restart requires RFC 6311 synchronization beyond the bound or scoped SA retirement. Caller idleness covers authenticated IKE and Child-SA ESP traffic; NAT keepalives never count. |
 | Base recovery | Restore committed history and reconstruct the lost empty prefix. No synthetic local liveness probe is sent by recovery itself; an opt-in volatile probe is a separate caller-driven primitive (below). |
 | Negotiated sync | Persist authenticated bilateral agreement; require `sync_readiness`, initiation and response handlers. Never assert `IPSEC_REPLAY_COUNTER_SYNC_SUPPORTED` (16421); ESP counter restoration is outside this profile. |
 | Persistence | Exact prior birth/generation CAS under the current RFC 022 execution stamp, with the SA, window, IV state and operation outcome committed atomically. |
 | Execution | One live window and allocator owner per immutable SA key epoch, including within one process. Positive authority is required to recover that cohort. |
 | Excluded histories | Unknown or rolled-back key/IV state, omitted negotiated metadata, partial records, unconfirmed predecessor takeover and restored old ESP sequence state. |
 
-This profile does not negotiate IKE fragmentation. A bilateral fragmentation
-agreement permits later SKF use, including a large rekey, so qualifying only the
-initial packet sizes is insufficient. The configuration check must cover all
-admitted handshake and later exchange shapes. See
-[RFC 7383 §§2.3–2.4](https://www.rfc-editor.org/rfc/rfc7383.html#section-2.3).
-An authenticated SKF received nevertheless has a typed refusal and enters the
-committed, scoped Delete path below; it must not disappear as unexplained noise.
+RFC 7383 support is an explicit, durable opt-in before IKE_AUTH. Commit
+`prepare_fragmentation` from both exact SA_INIT transcripts and retain that
+agreement across IKE rekey. Use `receive_peer_packet` for ordinary traffic;
+`open_peer` is intentionally limited to complete SK. Missing bilateral support
+produces `FragmentationNotNegotiated` only after authentication. Authentication
+failure remains `Drop`. See [RFC 7383 §§2.3–2.6](https://www.rfc-editor.org/rfc/rfc7383.html#section-2.3)
+and the [API contract](../../crates/opc-proto-ikev2/README.md#negotiated-rfc-7383-fragmentation).
 
-The scoped implementation adds refusal diagnostics and tests, not fragment
-recovery. A consumer that requires SKF needs a separately sized extension for
-authenticated reassembly, persisted exact fragment responses, IV accounting and
-crash/retransmission coverage before enabling this profile. That decision is a
-consumer integration gate, not permission to silently narrow an already
-negotiated SA. This revision covers typed refusal and its REDs; full fragment
-recovery is a separate dependency if the consumer's declared
-handshake/rekey shapes require it. Before consumer integration implementation,
-the consumer must declare whether its IKE_AUTH or rekey exchanges require
-fragmentation; a required extension must then be sized and the integration
-reforecast before proceeding. No full-SKF estimate or support claim is made
-without that shape decision. Third-party interoperability remains separate for
-either cipher.
+Reassembly has separate request/response queues, each bounded to 256 fragments,
+64 KiB cleartext and 96 KiB wire bytes. Every fragment authenticates before
+storage; no partial payload or effect is released. Higher fragment totals
+replace the old incomplete set without refreshing its deadline. The caller
+schedules expiry even while idle. An authenticated bound violation closes the
+runtime and requires durable IKE/Child teardown. Timeout discards only the
+incomplete set, leaving ordinary exchange retry/expiry policy to the caller.
+
+Prepare and persist every outgoing packet atomically with the exchange outcome.
+Retain packet boundaries and order; restoring authenticates the whole collection
+and covers every locally sent GCM IV. A failed partial preparation burns IVs
+without releasing packets or advancing the ordinary Message ID. Retransmission
+uses the stored bytes without fresh encryption. Only authenticated fragment 1
+of a processed request triggers response replay, including canonical empty
+responses. Sync cutover discards incomplete queues. RFC 6311 synchronization
+messages must remain unfragmented ([RFC 7383 §3](https://www.rfc-editor.org/rfc/rfc7383.html#section-3)).
+Known PMTU and the RFC IPv4/IPv6 defaults include transport/cipher overhead;
+optional active PMTU probing is outside this profile.
+
+`tests/fragmented_recovery.rs` covers missing, reordered, duplicate, corrupt,
+replaced and oversized sets, exact errors, complete-SK replacement, canonical
+empty-prefix interaction, IV exhaustion and packet/cleartext boundaries.
+`tests/recovery_profile/fragmentation_tests.rs` composes complete encrypted rows,
+fenced CAS, 51 cipher profiles × two original roles × two sync modes, exact
+request/response replay and idempotent outcomes. Real child exits between request
+and response datagrams are followed by replacement processes that read only
+encrypted rows under successor ownership; replay consumes no new entropy or
+provider sealing call. IKE_AUTH certificate-shaped payload tests qualify
+fragment transport, not certificate verification or handshake authentication.
+
+The independent [Python reference](../../crates/opc-proto-ikev2/tests/vectors/ikev2_fragment_reference.py)
+uses OpenSSL through cryptography, with no SDK imports. Twelve known-answer
+sets cover GCM/CBC, three AES key sizes and both original roles. It verifies
+SDK-exported random-IV CBC and deterministic GCM packets, and rejects 6,456
+single-byte packet mutations. Published NIST examples check its cipher backend.
+Reproduce the pinned environment and run `--check`; set
+`OPC_FRAGMENT_VECTOR_EXPORT` while running the `fragment_vectors` Rust target,
+then pass that file to `--verify-export`. Provenance is retained beside the
+vectors. This is independent synthetic wire qualification, not a third-party
+VPN deployment or consumer integration claim.
 
 ## Durability, writer fencing and ownership
 
@@ -302,7 +329,9 @@ checkpoint fold it into the next atomic record. The declared peer window is
 still one. A pending probe serializes other locally initiated requests but
 leaves the opposite direction available. Retries preserve every original byte
 and use bounded exponential backoff under a fixed monotone deadline. Only the
-matching authenticated empty response completes the probe, once.
+authenticated INFORMATIONAL response carrying the outstanding probe Message ID
+completes the probe, once; it may carry payloads. `complete_empty_probe` returns
+those payloads for caller processing (RFC 7296 §1.4).
 
 GCM probes consume already reserved Ordinary IVs, never a new reservation or
 control headroom; CBC probes use fresh admitted random IVs. Caller idle policy

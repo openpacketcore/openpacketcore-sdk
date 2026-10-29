@@ -20,6 +20,7 @@ use crate::{
 impl<P: RecoveryProfile> Window<P> {
     fn sync_open(&self) -> Result<(), Error> {
         self.send.check_terminal()?;
+        self.fragments.ready()?;
         if self.quiescent {
             return Err(Error::CommitUncertain);
         }
@@ -493,6 +494,8 @@ impl<P: RecoveryProfile> Ikev2PreparedSyncInitiation<'_, P> {
         let check_clock = matches!(self.action, Ikev2SyncInitiatorAction::SendRequest(_));
         self.window.record = self.record;
         self.window.send.adopt(&self.window.record, true);
+        self.window.fragments.cutover();
+        self.window.packet_evidence = P::SyncEvidence::default();
         self.window.quiescent = false;
         self.window.observed_peer_request.set(None);
         self.window.sync_live = false;

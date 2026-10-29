@@ -37,7 +37,7 @@ fn local_empty_informational_can_start_a_fresh_liveness_exchange() {
     let response = f.peer(0, true, 37, empty(), 0, 91);
     let response = f.window.open_peer(f.profile, &f.keys, &response).unwrap();
     assert_eq!(f.window.pending_empty_request_message_id(), Some(0));
-    assert_eq!(f.window.complete_empty_probe(&response, 100), Ok(()));
+    assert_eq!(f.window.complete_empty_probe(&response, 100), Ok(empty()));
     assert_eq!(f.window.record(), &record);
     assert_eq!(f.window.next_send(), Some(1));
 }
