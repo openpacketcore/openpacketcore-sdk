@@ -21,9 +21,20 @@ from pathlib import Path
 import importlib.util, os, shutil, stat, subprocess, sys
 helper, root, uid, gid, mode = Path(sys.argv[1]), Path(sys.argv[2]), int(sys.argv[3]), int(sys.argv[4]), sys.argv[5]
 runner = root / 'runner'
+if mode == 'search-only':
+    ancestor = root/'search-only'
+    ancestor.mkdir(mode=0o711)
+    ancestor.chmod(0o711)
+    runner = ancestor/'runner'
+    runner.mkdir(mode=0o700)
+    os.chown(runner, uid, gid)
 env = dict(os.environ, RUNNER_TEMP=str(runner), GITHUB_ENV=str(root/'job-env'),
            GITHUB_JOB='rust-local-kernel-lifecycle',
            GITHUB_WORKFLOW_REF='owner/repository/.github/workflows/ci.yml@refs/heads/test')
+if mode == 'symlink':
+    alias = root/'alias'
+    alias.symlink_to(root, target_is_directory=True)
+    env['RUNNER_TEMP'] = str(alias/'runner')
 setpriv = [shutil.which('setpriv'), f'--reuid={uid}', f'--regid={gid}', '--init-groups']
 def run(*args, environment=env):
     return subprocess.run([*setpriv, 'bash', str(helper), *args], env=environment, text=True, capture_output=True)
@@ -56,6 +67,16 @@ try:
         if mode=='tmpfs':
             assert (mounted/'keep').read_text() == 'mounted data'
         assert scratch.exists(), 'refused cleanup must restore its root'
+    elif mode=='symlink':
+        victim = foreign/'runner'/scratch.name
+        victim.mkdir(parents=True)
+        (victim/'keep').write_text('foreign')
+        alias.unlink()
+        alias.symlink_to(foreign, target_is_directory=True)
+        result=run('cleanup','--privileged')
+        assert result.returncode==0, result.stderr
+        assert not scratch.exists(), 'cleanup must use the recorded physical parent'
+        assert (victim/'keep').read_text()=='foreign', 'changed runner alias must not redirect deletion'
     elif mode=='sudo-race':
         victim = foreign/scratch.name
         victim.mkdir()
@@ -150,7 +171,29 @@ class HelperTests(unittest.TestCase):
     def identity_env(self, runner, scratch):
         identity = lambda path: f"{path.stat().st_dev}:{path.stat().st_ino}"
         return dict(self.env, RUNNER_TEMP=str(runner), OPC_CI_DISK_TMPDIR=str(scratch),
-                    OPC_CI_DISK_TMPDIR_ID=identity(scratch), OPC_CI_DISK_PARENT_ID=identity(runner))
+                    OPC_CI_DISK_PARENT=str(runner), OPC_CI_DISK_TMPDIR_ID=identity(scratch),
+                    OPC_CI_DISK_PARENT_ID=identity(runner))
+
+    def test_prepare_resolves_symlinked_runner_ancestor_and_cleanup_uses_recorded_parent(self):
+        alias = self.root / "alias"
+        alias.symlink_to(self.root, target_is_directory=True)
+        self.env["RUNNER_TEMP"] = str(alias / self.runner.name)
+        scratch = self.prepare()
+        self.assertEqual(self.env["OPC_CI_DISK_PARENT"], str(self.runner))
+        self.assertEqual(scratch.parent, self.runner)
+        (scratch / "owned").write_text("data")
+        foreign = self.root / "foreign"
+        foreign.mkdir()
+        (foreign / "keep").write_text("foreign")
+        victim = foreign / self.runner.name / scratch.name
+        victim.mkdir(parents=True)
+        (victim / "keep").write_text("foreign scratch")
+        alias.unlink()
+        alias.symlink_to(foreign, target_is_directory=True)
+        self.assertEqual(self.run_helper("cleanup").returncode, 0)
+        self.assertFalse(scratch.exists())
+        self.assertEqual((foreign / "keep").read_text(), "foreign")
+        self.assertEqual((victim / "keep").read_text(), "foreign scratch")
 
     def test_preparation_records_private_directory_identity(self):
         scratch = self.prepare()
@@ -198,7 +241,7 @@ class HelperTests(unittest.TestCase):
                 self.assertTrue(self.runner.exists())
 
     def test_root_and_empty_runner_are_refused(self):
-        for value in [None, "", "/"]:
+        for value in [None, "", "/", "relative", str(self.runner / "..")]:
             with self.subTest(value=value):
                 env = dict(self.env)
                 env.pop("RUNNER_TEMP", None)
@@ -210,7 +253,7 @@ class HelperTests(unittest.TestCase):
         scratch = self.prepare()
         marker = scratch / "keep"
         marker.write_text("data")
-        for key in ["RUNNER_TEMP", "OPC_CI_DISK_TMPDIR", "OPC_CI_DISK_TMPDIR_ID", "OPC_CI_DISK_PARENT_ID"]:
+        for key in ["RUNNER_TEMP", "OPC_CI_DISK_PARENT", "OPC_CI_DISK_TMPDIR", "OPC_CI_DISK_TMPDIR_ID", "OPC_CI_DISK_PARENT_ID"]:
             for value in [None, ""]:
                 with self.subTest(key=key, value=value):
                     env = dict(self.env)
@@ -296,7 +339,9 @@ class HelperTests(unittest.TestCase):
             with self.subTest(workflow=workflow, job=job):
                 env = dict(self.env, GITHUB_ACTIONS="true", GITHUB_JOB=job,
                            GITHUB_WORKFLOW_REF=f"owner/repository/.github/workflows/{workflow}@refs/heads/test")
-                self.assertNotEqual(self.run_helper("cleanup", "--privileged", env=env).returncode, 0)
+                result = self.run_helper("cleanup", "--privileged", env=env)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn("not allowed in this job", result.stderr)
                 self.assertTrue(marker.exists())
 
     def test_sudo_failure_is_propagated_without_partial_cleanup(self):
@@ -324,6 +369,12 @@ class HelperTests(unittest.TestCase):
 
     def test_privileged_cleanup_retires_root_owned_entries_quietly(self):
         self.privileged_fixture("ordinary")
+
+    def test_search_only_ancestor_needs_no_read_permission(self):
+        self.privileged_fixture("search-only")
+
+    def test_privileged_cleanup_uses_recorded_parent_after_symlink_swap(self):
+        self.privileged_fixture("symlink")
 
     def test_bind_mount_on_the_same_device_is_refused(self):
         self.privileged_fixture("bind")

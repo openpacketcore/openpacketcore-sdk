@@ -14,6 +14,7 @@ import subprocess
 import sys
 
 DIRECTORY = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
+ANCESTOR = os.O_PATH | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
 ALLOWED = {("ci.yml", "rust-local-kernel-lifecycle"), ("ipsec-xfrm.yml", "privileged")}
 RAM = {0x1021994, 0x858458F6}
 
@@ -41,10 +42,11 @@ def canonical_parts(path):
 @contextlib.contextmanager
 def open_parent(path, uid):
     parts = canonical_parts(path)
-    descriptors = [os.open("/", DIRECTORY)]
+    descriptors = [os.open("/", ANCESTOR)]
     try:
-        for part in parts:
-            descriptors.append(os.open(part, DIRECTORY, dir_fd=descriptors[-1]))
+        for index, part in enumerate(parts):
+            flags = DIRECTORY if index == len(parts) - 1 else ANCESTOR
+            descriptors.append(os.open(part, flags, dir_fd=descriptors[-1]))
         parent = descriptors[-1]
         info = os.fstat(parent)
         if info.st_uid != uid or info.st_mode & 0o300 != 0o300:
@@ -62,6 +64,10 @@ def prepare():
     environment = os.environ.get("GITHUB_ENV", "")
     if not environment:
         raise RuntimeError("GITHUB_ENV is required")
+    # Resolve a runner's stable setup path once. Cleanup never resolves this
+    # potentially symlinked spelling: it uses the pinned, recorded parent.
+    canonical_parts(runner)
+    runner = os.path.realpath(runner, strict=True)
     with open_parent(runner, os.getuid()) as (parent, _):
         name = "opc-disk-scratch." + "".join(secrets.choice(string.ascii_letters + string.digits) for _ in range(8))
         os.mkdir(name, 0o700, dir_fd=parent)
@@ -74,7 +80,7 @@ def prepare():
                 if magic in RAM:
                     raise RuntimeError("durable tests require disk-backed runner scratch")
                 scratch = runner + "/" + name
-                values = {"TMPDIR": scratch, "OPC_CI_DISK_TMPDIR": scratch,
+                values = {"TMPDIR": scratch, "OPC_CI_DISK_TMPDIR": scratch, "OPC_CI_DISK_PARENT": runner,
                           "OPC_CI_DISK_TMPDIR_ID": identity(fd), "OPC_CI_DISK_PARENT_ID": identity(parent)}
                 with open(environment, "a", encoding="utf-8") as output:
                     output.write("".join(f"{key}={value}\n" for key, value in values.items()))
@@ -239,8 +245,11 @@ def main():
         prepare()
         return 0
     if args in [["cleanup"], ["cleanup", "--privileged"]]:
+        # Require valid runner metadata, but never resolve or traverse it for
+        # deletion; the recorded physical parent is the sole path authority.
+        canonical_parts(os.environ.get("RUNNER_TEMP", ""))
         values = [os.environ.get(key, "") for key in
-                  ["RUNNER_TEMP", "OPC_CI_DISK_TMPDIR", "OPC_CI_DISK_TMPDIR_ID", "OPC_CI_DISK_PARENT_ID"]]
+                  ["OPC_CI_DISK_PARENT", "OPC_CI_DISK_TMPDIR", "OPC_CI_DISK_TMPDIR_ID", "OPC_CI_DISK_PARENT_ID"]]
         checked_values(*values)
         if len(args) == 2:
             workflow, job = os.environ.get("GITHUB_WORKFLOW_REF", ""), os.environ.get("GITHUB_JOB", "")

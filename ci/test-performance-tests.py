@@ -324,9 +324,17 @@ class DurableScratchWorkflowTests(unittest.TestCase):
                     self.assertNotIn("continue-on-error", teardown)
                     runner = Path(temporary)
                     github_env = runner / "github-env"
+                    tools = runner / "tools"
+                    tools.mkdir()
+                    sudo = tools / "sudo"
+                    sudo.write_text('#!/bin/sh\nprintf "%s\\n" "$@" > "$SCRATCH_TEST_SUDO_CAPTURE"\nexec bash ci/disk-scratch.sh cleanup\n')
+                    sudo.chmod(0o755)
+                    sudo_capture = runner / "sudo-argv"
                     env = dict(os.environ, RUNNER_TEMP=str(runner), GITHUB_ENV=str(github_env),
                                GITHUB_JOB=name,
-                               GITHUB_WORKFLOW_REF=f"owner/repository/.github/workflows/{filename}@refs/heads/test")
+                               GITHUB_WORKFLOW_REF=f"owner/repository/.github/workflows/{filename}@refs/heads/test",
+                               PATH=str(tools) + os.pathsep + os.environ["PATH"],
+                               SCRATCH_TEST_SUDO_CAPTURE=str(sudo_capture))
                     subprocess.run(["bash", "-e", "-o", "pipefail", "-c", setup["run"]], cwd=root, env=env, check=True)
                     exported = dict(line.split("=", 1) for line in github_env.read_text().splitlines())
                     scratch = Path(exported["TMPDIR"])
@@ -339,6 +347,16 @@ class DurableScratchWorkflowTests(unittest.TestCase):
                     self.assertEqual(observed, str(scratch))
                     (scratch / "test-output").write_text("retained until job cleanup")
                     subprocess.run(["bash", "-e", "-o", "pipefail", "-c", teardown["run"]], cwd=root, env=env, check=True)
+                    if (filename, name) in self.privileged:
+                        arguments = sudo_capture.read_text().splitlines()
+                        self.assertEqual(arguments[:3], ["-n", "/usr/bin/python3", "-I"])
+                        self.assertEqual(Path(arguments[3]), root / "ci/disk-scratch.py")
+                        self.assertEqual(arguments[4:], ["privileged-cleanup", exported["OPC_CI_DISK_PARENT"],
+                                                         str(scratch), exported["OPC_CI_DISK_TMPDIR_ID"],
+                                                         exported["OPC_CI_DISK_PARENT_ID"],
+                                                         env["GITHUB_WORKFLOW_REF"], name])
+                    else:
+                        self.assertFalse(sudo_capture.exists())
                     self.assertFalse(scratch.exists())
                     self.assertTrue(github_env.exists(), "cleanup must not remove its runner parent")
 
@@ -422,13 +440,25 @@ class WorkflowMutationTests(unittest.TestCase):
             for path in (ROOT / "ci").glob(pattern):
                 shutil.copy2(path, self.root / "ci" / path.name)
 
-    def policy_result(self):
+    def policy_result(self, env=None):
         return subprocess.run([sys.executable, "ci/test-performance-tests.py", "DurableScratchWorkflowTests"],
-                              cwd=self.root, text=True, capture_output=True)
+                              cwd=self.root, text=True, capture_output=True, env=env)
 
     def test_unmodified_workflow_copy_passes_the_same_policy(self):
         result = self.policy_result()
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
+    def test_policy_does_not_require_passwordless_sudo(self):
+        tools = self.root / "denied-sudo"
+        tools.mkdir()
+        denied = tools / "sudo"
+        denied.write_text('#!/bin/sh\necho denied >> "$SCRATCH_TEST_DENIED"\nexit 77\n')
+        denied.chmod(0o755)
+        marker = self.root / "denied-sudo-called"
+        env = dict(os.environ, PATH=str(tools) + os.pathsep + os.environ["PATH"], SCRATCH_TEST_DENIED=str(marker))
+        result = self.policy_result(env=env)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertFalse(marker.exists(), "policy fixtures must not use the host sudo")
 
     def test_privileged_launch_without_tmpdir_forwarding_is_detected(self):
         path = self.root / ".github/workflows/ipsec-xfrm.yml"
