@@ -78,8 +78,8 @@ jobs:
           if-no-files-found: error
 
       - name: Remove disk-backed scratch
-        if: always()
-        run: bash ci/disk-scratch.sh cleanup --privileged
+        if: always() && env.OPC_CI_DISK_TMPDIR != ''
+        run: bash ci/disk-scratch.sh cleanup
 
   report-nightly:
     name: Report nightly latency qualification failure

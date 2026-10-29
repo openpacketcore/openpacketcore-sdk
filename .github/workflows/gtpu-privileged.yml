@@ -45,9 +45,6 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v7
 
-      - name: Prepare disk-backed scratch
-        run: bash ci/disk-scratch.sh prepare
-
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
 
@@ -78,16 +75,16 @@ jobs:
           # ships in the same optional module package as gtp. Create a VRF
           # in a throwaway namespace rather than look for a module: that
           # holds for a built-in driver as well.
-          if ! sudo env "TMPDIR=${TMPDIR}" unshare -n -- ip link add vrf-probe type vrf table 10; then
+          if ! sudo unshare -n -- ip link add vrf-probe type vrf table 10; then
             sudo apt-get install -y "linux-modules-extra-$(uname -r)" || true
             sudo modprobe vrf
-            sudo env "TMPDIR=${TMPDIR}" unshare -n -- ip link add vrf-probe type vrf table 10
+            sudo unshare -n -- ip link add vrf-probe type vrf table 10
           fi
           # The test of the attachment's interface enslaves it to a bridge.
-          sudo env "TMPDIR=${TMPDIR}" unshare -n -- ip link add bridge-probe type bridge
+          sudo unshare -n -- ip link add bridge-probe type bridge
           # The tests of a device stacked on the attachment's interface, and
           # of the frames of a VLAN above it, need these drivers.
-          sudo env "TMPDIR=${TMPDIR}" unshare -n -- sh -euc '
+          sudo unshare -n -- sh -euc '
             ip link add lower-probe type dummy
             ip link add link lower-probe name macvlan-probe type macvlan mode passthru
             ip link del macvlan-probe
@@ -96,7 +93,7 @@ jobs:
             ip link add gre-probe type gre local 192.0.2.1 remote 192.0.2.2 dev lower-probe
           '
           sudo mountpoint -q /sys/fs/bpf || sudo mount -t bpf bpf /sys/fs/bpf
-          sudo env "TMPDIR=${TMPDIR}" unshare -n -- ip link set lo up
+          sudo unshare -n -- ip link set lo up
 
       - name: Prove empty historical hierarchy normalization and crash recovery
         run: |
@@ -109,7 +106,7 @@ jobs:
             | if length == 1 then .[0].executable else error("expected one GTP-U test binary") end
           ' "${RUNNER_TEMP}/gtpu-empty-normalization-build.jsonl")"
           normalization_log="${RUNNER_TEMP}/gtpu-empty-normalization.log"
-          sudo env "TMPDIR=${TMPDIR}" OPC_GTPU_RUN_PRIVILEGED=1 \
+          sudo env OPC_GTPU_RUN_PRIVILEGED=1 \
             unshare -mn --propagation private -- bash -euxo pipefail -c '
               ip link set lo up
               mount -t bpf bpf /sys/fs/bpf
@@ -133,7 +130,7 @@ jobs:
           export CARGO_HOME="${CARGO_HOME:-${HOME}/.cargo}"
           export RUSTUP_HOME="${RUSTUP_HOME:-${HOME}/.rustup}"
           datapath_log="${RUNNER_TEMP}/gtpu-native-provenance.log"
-          sudo env "TMPDIR=${TMPDIR}" \
+          sudo env \
             "PATH=${PATH}" \
             "CARGO_HOME=${CARGO_HOME}" \
             "RUSTUP_HOME=${RUSTUP_HOME}" \
@@ -186,7 +183,7 @@ jobs:
           print(binaries[0])
           PY
           )"
-          sudo env "TMPDIR=${TMPDIR}" unshare -n -- bash ci/qualify-gtpu-control-native.sh \
+          sudo unshare -n -- bash ci/qualify-gtpu-control-native.sh \
             "$gtpu_control_binary" "${RUNNER_TEMP}/gtpu-control-native" kernel-config
 
       - name: Upload shared GTP-U control queue qualification logs
@@ -216,7 +213,7 @@ jobs:
               | if length == 1 then .[0].executable else error("expected one route test binary") end
             ' "${RUNNER_TEMP}/route-kernel-build.jsonl")"
             route_log="${RUNNER_TEMP}/${target}.log"
-            sudo env "TMPDIR=${TMPDIR}" unshare -mn --propagation private -- bash -euxo pipefail -c '
+            sudo unshare -mn --propagation private -- bash -euxo pipefail -c '
               # Named child netns mounts must remain inside this test namespace.
               mount -t tmpfs tmpfs /run
               mkdir -p /run/netns
@@ -242,10 +239,6 @@ jobs:
             ${{ runner.temp }}/live_locked_route_mtu.log
           if-no-files-found: warn
 
-      - name: Remove disk-backed scratch
-        if: always()
-        run: bash ci/disk-scratch.sh cleanup --privileged
-
   privileged-gtpu-resets:
     name: Privileged Linux GTP-U workload resets
     runs-on: ubuntu-latest
@@ -255,9 +248,6 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v7
-
-      - name: Prepare disk-backed scratch
-        run: bash ci/disk-scratch.sh prepare
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
@@ -289,16 +279,16 @@ jobs:
           # ships in the same optional module package as gtp. Create a VRF
           # in a throwaway namespace rather than look for a module: that
           # holds for a built-in driver as well.
-          if ! sudo env "TMPDIR=${TMPDIR}" unshare -n -- ip link add vrf-probe type vrf table 10; then
+          if ! sudo unshare -n -- ip link add vrf-probe type vrf table 10; then
             sudo apt-get install -y "linux-modules-extra-$(uname -r)" || true
             sudo modprobe vrf
-            sudo env "TMPDIR=${TMPDIR}" unshare -n -- ip link add vrf-probe type vrf table 10
+            sudo unshare -n -- ip link add vrf-probe type vrf table 10
           fi
           # The test of the attachment's interface enslaves it to a bridge.
-          sudo env "TMPDIR=${TMPDIR}" unshare -n -- ip link add bridge-probe type bridge
+          sudo unshare -n -- ip link add bridge-probe type bridge
           # The tests of a device stacked on the attachment's interface, and
           # of the frames of a VLAN above it, need these drivers.
-          sudo env "TMPDIR=${TMPDIR}" unshare -n -- sh -euc '
+          sudo unshare -n -- sh -euc '
             ip link add lower-probe type dummy
             ip link add link lower-probe name macvlan-probe type macvlan mode passthru
             ip link del macvlan-probe
@@ -307,7 +297,7 @@ jobs:
             ip link add gre-probe type gre local 192.0.2.1 remote 192.0.2.2 dev lower-probe
           '
           sudo mountpoint -q /sys/fs/bpf || sudo mount -t bpf bpf /sys/fs/bpf
-          sudo env "TMPDIR=${TMPDIR}" unshare -n -- ip link set lo up
+          sudo unshare -n -- ip link set lo up
 
       - name: Build privileged eBPF GTP-U test
         run: |
@@ -328,7 +318,7 @@ jobs:
           echo "reset suite expects ${expected_tests} tests from ${datapath_source}"
           test "${expected_tests}" -gt 0
           datapath_log="${RUNNER_TEMP}/gtpu-native-resets.log"
-          sudo env "TMPDIR=${TMPDIR}" \
+          sudo env \
             "PATH=${PATH}" \
             "CARGO_HOME=${CARGO_HOME}" \
             "RUSTUP_HOME=${RUSTUP_HOME}" \
@@ -357,10 +347,6 @@ jobs:
           path: ${{ runner.temp }}/gtpu-native-resets.log
           if-no-files-found: warn
 
-      - name: Remove disk-backed scratch
-        if: always()
-        run: bash ci/disk-scratch.sh cleanup --privileged
-
   privileged-gtpu:
     name: Privileged Linux GTP-U datapath
     runs-on: ubuntu-latest
@@ -370,9 +356,6 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v7
-
-      - name: Prepare disk-backed scratch
-        run: bash ci/disk-scratch.sh prepare
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
@@ -407,16 +390,16 @@ jobs:
           # ships in the same optional module package as gtp. Create a VRF
           # in a throwaway namespace rather than look for a module: that
           # holds for a built-in driver as well.
-          if ! sudo env "TMPDIR=${TMPDIR}" unshare -n -- ip link add vrf-probe type vrf table 10; then
+          if ! sudo unshare -n -- ip link add vrf-probe type vrf table 10; then
             sudo apt-get install -y "linux-modules-extra-$(uname -r)" || true
             sudo modprobe vrf
-            sudo env "TMPDIR=${TMPDIR}" unshare -n -- ip link add vrf-probe type vrf table 10
+            sudo unshare -n -- ip link add vrf-probe type vrf table 10
           fi
           # The test of the attachment's interface enslaves it to a bridge.
-          sudo env "TMPDIR=${TMPDIR}" unshare -n -- ip link add bridge-probe type bridge
+          sudo unshare -n -- ip link add bridge-probe type bridge
           # The tests of a device stacked on the attachment's interface, and
           # of the frames of a VLAN above it, need these drivers.
-          sudo env "TMPDIR=${TMPDIR}" unshare -n -- sh -euc '
+          sudo unshare -n -- sh -euc '
             ip link add lower-probe type dummy
             ip link add link lower-probe name macvlan-probe type macvlan mode passthru
             ip link del macvlan-probe
@@ -425,7 +408,7 @@ jobs:
             ip link add gre-probe type gre local 192.0.2.1 remote 192.0.2.2 dev lower-probe
           '
           sudo mountpoint -q /sys/fs/bpf || sudo mount -t bpf bpf /sys/fs/bpf
-          sudo env "TMPDIR=${TMPDIR}" unshare -n -- ip link set lo up
+          sudo unshare -n -- ip link set lo up
 
       - name: Prove map-in-map reader grace
         run: |
@@ -439,7 +422,7 @@ jobs:
           test -n "${grace_binary}"
           test -x "${grace_binary}"
           sha256sum "${grace_binary}"
-          sudo env "TMPDIR=${TMPDIR}" OPC_GTPU_RUN_PRIVILEGED=1 "${grace_binary}" \
+          sudo env OPC_GTPU_RUN_PRIVILEGED=1 "${grace_binary}" \
             --ignored --exact linux::reader_grace::tests::map_in_map_grace_waits_for_live_non_sleepable_reader \
             --nocapture --test-threads=1 | tee "${RUNNER_TEMP}/gtpu-reader-grace.log"
           grep -Eq '^test result: ok\. 1 passed; 0 failed; 0 ignored;' "${RUNNER_TEMP}/gtpu-reader-grace.log"
@@ -459,7 +442,7 @@ jobs:
           set -euo pipefail
           export CARGO_HOME="${CARGO_HOME:-${HOME}/.cargo}"
           export RUSTUP_HOME="${RUSTUP_HOME:-${HOME}/.rustup}"
-          sudo env "TMPDIR=${TMPDIR}" \
+          sudo env \
             "PATH=${PATH}" \
             "CARGO_HOME=${CARGO_HOME}" \
             "RUSTUP_HOME=${RUSTUP_HOME}" \
@@ -510,7 +493,7 @@ jobs:
           echo "datapath suite expects ${expected_tests} tests from ${datapath_source}"
           test "${expected_tests}" -gt 0
           datapath_log="${RUNNER_TEMP}/gtpu-68-datapath.log"
-          sudo env "TMPDIR=${TMPDIR}" \
+          sudo env \
             "PATH=${PATH}" \
             "CARGO_HOME=${CARGO_HOME}" \
             "RUSTUP_HOME=${RUSTUP_HOME}" \
@@ -582,10 +565,6 @@ jobs:
           grep -Fq 'OPC_GTPU_ORDINARY_INNER_IPV6_CLEANUP_PROVEN' "${datapath_log}"
           grep -Fq 'OPC_GTPU_CLEANUP_ACTIVATION_FORWARDS_PROVEN' "${datapath_log}"
           grep -Fq 'OPC_GTPU_CLEANUP_ACTIVATION_ROLLBACK_PROVEN' "${datapath_log}"
-
-      - name: Remove disk-backed scratch
-        if: always()
-        run: bash ci/disk-scratch.sh cleanup --privileged
 
   linux-6-8-classifier-load:
     name: Linux 6.8 committed classifier load

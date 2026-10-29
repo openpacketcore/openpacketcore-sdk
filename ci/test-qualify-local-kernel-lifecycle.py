@@ -655,7 +655,7 @@ class WorkflowTests(unittest.TestCase):
             "cargo test --locked -p opc-gtpu-dataplane --test ebpf_gtpu_privileged -- --ignored --nocapture --test-threads=1 --skip workload_strict_reset_ --skip workload_exclusive_reset_": "privileged-gtpu",
             "cargo test --locked -p opc-gtpu-dataplane --test ebpf_gtpu_privileged -- --ignored --nocapture --test-threads=1 workload_strict_reset_ workload_exclusive_reset_": "privileged-gtpu-resets",
             "cargo test --locked -p opc-gtpu-dataplane --lib -- --ignored --nocapture --test-threads=1 " + library_filters: "privileged-gtpu-regressions",
-            'sudo env "TMPDIR=${TMPDIR}" unshare -n -- bash ci/qualify-gtpu-control-native.sh': "privileged-gtpu-regressions",
+            'sudo unshare -n -- bash ci/qualify-gtpu-control-native.sh': "privileged-gtpu-regressions",
         }
         for command, owner in selections.items():
             with self.subTest(command=command):

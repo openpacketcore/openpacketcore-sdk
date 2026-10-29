@@ -10,6 +10,8 @@ on:
       - "crates/opc-linux-xfrm-sys/**"
       - "crates/opc-types/**"
       - ".github/workflows/ipsec-xfrm.yml"
+      - "ci/disk-scratch.sh"
+      - "ci/disk-scratch.py"
       - "scripts/build-ipsec-xfrm-ebpf.sh"
       - "ci/download-image.sh"
       - "ci/qualify-n3-mobike-kernel.py"
@@ -29,6 +31,8 @@ on:
       - "crates/opc-linux-xfrm-sys/**"
       - "crates/opc-types/**"
       - ".github/workflows/ipsec-xfrm.yml"
+      - "ci/disk-scratch.sh"
+      - "ci/disk-scratch.py"
       - "scripts/build-ipsec-xfrm-ebpf.sh"
       - "ci/download-image.sh"
       - "ci/qualify-n3-mobike-kernel.py"
@@ -139,7 +143,7 @@ jobs:
         run: RUSTDOCFLAGS="-D warnings" cargo doc --locked -p opc-ipsec-xfrm -p opc-ipsec-xfrm-ebpf-common -p opc-types --no-deps --all-features
 
       - name: Remove disk-backed scratch
-        if: always()
+        if: always() && env.OPC_CI_DISK_TMPDIR != ''
         run: bash ci/disk-scratch.sh cleanup
 
   privileged:
@@ -165,7 +169,7 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y iproute2 iptables iputils-ping tcpdump
           mountpoint -q /sys/fs/bpf || sudo mount -t bpf bpf /sys/fs/bpf
-          sudo env "TMPDIR=${TMPDIR}" unshare -n -- bash -c 'ip link set lo up; ip xfrm state list'
+          sudo unshare -n -- bash -c 'ip link set lo up; ip xfrm state list'
 
       - name: Build privileged tests
         run: |
@@ -539,7 +543,7 @@ jobs:
             '
 
       - name: Remove disk-backed scratch
-        if: always()
+        if: always() && env.OPC_CI_DISK_TMPDIR != ''
         run: bash ci/disk-scratch.sh cleanup --privileged
 
   ebpf-object:
