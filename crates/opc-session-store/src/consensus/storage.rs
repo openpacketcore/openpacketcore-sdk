@@ -2492,6 +2492,9 @@ pub enum SessionConsensusStorageError {
     /// A required row, constraint, or typed high-water mark is invalid.
     #[error("session consensus durable state is corrupt")]
     CorruptState,
+    /// A format-five namespace lost its mandatory initial roster witness.
+    #[error("session consensus durable state is corrupt: mandatory roster witness is missing; a store created by a pre-release build must be reinitialized")]
+    MissingMandatoryRosterWitness,
     /// The supplied identity could not be represented by the durable schema.
     #[error("invalid session consensus storage identity")]
     InvalidIdentity,
@@ -2518,6 +2521,7 @@ impl SessionConsensusStorageError {
             Some(Self::FreshInstallationRequired) => Self::FreshInstallationRequired,
             Some(Self::PersistenceFormatMismatch) => Self::PersistenceFormatMismatch,
             Some(Self::BackendUnavailable) => Self::BackendUnavailable,
+            Some(Self::MissingMandatoryRosterWitness) => Self::MissingMandatoryRosterWitness,
             _ => Self::CorruptState,
         }
     }

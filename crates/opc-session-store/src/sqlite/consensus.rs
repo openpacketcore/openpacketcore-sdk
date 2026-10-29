@@ -15,6 +15,8 @@ pub(crate) mod roster_reads;
 pub(crate) mod roster_rows;
 #[cfg(target_os = "linux")]
 pub(crate) mod roster_snapshot;
+#[cfg(all(test, target_os = "linux"))]
+pub(crate) mod roster_work_observer;
 pub(crate) mod scope_authority;
 pub(crate) mod scope_batch;
 mod scope_continuity;
@@ -9031,6 +9033,28 @@ pub(crate) fn read_membership_transition_evidence_sync(
 }
 
 impl SqliteSessionBackend {
+    pub(crate) async fn consensus_protected_roster_maintenance_due(
+        &self,
+        storage_identity: SessionConsensusIdentity,
+        now: Timestamp,
+    ) -> io::Result<(ProtectedRosterLedgerOccupancy, bool)> {
+        #[cfg(target_os = "linux")]
+        if let Some(result) = self.native_read(|wal| {
+            wal.native_public_scalar_read(|state| {
+                if state.identity() != storage_identity {
+                    return Err(invalid_data("native roster maintenance identity differs"));
+                }
+                state.protected_roster_maintenance_due(now)
+            })
+        }) {
+            return result;
+        }
+        let conn = self.conn.lock().await;
+        self.with_application_cache_read(&conn, || {
+            protected_roster_maintenance_due_sync(&conn, storage_identity, now)
+        })?
+    }
+
     pub(crate) async fn provisional_consensus_candidate_is_cancelled(
         &self,
         storage_identity: SessionConsensusIdentity,
@@ -10862,6 +10886,36 @@ fn hash_operator_recovery_v2_authority_value(
     Ok(())
 }
 
+/// Format five publishes an initial witness with its namespace, even before
+/// the first admission. Its presence survives authority changes and complete
+/// history retirement. An older layout may still have no witness.
+pub(crate) fn validate_mandatory_roster_witness_in_sync(
+    conn: &Connection,
+    attached: bool,
+) -> Result<(), SessionConsensusStorageError> {
+    if persisted_schema_version_in_sync(conn, attached)
+        .map_err(|_| SessionConsensusStorageError::CorruptState)?
+        < PROTECTED_ROSTER_V2_DATABASE_FORMAT
+    {
+        return Ok(());
+    }
+    let schema = if attached {
+        "consensus_incoming"
+    } else {
+        "main"
+    };
+    let present: bool = conn.query_row(
+        &format!("SELECT EXISTS(SELECT 1 FROM {schema}.consensus_protected_roster_witness WHERE singleton=1)"),
+        [],
+        |row| row.get(0),
+    ).map_err(|_| SessionConsensusStorageError::CorruptState)?;
+    if present {
+        Ok(())
+    } else {
+        Err(SessionConsensusStorageError::MissingMandatoryRosterWitness)
+    }
+}
+
 /// Validate every persisted roster projection through the canonical decoders
 /// and domain invariants.  A prepared roster namespace is required to be
 /// empty and is therefore a valid recovery state.
@@ -10870,6 +10924,7 @@ pub(crate) fn validate_protected_roster_recovery_state_sync(
     identity: SessionConsensusIdentity,
 ) -> Result<(), SessionConsensusStorageError> {
     let layout = protected_roster_recovery_layout_sync(conn)?;
+    validate_mandatory_roster_witness_in_sync(conn, false)?;
     match layout {
         ProtectedRosterRecoveryLayout::Legacy => Ok(()),
         ProtectedRosterRecoveryLayout::Prepared | ProtectedRosterRecoveryLayout::Activated => {
@@ -11026,12 +11081,34 @@ fn ensure_protected_roster_schema_sync(conn: &Connection) -> io::Result<()> {
 }
 
 fn activate_protected_roster_schema_sync(conn: &Connection) -> io::Result<()> {
+    let identity = read_storage_identity_sync(conn)
+        .map_err(|_| invalid_data("protected roster storage identity is invalid"))?;
+    // V2 provisions the shared witness even before V1 is admitted. Its
+    // presence makes the common namespace operational, but cannot authorize
+    // this V1 activation fast path or bypass the higher-format downgrade fence.
+    if persisted_schema_version_in_sync(conn, false)? == PROTECTED_ROSTER_V2_DATABASE_FORMAT {
+        let scope = read_membership_scope_sync(conn, identity)?;
+        if !protected_roster_profile_activation_matches_scope_sync(
+            conn,
+            identity,
+            scope.current_identity,
+            &scope.current_members,
+        )? {
+            return Err(invalid_data("protected roster V1 activation is missing"));
+        }
+    }
     match protected_roster_layout_in_sync(conn, false)? {
-        ProtectedRosterLayout::Activated => Ok(()),
+        ProtectedRosterLayout::Activated => {
+            let legacy_empty_witness = persisted_schema_version_in_sync(conn, false)?
+                < PROTECTED_ROSTER_V2_DATABASE_FORMAT;
+            initialize_protected_roster_witness_sync(conn, identity, legacy_empty_witness)
+        }
         ProtectedRosterLayout::Legacy => {
             Err(invalid_data("protected roster schema is not prepared"))
         }
         ProtectedRosterLayout::Prepared => {
+            let fresh =
+                protected_roster_v2_layout_in_sync(conn, false)? == ProtectedRosterV2Layout::Absent;
             let changed = void_profile::set_layout(
                 conn,
                 PROTECTED_ROSTER_DATABASE_FORMAT,
@@ -11045,8 +11122,28 @@ fn activate_protected_roster_schema_sync(conn: &Connection) -> io::Result<()> {
                     "protected roster schema activation is invalid",
                 ));
             }
-            Ok(())
+            initialize_protected_roster_witness_sync(conn, identity, fresh)
         }
+    }
+}
+
+fn initialize_protected_roster_witness_sync(
+    conn: &Connection,
+    identity: SessionConsensusIdentity,
+    fresh: bool,
+) -> io::Result<()> {
+    match protected_roster_read_witness_sync(conn, identity)
+        .map_err(|_| invalid_data("protected roster witness is invalid"))?
+    {
+        Some(_) => Ok(()),
+        None if fresh => {
+            protected_roster_write_witness_sync(conn, identity, GlobalChargeWitness::empty())
+                .map_err(|_| invalid_data("protected roster initial witness is unavailable"))
+        }
+        None => Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            SessionConsensusStorageError::MissingMandatoryRosterWitness,
+        )),
     }
 }
 
@@ -11059,6 +11156,7 @@ fn activate_protected_roster_schema_sync(conn: &Connection) -> io::Result<()> {
 pub(crate) enum ProtectedRosterApplyError {
     Rejected,
     Corrupt,
+    MissingMandatoryWitness,
 }
 
 impl ProtectedRosterApplyError {
@@ -11066,6 +11164,9 @@ impl ProtectedRosterApplyError {
         match self {
             Self::Rejected => StoreError::InvalidKey("protected roster rejected".into()),
             Self::Corrupt => StoreError::BackendUnavailable("protected roster unavailable".into()),
+            Self::MissingMandatoryWitness => StoreError::BackendUnavailable(
+                SessionConsensusStorageError::MissingMandatoryRosterWitness.to_string(),
+            ),
         }
     }
 }
@@ -11093,7 +11194,8 @@ impl ProtectedRosterCommandApplyError {
             ProtectedRosterApplyError::Rejected => {
                 Self::Rejected(ConsensusRosterRejection::Authority)
             }
-            ProtectedRosterApplyError::Corrupt => Self::Fatal,
+            ProtectedRosterApplyError::Corrupt
+            | ProtectedRosterApplyError::MissingMandatoryWitness => Self::Fatal,
         }
     }
 
@@ -11106,7 +11208,8 @@ impl ProtectedRosterCommandApplyError {
             ProtectedRosterApplyError::Rejected => {
                 Self::Rejected(ConsensusRosterRejection::TerminalConflict)
             }
-            ProtectedRosterApplyError::Corrupt => Self::Fatal,
+            ProtectedRosterApplyError::Corrupt
+            | ProtectedRosterApplyError::MissingMandatoryWitness => Self::Fatal,
         }
     }
 }
@@ -11119,11 +11222,7 @@ fn protected_roster_reservation_error(error: ReservationError) -> ProtectedRoste
         ReservationError::LiveLimit => {
             ProtectedRosterCommandApplyError::rejected(ConsensusRosterRejection::LiveFull)
         }
-        ReservationError::BindingLimit
-        | ReservationError::DurableBindingLimit
-        | ReservationError::FloorAdvance
-        | ReservationError::FloorLimit
-        | ReservationError::InvalidEpoch => {
+        ReservationError::FloorAdvance | ReservationError::InvalidEpoch => {
             ProtectedRosterCommandApplyError::rejected(ConsensusRosterRejection::HistoryFull)
         }
         ReservationError::BusinessCas => ProtectedRosterCommandApplyError::rejected(
@@ -11160,11 +11259,7 @@ fn protected_roster_v2_admission_reservation_error(
         ReservationError::LiveLimit => {
             ProtectedRosterCommandApplyError::rejected(ConsensusRosterRejection::LiveFull)
         }
-        ReservationError::BindingLimit
-        | ReservationError::DurableBindingLimit
-        | ReservationError::FloorAdvance
-        | ReservationError::FloorLimit
-        | ReservationError::InvalidEpoch => {
+        ReservationError::FloorAdvance | ReservationError::InvalidEpoch => {
             ProtectedRosterCommandApplyError::rejected(ConsensusRosterRejection::HistoryFull)
         }
         ReservationError::BusinessCas
@@ -11713,6 +11808,18 @@ fn protected_roster_read_record_sync(
     protected_roster_hydrate_record_projection_sync(identity, binding, row).map(Some)
 }
 
+/// Validated maintenance readiness for each independent roster profile.
+#[derive(Clone, Copy)]
+struct ProtectedRosterMaintenanceProfiles {
+    v1: bool,
+    v2: bool,
+}
+
+impl ProtectedRosterMaintenanceProfiles {
+    #[cfg(test)]
+    const ALL: Self = Self { v1: true, v2: true };
+}
+
 /// Decode only the exact oldest due reclaim prefix chosen by the indexed
 /// `(terminalized_at, binding)` order. Restart and snapshot validation stream
 /// their rows, while an ordinary clock tick still must never deserialize the
@@ -11743,6 +11850,7 @@ fn protected_roster_due_reclaim_records_sync(
     conn: &Connection,
     identity: SessionConsensusIdentity,
     maintenance: ConsensusMaintenanceTimestamp,
+    profiles: ProtectedRosterMaintenanceProfiles,
 ) -> Result<Vec<ProtectedRosterMixedRecord>, ProtectedRosterApplyError> {
     let cutoff = maintenance
         .as_nanos()
@@ -11751,8 +11859,9 @@ fn protected_roster_due_reclaim_records_sync(
         .ok_or(ProtectedRosterApplyError::Corrupt)?;
     let v2_present = protected_roster_v2_namespace_is_present_sync(conn)
         .map_err(|_| ProtectedRosterApplyError::Corrupt)?;
-    let query = if v2_present {
-        "SELECT profile, binding FROM ( \
+    let query = match (profiles.v1, profiles.v2 && v2_present) {
+        (true, true) => {
+            "SELECT profile, binding FROM ( \
              SELECT 1 AS profile, binding, terminalized_at \
              FROM consensus_protected_roster_rows \
              WHERE state=2 AND terminalized_at IS NOT NULL AND terminalized_at<=?1 \
@@ -11761,11 +11870,20 @@ fn protected_roster_due_reclaim_records_sync(
              FROM consensus_protected_roster_v2_admissions \
              WHERE state=2 AND terminalized_at IS NOT NULL AND terminalized_at<=?1 \
          ) ORDER BY terminalized_at ASC, binding ASC, profile ASC LIMIT ?2"
-    } else {
-        "SELECT 1 AS profile, binding \
+        }
+        (true, false) => {
+            "SELECT 1 AS profile, binding \
          FROM consensus_protected_roster_rows \
          WHERE state=2 AND terminalized_at IS NOT NULL AND terminalized_at<=?1 \
          ORDER BY terminalized_at ASC, binding ASC LIMIT ?2"
+        }
+        (false, true) => {
+            "SELECT 2 AS profile, binding \
+         FROM consensus_protected_roster_v2_admissions \
+         WHERE state=2 AND terminalized_at IS NOT NULL AND terminalized_at<=?1 \
+         ORDER BY terminalized_at ASC, binding ASC LIMIT ?2"
+        }
+        (false, false) => return Ok(Vec::new()),
     };
     let mut statement = conn
         .prepare(query)
@@ -11829,6 +11947,7 @@ fn protected_roster_due_reclaim_records_sync(
 fn protected_roster_due_reclaim_order_sync(
     conn: &Connection,
     maintenance: ConsensusMaintenanceTimestamp,
+    profiles: ProtectedRosterMaintenanceProfiles,
 ) -> Result<Vec<(i128, RequestBindingKey, ProductionRosterProfileTag)>, ProtectedRosterApplyError> {
     let cutoff = maintenance
         .as_nanos()
@@ -11837,8 +11956,9 @@ fn protected_roster_due_reclaim_order_sync(
         .ok_or(ProtectedRosterApplyError::Corrupt)?;
     let v2_present = protected_roster_v2_namespace_is_present_sync(conn)
         .map_err(|_| ProtectedRosterApplyError::Corrupt)?;
-    let query = if v2_present {
-        "SELECT profile, binding, terminalized_at FROM ( \
+    let query = match (profiles.v1, profiles.v2 && v2_present) {
+        (true, true) => {
+            "SELECT profile, binding, terminalized_at FROM ( \
              SELECT 1 AS profile, binding, terminalized_at \
              FROM consensus_protected_roster_rows \
              WHERE state=2 AND terminalized_at IS NOT NULL AND terminalized_at<=?1 \
@@ -11847,11 +11967,20 @@ fn protected_roster_due_reclaim_order_sync(
              FROM consensus_protected_roster_v2_admissions \
              WHERE state=2 AND terminalized_at IS NOT NULL AND terminalized_at<=?1 \
          ) ORDER BY terminalized_at ASC, binding ASC, profile ASC LIMIT ?2"
-    } else {
-        "SELECT 1 AS profile, binding, terminalized_at \
+        }
+        (true, false) => {
+            "SELECT 1 AS profile, binding, terminalized_at \
          FROM consensus_protected_roster_rows \
          WHERE state=2 AND terminalized_at IS NOT NULL AND terminalized_at<=?1 \
          ORDER BY terminalized_at ASC, binding ASC LIMIT ?2"
+        }
+        (false, true) => {
+            "SELECT 2 AS profile, binding, terminalized_at \
+         FROM consensus_protected_roster_v2_admissions \
+         WHERE state=2 AND terminalized_at IS NOT NULL AND terminalized_at<=?1 \
+         ORDER BY terminalized_at ASC, binding ASC LIMIT ?2"
+        }
+        (false, false) => return Ok(Vec::new()),
     };
     let mut statement = conn
         .prepare(query)
@@ -11942,6 +12071,8 @@ fn validate_protected_roster_state_sync(
         return Err(ProtectedRosterApplyError::Corrupt);
     }
     let witness = protected_roster_read_witness_sync(conn, identity)?;
+    validate_mandatory_roster_witness_in_sync(conn, attached)
+        .map_err(|_| ProtectedRosterApplyError::Corrupt)?;
     let accounting_witness = witness.unwrap_or_else(GlobalChargeWitness::empty);
     let mut validator =
         ProductionSnapshotStreamValidator::new(application_sequence, applied_raft_log_index);
@@ -13024,14 +13155,89 @@ pub(crate) fn protected_roster_diagnostic_occupancy_sync(
     conn: &Connection,
     identity: SessionConsensusIdentity,
 ) -> io::Result<ProtectedRosterLedgerOccupancy> {
-    if !table_exists(conn, "consensus_protected_roster_witness").map_err(db_error)? {
-        return Ok(ProtectedRosterLedgerOccupancy::default());
-    }
-    protected_roster_read_witness_sync(conn, identity)
+    roster_engine::RosterCommandStore::witness(&conn, identity)
         .map_err(|_| invalid_data("protected roster diagnostic witness is invalid"))?
         .unwrap_or_else(GlobalChargeWitness::empty)
         .diagnostic_occupancy()
         .map_err(|_| invalid_data("protected roster diagnostic occupancy is invalid"))
+}
+
+/// Eligibility is a read-only scheduling hint. Query the two fixed reclaim
+/// indexes and at most the first terminal in each profile, never the retained
+/// history. A later tombstone cannot retire past an earlier retained row.
+fn protected_roster_maintenance_due_sync(
+    conn: &Connection,
+    identity: SessionConsensusIdentity,
+    now: Timestamp,
+) -> io::Result<(ProtectedRosterLedgerOccupancy, bool)> {
+    #[cfg(all(test, target_os = "linux"))]
+    let _work = roster_work_observer::sqlite_probe(conn, identity);
+    match protected_roster_layout_in_sync(conn, false)? {
+        ProtectedRosterLayout::Legacy | ProtectedRosterLayout::Prepared => {
+            return Ok((ProtectedRosterLedgerOccupancy::default(), false));
+        }
+        ProtectedRosterLayout::Activated => {}
+    }
+    let witness = roster_engine::RosterCommandStore::witness(&conn, identity)
+        .map_err(|_| invalid_data("protected roster maintenance witness invalid"))?
+        .unwrap_or_else(GlobalChargeWitness::empty);
+    let occupancy = witness
+        .diagnostic_occupancy()
+        .map_err(|_| invalid_data("protected roster maintenance occupancy invalid"))?;
+    let now = logical_time_sync(conn, identity)?.map_or(now, |persisted| persisted.max(now));
+    let maintenance = ConsensusMaintenanceTimestamp::from_consensus_timestamp(now)
+        .map_err(|_| invalid_data("protected roster maintenance time invalid"))?;
+    let Some(cutoff) = maintenance
+        .as_nanos()
+        .checked_sub(PROTECTED_ROSTER_TERMINAL_RETENTION_NANOS)
+        .filter(|cutoff| *cutoff >= 0)
+    else {
+        return Ok((occupancy, false));
+    };
+    let v2_present = protected_roster_v2_namespace_is_present_sync(conn)?;
+    let due_reclaim: bool = conn
+        .query_row(
+            if v2_present {
+                "SELECT EXISTS(SELECT 1 FROM consensus_protected_roster_rows \
+             WHERE state=2 AND terminalized_at IS NOT NULL AND terminalized_at<=?1 LIMIT 1) \
+             OR EXISTS(SELECT 1 FROM consensus_protected_roster_v2_admissions \
+             WHERE state=2 AND terminalized_at IS NOT NULL AND terminalized_at<=?1 LIMIT 1)"
+            } else {
+                "SELECT EXISTS(SELECT 1 FROM consensus_protected_roster_rows \
+             WHERE state=2 AND terminalized_at IS NOT NULL AND terminalized_at<=?1 LIMIT 1)"
+            },
+            [cutoff.to_be_bytes().as_slice()],
+            |row| row.get(0),
+        )
+        .map_err(db_error)?;
+    if due_reclaim {
+        return Ok((occupancy, true));
+    }
+    let retired = i64::try_from(witness.retired_terminal_sequence())
+        .map_err(|_| invalid_data("protected roster retirement sequence invalid"))?;
+    let head = |table: &str| -> io::Result<Option<(i64, i64)>> {
+        conn.query_row(
+            &format!("SELECT terminal_sequence,state FROM {table} WHERE terminal_sequence>?1 ORDER BY terminal_sequence LIMIT 1"),
+            [retired], |row| Ok((row.get(0)?, row.get(1)?)),
+        ).optional().map_err(db_error)
+    };
+    let one = head("consensus_protected_roster_rows")?;
+    let two = if v2_present {
+        head("consensus_protected_roster_v2_admissions")?
+    } else {
+        None
+    };
+    let first = one.into_iter().chain(two).min_by_key(|row| row.0);
+    let due = match first {
+        Some((_, 3)) => true,
+        Some((_, 2)) | None => false,
+        _ => {
+            return Err(invalid_data(
+                "protected roster terminal index state invalid",
+            ))
+        }
+    };
+    Ok((occupancy, due))
 }
 
 fn protected_roster_write_witness_sync(
@@ -14578,6 +14784,12 @@ impl roster_engine::RosterCommandStore for &Connection {
         &self,
         identity: SessionConsensusIdentity,
     ) -> Result<Option<GlobalChargeWitness>, ProtectedRosterApplyError> {
+        validate_mandatory_roster_witness_in_sync(self, false).map_err(|error| match error {
+            SessionConsensusStorageError::MissingMandatoryRosterWitness => {
+                ProtectedRosterApplyError::MissingMandatoryWitness
+            }
+            _ => ProtectedRosterApplyError::Corrupt,
+        })?;
         protected_roster_read_witness_sync(self, identity)
     }
     fn vacancy(
@@ -15433,10 +15645,25 @@ fn protected_roster_replace_v2_reclaim_sync(
         .ok_or(ProtectedRosterApplyError::Corrupt)
 }
 
+#[cfg(test)]
 fn reclaim_protected_rosters_sync(
     conn: &Connection,
     identity: SessionConsensusIdentity,
     logical_time: Timestamp,
+) -> Result<(), StoreError> {
+    reclaim_protected_rosters_for_profiles_sync(
+        conn,
+        identity,
+        logical_time,
+        ProtectedRosterMaintenanceProfiles::ALL,
+    )
+}
+
+fn reclaim_protected_rosters_for_profiles_sync(
+    conn: &Connection,
+    identity: SessionConsensusIdentity,
+    logical_time: Timestamp,
+    profiles: ProtectedRosterMaintenanceProfiles,
 ) -> Result<(), StoreError> {
     let maintenance = ConsensusMaintenanceTimestamp::from_consensus_timestamp(logical_time)
         .map_err(|_| {
@@ -15452,8 +15679,8 @@ fn reclaim_protected_rosters_sync(
     let witness = witness.ok_or_else(|| {
         StoreError::BackendUnavailable("protected roster maintenance unavailable".into())
     })?;
-    let records =
-        protected_roster_due_reclaim_records_sync(conn, identity, maintenance).map_err(|_| {
+    let records = protected_roster_due_reclaim_records_sync(conn, identity, maintenance, profiles)
+        .map_err(|_| {
             StoreError::BackendUnavailable("protected roster maintenance unavailable".into())
         })?;
     if records.is_empty() {
@@ -15560,8 +15787,8 @@ fn reclaim_protected_rosters_sync(
             }
         }
     }
-    let reproved_order =
-        protected_roster_due_reclaim_order_sync(conn, maintenance).map_err(|_| {
+    let reproved_order = protected_roster_due_reclaim_order_sync(conn, maintenance, profiles)
+        .map_err(|_| {
             StoreError::BackendUnavailable("protected roster maintenance unavailable".into())
         })?;
     let expected_order = prepared
@@ -15598,15 +15825,28 @@ fn reclaim_protected_rosters_sync(
     })
 }
 
+#[cfg(test)]
+fn retire_protected_rosters_sync(
+    conn: &Connection,
+    identity: SessionConsensusIdentity,
+) -> Result<bool, StoreError> {
+    retire_protected_rosters_for_profiles_sync(
+        conn,
+        identity,
+        ProtectedRosterMaintenanceProfiles::ALL,
+    )
+}
+
 /// Retire one deterministic partition/epoch tombstone prefix.  This is a
 /// separate turn from the 24-hour payload reclaim: the latter preserves the
 /// stable admission child, while this path can remove that child only after
 /// the exact epoch is irreversibly closed by its floor CAS. A later reuse of
 /// the same roster nonce is therefore a new binding only at a higher history
 /// epoch; it is not a claim of permanent global nonce uniqueness.
-fn retire_protected_rosters_sync(
+fn retire_protected_rosters_for_profiles_sync(
     conn: &Connection,
     identity: SessionConsensusIdentity,
+    profiles: ProtectedRosterMaintenanceProfiles,
 ) -> Result<bool, StoreError> {
     let witness = protected_roster_read_witness_sync(conn, identity)
         .map_err(|_| {
@@ -15648,7 +15888,6 @@ fn retire_protected_rosters_sync(
             StoreError::BackendUnavailable("protected roster maintenance unavailable".into())
         })?;
     let mut selected = Vec::new();
-    let mut selected_floor_epochs = BTreeMap::new();
     while let Some(row) = rows.next().map_err(|_| {
         StoreError::BackendUnavailable("protected roster maintenance unavailable".into())
     })? {
@@ -15658,7 +15897,19 @@ fn retire_protected_rosters_sync(
         let state: i64 = row.get(3).map_err(|_| {
             StoreError::BackendUnavailable("protected roster maintenance unavailable".into())
         })?;
-        if state != protected_roster_snapshot_state_code(ReservationState::Tombstone) {
+        let ready = match profile {
+            1 => profiles.v1,
+            2 => profiles.v2,
+            _ => {
+                return Err(StoreError::BackendUnavailable(
+                    "protected roster maintenance unavailable".into(),
+                ))
+            }
+        };
+        // The global terminal horizon must not cross an inactive predecessor,
+        // even when that predecessor is already a tombstone. Keep all profiles
+        // in this ordered query and in the shared survivor checks below.
+        if !ready || state != protected_roster_snapshot_state_code(ReservationState::Tombstone) {
             break;
         }
         let bytes: Vec<u8> = row.get(1).map_err(|_| {
@@ -15670,22 +15921,6 @@ fn retire_protected_rosters_sync(
         .map_err(|_| {
             StoreError::BackendUnavailable("protected roster maintenance unavailable".into())
         })?;
-        let floor_key = ProductionFloorKey::from_binding(binding).map_err(|_| {
-            StoreError::BackendUnavailable("protected roster maintenance unavailable".into())
-        })?;
-        // Retirement advances one shared floor/cursor CAS per `(tenant,
-        // scope)` partition.  Once the terminal prefix reaches a different
-        // epoch in a partition already selected this turn, stop at that
-        // prefix boundary: skipping it would advance the global terminal
-        // witness past undeleted evidence, while selecting it would produce
-        // competing stale CAS actions for the same floor key.
-        if !protected_roster_retirement_accepts_floor_epoch(
-            &mut selected_floor_epochs,
-            floor_key,
-            binding.history_epoch(),
-        ) {
-            break;
-        }
         let record = match profile {
             1 => ProtectedRosterMixedRecord::V1(Box::new(
                 protected_roster_read_record_sync(conn, identity, binding)
@@ -15729,72 +15964,52 @@ fn retire_protected_rosters_sync(
     if selected.is_empty() {
         return Ok(false);
     }
-    let mut partition_rows = BTreeMap::<(ProductionFloorKey, u64), usize>::new();
+    let mut partition_rows = BTreeMap::new();
     for record in &selected {
         let binding = match record {
             ProtectedRosterMixedRecord::V1(record) => record.binding(),
             ProtectedRosterMixedRecord::V2(record) => record.binding(),
         };
-        *partition_rows
-            .entry((
-                ProductionFloorKey::from_binding(binding).map_err(|_| {
-                    StoreError::BackendUnavailable(
-                        "protected roster maintenance unavailable".into(),
-                    )
-                })?,
-                binding.history_epoch(),
-            ))
-            .or_default() += 1;
+        protected_roster_retirement_include_floor_epoch(
+            &mut partition_rows,
+            ProductionFloorKey::from_binding(binding).map_err(|_| {
+                StoreError::BackendUnavailable("protected roster maintenance unavailable".into())
+            })?,
+            binding.history_epoch(),
+        );
     }
     let mut partitions = Vec::with_capacity(partition_rows.len());
-    for ((key, epoch), selected_count) in partition_rows {
-        // The floor is shared by both physical profile tables.  An older
-        // binding prevents only the final floor advance/release; it does not
-        // prevent deletion of this terminal-prefix row while a no-op floor
-        // CAS preserves the lower binding's restart proof.
-        let lower_exists: bool = conn
-            .query_row(
-                if v2_present {
-                    "SELECT EXISTS(SELECT 1 FROM consensus_protected_roster_rows \
-                     WHERE partition=?1 AND history_epoch<?2) \
-                     OR EXISTS(SELECT 1 FROM consensus_protected_roster_v2_admissions \
-                     WHERE partition=?1 AND history_epoch<?2)"
-                } else {
-                    "SELECT EXISTS(SELECT 1 FROM consensus_protected_roster_rows \
-                     WHERE partition=?1 AND history_epoch<?2)"
-                },
-                params![
-                    key.as_bytes().as_slice(),
-                    checked_positive_i64(epoch).map_err(|_| StoreError::BackendUnavailable(
-                        "protected roster maintenance unavailable".into(),
-                    ))?,
-                ],
-                |row| row.get(0),
-            )
-            .map_err(|_| {
-                StoreError::BackendUnavailable("protected roster maintenance unavailable".into())
-            })?;
+    for (key, (epoch, selected_count)) in partition_rows {
+        // The shared floor can advance only if every binding through the
+        // greatest selected epoch is deleted. Count at most the selected
+        // rows plus one survivor, across both profiles and all row states.
         let total: i64 = conn.query_row(
             if v2_present {
-                "SELECT (SELECT COUNT(*) FROM consensus_protected_roster_rows WHERE partition=?1 AND history_epoch=?2) + \
-                 (SELECT COUNT(*) FROM consensus_protected_roster_v2_admissions WHERE partition=?1 AND history_epoch=?2)"
+                "SELECT COUNT(*) FROM ( \
+                 SELECT binding FROM consensus_protected_roster_rows WHERE partition=?1 AND history_epoch<=?2 \
+                 UNION ALL \
+                 SELECT binding FROM consensus_protected_roster_v2_admissions WHERE partition=?1 AND history_epoch<=?2 \
+                 LIMIT ?3)"
             } else {
-                "SELECT COUNT(*) FROM consensus_protected_roster_rows \
-                 WHERE partition=?1 AND history_epoch=?2"
+                "SELECT COUNT(*) FROM (SELECT binding FROM consensus_protected_roster_rows \
+                 WHERE partition=?1 AND history_epoch<=?2 LIMIT ?3)"
             },
-            params![key.as_bytes().as_slice(), checked_positive_i64(epoch).map_err(|_| StoreError::BackendUnavailable("protected roster maintenance unavailable".into()))?],
+            params![
+                key.as_bytes().as_slice(),
+                checked_positive_i64(epoch).map_err(|_| StoreError::BackendUnavailable("protected roster maintenance unavailable".into()))?,
+                i64::try_from(selected_count + 1).map_err(|_| StoreError::BackendUnavailable("protected roster maintenance unavailable".into()))?,
+            ],
             |row| row.get(0),
         ).map_err(|_| StoreError::BackendUnavailable("protected roster maintenance unavailable".into()))?;
-        // A terminal-sequence prefix may encounter a later history epoch
-        // before an older one from the same shared floor partition.  It is
-        // safe (and required for liveness) to retire that prefix row while
-        // preserving the shared floor/cursor.  Only the final target-epoch
-        // page may advance or release the floor, and that is forbidden while
-        // an older epoch survives in either profile namespace.
-        let final_batch = usize::try_from(total).map_err(|_| {
+        let total = usize::try_from(total).map_err(|_| {
             StoreError::BackendUnavailable("protected roster maintenance unavailable".into())
-        })? == selected_count
-            && !lower_exists;
+        })?;
+        if total < selected_count {
+            return Err(StoreError::BackendUnavailable(
+                "protected roster maintenance unavailable".into(),
+            ));
+        }
+        let final_batch = total == selected_count;
         // A final target-epoch page can release its floor only when no binding
         // in either complete profile namespace remains at a higher epoch.
         // The layout gate above makes format-four V1's V2 contribution exactly
@@ -15960,31 +16175,29 @@ fn retire_protected_rosters_sync(
     Ok(true)
 }
 
-fn protected_roster_retirement_accepts_floor_epoch(
-    selected: &mut BTreeMap<ProductionFloorKey, u64>,
+fn protected_roster_retirement_include_floor_epoch(
+    selected: &mut BTreeMap<ProductionFloorKey, (u64, usize)>,
     floor_key: ProductionFloorKey,
     history_epoch: u64,
-) -> bool {
-    match selected.get(&floor_key) {
-        Some(selected_epoch) => *selected_epoch == history_epoch,
-        None => {
-            selected.insert(floor_key, history_epoch);
-            true
-        }
-    }
+) {
+    let (epoch, count) = selected.entry(floor_key).or_default();
+    *epoch = (*epoch).max(history_epoch);
+    *count += 1;
 }
 
-/// Run at most one protected-roster reclaim turn as part of an already
+/// Run at most one protected-roster maintenance turn as part of an already
 /// committed logical-time advance.  This is deliberately the same bounded
 /// maintenance seam that compacts ordinary consensus receipts: it never
 /// proposes another Raft command, never touches live rows, and only enters
-/// the bounded domain planner after the reclaim index proves that at least
-/// one retained row is due.
+/// the bounded domain planner when the reclaim or terminal index identifies
+/// an eligible retained row or tombstone prefix.
 fn maintain_due_protected_roster_reclaim_sync(
     conn: &Connection,
     identity: SessionConsensusIdentity,
     logical_time: Timestamp,
 ) -> Result<bool, StoreError> {
+    #[cfg(all(test, target_os = "linux"))]
+    let _work = roster_work_observer::sqlite_turn(conn, identity);
     // The prepared namespace is intentionally inert.  Avoid probing roster
     // tables for legacy/prepared databases on every unrelated command while
     // still rejecting any unknown persisted schema revision fail-closed.
@@ -16021,41 +16234,58 @@ fn maintain_due_protected_roster_reclaim_sync(
         // predicate over nonnegative timestamps. This remains a true no-op.
         return Ok(false);
     };
-    let v2_present = protected_roster_v2_namespace_is_present_sync(conn).map_err(|_| {
+    let v2_layout = protected_roster_v2_layout_in_sync(conn, false).map_err(|_| {
         StoreError::BackendUnavailable("protected roster maintenance unavailable".into())
     })?;
-    let due_reclaim: bool = conn
+    let v2_present = v2_layout != ProtectedRosterV2Layout::Absent;
+    let (v1_due_reclaim, v2_due_reclaim): (bool, bool) = conn
         .query_row(
             if v2_present {
                 "SELECT EXISTS(SELECT 1 FROM consensus_protected_roster_rows \
                  WHERE state=2 AND terminalized_at IS NOT NULL AND terminalized_at<=?1 LIMIT 1) \
-                 OR EXISTS(SELECT 1 FROM consensus_protected_roster_v2_admissions \
+                 , EXISTS(SELECT 1 FROM consensus_protected_roster_v2_admissions \
                  WHERE state=2 AND terminalized_at IS NOT NULL AND terminalized_at<=?1 LIMIT 1)"
             } else {
                 "SELECT EXISTS(SELECT 1 FROM consensus_protected_roster_rows \
-                 WHERE state=2 AND terminalized_at IS NOT NULL AND terminalized_at<=?1 LIMIT 1)"
+                 WHERE state=2 AND terminalized_at IS NOT NULL AND terminalized_at<=?1 LIMIT 1), 0"
             },
             [cutoff.to_be_bytes().as_slice()],
-            |row| row.get(0),
+            |row| Ok((row.get(0)?, row.get(1)?)),
         )
         .map_err(|_| {
             StoreError::BackendUnavailable("protected roster maintenance unavailable".into())
         })?;
-    let due_retirement: bool = conn
-        .query_row(
-            if v2_present {
-                "SELECT EXISTS(SELECT 1 FROM consensus_protected_roster_rows WHERE state=3 LIMIT 1) \
-                 OR EXISTS(SELECT 1 FROM consensus_protected_roster_v2_admissions WHERE state=3 LIMIT 1)"
-            } else {
-                "SELECT EXISTS(SELECT 1 FROM consensus_protected_roster_rows WHERE state=3 LIMIT 1)"
-            },
-            [],
-            |row| row.get(0),
-        )
-        .map_err(|_| {
-            StoreError::BackendUnavailable("protected roster maintenance unavailable".into())
-        })?;
-    if !due_reclaim && !due_retirement {
+    // The fixed witness authenticates the aggregate across both profiles and
+    // is updated atomically with every row transition. Checking that aggregate
+    // preserves policy validation even when a retained row blocks a later
+    // tombstone, without scanning all retained history on every clock tick.
+    // Keep the legacy missing-witness path: format four may have no witness,
+    // while the shared accessor rejects a missing mandatory format-five row.
+    let due_retirement = match roster_engine::RosterCommandStore::witness(&conn, identity)
+        .map_err(ProtectedRosterApplyError::store_error)?
+    {
+        Some(witness) => witness
+            .diagnostic_occupancy()
+            .map_err(|_| {
+                StoreError::BackendUnavailable("protected roster maintenance unavailable".into())
+            })?
+            .tombstone_reservations != 0,
+        None => conn
+            .query_row(
+                if v2_present {
+                    "SELECT EXISTS(SELECT 1 FROM consensus_protected_roster_rows WHERE state=3 LIMIT 1) \
+                     OR EXISTS(SELECT 1 FROM consensus_protected_roster_v2_admissions WHERE state=3 LIMIT 1)"
+                } else {
+                    "SELECT EXISTS(SELECT 1 FROM consensus_protected_roster_rows WHERE state=3 LIMIT 1)"
+                },
+                [],
+                |row| row.get(0),
+            )
+            .map_err(|_| {
+                StoreError::BackendUnavailable("protected roster maintenance unavailable".into())
+            })?,
+    };
+    if !v1_due_reclaim && !v2_due_reclaim && !due_retirement {
         return Ok(false);
     }
 
@@ -16070,11 +16300,108 @@ fn maintain_due_protected_roster_reclaim_sync(
             "protected roster maintenance unavailable".into(),
         ));
     }
-    if due_reclaim {
-        reclaim_protected_rosters_sync(conn, identity, logical_time).map(|()| true)
-    } else {
-        retire_protected_rosters_sync(conn, identity)
+    let scope = read_membership_scope_sync(conn, identity).map_err(|_| {
+        StoreError::BackendUnavailable("protected roster maintenance unavailable".into())
+    })?;
+    // Each exact namespace receives its own maintain/defer decision. A
+    // deferred profile writes nothing, including during a pending cutover.
+    // Decode and reject every present foreign/stale certificate before either
+    // profile can mutate the shared witness or its own rows.
+    let v1_rows: bool = conn
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM consensus_protected_roster_rows LIMIT 1)",
+            [],
+            |row| row.get(0),
+        )
+        .map_err(|_| {
+            StoreError::BackendUnavailable("protected roster maintenance unavailable".into())
+        })?;
+    let profiles = (|| -> io::Result<ProtectedRosterMaintenanceProfiles> {
+        if v1_rows
+            && fenced_transition_receipt_ledger_layout_sync(conn)?
+                != FencedTransitionReceiptLedgerLayout::Activated
+        {
+            return Err(invalid_data(
+                "protected roster maintenance policy is invalid",
+            ));
+        }
+        let settled = scope.pending.is_none()
+            && scope.application_authority_epoch == scope.current_identity.configuration_epoch()
+            && scope.application_authority_members == scope.current_members;
+        let v1 = match read_fenced_transition_activation_certificate_sync(conn, identity, false)? {
+            None => false,
+            Some((certificate_scope, digest)) => {
+                if certificate_scope != scope.current_identity {
+                    return Err(invalid_data(
+                        "protected roster maintenance policy is invalid",
+                    ));
+                }
+                if digest
+                    == protected_roster_profile_voter_set_digest(
+                        scope.current_identity,
+                        &scope.current_members,
+                    )
+                {
+                    settled
+                } else if digest
+                    == fenced_transition_voter_set_digest(
+                        scope.current_identity,
+                        &scope.current_members,
+                    )
+                {
+                    // Generic fenced-transition activation carries no roster
+                    // policy, so it cannot authorize roster maintenance.
+                    false
+                } else {
+                    return Err(invalid_data(
+                        "protected roster maintenance policy is invalid",
+                    ));
+                }
+            }
+        };
+        let v2 = match v2_layout {
+            ProtectedRosterV2Layout::Absent | ProtectedRosterV2Layout::Inactive => false,
+            ProtectedRosterV2Layout::Activated => {
+                let (certificate_scope, voter_digest, profile_digest) =
+                    read_protected_roster_v2_activation_certificate_in_sync(conn, identity, false)?
+                        .ok_or_else(|| {
+                            invalid_data("protected roster maintenance policy is invalid")
+                        })?;
+                if certificate_scope != scope.current_identity
+                    || voter_digest
+                        != protected_roster_profile_v2_voter_set_digest(
+                            scope.current_identity,
+                            &scope.current_members,
+                        )
+                    || profile_digest != crate::fenced_mutation_roster::Profile::v2().digest()
+                {
+                    return Err(invalid_data(
+                        "protected roster maintenance policy is invalid",
+                    ));
+                }
+                settled
+            }
+        };
+        Ok(ProtectedRosterMaintenanceProfiles { v1, v2 })
+    })()
+    .map_err(|_| {
+        StoreError::BackendUnavailable("protected roster maintenance unavailable".into())
+    })?;
+    if !profiles.v1 && !profiles.v2 {
+        return Ok(false);
     }
+    // Drain an eligible terminal prefix before reclaiming newer rows. The
+    // retirement planner returns false when an older retained row blocks it;
+    // reclaim then keeps its original retention predicate and batch bound.
+    // A retirement turn cannot create tombstones, so reclaim also progresses.
+    if due_retirement && retire_protected_rosters_for_profiles_sync(conn, identity, profiles)? {
+        return Ok(true);
+    }
+    if (profiles.v1 && v1_due_reclaim) || (profiles.v2 && v2_due_reclaim) {
+        reclaim_protected_rosters_for_profiles_sync(conn, identity, logical_time, profiles)?;
+        return Ok(true);
+    }
+    Ok(false)
 }
 
 /// Test-only bounded compaction followed by the production restart scanner.
@@ -16096,6 +16423,33 @@ pub(crate) async fn compact_and_validate_protected_roster_for_test(
     validate_protected_roster_state_sync(&conn, identity).map_err(|_| {
         StoreError::BackendUnavailable("protected roster test hydration rejected".into())
     })
+}
+
+/// Read the canonical retirement authority for the SQLite dynamic-membership
+/// fixture. This observes production state without performing maintenance or
+/// changing the lane, clock, retention policy, or row contents.
+#[cfg(feature = "test-control")]
+pub(crate) async fn protected_roster_retirement_authority_for_test(
+    backend: &SqliteSessionBackend,
+    identity: SessionConsensusIdentity,
+) -> Result<(u64, u64), StoreError> {
+    let conn = backend.conn.lock().await;
+    backend
+        .with_application_cache_read(&conn, || -> io::Result<(u64, u64)> {
+            validate_protected_roster_state_sync(&conn, identity)
+                .map_err(|_| invalid_data("test retirement state is invalid"))?;
+            let witness = protected_roster_read_witness_sync(&conn, identity)
+                .map_err(|_| invalid_data("test retirement witness is invalid"))?
+                .ok_or_else(|| invalid_data("test retirement witness is missing"))?;
+            Ok((
+                witness.retired_terminal_sequence(),
+                witness.highest_retired_admission_fence(),
+            ))
+        })
+        .map_err(|_| {
+            StoreError::BackendUnavailable("test retirement authority read failed".into())
+        })?
+        .map_err(|_| StoreError::BackendUnavailable("test retirement authority is invalid".into()))
 }
 
 /// The immutable authority projection recorded beside every protected binding.
@@ -16425,6 +16779,7 @@ fn validate_existing_schema_with_roster_requirement(
     if require_protected_roster {
         protected_roster_layout_in_sync(conn, false)
             .map_err(|_| SessionConsensusStorageError::CorruptState)?;
+        validate_mandatory_roster_witness_in_sync(conn, false)?;
         validate_protected_roster_state_sync(conn, storage_identity)
             .map_err(|_| SessionConsensusStorageError::CorruptState)?;
     }
@@ -17081,7 +17436,12 @@ fn activate_protected_roster_profile_v2_scope_sync(
     // roster certificate. V1 traffic still remains gated by its separate
     // certificate and cannot use this Prepared namespace.
     ensure_protected_roster_schema_sync(conn)?;
-    if protected_roster_v2_layout_in_sync(conn, false)? == ProtectedRosterV2Layout::Absent {
+    let previous_layout = protected_roster_v2_layout_in_sync(conn, false)?;
+    // The format transition and its initial witness share the caller's
+    // apply/export transaction. Format four may legitimately have no witness;
+    // an already-published format five must never recreate a missing one.
+    let fresh = previous_layout == ProtectedRosterV2Layout::Absent;
+    if previous_layout == ProtectedRosterV2Layout::Absent {
         conn.execute_batch(PROTECTED_ROSTER_V2_SCHEMA)
             .map_err(db_error)?;
         let changed = void_profile::set_layout(
@@ -17104,6 +17464,7 @@ fn activate_protected_roster_profile_v2_scope_sync(
             "protected roster V2 activation schema is invalid",
         ));
     }
+    initialize_protected_roster_witness_sync(conn, storage_identity, fresh)?;
     let voter_digest = protected_roster_profile_v2_voter_set_digest(scope_identity, voters);
     conn.execute(
         "INSERT INTO consensus_protected_roster_v2_activation (singleton, storage_configuration_epoch, scope_configuration_id, scope_configuration_epoch, voter_set_digest, profile_digest) VALUES (1, ?1, ?2, ?3, ?4, ?5) ON CONFLICT(singleton) DO UPDATE SET storage_configuration_epoch=excluded.storage_configuration_epoch, scope_configuration_id=excluded.scope_configuration_id, scope_configuration_epoch=excluded.scope_configuration_epoch, voter_set_digest=excluded.voter_set_digest, profile_digest=excluded.profile_digest",
@@ -33175,11 +33536,12 @@ fn apply_entries_with_authority_and_diagnostics_and_hooks_sync(
         };
 
         // Retained protected-roster rows age solely against the replicated
-        // logical clock.  Fold one deterministic reclaim turn into every
+        // logical clock. Fold one deterministic maintenance turn into every
         // normal command that advances or observes that clock; the helper is
         // an indexed no-op unless an activated roster has an eligible row.
-        // This is maintenance within this Raft apply transaction, never a
-        // separately proposed command and never a replication/watch event.
+        // Maintenance runs inside this Raft apply transaction and emits no watch
+        // event. An idle store's retention lane can propose AdvanceLogicalTime
+        // to trigger the same bounded turn when indexed work becomes eligible.
         if let Some(logical_time) = response.logical_time {
             let maintenance_started = Instant::now();
             if maintain_due_protected_roster_reclaim_sync(&tx, identity, logical_time)
@@ -38056,7 +38418,14 @@ fn protected_roster_v2_snapshot_incoming_closure_covers_tombstone(
     local_witness.configuration_epoch == incoming_witness.configuration_epoch
         && incoming_witness.witness.retired_terminal_sequence()
             >= local_witness.witness.retired_terminal_sequence()
+        && incoming_witness.witness.highest_retired_admission_fence()
+            >= local_witness.witness.highest_retired_admission_fence()
         && sequence <= incoming_witness.witness.retired_terminal_sequence()
+        && record.tombstone().ok().flatten().is_some_and(|tombstone| {
+            tombstone.original_admission_fence().is_ok_and(|fence| {
+                fence <= incoming_witness.witness.highest_retired_admission_fence()
+            })
+        })
 }
 
 /// V2 follows the same Live → Retained → Tombstone timeline as V1.  Its
@@ -38339,7 +38708,9 @@ fn validate_attached_snapshot_protected_roster_floors_and_cursors(
         (Some(local_witness), Some(incoming_witness))
             if local_witness.configuration_epoch == incoming_witness.configuration_epoch
                 && incoming_witness.witness.retired_terminal_sequence()
-                    >= local_witness.witness.retired_terminal_sequence() => {}
+                    >= local_witness.witness.retired_terminal_sequence()
+                && incoming_witness.witness.highest_retired_admission_fence()
+                    >= local_witness.witness.highest_retired_admission_fence() => {}
         (None, None | Some(_)) if protected_roster_snapshot_local_side_tables_are_empty(conn)? => {}
         _ => return Err(protected_roster_snapshot_monotonicity_error()),
     }
@@ -38562,13 +38933,24 @@ fn validate_attached_snapshot_preserves_protected_roster_sync(
         let local_state = local_row.state;
         let local_terminal_sequence = local_row.terminal_sequence;
         let Some((incoming_binding, incoming_row)) = incoming_row else {
-            let _local_record = protected_roster_snapshot_decode_row(binding, local_row)?;
+            let local_record = protected_roster_snapshot_decode_row(binding, local_row)?;
             let retired = local_terminal_sequence
                 .and_then(|sequence| u64::try_from(sequence).ok())
                 .zip(incoming_retired_terminal_sequence)
                 .is_some_and(|(sequence, retired)| sequence <= retired);
             if local_state == protected_roster_snapshot_state_code(ReservationState::Tombstone)
                 && retired
+                && local_record
+                    .tombstone()
+                    .ok()
+                    .flatten()
+                    .is_some_and(|tombstone| {
+                        tombstone.original_admission_fence().is_ok_and(|fence| {
+                            incoming_witness.as_ref().is_some_and(|witness| {
+                                fence <= witness.witness.highest_retired_admission_fence()
+                            })
+                        })
+                    })
             {
                 continue;
             }
@@ -41132,6 +41514,9 @@ mod tests {
     #[cfg(target_os = "linux")]
     mod descriptor_locks;
     mod lease_deferral;
+    mod mandatory_witness;
+    mod retired_admission;
+    mod roster_maintenance_cutover;
     #[path = "scope_authority.rs"]
     mod scope_authority_tests;
     #[path = "scope_batch.rs"]
@@ -46428,10 +46813,7 @@ mod tests {
     fn protected_roster_q2_reservation_failures_are_never_capacity_rejections() {
         // Q1 retains its public admission-time mapping.
         for error in [
-            ReservationError::BindingLimit,
-            ReservationError::DurableBindingLimit,
             ReservationError::FloorAdvance,
-            ReservationError::FloorLimit,
             ReservationError::InvalidEpoch,
         ] {
             assert!(matches!(
@@ -46446,10 +46828,7 @@ mod tests {
         for error in [
             ReservationError::BudgetExceeded,
             ReservationError::LiveLimit,
-            ReservationError::BindingLimit,
-            ReservationError::DurableBindingLimit,
             ReservationError::FloorAdvance,
-            ReservationError::FloorLimit,
             ReservationError::InvalidEpoch,
         ] {
             assert!(matches!(
@@ -46487,11 +46866,8 @@ mod tests {
             ReservationError::CanonicalEncoding,
             ReservationError::StateShape,
             ReservationError::FloorAdvance,
-            ReservationError::FloorLimit,
             ReservationError::BusinessCas,
             ReservationError::LiveLimit,
-            ReservationError::BindingLimit,
-            ReservationError::DurableBindingLimit,
             ReservationError::Duplicate,
             ReservationError::Unknown,
             ReservationError::InvalidState,
@@ -48167,11 +48543,27 @@ mod tests {
         write_retirement_fixture_witness_for_identity(conn, identity(), records)
     }
 
+    fn activate_retirement_fixture_policy(conn: &Connection, identity: SessionConsensusIdentity) {
+        let scope = read_membership_scope_sync(conn, identity).expect("fixture membership");
+        activate_fenced_transition_scope_with_voter_digest_sync(
+            conn,
+            identity,
+            scope.current_identity,
+            &scope.current_members,
+            protected_roster_profile_voter_set_digest(
+                scope.current_identity,
+                &scope.current_members,
+            ),
+        )
+        .expect("activate fixture policy");
+    }
+
     fn write_retirement_fixture_witness_for_identity(
         conn: &Connection,
         identity: SessionConsensusIdentity,
         records: &[ProductionReservationRecord],
     ) -> GlobalChargeWitness {
+        activate_retirement_fixture_policy(conn, identity);
         let mut counters = crate::fenced_mutation_roster_storage::validate_production_snapshot(
             records,
             ChargeProfile::v1(),
@@ -48217,12 +48609,144 @@ mod tests {
             reserved_roster_auxiliary_charge_bytes: u64,
             roster: Counters,
             retired_terminal_sequence: u64,
+            highest_retired_admission_fence: u64,
         }
 
         postcard::from_bytes::<Witness>(&witness.to_canonical_bytes().expect("canonical witness"))
             .expect("decode witness")
             .roster
             .durable_epoch_bindings
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn protected_roster_idle_turn_work_is_independent_of_retained_history() {
+        let mut measured = Vec::new();
+        for rows in [1_800_u16, 18_000] {
+            let backend = SqliteSessionBackend::in_memory().unwrap();
+            let conn = backend.conn.blocking_lock();
+            initialize_schema(&conn, identity(), &expected_members()).unwrap();
+            activate_protected_roster_schema_sync(&conn).unwrap();
+            let retained_at = Timestamp::from_str("2026-01-01T00:00:00Z").unwrap();
+            let records = (0..rows)
+                .map(|roster| {
+                    retirement_fixture_retained_with_terminal_sequence(
+                        0x32,
+                        roster,
+                        u64::from(roster) + 1,
+                        retained_at,
+                        u64::from(roster) + 1,
+                    )
+                })
+                .collect::<Vec<_>>();
+            for record in &records {
+                write_retirement_fixture_record(&conn, record, retained_at);
+            }
+            write_retirement_fixture_floor(&conn, records[0].binding());
+            let witness = write_retirement_fixture_witness(&conn, &records);
+            let occupancy = witness.diagnostic_occupancy().unwrap();
+            assert_eq!(occupancy.retained_reservations, u64::from(rows));
+            assert_eq!(occupancy.tombstone_reservations, 0);
+            let before = conn.total_changes();
+            let observation = roster_work_observer::WorkObservation::new(identity());
+            // A no-op turn must not scan every young retained row to discover
+            // that no tombstone exists. This isolates the query cost from Raft,
+            // filesystem service and shutdown; signed fleet proofs cover them.
+            assert!(!maintain_due_protected_roster_reclaim_sync(
+                &conn,
+                identity(),
+                retained_at.add_seconds(24 * 60 * 60 - 1).unwrap(),
+            )
+            .unwrap());
+            let work = observation.counts();
+            assert_eq!(work.turns, 1);
+            assert!(work.sqlite_vm_steps > 0);
+            assert_eq!(
+                conn.total_changes(),
+                before,
+                "idle maintenance writes nothing"
+            );
+            eprintln!("roster SQLite idle work: history={rows}, work={work:?}");
+            measured.push(work);
+        }
+        assert_eq!(measured.len(), 2);
+        assert_eq!(
+            measured[0], measured[1],
+            "idle maintenance work must not grow with retained history"
+        );
+    }
+
+    #[test]
+    fn protected_roster_maintenance_rejects_foreign_v1_policy_before_mutation() {
+        let backend = SqliteSessionBackend::in_memory().unwrap();
+        let conn = backend.conn.blocking_lock();
+        initialize_schema(&conn, identity(), &expected_members()).unwrap();
+        activate_protected_roster_schema_sync(&conn).unwrap();
+        let retained_at = timestamp(10);
+        let record = retirement_fixture_retained(0x32, 1, 7, retained_at);
+        write_retirement_fixture_record(&conn, &record, retained_at);
+        write_retirement_fixture_floor(&conn, record.binding());
+        let witness = write_retirement_fixture_witness(&conn, std::slice::from_ref(&record));
+        conn.execute(
+            "UPDATE consensus_fenced_transition_activation SET voter_set_digest=?1",
+            [[0xCE_u8; 32].as_slice()],
+        )
+        .unwrap();
+        let before = conn.total_changes();
+        assert!(maintain_due_protected_roster_reclaim_sync(
+            &conn,
+            identity(),
+            retained_at.add_seconds(24 * 60 * 60).unwrap(),
+        )
+        .is_err());
+        assert_eq!(
+            conn.total_changes(),
+            before,
+            "no row, floor, cursor or witness write"
+        );
+        assert_eq!(
+            protected_roster_read_witness_sync(&conn, identity()).unwrap(),
+            Some(witness)
+        );
+    }
+
+    #[test]
+    fn protected_roster_maintenance_rejects_foreign_v2_policy_before_mutation() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("maintenance-policy.sqlite");
+        initialize_protected_roster_v2_recovery_fixture(
+            &path,
+            ProtectedRosterV2RecoveryFixtureState::Aborted,
+        )
+        .unwrap();
+        let conn = Connection::open(path).unwrap();
+        let signed = crate::consensus::types::roster_v2_aborted_persistence_fixture();
+        conn.execute(
+            "UPDATE consensus_protected_roster_v2_activation SET voter_set_digest=?1",
+            [[0xCE_u8; 32].as_slice()],
+        )
+        .unwrap();
+        let witness = protected_roster_read_witness_sync(&conn, signed.identity).unwrap();
+        let before = conn.total_changes();
+        assert!(maintain_due_protected_roster_reclaim_sync(
+            &conn,
+            signed.identity,
+            signed
+                .authority
+                .acquired_at()
+                .add_seconds(1 + 24 * 60 * 60)
+                .unwrap(),
+        )
+        .is_err());
+        assert_eq!(
+            conn.total_changes(),
+            before,
+            "no row, floor, cursor or witness write"
+        );
+        assert_eq!(
+            protected_roster_read_witness_sync(&conn, signed.identity).unwrap(),
+            witness
+        );
     }
 
     fn snapshot_monotonic_state(application_sequence: u64) -> SnapshotMonotonicState {
@@ -48322,7 +48846,7 @@ mod tests {
         )
         .expect("empty incoming roster counters");
         let witness = GlobalChargeWitness::v1(0, 0, empty)
-            .retired_through_terminal_sequence_for_test(retired_terminal_sequence)
+            .retired_through_terminal_sequence_for_test(retired_terminal_sequence, 1)
             .expect("incoming closure witness");
         protected_roster_write_witness_sync(&conn, identity(), witness)
             .expect("persist incoming closure witness");
@@ -48750,6 +49274,15 @@ mod tests {
 
     #[test]
     fn protected_roster_retirement_uses_a_1024_row_global_prefix_then_final_partial_batch() {
+        assert_retirement_uses_bounded_prefix(false);
+    }
+
+    #[test]
+    fn protected_roster_retirement_spans_1024_distinct_epochs_then_final_partial_batch() {
+        assert_retirement_uses_bounded_prefix(true);
+    }
+
+    fn assert_retirement_uses_bounded_prefix(distinct_epochs: bool) {
         let backend = SqliteSessionBackend::in_memory().expect("backend");
         let conn = backend.conn.blocking_lock();
         initialize_schema(&conn, identity(), &expected_members()).expect("consensus schema");
@@ -48759,7 +49292,14 @@ mod tests {
             .add_seconds(2 * 24 * 60 * 60)
             .expect("maintenance time");
         let records = (0_u16..1_025)
-            .map(|roster| retirement_fixture_retained(0x32, roster, 7, retained_at))
+            .map(|roster| {
+                let epoch = if distinct_epochs {
+                    u64::from(roster) + 7
+                } else {
+                    7
+                };
+                retirement_fixture_retained(0x32, roster, epoch, retained_at)
+            })
             .collect::<Vec<_>>();
         let mut bindings = records
             .iter()
@@ -48772,10 +49312,43 @@ mod tests {
         let (_, key) = write_retirement_fixture_floor(&conn, bindings[0]);
         write_retirement_fixture_witness(&conn, &records);
 
-        maintain_due_protected_roster_reclaim_sync(&conn, identity(), maintenance_at)
+        // Seed both bounded compaction phases explicitly: automatic maintenance
+        // may retire an eligible prefix between them. This fixture isolates
+        // retirement's full batch and final partial batch from that scheduling.
+        reclaim_protected_rosters_sync(&conn, identity(), maintenance_at)
             .expect("first payload compaction");
-        maintain_due_protected_roster_reclaim_sync(&conn, identity(), maintenance_at)
+        assert_eq!(
+            conn.query_row(
+                "SELECT COUNT(*) FROM consensus_protected_roster_rows WHERE state=3",
+                [],
+                |row| row.get::<_, i64>(0)
+            )
+            .unwrap(),
+            1_024,
+            "the first reclaim phase preserves its exact batch bound"
+        );
+        assert_eq!(
+            conn.query_row(
+                "SELECT COUNT(*) FROM consensus_protected_roster_rows WHERE state=2",
+                [],
+                |row| row.get::<_, i64>(0)
+            )
+            .unwrap(),
+            1,
+            "one retained payload remains for the final reclaim phase"
+        );
+        reclaim_protected_rosters_sync(&conn, identity(), maintenance_at)
             .expect("final payload compaction");
+        assert_eq!(
+            conn.query_row(
+                "SELECT COUNT(*) FROM consensus_protected_roster_rows WHERE state=3",
+                [],
+                |row| row.get::<_, i64>(0)
+            )
+            .unwrap(),
+            1_025,
+            "both compaction phases are complete before testing retirement"
+        );
         assert!(retire_protected_rosters_sync(&conn, identity()).expect("maximum retirement batch"));
         assert!(
             protected_roster_read_retirement_cursor_sync(&conn, identity(), key)
@@ -49061,6 +49634,7 @@ mod tests {
         let conn = backend.conn.blocking_lock();
         initialize_schema(&conn, identity(), &expected_members()).expect("consensus schema");
         activate_protected_roster_schema_sync(&conn).expect("activate protected roster");
+        activate_retirement_fixture_policy(&conn, identity());
 
         let retained_at =
             Timestamp::from_str("2026-01-01T00:00:00Z").expect("retained logical time");
@@ -49163,6 +49737,23 @@ mod tests {
         protected_roster_write_witness_sync(&conn, identity(), witness)
             .expect("persist fixture witness");
 
+        let just_before_due = retained_at
+            .add_seconds(24 * 60 * 60 - 1)
+            .expect("last ineligible second");
+        let (occupancy, due) =
+            protected_roster_maintenance_due_sync(&conn, identity(), just_before_due)
+                .expect("read young retention eligibility");
+        assert_eq!(occupancy.retained_reservations, 1_025);
+        assert!(
+            !due,
+            "young retained rows must not request an empty Raft entry"
+        );
+        assert!(
+            protected_roster_maintenance_due_sync(&conn, identity(), maintenance_at)
+                .expect("read due retention eligibility")
+                .1
+        );
+
         // A malformed admission child must fail the whole compaction turn
         // before it can replace either the retained parent or its mapping.
         let guarded_binding = ordered_retained[0].1;
@@ -49210,6 +49801,11 @@ mod tests {
             [live_binding.to_bytes().as_slice()],
         )
         .expect("corrupt unselected live canonical frame");
+        assert!(
+            protected_roster_maintenance_due_sync(&conn, identity(), maintenance_at)
+                .expect("eligibility never decodes unrelated live frames")
+                .1
+        );
 
         reset_protected_roster_reclaim_hydrated_rows_for_test();
         maintain_due_protected_roster_reclaim_sync(&conn, identity(), maintenance_at)
@@ -49495,7 +50091,7 @@ mod tests {
 
         let future_closure = retained
             .next_witness()
-            .retired_through_terminal_sequence_for_test(2)
+            .retired_through_terminal_sequence_for_test(2, 1)
             .expect("future closure fixture");
         protected_roster_write_witness_sync(&conn, identity(), future_closure)
             .expect("persist future closure fixture");
@@ -54525,6 +55121,42 @@ mod tests {
     }
 
     #[test]
+    fn protected_roster_shared_witness_does_not_authorize_v1_activation() {
+        let backend = SqliteSessionBackend::in_memory().unwrap();
+        let conn = backend.conn.blocking_lock();
+        let identity = identity();
+        let members = expected_members();
+        initialize_schema(&conn, identity, &members).unwrap();
+        activate_protected_roster_profile_v2_scope_sync(
+            &conn,
+            identity,
+            identity,
+            &members,
+            crate::fenced_mutation_roster::Profile::v2().digest(),
+        )
+        .unwrap();
+        assert!(protected_roster_read_witness_sync(&conn, identity)
+            .unwrap()
+            .is_some());
+        assert!(activate_protected_roster_schema_sync(&conn).is_err());
+        // A separately admitted V1 certificate still permits mixed-profile
+        // traffic, without changing the higher durable format.
+        activate_fenced_transition_scope_with_voter_digest_sync(
+            &conn,
+            identity,
+            identity,
+            &members,
+            protected_roster_profile_voter_set_digest(identity, &members),
+        )
+        .unwrap();
+        activate_protected_roster_schema_sync(&conn).unwrap();
+        assert_eq!(
+            persisted_schema_version_in_sync(&conn, false).unwrap(),
+            PROTECTED_ROSTER_V2_DATABASE_FORMAT,
+        );
+    }
+
+    #[test]
     fn protected_roster_v2_absence_rejects_unknown_namespace_on_main_attached_and_recovery() {
         let directory = tempfile::tempdir().expect("V2 namespace directory");
         let path = directory.path().join("unknown-v2-namespace.sqlite");
@@ -55055,9 +55687,13 @@ mod tests {
             let witness = protected_roster_read_witness_sync(&conn, fixture_identity)
                 .expect("read V2 reclaim witness")
                 .expect("V2 reclaim witness exists");
-            let records =
-                protected_roster_due_reclaim_records_sync(&conn, fixture_identity, maintenance)
-                    .expect("hydrate exact due V2 reclaim prefix");
+            let records = protected_roster_due_reclaim_records_sync(
+                &conn,
+                fixture_identity,
+                maintenance,
+                ProtectedRosterMaintenanceProfiles::ALL,
+            )
+            .expect("hydrate exact due V2 reclaim prefix");
             assert_eq!(records.len(), 1, "one V2 retained row is exactly due");
             let selections = records
                 .iter()
@@ -55163,6 +55799,132 @@ mod tests {
             )
             .is_ok(),
             "a V2 tombstone may be omitted only after the incoming shared closure covers it",
+        );
+    }
+
+    #[test]
+    fn protected_roster_missing_retired_witness_must_not_authorize_verified_absence() {
+        let directory = tempfile::tempdir().expect("retired recovery directory");
+        let path = directory.path().join("retired-recovery.sqlite");
+        let fixture = crate::consensus::types::roster_v2_persistence_fixture();
+        let identity = initialize_protected_roster_v2_recovery_fixture(
+            &path,
+            ProtectedRosterV2RecoveryFixtureState::Established,
+        )
+        .expect("materialize complete production recovery state")
+        .identity;
+        let now = v2_persistence_logical_time();
+        let due = now.add_seconds(24 * 60 * 60).expect("retention boundary");
+        {
+            let backend = SqliteSessionBackend::open(&path).expect("open retained ledger");
+            let conn = backend.conn.blocking_lock();
+            reclaim_protected_rosters_sync(&conn, identity, due).unwrap();
+            assert!(retire_protected_rosters_sync(&conn, identity).unwrap());
+            assert_eq!(
+                conn.query_row(
+                    "SELECT COUNT(*) FROM consensus_protected_roster_floors",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+                0,
+                "retiring the last row releases its partition floor"
+            );
+        }
+        let backend = SqliteSessionBackend::open(&path).expect("reopen retired ledger");
+        let conn = backend.conn.blocking_lock();
+        assert!(
+            protected_roster_read_witness_sync(&conn, identity)
+                .unwrap()
+                .unwrap()
+                .retired_terminal_sequence()
+                > 0,
+            "the global retirement witness survives the empty partition and reopen"
+        );
+        // Install a current successor through the ordinary lease allocator.
+        ops::insert_or_replace_fence_sync(
+            &conn,
+            fixture.authority.key(),
+            fixture.authority.fence().get(),
+        )
+        .unwrap();
+        conn.execute(
+            "UPDATE lease_globals SET val=?1 WHERE key='next_credential_id'",
+            [checked_positive_i64(fixture.authority.credential_id() + 1).unwrap()],
+        )
+        .unwrap();
+        let guard = crate::sqlite::lease::acquire_sync(
+            &conn,
+            fixture.authority.key(),
+            OwnerId::new("retired-recovery-successor").unwrap(),
+            Duration::from_secs(60),
+            due,
+        )
+        .expect("acquire successor after original guard expiry");
+        let successor = AuthorityBinding::from_consensus_parts(
+            fixture.authority.scope().digest(),
+            guard.key().clone(),
+            guard.owner().clone(),
+            guard.fence(),
+            AuthorityLeaseMetadata::new(
+                guard.credential_id(),
+                Generation::new(1),
+                guard.acquired_at(),
+                guard.expires_at(),
+            ),
+        )
+        .unwrap();
+        let recovery = RecoveryRequest::new(
+            crate::fenced_mutation_roster_executor::RecoveryRequestInput::new(
+                crate::fenced_mutation_roster_executor::RecoveryLookup::new(
+                    fixture.admission.scope(),
+                    fixture.admission.roster_id(),
+                ),
+                fixture.authority.owner().clone(),
+                fixture.authority.fence(),
+                successor,
+            ),
+        )
+        .and_then(|request| request.bind_original_key(fixture.authority.key().clone()))
+        .unwrap();
+        let read = read_protected_roster_v2_recovery_sync(&conn, identity, &recovery, due)
+            .expect("verified successor can read the retired namespace");
+        assert!(
+            !matches!(read, ProtectedRosterV2ReadResult::Missing),
+            "a retired committed admission must never be reported as verified missing"
+        );
+        assert!(matches!(
+            read,
+            ProtectedRosterV2ReadResult::HistoryUnavailable
+        ));
+        assert!(
+            read_protected_roster_v2_recovery_sync(
+                &conn,
+                identity,
+                &recovery,
+                due.add_seconds(61).unwrap(),
+            )
+            .is_err(),
+            "expired authority is refused before history classification"
+        );
+        validate_protected_roster_state_sync(&conn, identity)
+            .expect("the complete retired namespace validates before witness loss");
+        assert_eq!(
+            conn.execute("DELETE FROM consensus_protected_roster_witness", [])
+                .unwrap(),
+            1
+        );
+        let validation = validate_protected_roster_state_sync(&conn, identity);
+        let recovered = read_protected_roster_v2_recovery_sync(&conn, identity, &recovery, due);
+        eprintln!("missing retired witness corruption probe: validation_accepted={}, recovery_missing={}, recovery_rejected={}",
+            validation.is_ok(), matches!(recovered, Ok(ProtectedRosterV2ReadResult::Missing)), recovered.is_err());
+        assert!(
+            validation.is_err(),
+            "loss of a retired namespace's only witness must not pass recovery validation"
+        );
+        assert!(
+            recovered.is_err(),
+            "loss of a retired namespace's witness must not authorize verified absence"
         );
     }
 
@@ -55354,51 +56116,36 @@ mod tests {
     }
 
     #[test]
-    fn protected_roster_retirement_batches_one_epoch_per_floor_without_collapsing_same_epoch_rows()
-    {
+    fn protected_roster_retirement_folds_all_selected_epochs_into_one_floor_action() {
         let first = retirement_fixture_retained(0x79, 1, 7, timestamp(10));
         let same_epoch = retirement_fixture_retained(0x79, 2, 7, timestamp(11));
         let next_epoch = retirement_fixture_retained(0x79, 3, 8, timestamp(12));
         let other_floor = retirement_fixture_retained(0x7a, 1, 8, timestamp(13));
-        let floor = ProductionFloorKey::from_binding(first.binding()).expect("first floor key");
-        assert_eq!(
-            floor,
-            ProductionFloorKey::from_binding(same_epoch.binding()).expect("same-epoch floor key"),
-        );
-        assert_eq!(
-            floor,
-            ProductionFloorKey::from_binding(next_epoch.binding()).expect("next-epoch floor key"),
-        );
-
+        let floor = ProductionFloorKey::from_binding(first.binding()).unwrap();
         let mut selected = BTreeMap::new();
-        assert!(protected_roster_retirement_accepts_floor_epoch(
-            &mut selected,
-            floor,
-            first.binding().history_epoch(),
-        ));
-        assert!(
-            protected_roster_retirement_accepts_floor_epoch(
+        // Terminal order need not match admission order. Preserve every row
+        // count while folding the greatest epoch into one shared floor action.
+        for record in [&next_epoch, &first, &same_epoch, &other_floor] {
+            protected_roster_retirement_include_floor_epoch(
                 &mut selected,
-                floor,
-                same_epoch.binding().history_epoch(),
-            ),
-            "rows from the same floor and epoch remain in one bounded retirement turn",
+                ProductionFloorKey::from_binding(record.binding()).unwrap(),
+                record.binding().history_epoch(),
+            );
+        }
+        assert_eq!(
+            ProductionFloorKey::from_binding(same_epoch.binding()).unwrap(),
+            floor
         );
-        assert!(
-            !protected_roster_retirement_accepts_floor_epoch(
-                &mut selected,
-                floor,
-                next_epoch.binding().history_epoch(),
-            ),
-            "a second epoch for one shared floor must end the selected prefix",
+        assert_eq!(
+            ProductionFloorKey::from_binding(next_epoch.binding()).unwrap(),
+            floor
         );
-        assert!(protected_roster_retirement_accepts_floor_epoch(
-            &mut selected,
-            ProductionFloorKey::from_binding(other_floor.binding()).expect("other floor key"),
-            other_floor.binding().history_epoch(),
-        ));
         assert_eq!(selected.len(), 2);
-        assert_eq!(selected.get(&floor), Some(&7));
+        assert_eq!(selected[&floor], (8, 3));
+        assert_eq!(
+            selected[&ProductionFloorKey::from_binding(other_floor.binding()).unwrap()],
+            (8, 1)
+        );
     }
 
     #[test]

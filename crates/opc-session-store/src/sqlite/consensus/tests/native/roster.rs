@@ -9,6 +9,7 @@ use crate::sqlite::consensus::wal::native::Opening;
 use std::fs;
 
 pub(super) mod export;
+mod roster_work_bound;
 
 #[cfg(feature = "test-control")]
 async fn terminal_observation_native_fixture(

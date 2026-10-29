@@ -36,8 +36,7 @@ use crate::consensus::{
 };
 use crate::sqlite::{consensus, open_regular_read_nofollow, ops};
 use crate::{
-    ReplicationEntry, ReplicationTxId, FENCED_MUTATION_ROSTER_MAX_LIVE_ROSTERS,
-    FENCED_MUTATION_ROSTER_MAX_RESERVED_AND_RETAINED, FENCED_TRANSITION_MAX_HISTORY_ENTRIES,
+    ReplicationEntry, ReplicationTxId, FENCED_TRANSITION_MAX_HISTORY_ENTRIES,
     FENCED_TRANSITION_V2_MAX_HISTORY_ENTRIES, FENCED_TRANSITION_V2_MAX_REPLAY_EPOCHS,
     FENCED_TRANSITION_V2_MAX_RETAINED_HISTORY_ENTRIES,
     FENCED_TRANSITION_V2_RECEIPT_RESPONSE_MAX_BYTES, FENCED_TRANSITION_V2_REQUEST_ID_BYTES,
@@ -47,6 +46,10 @@ use crate::{
 #[cfg(test)]
 #[path = "sqlite/scope_scan_schema_tests.rs"]
 mod scope_scan_schema_tests;
+
+#[cfg(test)]
+#[path = "sqlite/roster_capacity_tests.rs"]
+mod roster_capacity_tests;
 
 #[cfg(all(test, target_os = "linux"))]
 #[path = "sqlite/descriptor_locks.rs"]
@@ -1149,6 +1152,13 @@ fn inspect_current(
         SessionConsensusConfigurationId::from_bytes(configuration),
         epoch,
     );
+    consensus::validate_mandatory_roster_witness_in_sync(conn, false).map_err(|error| {
+        match error {
+            crate::consensus::storage::SessionConsensusStorageError::MissingMandatoryRosterWitness =>
+                RecoveryError::MissingMandatoryRosterWitness,
+            _ => RecoveryError::CorruptReplica,
+        }
+    })?;
     // Keep the optional snapshot descriptor alive through both the inode
     // commitment and the branch walk below.  In particular, finalization
     // supplies the installed target pin here; reopening its pathname between
@@ -1831,7 +1841,7 @@ fn preflight_fenced_transition_v2_receipt_count(conn: &Connection) -> Result<usi
 struct ProtectedRosterPreflightTable {
     count_query: &'static str,
     values_query: &'static str,
-    protocol_cap: usize,
+    protocol_cap: Option<u64>,
     protocol_max_value: ProtectedRosterValueCap,
 }
 
@@ -1842,10 +1852,9 @@ enum ProtectedRosterValueCap {
     CanonicalBusiness,
 }
 
-/// Check the protocol-owned roster cardinalities before any aggregate or
-/// canonical decoder can inspect the complete table. Every count query sees
-/// at most one row beyond its immutable format cap; every width query sees at
-/// most that cap. Recovery limits remain an additional caller-owned bound.
+/// Bound inspection by the caller's work allowance before canonical decoding.
+/// Singleton metadata retains its structural cap; roster history has no
+/// protocol count quota. Widths remain bounded by their canonical formats.
 fn preflight_protected_roster_tables(
     conn: &Connection,
     budget: &InspectionBudget,
@@ -1860,44 +1869,44 @@ fn preflight_protected_roster_tables(
     const ROOT: ProtectedRosterPreflightTable = ProtectedRosterPreflightTable {
         count_query: "SELECT COUNT(*) FROM (SELECT singleton FROM consensus_identity LIMIT ?1)",
         values_query: "SELECT COUNT(*), COALESCE(MAX(MAX(COALESCE(length(roster_attestation_root_id), 0), COALESCE(length(roster_attestation_public_key), 0), COALESCE(length(roster_attestation_algorithm_version), 0))), 0), COALESCE(SUM(COALESCE(length(roster_attestation_root_id), 0) + COALESCE(length(roster_attestation_public_key), 0) + COALESCE(length(roster_attestation_algorithm_version), 0)), 0) FROM (SELECT roster_attestation_root_id, roster_attestation_public_key, roster_attestation_algorithm_version FROM consensus_identity LIMIT ?1)",
-        protocol_cap: 1,
+        protocol_cap: Some(1),
         protocol_max_value: ProtectedRosterValueCap::Fixed(33),
     };
     const TABLES: &[ProtectedRosterPreflightTable] = &[
         ProtectedRosterPreflightTable {
             count_query: "SELECT COUNT(*) FROM (SELECT binding FROM consensus_protected_roster_rows LIMIT ?1)",
             values_query: "SELECT COUNT(*), COALESCE(MAX(MAX(length(binding), length(partition), COALESCE(length(terminalized_at), 0), length(canonical_record))), 0), COALESCE(SUM(length(binding) + length(partition) + COALESCE(length(terminalized_at), 0) + length(canonical_record)), 0) FROM (SELECT binding, partition, terminalized_at, canonical_record FROM consensus_protected_roster_rows LIMIT ?1)",
-            protocol_cap: FENCED_MUTATION_ROSTER_MAX_RESERVED_AND_RETAINED,
+            protocol_cap: None,
             protocol_max_value: ProtectedRosterValueCap::CanonicalRecord,
         },
         ProtectedRosterPreflightTable {
             count_query: "SELECT COUNT(*) FROM (SELECT partition FROM consensus_protected_roster_floors LIMIT ?1)",
             values_query: "SELECT COUNT(*), COALESCE(MAX(MAX(length(partition), length(canonical_floor))), 0), COALESCE(SUM(length(partition) + length(canonical_floor)), 0) FROM (SELECT partition, canonical_floor FROM consensus_protected_roster_floors LIMIT ?1)",
-            protocol_cap: FENCED_MUTATION_ROSTER_MAX_RESERVED_AND_RETAINED,
+            protocol_cap: None,
             protocol_max_value: ProtectedRosterValueCap::Fixed(128),
         },
         ProtectedRosterPreflightTable {
             count_query: "SELECT COUNT(*) FROM (SELECT partition FROM consensus_protected_roster_retirement_cursors LIMIT ?1)",
             values_query: "SELECT COUNT(*), COALESCE(MAX(MAX(length(partition), length(canonical_cursor))), 0), COALESCE(SUM(length(partition) + length(canonical_cursor)), 0) FROM (SELECT partition, canonical_cursor FROM consensus_protected_roster_retirement_cursors LIMIT ?1)",
-            protocol_cap: FENCED_MUTATION_ROSTER_MAX_RESERVED_AND_RETAINED,
+            protocol_cap: None,
             protocol_max_value: ProtectedRosterValueCap::Fixed(256),
         },
         ProtectedRosterPreflightTable {
             count_query: "SELECT COUNT(*) FROM (SELECT singleton FROM consensus_protected_roster_witness LIMIT ?1)",
             values_query: "SELECT COUNT(*), COALESCE(MAX(length(canonical_witness)), 0), COALESCE(SUM(length(canonical_witness)), 0) FROM (SELECT canonical_witness FROM consensus_protected_roster_witness LIMIT ?1)",
-            protocol_cap: 1,
+            protocol_cap: Some(1),
             protocol_max_value: ProtectedRosterValueCap::Fixed(1_024),
         },
         ProtectedRosterPreflightTable {
             count_query: "SELECT COUNT(*) FROM (SELECT business_key FROM consensus_protected_roster_business LIMIT ?1)",
             values_query: "SELECT COUNT(*), COALESCE(MAX(MAX(length(business_key), length(binding), length(canonical_business))), 0), COALESCE(SUM(length(business_key) + length(binding) + length(canonical_business)), 0) FROM (SELECT business_key, binding, canonical_business FROM consensus_protected_roster_business LIMIT ?1)",
-            protocol_cap: FENCED_MUTATION_ROSTER_MAX_LIVE_ROSTERS,
+            protocol_cap: None,
             protocol_max_value: ProtectedRosterValueCap::CanonicalBusiness,
         },
         ProtectedRosterPreflightTable {
             count_query: "SELECT COUNT(*) FROM (SELECT binding FROM consensus_protected_roster_admissions LIMIT ?1)",
             values_query: "SELECT COUNT(*), COALESCE(MAX(MAX(length(binding), length(stable_slot), length(admission_request_id), length(terminal_request_id), length(original_owner), length(original_acquired_at), length(original_expires_at))), 0), COALESCE(SUM(length(binding) + length(stable_slot) + length(admission_request_id) + length(terminal_request_id) + length(original_owner) + length(original_acquired_at) + length(original_expires_at)), 0) FROM (SELECT binding, stable_slot, admission_request_id, terminal_request_id, original_owner, original_acquired_at, original_expires_at FROM consensus_protected_roster_admissions LIMIT ?1)",
-            protocol_cap: FENCED_MUTATION_ROSTER_MAX_RESERVED_AND_RETAINED,
+            protocol_cap: None,
             protocol_max_value: ProtectedRosterValueCap::Fixed(128),
         },
     ];
@@ -1944,19 +1953,19 @@ fn preflight_protected_roster_v2_tables(
     const ACTIVATION: ProtectedRosterPreflightTable = ProtectedRosterPreflightTable {
         count_query: "SELECT COUNT(*) FROM (SELECT singleton FROM consensus_protected_roster_v2_activation LIMIT ?1)",
         values_query: "SELECT COUNT(*), COALESCE(MAX(MAX(length(scope_configuration_id), length(voter_set_digest), length(profile_digest))), 0), COALESCE(SUM(length(scope_configuration_id) + length(voter_set_digest) + length(profile_digest)), 0) FROM (SELECT scope_configuration_id, voter_set_digest, profile_digest FROM consensus_protected_roster_v2_activation LIMIT ?1)",
-        protocol_cap: 1,
+        protocol_cap: Some(1),
         protocol_max_value: ProtectedRosterValueCap::Fixed(32),
     };
     const RESERVATIONS: ProtectedRosterPreflightTable = ProtectedRosterPreflightTable {
         count_query: "SELECT COUNT(*) FROM (SELECT binding FROM consensus_protected_roster_v2_absence_reservations LIMIT ?1)",
         values_query: "SELECT COUNT(*), COALESCE(MAX(MAX(length(business_key), length(binding))), 0), COALESCE(SUM(length(business_key) + length(binding)), 0) FROM (SELECT business_key, binding FROM consensus_protected_roster_v2_absence_reservations LIMIT ?1)",
-        protocol_cap: FENCED_MUTATION_ROSTER_MAX_RESERVED_AND_RETAINED,
+        protocol_cap: None,
         protocol_max_value: ProtectedRosterValueCap::Fixed(120),
     };
     const ADMISSIONS: ProtectedRosterPreflightTable = ProtectedRosterPreflightTable {
         count_query: "SELECT COUNT(*) FROM (SELECT binding FROM consensus_protected_roster_v2_admissions LIMIT ?1)",
         values_query: "SELECT COUNT(*), COALESCE(MAX(MAX(length(binding), length(stable_slot), length(admission_request_id), length(terminal_request_id), length(original_owner), length(original_acquired_at), length(original_expires_at), length(canonical_record))), 0), COALESCE(SUM(length(binding) + length(stable_slot) + length(admission_request_id) + length(terminal_request_id) + length(original_owner) + length(original_acquired_at) + length(original_expires_at) + length(canonical_record)), 0) FROM (SELECT binding, stable_slot, admission_request_id, terminal_request_id, original_owner, original_acquired_at, original_expires_at, canonical_record FROM consensus_protected_roster_v2_admissions LIMIT ?1)",
-        protocol_cap: FENCED_MUTATION_ROSTER_MAX_RESERVED_AND_RETAINED,
+        protocol_cap: None,
         protocol_max_value: ProtectedRosterValueCap::CanonicalRecord,
     };
 
@@ -1974,24 +1983,32 @@ fn preflight_protected_roster_table(
     canonical_record: usize,
     canonical_business: usize,
 ) -> Result<(), RecoveryError> {
-    let probe_limit = i64::try_from(
-        table
-            .protocol_cap
-            .checked_add(1)
-            .ok_or(RecoveryError::CorruptReplica)?,
-    )
-    .map_err(|_| RecoveryError::CorruptReplica)?;
+    budget.check()?;
+    let remaining_rows = budget
+        .limits
+        .max_rows()
+        .checked_sub(budget.rows)
+        .ok_or(RecoveryError::WorkLimitExceeded)?;
+    let allowed_rows = table
+        .protocol_cap
+        .map_or(remaining_rows, |cap| cap.min(remaining_rows));
+    let probe_limit = allowed_rows
+        .checked_add(1)
+        .and_then(|value| i64::try_from(value).ok())
+        .ok_or(RecoveryError::WorkLimitExceeded)?;
     let observed_count: i64 = conn
         .query_row(table.count_query, [probe_limit], |row| row.get(0))
         .map_err(|error| inspection_sql_error(error, budget))?;
     let observed_count =
-        usize::try_from(observed_count).map_err(|_| RecoveryError::CorruptReplica)?;
-    if observed_count > table.protocol_cap {
+        u64::try_from(observed_count).map_err(|_| RecoveryError::CorruptReplica)?;
+    if table.protocol_cap.is_some_and(|cap| observed_count > cap) {
         return Err(RecoveryError::CorruptReplica);
     }
-
+    if observed_count > remaining_rows {
+        return Err(RecoveryError::WorkLimitExceeded);
+    }
     let aggregate_limit =
-        i64::try_from(table.protocol_cap).map_err(|_| RecoveryError::CorruptReplica)?;
+        i64::try_from(observed_count).map_err(|_| RecoveryError::WorkLimitExceeded)?;
     let (count, maximum, total): (i64, i64, i64) = conn
         .query_row(table.values_query, [aggregate_limit], |row| {
             Ok((row.get(0)?, row.get(1)?, row.get(2)?))

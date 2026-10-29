@@ -424,6 +424,13 @@
       ]
     },
     {
+      "module": "consensus::native::generation::catalog::tests::roster_tests",
+      "shard": "roster-history",
+      "tests": [
+        "native_roster_completed_history_exceeds_old_capacity_and_cold_reopens"
+      ]
+    },
+    {
       "module": "consensus::native::lease_deferral_tests",
       "shard": "native-log-3",
       "tests": [
@@ -505,6 +512,20 @@
       "shard": "heavy-0",
       "tests": [
         "caller_deadline_accepts_in_time_and_rejects_late_valid_replies"
+      ]
+    },
+    {
+      "module": "sqlite::consensus::tests::native::roster::roster_work_bound",
+      "shard": "native-log-6",
+      "tests": [
+        "roster_maintenance_native_work_is_independent_of_retained_history"
+      ]
+    },
+    {
+      "module": "sqlite::consensus::tests::native::roster::roster_work_bound",
+      "shard": "native-log-6",
+      "tests": [
+        "roster_maintenance_sqlite_work_is_independent_of_retained_history"
       ]
     }
   ]

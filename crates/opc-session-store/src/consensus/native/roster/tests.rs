@@ -456,6 +456,10 @@ fn native_roster_indexes_preserve_alias_rejection_and_bounded_mixed_history_pref
     assert_eq!(last.history_epoch(), 9);
     assert_eq!(index.epoch_count(partition, 1), 1026);
     assert_eq!(index.epoch_count(partition, 9), 1);
+    assert_eq!(index.partition_count_through(partition, 9, 1025), 1025);
+    assert_eq!(index.partition_count_through(partition, 1, 1027), 1026);
+    assert_eq!(index.partition_count_through(partition, 9, 1028), 1027);
+    assert_eq!(index.partition_count_through(partition, 0, 1025), 0);
     assert_eq!(
         index
             .partition_prefix(partition, 1, Some(make(1023, 1, State::Retained).binding))
@@ -569,7 +573,18 @@ fn native_v2_successor_recovery_distinguishes_retired_history_from_missing() {
     ))
     .and_then(|request| request.bind_original_key(signed.authority.key().clone()))
     .unwrap();
-    let empty = Store::new(&successor_delta, &Ledger::empty(), &signed.root).unwrap();
+    let missing_witness = Store::new(&successor_delta, &Ledger::empty(), &signed.root).unwrap();
+    assert!(roster_reads::read_protected_roster_v2_recovery_sync(
+        &missing_witness,
+        signed.identity,
+        &recovery,
+        due,
+    )
+    .is_err());
+    let mut virgin = Edit::new(&Ledger::empty(), 0, 0).unwrap();
+    virgin.witness = Some(GlobalChargeWitness::empty());
+    let (virgin, _) = virgin.finish().unwrap();
+    let empty = Store::new(&successor_delta, &virgin, &signed.root).unwrap();
     assert!(matches!(
         roster_reads::read_protected_roster_v2_recovery_sync(
             &empty,
@@ -758,7 +773,7 @@ fn native_roster_maintenance_matches_sql_at_retention_and_empty_partition_releas
 }
 
 #[test]
-fn native_roster_maintenance_streams_atomic_reclaim_and_stops_at_the_next_partition_epoch() {
+fn native_roster_maintenance_streams_atomic_reclaim_and_retires_across_partition_epochs() {
     let first = crate::consensus::types::roster_v2_aborted_persistence_fixture();
     let second =
         crate::consensus::types::roster_v2_aborted_persistence_fixture_for_history([0x92; 16], 3);
@@ -845,15 +860,14 @@ fn native_roster_maintenance_streams_atomic_reclaim_and_stops_at_the_next_partit
         |_| Ok(None),
     )
     .unwrap();
-    // Both tombstones are eligible, but the shared floor receives one epoch
-    // action per turn. The global terminal prefix cannot skip epoch three.
+    // One shared floor action covers both selected admission epochs.
     assert!(store.maintain_due(due).unwrap());
     assert!(!store.ledger.rows.contains_key(&first_binding));
-    assert!(store.ledger.rows.contains_key(&second_binding));
-    assert_eq!(store.ledger.partitions[&key].floor.retired_through(), 1);
-    assert_eq!(store.ledger.witness.unwrap().retired_terminal_sequence(), 2);
+    assert!(!store.ledger.rows.contains_key(&second_binding));
+    assert!(!store.ledger.partitions.contains_key(&key));
+    assert_eq!(store.ledger.witness.unwrap().retired_terminal_sequence(), 4);
     assert_eq!(store.ledger.index.epoch_count(key, 1), 0);
-    assert_eq!(store.ledger.index.epoch_count(key, 3), 1);
+    assert_eq!(store.ledger.index.epoch_count(key, 3), 0);
     Ledger::admit(
         &first.root,
         &fixed_scope(first.identity, &state.members),
@@ -869,7 +883,6 @@ fn native_roster_maintenance_streams_atomic_reclaim_and_stops_at_the_next_partit
         |_| Ok(None),
     )
     .unwrap();
-    assert!(store.maintain_due(due).unwrap());
     assert!(store.ledger.rows.is_empty());
     assert!(store.ledger.partitions.is_empty());
     assert_eq!(store.ledger.witness.unwrap().retired_terminal_sequence(), 4);
@@ -1196,7 +1209,7 @@ fn run_signed_v1_sql_ledger(selected: bool) {
                 due.add_seconds(-1).unwrap()
             )
             .unwrap());
-            for turn in 0..3 {
+            for turn in 0..2 {
                 if selected {
                     selected_files.extend(row_tests::select_all(&mut maintenance));
                 }
@@ -1204,24 +1217,25 @@ fn run_signed_v1_sql_ledger(selected: bool) {
                 assert!(native_roster_maintenance_fixture(&path, signed.identity, due).unwrap());
                 assert_mixed_sql_ledger(&maintenance, &sql, 6);
                 match turn {
-                    0 => assert!(maintenance
-                        .ledger
-                        .rows
-                        .values()
-                        .all(|row| row.facts.state == State::Tombstone)),
-                    1 => {
-                        assert!(!maintenance.ledger.rows.contains_key(&v2));
-                        assert!(maintenance.ledger.rows.contains_key(&v1));
+                    0 => {
+                        assert!(maintenance
+                            .ledger
+                            .rows
+                            .values()
+                            .all(|row| row.facts.state == State::Tombstone));
                         assert_eq!(
                             maintenance
                                 .ledger
                                 .witness
                                 .unwrap()
                                 .retired_terminal_sequence(),
-                            2
+                            0,
+                            "reclamation alone does not retire either profile"
                         );
                     }
-                    2 => {
+                    1 => {
+                        assert!(!maintenance.ledger.rows.contains_key(&v2));
+                        assert!(!maintenance.ledger.rows.contains_key(&v1));
                         assert!(maintenance.ledger.rows.is_empty());
                         assert!(maintenance.ledger.partitions.is_empty());
                         assert_eq!(

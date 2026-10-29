@@ -1,5 +1,6 @@
 //! Volatile class admission at the durable proposal and outbound boundaries.
-//! Class metadata is authenticated forwarding context, never command bytes.
+//! Scope class metadata is authenticated forwarding context; roster admission
+//! class is bound by the immutable signed command.
 use super::*;
 #[cfg(test)]
 use crate::scope_scheduler::ScopeSchedulerBudgets;
@@ -52,6 +53,30 @@ impl ForwardMutationRequest {
         };
         Ok((key, class))
     }
+
+    /// Emergency admission and completion use physical capacity without a
+    /// policy quota. Both carry their class in the authenticated immutable
+    /// command. An ordinary completion is metered but needs no new roster
+    /// reservation. Scheduling never substitutes for apply authorization.
+    pub(super) fn bypasses_roster_policy_quota(&self) -> bool {
+        self.work_class == ForwardWorkClass::Inferred
+            && match &self.intent {
+                SessionMutationIntent::RosterAdmission(command)
+                | SessionMutationIntent::RosterAdmissionV2(command) => {
+                    command.admission().admission_class()
+                        == crate::fenced_mutation_roster::AdmissionClass::Emergency
+                }
+                SessionMutationIntent::RosterTerminal(command) => {
+                    command.admission_class()
+                        == crate::fenced_mutation_roster::AdmissionClass::Emergency
+                }
+                SessionMutationIntent::RosterTerminalV2(command) => {
+                    command.admission_class()
+                        == crate::fenced_mutation_roster::AdmissionClass::Emergency
+                }
+                _ => false,
+            }
+    }
 }
 
 fn inferred_class(intent: &SessionMutationIntent) -> ScopeWorkClass {
@@ -79,6 +104,21 @@ fn inferred_class(intent: &SessionMutationIntent) -> ScopeWorkClass {
         SessionMutationIntent::MaintainFencedTransitionV2History { .. } => {
             ScopeWorkClass::Maintenance
         }
+        SessionMutationIntent::RosterAdmission(command)
+        | SessionMutationIntent::RosterAdmissionV2(command) => {
+            match command.admission().admission_class() {
+                crate::fenced_mutation_roster::AdmissionClass::Ordinary => ScopeWorkClass::Normal,
+                crate::fenced_mutation_roster::AdmissionClass::Emergency => {
+                    ScopeWorkClass::Emergency
+                }
+            }
+        }
+        SessionMutationIntent::RosterTerminal(command) => {
+            roster_work_class(command.admission_class())
+        }
+        SessionMutationIntent::RosterTerminalV2(command) => {
+            roster_work_class(command.admission_class())
+        }
         // Unclassified read APIs, including both logical-read supervisors,
         // use Normal. Explicit record-expiry floors acquire Maintenance at
         // their typed entry points; sharing this intent does not make a read
@@ -98,14 +138,17 @@ fn inferred_class(intent: &SessionMutationIntent) -> ScopeWorkClass {
         | SessionMutationIntent::FencedTransitionV2(_)
         | SessionMutationIntent::ActivateFencedTransitionV2 { .. }
         | SessionMutationIntent::FencedTransitionV2Batch(_)
-        | SessionMutationIntent::RosterAdmission(_)
-        | SessionMutationIntent::RosterTerminal(_)
-        | SessionMutationIntent::RosterAdmissionV2(_)
-        | SessionMutationIntent::RosterTerminalV2(_)
         | SessionMutationIntent::VoidFencedTransitionV2(_)
         | SessionMutationIntent::ActivateVoidFencedTransitionV2 { .. }
         | SessionMutationIntent::ScopeBatch(_)
         | SessionMutationIntent::ScopeBatchCancel(_) => ScopeWorkClass::Normal,
+    }
+}
+
+fn roster_work_class(class: crate::fenced_mutation_roster::AdmissionClass) -> ScopeWorkClass {
+    match class {
+        crate::fenced_mutation_roster::AdmissionClass::Ordinary => ScopeWorkClass::Normal,
+        crate::fenced_mutation_roster::AdmissionClass::Emergency => ScopeWorkClass::Emergency,
     }
 }
 
@@ -132,6 +175,7 @@ pub(super) struct StoreWorkAdmission {
 }
 
 pub(super) enum ProposalAdmission {
+    UnmeteredRoster,
     Running(ScopeWorkPermit),
     ActivationRead(ScopeWorkReservation),
 }
@@ -327,12 +371,14 @@ impl ConsensusSessionStore {
 
     /// Observational proposal counts by class. Accepted proposals retain their
     /// running credits until Openraft resolves, even after caller cancellation.
+    /// Emergency roster admission and emergency completion bypass these quotas.
     pub fn scope_proposal_scheduling_snapshot(&self) -> ScopeSchedulerSnapshot {
         self.inner.proposal_admission.snapshot()
     }
 
     /// Observational outbound mutation counts by class, independent from local
     /// proposal admission. The transport must also preserve class isolation.
+    /// Emergency roster admission and emergency completion bypass these quotas.
     pub fn scope_forward_scheduling_snapshot(&self) -> ScopeSchedulerSnapshot {
         self.inner.forward_admission.snapshot()
     }
@@ -346,13 +392,19 @@ impl ConsensusSessionStore {
         let (key, class) = request
             .scheduling()
             .map_err(|_| ConsensusPeerCallFailure::BeforeTransmission)?;
-        let _permit = tokio::time::timeout_at(
-            deadline,
-            self.inner.forward_admission.acquire_for(key, class),
-        )
-        .await
-        .map_err(|_| ConsensusPeerCallFailure::BeforeTransmission)?
-        .map_err(|_| ConsensusPeerCallFailure::BeforeTransmission)?;
+        let _permit = if request.bypasses_roster_policy_quota() {
+            None
+        } else {
+            Some(
+                tokio::time::timeout_at(
+                    deadline,
+                    self.inner.forward_admission.acquire_for(key, class),
+                )
+                .await
+                .map_err(|_| ConsensusPeerCallFailure::BeforeTransmission)?
+                .map_err(|_| ConsensusPeerCallFailure::BeforeTransmission)?,
+            )
+        };
         // Admission can wait. Revalidate at the transmission boundary, using
         // the same typed authority route as local submission. A permit is not
         // a saved authorization token.

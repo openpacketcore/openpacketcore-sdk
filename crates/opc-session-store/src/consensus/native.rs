@@ -1083,6 +1083,17 @@ impl NativeState {
         Ok(Sha256::digest(bytes).into())
     }
 
+    /// Raw retained roster count and witness, independent of recovery classification.
+    #[cfg(test)]
+    pub(crate) fn roster_history_for_test(
+        &self,
+    ) -> (
+        usize,
+        Option<crate::fenced_mutation_roster_storage::GlobalChargeWitness>,
+    ) {
+        (self.roster.rows.len(), self.roster.witness)
+    }
+
     /// Raw per-key fence, independent of read or acceptance validation.
     #[cfg(test)]
     pub(crate) fn key_fence_for_test(&self, key: &SessionKey) -> u64 {
