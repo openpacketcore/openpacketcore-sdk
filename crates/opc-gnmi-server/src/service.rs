@@ -662,6 +662,7 @@ pub const fn code_from_status(status: opc_mgmt_errors::MgmtStatus) -> tonic::Cod
 #[allow(deprecated, clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     mod sensitive_keys;
+    mod target_defined;
     use std::collections::BTreeMap;
     use std::future::Future;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -5682,6 +5683,33 @@ mod tests {
 
     #[tokio::test]
     async fn subscribe_malformed_first_request_records_failure_without_success() {
+        // This assertion observes a process-global metric. Keep the complete
+        // RPC and both counter assertions in a child running only this test,
+        // so unrelated successful subscriptions cannot change its baseline.
+        const CHILD: &str = "OPC_GNMI_MALFORMED_SUBSCRIBE_METRIC_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", "service::tests::subscribe_malformed_first_request_records_failure_without_success", "--nocapture"])
+                .env(CHILD, "1")
+                .output()
+                .expect("isolated metric regression process");
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            assert!(
+                output.status.success(),
+                "isolated metric regression failed:\n{stdout}\n{stderr}"
+            );
+            assert!(
+                stdout.lines().any(|line| line == "running 1 test"),
+                "isolated metric regression did not run exactly one test:\n{stdout}"
+            );
+            assert!(
+                stdout.lines().any(|line| line
+                    .starts_with("test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured;")),
+                "isolated metric regression did not pass exactly one test:\n{stdout}"
+            );
+            return;
+        }
         let service =
             authenticated_service_with_policy(allow_all_read_and_subscribe_policy()).await;
         let success_before = gnmi_rpc_request_count("Subscribe", "success");
@@ -5876,7 +5904,7 @@ mod tests {
             ),
         )
         .unwrap_err();
-        assert_eq!(target_defined.status().as_str(), "UNIMPLEMENTED");
+        assert_eq!(target_defined.status().as_str(), "INVALID_ARGUMENT");
 
         let mut qos = subscribe_list(
             gnmi::subscription_list::Mode::Once,

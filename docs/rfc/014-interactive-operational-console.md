@@ -918,6 +918,14 @@ Provider-specific differences remain behind these ports. OIDC discovery and
 OpenShift OAuth authorization-server discovery are not assumed to be
 interchangeable, and workload identity is not described as human login.
 
+For OAuth authorization-server metadata, provider adapters MUST insert
+`/.well-known/oauth-authorization-server` between the HTTPS authority and the
+issuer path (RFC 8414 §3). For example, issuer `https://auth.example/tenant/a`
+maps to `https://auth.example/.well-known/oauth-authorization-server/tenant/a`.
+The returned `issuer` MUST exactly match the configured issuer. OIDC discovery
+uses its own provider rules. This is an adapter acceptance requirement; this
+RFC does not provide a metadata-discovery implementation.
+
 ### 10.4 Native Interactive Flow
 
 For OIDC-capable providers, the CLI uses an external browser, authorization

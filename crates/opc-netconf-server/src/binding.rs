@@ -7,7 +7,7 @@ use opc_config_model::{OpcConfig, YangPath};
 use opc_mgmt_opstate::{OperationalError, OperationalRequest, OperationalResponse};
 use opc_mgmt_schema::subtree::{AuthorizedSubtreePlan, SubtreeError};
 use opc_mgmt_schema::{
-    merge_netconf_data, render_netconf_data, DefaultReport, EditOperation, NetconfEditError,
+    merge_netconf_data, render_netconf_data, DefaultReport, NetconfEditError,
     NetconfProjectionError, NetconfXmlEditApplicator, NetconfXmlRenderer, NodeKind, SchemaRegistry,
 };
 use thiserror::Error;
@@ -892,16 +892,8 @@ pub trait NetconfConfigBinding<C: OpcConfig>: Send + Sync {
 
 fn netconf_edit_error_to_binding_error(err: NetconfEditError) -> EditConfigError {
     match err {
-        NetconfEditError::OperationNotSupported {
-            operation: EditOperation::Create,
-            kind: NodeKind::LeafList,
-            ..
-        } => EditConfigError::DataExists,
-        NetconfEditError::OperationNotSupported {
-            operation: EditOperation::Delete,
-            kind: NodeKind::LeafList,
-            ..
-        } => EditConfigError::DataMissing,
+        NetconfEditError::DataExists { .. } => EditConfigError::DataExists,
+        NetconfEditError::DataMissing { .. } => EditConfigError::DataMissing,
         NetconfEditError::UnsupportedShape { .. } => EditConfigError::InvalidValue,
         NetconfEditError::OperationNotSupported { .. } => EditConfigError::InvalidValue,
         NetconfEditError::ReadOnly { .. } => EditConfigError::InvalidValue,

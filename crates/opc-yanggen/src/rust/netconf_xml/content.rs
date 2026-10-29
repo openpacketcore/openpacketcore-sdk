@@ -180,7 +180,7 @@ fn scalar_ref(node: &SchemaNode, nodes: &NodeIndex<'_>, value: TokenStream) -> T
             quote! { #kind::Integer(i64::from(*#value)) }
         }
         Some(TypeRef::Int64) => quote! { #kind::Integer(#value.0) },
-        Some(TypeRef::Decimal64) => quote! { #kind::Decimal(#value.0) },
+        Some(TypeRef::Decimal64 { .. }) => quote! { #kind::Decimal(#value.as_decimal()) },
         Some(TypeRef::Empty) => quote! { { let _ = #value; #kind::Empty } },
         _ => quote! { #kind::Text(#value.as_str()) },
     }

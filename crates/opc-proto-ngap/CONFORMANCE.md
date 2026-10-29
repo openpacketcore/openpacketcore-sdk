@@ -486,7 +486,7 @@ Resource Setup admission is a separate `resource_setup` boundary below.
 | Field | IE | Criticality | Construction / receive |
 | --- | --- | --- | --- |
 | Session aggregate maximum bit rate | 130 | reject | Distinct UL/DL root rates; required by the default API, or when any flow is caller-classified non-GBR (8.2.1.4) |
-| UL NG-U UP transport information | 139 | reject | Mandatory single IPv4/IPv6 GTP tunnel |
+| UL NG-U UP transport information | 139 | reject | Mandatory IPv4, IPv6 or combined-address GTP tunnel |
 | PDU session type | 134 | reject | Mandatory; all five root payload kinds |
 | Security Indication | 138 | reject | Optional three-root integrity/confidentiality requirements; conditional UL rate |
 | Network Instance | 129 | reject | Optional root 1–256; Common takes precedence when supplied |
@@ -632,7 +632,7 @@ interoperability claims are introduced.
 
 | Transfer | Admitted contents | Explicitly unsupported |
 | --- | --- | --- |
-| Setup response | One mandatory and up to three additional downlink IPv4/IPv6 GTP tunnels; 1–64 associated QFIs per tunnel with optional root mapping indications; optional failed QFIs with root Cause; optional root Security Result | Extensions |
+| Setup response | One mandatory and up to three additional downlink IPv4/IPv6/combined GTP tunnels; 1–64 associated QFIs per tunnel with optional root mapping indications; optional failed QFIs with root Cause; optional root Security Result | Extensions |
 | Setup unsuccessful | Root Cause in any of the five classes; optional root response diagnostics | Extensions |
 
 QFIs must be unique within each tunnel and the failed list; failures must not
@@ -1258,7 +1258,7 @@ The standalone field boundary adds no PDU outcome.
 | `QosFlowModifications` | 1–64 unique QFIs; absent parameters or explicit root QoS profiles; optional E-RAB | 3 for identifiers only; 6 non-dynamic / 7 dynamic |
 | `ModifiedQosFlows` | 1–64 unique reported QFIs | 3 |
 | `QosFlowCauses` | 1–64 unique QFI/root-Cause pairs | 4 |
-| `UplinkModifications` | 1–4 ordered UL/DL GTP-tunnel pairs; IPv4 or IPv6 per endpoint | 5 |
+| `UplinkModifications` | 1–4 ordered UL/DL GTP-tunnel pairs; IPv4, IPv6 or both per endpoint | 5 |
 
 Request parameter absence is represented separately from supplied parameters;
 it does not establish that a flow exists or provide default QoS. Root ARP has
@@ -1517,8 +1517,8 @@ complete-message construction/admission, exact and one-short limits, constructor
 bounds, truncations and mutations. Shared fuzz/replay code rebuilds additional
 endpoints and mappings through public constructors; 79 new corpus seeds exercise
 those boundaries. Root item extensions,
-redundant/forwarding extension fields and combined IPv4-plus-IPv6 addresses
-remain explicit gaps; this evidence is not live-peer interoperability.
+redundant/forwarding extension fields remain explicit gaps; combined transport
+addresses are qualified separately above. This evidence is not live-peer interoperability.
 
 ## Complete PDU Session Resource Modify
 

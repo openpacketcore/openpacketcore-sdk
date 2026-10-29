@@ -1314,6 +1314,32 @@
       "kind": "fixture-setup-changed",
       "reason": "Keep autonomous maintenance enabled and wait within the existing operation budget for durable retirement of the expired D5 terminal. Replace the exact retained D5 compacted row with row absence backed by the canonical witness frontier and original admission fence. Replace authenticated Recorded(Compacted{..}) status with Rejected(RecoveryRequired), and terminalization Rejected(Conflict) with Rejected(RecoveryRequired); retired history remains non-definitive. Observe retirement on both leader and snapshot target before isolation, replacing the compacted target setup with retired-to-retired snapshot installation and cold reopen. The separately tracked lagging-follower recovery design is outside this fixture. Preserve predecessor and successor scope checks, stale ingress rejection, all topology assertions, and fresh successor signed-roster acceptance.",
       "issue": 1307
+    },
+    {
+      "test": "rust:crates/opc-peer-discovery::test=dns_contracts::every_failure_preserves_last_good_without_time_cutoff",
+      "kind": "removed",
+      "renamed_to": "rust:crates/opc-peer-discovery::test=dns_contracts::transient_failures_preserve_last_good_only_within_stale_limit",
+      "reason": "RFC 8767 requires a maximum stale timer and authoritative refreshes replace prior data. Retain transient-error last-good assertions within the timer, add expiry assertions, and separately test authoritative negatives with and without SOA TTLs.",
+      "issue": 1355
+    },
+    {
+      "test": "rust:crates/opc-api-nnrf::test=compat_sbi::sbi_nf_profile_deserializes_into_generated_type",
+      "kind": "assertions-decreased",
+      "reason": "Remove sbi_value_to_generated, whose assertion-bearing normalization helper concealed invalid NRF wire JSON. Both tests now deserialize the actual serialized SBI payload directly into the generated TS 29.510 schema; existing identity, PLMN, slice and service field assertions remain. Literal wire-format regressions in opc-sbi cover the corrected representation.",
+      "issue": 1362
+    },
+    {
+      "test": "rust:crates/opc-api-nnrf::test=compat_sbi::sbi_nf_profile_round_trip_preserves_identity",
+      "kind": "assertions-decreased",
+      "reason": "Remove sbi_value_to_generated, whose assertion-bearing normalization helper concealed invalid NRF wire JSON. Both tests now deserialize the actual serialized SBI payload directly into the generated TS 29.510 schema; existing identity, PLMN, slice and service field assertions remain. Literal wire-format regressions in opc-sbi cover the corrected representation.",
+      "issue": 1362
+    },
+    {
+      "test": "rust:crates/opc-proto-diameter::test=app_dictionaries::rf_grouped_mscc_rejects_excessive_nesting_depth",
+      "kind": "removed",
+      "renamed_to": "rust:crates/opc-proto-diameter::test=app_dictionaries::rf_grouped_service_data_rejects_excessive_nesting_depth",
+      "reason": "Replace the nonconforming online MSCC shape in Rf with Service-Information / PS-Information / Service-Data-Container. Retains the nesting-limit assertion and checks the exact DepthExceeded category at the offline container boundary.",
+      "issue": 1361
     }
   ]
 }

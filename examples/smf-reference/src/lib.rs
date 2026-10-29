@@ -385,9 +385,19 @@ fn build_smf_profile(config: &SmfConfig) -> NfProfile {
         nf_status: NfStatus::Registered,
         ipv4_addresses: vec![config.n4_addr.ip().to_string()],
         fqdn: None,
-        plmn_list: vec![config.plmn.clone()],
-        s_nssais: vec![config.s_nssai.clone()],
-        nf_services: vec![opc_sbi::nrf::services::NSMF_PDUSESSION.to_string()],
+        plmn_list: vec![config.plmn.clone().into()],
+        s_nssais: vec![config.s_nssai.clone().into()],
+        nf_services: vec![opc_sbi::nrf::NfService::new(
+            format!("{}-pdusession", config.instance_id.as_str()),
+            opc_sbi::nrf::services::NSMF_PDUSESSION.into(),
+            vec![opc_sbi::nrf::NfServiceVersion {
+                api_version_in_uri: "v1".into(),
+                api_full_version: "1.0.0".into(),
+                expiry: None,
+            }],
+            "https".into(),
+            opc_sbi::nrf::NfServiceStatus::Registered,
+        )],
         priority: 10,
         capacity: 100,
     }

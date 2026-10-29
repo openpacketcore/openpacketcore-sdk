@@ -82,8 +82,8 @@ fn deadline(now: PeerDiscoveryTime, duration: Duration) -> PeerDiscoveryTime {
     now.checked_add(duration).unwrap_or(now)
 }
 
-/// Serving result. A positive last-good answer always takes precedence over a
-/// later negative or transient failure, even after arbitrarily long outages.
+/// Serving result. Transient failures retain last-good data only within the
+/// maximum stale timer; authoritative negatives replace prior positives.
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum DnsCachedResult {
@@ -97,7 +97,7 @@ pub enum DnsCachedResult {
         /// acceptance for unknown TTLs.
         age: Duration,
     },
-    /// A cold authoritative denial or SRV service withdrawal within its
+    /// An authoritative denial or SRV service withdrawal within its
     /// observed deadline and the cache's negative TTL cap.
     Negative(DnsError),
     /// No positive answer or currently live authoritative denial.
@@ -183,6 +183,20 @@ impl Entry {
         self.answer.is_some() && self.expires_at.is_some_and(|expiry| now < expiry)
     }
 
+    fn retained(&self, now: PeerDiscoveryTime, max_stale: Duration) -> bool {
+        self.answer.is_some()
+            && self
+                .expires_at
+                .is_some_and(|expiry| now < deadline(expiry, max_stale))
+    }
+
+    fn expire_stale(&mut self, now: PeerDiscoveryTime, max_stale: Duration) {
+        if !self.fresh(now) && !self.retained(now, max_stale) {
+            self.answer = None;
+            self.expires_at = None;
+        }
+    }
+
     fn due(&self, now: PeerDiscoveryTime) -> bool {
         self.flight.is_none() && !self.fresh(now) && self.retry_at.is_none_or(|retry| now >= retry)
     }
@@ -196,6 +210,17 @@ impl Entry {
     ) {
         self.flight = None;
         self.last_error = Some(error);
+        let authoritative = matches!(
+            error,
+            DnsError::NxDomain { .. }
+                | DnsError::NoData { .. }
+                | DnsError::ServiceUnavailable { .. }
+        ) || matches!(error, DnsError::Snaptr { reason: crate::SnaptrFailure::NoMatchingService(kind), .. }
+                if kind != crate::SnaptrNoMatch::MalformedRequestedService);
+        if authoritative {
+            self.answer = None;
+            self.expires_at = None;
+        }
         // Retry pacing is separate from authority: an uncacheable denial must
         // remain a miss even while its next attempt is suppressed.
         self.negative_expires_at = error
@@ -231,7 +256,7 @@ impl Entry {
 
 /// DNS-aware, caller-clock cache with bounded admission. Consumers explicitly
 /// remove obsolete keys with positive data; capacity pressure never discards a
-/// last-good answer. Expired cold failures without a flight can be reclaimed.
+/// usable last-good answer. Expired entries without a flight can be reclaimed.
 /// Reclaimed keys lose their error and leave [`Self::refresh_due`]; drivers
 /// must retain their configured key set and re-admit keys they still need.
 ///
@@ -245,6 +270,7 @@ pub struct DnsCache {
     retry: DnsRetryPolicy,
     max_ttl: Duration,
     max_negative_ttl: Duration,
+    max_stale: Duration,
     refresh_interval: Duration,
 }
 
@@ -272,6 +298,7 @@ impl DnsCache {
             retry,
             max_ttl: Duration::from_secs(7 * 24 * 60 * 60),
             max_negative_ttl: Duration::from_secs(3 * 60 * 60),
+            max_stale: Duration::from_secs(24 * 60 * 60),
             refresh_interval: Duration::from_secs(5),
         }
     }
@@ -283,14 +310,23 @@ impl DnsCache {
     /// [RFC 2308 section 5](https://www.rfc-editor.org/rfc/rfc2308.html#section-5).
     /// Both caps are clamped to 2^31 - 1 seconds under this API's conservative
     /// [RFC 2181 section 8](https://www.rfc-editor.org/rfc/rfc2181.html#section-8)
-    /// policy; the negative cap is at most the positive cap. Zero disables fresh
-    /// caching but preserves retry pacing and positive last-good retention.
+    /// policy; the negative cap is at most the positive cap. Zero disables
+    /// caching but preserves retry pacing.
     /// Caps never extend record deadlines or rewrite their provenance.
     /// The negative cap also bounds positive answers with a partial denial
     /// recorded using [`DnsAnswer::with_negative_freshness_bound`].
     pub fn with_ttl_caps(mut self, max_ttl: Duration, max_negative_ttl: Duration) -> Self {
         self.max_ttl = max_ttl.min(MAX_TTL);
         self.max_negative_ttl = max_negative_ttl.min(self.max_ttl);
+        self
+    }
+
+    /// Bound how long expired records remain usable during transient failures.
+    /// Defaults to one day (RFC 8767 section 5 suggests one to three days).
+    /// Zero disables stale reuse. The limit is capped at seven days and applies
+    /// to existing entries too; failures never restart the timer.
+    pub fn with_stale_limit(mut self, max_stale: Duration) -> Self {
+        self.max_stale = max_stale.min(Duration::from_secs(7 * 24 * 60 * 60));
         self
     }
 
@@ -332,7 +368,11 @@ impl DnsCache {
                 refreshing: false,
             };
         };
-        let result = if let Some(answer) = &entry.answer {
+        let result = if let Some(answer) = entry
+            .answer
+            .as_ref()
+            .filter(|_| entry.fresh(now) || entry.retained(now, self.max_stale))
+        {
             if entry.fresh(now) {
                 DnsCachedResult::Fresh(answer.clone())
             } else {
@@ -352,8 +392,13 @@ impl DnsCache {
             DnsCachedResult::Miss
         };
         DnsCacheStatus {
+            fresh_until: matches!(
+                result,
+                DnsCachedResult::Fresh(_) | DnsCachedResult::Stale { .. }
+            )
+            .then_some(entry.expires_at)
+            .flatten(),
             result,
-            fresh_until: entry.expires_at,
             last_error: entry.last_error,
             retry_at: entry.retry_at,
             refreshing: entry
@@ -368,7 +413,7 @@ impl DnsCache {
     ///
     /// # Errors
     /// Returns [`DnsCacheError::Capacity`] for a new key at capacity after
-    /// reclaiming expired cold failures without a flight. Positive last-good
+    /// reclaiming expired entries without a flight. Usable positive last-good
     /// data, live negatives/backoffs and in-flight work are never evicted.
     pub fn begin_refresh(
         &mut self,
@@ -380,9 +425,10 @@ impl DnsCache {
         if !self.entries.contains_key(&key) && self.entries.len() >= self.capacity {
             self.entries.retain(|_, entry| {
                 entry.expire_flight(now, &mut self.retry, self.max_negative_ttl);
+                entry.expire_stale(now, self.max_stale);
                 entry.answer.is_some()
                     || entry.flight.is_some()
-                    || entry.retry_at.is_none_or(|retry| now < retry)
+                    || entry.retry_at.is_some_and(|retry| now < retry)
             });
             if self.entries.len() >= self.capacity {
                 return Err(DnsCacheError::Capacity);
@@ -390,6 +436,7 @@ impl DnsCache {
         }
         let entry = self.entries.entry(key.clone()).or_default();
         entry.expire_flight(now, &mut self.retry, self.max_negative_ttl);
+        entry.expire_stale(now, self.max_stale);
         if entry.flight.is_some() {
             return Ok(DnsRefresh::Pending);
         }
@@ -406,7 +453,8 @@ impl DnsCache {
 
     /// Finish the admitted attempt. Returns false for an expired, foreign or
     /// removed token; a late answer can never overwrite newer state. A valid
-    /// failure updates retry/error metadata and preserves every last-good byte.
+    /// transient failure updates retry/error metadata while retaining bounded
+    /// last-good data. Authoritative negatives replace prior positive data.
     /// Future-dated record observations (including retained alternate paths),
     /// disallowed families, or mismatched SRV/S-NAPTR query provenance are malformed.
     #[must_use = "check whether this attempt still owned publication"]
@@ -427,6 +475,7 @@ impl DnsCache {
             return false;
         }
         entry.expire_flight(now, &mut self.retry, self.max_negative_ttl);
+        entry.expire_stale(now, self.max_stale);
         if entry.flight.is_none() {
             return false;
         }
@@ -471,7 +520,18 @@ impl DnsCache {
                     )
                     .unwrap_or(now);
                 entry.expires_at = Some(expires_at);
-                entry.answer = Some(answer);
+                // TTL zero is usable only for the transaction that obtained it.
+                let cacheable = !self.max_ttl.is_zero()
+                    && !answer.candidates().iter().any(|candidate| {
+                        candidate
+                            .all_records()
+                            .any(|record| record.ttl == 0 || record.ttl & 0x8000_0000 != 0)
+                    });
+                entry.answer = cacheable.then_some(answer);
+                if !cacheable {
+                    entry.expires_at = None;
+                }
+                entry.expire_stale(now, self.max_stale);
                 entry.last_error = None;
                 entry.negative_expires_at = None;
                 entry.retry_at = if expires_at <= now {
@@ -501,6 +561,7 @@ impl DnsCache {
             .iter_mut()
             .filter_map(|(key, entry)| {
                 entry.expire_flight(now, &mut self.retry, self.max_negative_ttl);
+                entry.expire_stale(now, self.max_stale);
                 entry.due(now).then(|| key.clone())
             })
             .collect()

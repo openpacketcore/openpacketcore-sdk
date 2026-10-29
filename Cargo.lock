@@ -3266,6 +3266,7 @@ dependencies = [
  "opc-data-governance",
  "opc-redaction",
  "regex",
+ "serde",
  "sha2 0.11.0",
 ]
 
@@ -3674,6 +3675,7 @@ dependencies = [
  "hyper",
  "hyper-util",
  "jsonwebtoken",
+ "opc-api-nnrf",
  "opc-identity",
  "opc-redaction",
  "opc-runtime",
@@ -3681,6 +3683,7 @@ dependencies = [
  "opc-tls",
  "opc-types",
  "rand 0.10.3",
+ "rcgen",
  "rustls",
  "rustls-pki-types",
  "serde",
@@ -3692,6 +3695,7 @@ dependencies = [
  "tower",
  "tower-http 0.7.1",
  "tracing",
+ "uuid",
 ]
 
 [[package]]
