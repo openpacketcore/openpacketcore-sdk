@@ -23739,11 +23739,15 @@ mod membership_tests {
             .await
             .unwrap_or_else(|error| {
                 #[cfg(feature = "test-control")]
-                eprintln!("roster work snapshot diagnostics: phase={}, counters={:?}",
-                    voter.inner.backend.snapshot_observation().phase_for_test(),
-                    voter.inner.backend.snapshot_observation().build_failure_diagnostics());
-                panic!("normal history snapshot covers the applied frontier: {error:?}; retained={retained}, through={through}, status={:?}, snapshot={:?}, failure={:?}",
-                    voter.status(), metrics.borrow().snapshot, voter.snapshot_build_failure());
+                eprintln!(
+                    "roster work snapshot diagnostics: phase={}",
+                    voter.inner.backend.snapshot_observation().phase_for_test()
+                );
+                let status = voter.status();
+                let health = voter.persistence_health();
+                let current = metrics.borrow();
+                panic!("normal history snapshot covers the applied frontier: {error:?}; retained={retained}, through={through}, status={status:?}, snapshot={:?}, running_state={:?}, persistence_health={health:?}",
+                    current.snapshot, current.running_state);
             });
             voter.inner.raft.trigger().purge_log(through).await.unwrap();
             tokio::time::timeout(Duration::from_secs(30), async {
