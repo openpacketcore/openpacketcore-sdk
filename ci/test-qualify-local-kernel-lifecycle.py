@@ -992,6 +992,20 @@ class QualificationTests(unittest.TestCase):
         self.assertEqual(record["source"], self.record["source"])
         self.assertEqual(record["build_kernel"], {"release": "build-host"})
 
+    def test_native_cases_keep_configured_scratch_after_sudo(self):
+        scratch = str(self.root / "private disk scratch")
+        with patch.dict(RUNNER.os.environ, {"TMPDIR": scratch}), \
+                patch.object(RUNNER.os, "geteuid", return_value=1000):
+            code, record, invocations = self.run_guest()
+        self.assertEqual(code, 0)
+        self.assertTrue(record["complete"] and record["passed"])
+        self.assertEqual(len(invocations), 2)
+        for command in invocations:
+            self.assertEqual(command[:2], ["sudo", "-n"])
+            self.assertIn("TMPDIR=" + scratch, command)
+            self.assertLess(command.index("env"), command.index("TMPDIR=" + scratch))
+            self.assertLess(command.index("TMPDIR=" + scratch), command.index("unshare"))
+
     def test_guest_failure_is_retained_and_stops_the_suite(self):
         code, record, invocations = self.run_guest(code=101)
         self.assertEqual(code, 1)

@@ -35,13 +35,11 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v7
 
+      - name: Prepare disk-backed scratch
+        run: bash ci/disk-scratch.sh prepare
+
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
-
-      - name: Prepare mutable disk scratch
-        run: |
-          scratch="$(mktemp -d "${RUNNER_TEMP}/realtime-qualification.XXXXXX")"
-          printf 'TMPDIR=%s\n' "$scratch" >> "$GITHUB_ENV"
 
       - name: Cache Rust dependencies
         uses: Swatinem/rust-cache@v2
@@ -62,6 +60,10 @@ jobs:
           name: realtime-qualification
           path: qualification-results/
           if-no-files-found: error
+
+      - name: Remove disk-backed scratch
+        if: always() && env.OPC_CI_DISK_TMPDIR != ''
+        run: bash ci/disk-scratch.sh cleanup
 
   report-nightly:
     name: Report nightly qualification failure

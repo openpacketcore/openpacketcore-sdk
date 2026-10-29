@@ -10,6 +10,8 @@ on:
       - "crates/opc-linux-xfrm-sys/**"
       - "crates/opc-types/**"
       - ".github/workflows/ipsec-xfrm.yml"
+      - "ci/disk-scratch.sh"
+      - "ci/disk-scratch.py"
       - "scripts/build-ipsec-xfrm-ebpf.sh"
       - "ci/download-image.sh"
       - "ci/qualify-n3-mobike-kernel.py"
@@ -31,6 +33,8 @@ on:
       - "crates/opc-linux-xfrm-sys/**"
       - "crates/opc-types/**"
       - ".github/workflows/ipsec-xfrm.yml"
+      - "ci/disk-scratch.sh"
+      - "ci/disk-scratch.py"
       - "scripts/build-ipsec-xfrm-ebpf.sh"
       - "ci/download-image.sh"
       - "ci/qualify-n3-mobike-kernel.py"
@@ -178,6 +182,9 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v7
 
+      - name: Prepare disk-backed scratch
+        run: bash ci/disk-scratch.sh prepare
+
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
         with:
@@ -204,6 +211,10 @@ jobs:
       - name: Build crate docs
         run: RUSTDOCFLAGS="-D warnings" cargo doc --locked -p opc-ipsec-xfrm -p opc-ipsec-xfrm-ebpf-common -p opc-types --no-deps --all-features
 
+      - name: Remove disk-backed scratch
+        if: always() && env.OPC_CI_DISK_TMPDIR != ''
+        run: bash ci/disk-scratch.sh cleanup
+
   privileged:
     name: Privileged Linux XFRM datapath
     runs-on: ubuntu-latest
@@ -211,6 +222,9 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v7
+
+      - name: Prepare disk-backed scratch
+        run: bash ci/disk-scratch.sh prepare
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
@@ -283,7 +297,7 @@ jobs:
           if selected != [sys.argv[1]]:
               raise SystemExit(f"SA direction test must resolve exactly once: {selected!r}")
           ' "${selector}"
-          sudo unshare -n -- env OPC_XFRM_RUN_SA_DIRECTION_PRIVILEGED=1 \
+          sudo env "TMPDIR=${TMPDIR}" unshare -n -- env OPC_XFRM_RUN_SA_DIRECTION_PRIVILEGED=1 \
             "${test_binary}" --ignored --exact "${selector}" \
             --nocapture --test-threads=4
 
@@ -315,7 +329,7 @@ jobs:
           print(executables[0])
           '
           )"
-          sudo env \
+          sudo env "TMPDIR=${TMPDIR}" \
             "PATH=${PATH}" \
             "CARGO_HOME=${CARGO_HOME}" \
             "RUSTUP_HOME=${RUSTUP_HOME}" \
@@ -348,7 +362,7 @@ jobs:
           '
           )"
           reset_log="${RUNNER_TEMP}/xfrm-exclusive-reset.log"
-          sudo env "PATH=${PATH}" "OPC_XFRM_RUN_EXCLUSIVE_RESET_PRIVILEGED=1" \
+          sudo env "TMPDIR=${TMPDIR}" "PATH=${PATH}" "OPC_XFRM_RUN_EXCLUSIVE_RESET_PRIVILEGED=1" \
             "${test_binary}" --ignored --skip exclusive_namespace_reset_seed \
             --nocapture --test-threads=1 2>&1 | tee "${reset_log}"
           if grep -q 'skipping:' "${reset_log}"; then
@@ -390,7 +404,7 @@ jobs:
           print(executables[0])
           '
           )"
-          sudo env \
+          sudo env "TMPDIR=${TMPDIR}" \
             "PATH=${PATH}" \
             "OPC_XFRM_RUN_OBJECT_RECOVERY_PRIVILEGED=1" \
             "${test_binary}" --ignored --nocapture --test-threads=1
@@ -432,7 +446,7 @@ jobs:
           '
           )"
           roster_log="${RUNNER_TEMP}/xfrm-677-roster.log"
-          sudo env \
+          sudo env "TMPDIR=${TMPDIR}" \
             "PATH=${PATH}" \
             "OPC_XFRM_RUN_OBJECT_ROSTER_RECOVERY_PRIVILEGED=1" \
             "${test_binary}" --ignored --nocapture --test-threads=1 2>&1 | tee "${roster_log}"
@@ -473,7 +487,7 @@ jobs:
           print(executables[0])
           '
           )"
-          sudo env \
+          sudo env "TMPDIR=${TMPDIR}" \
             "PATH=${PATH}" \
             "OPC_XFRM_RUN_SA_RELOCATION_RECOVERY_PRIVILEGED=1" \
             "${test_binary}" --ignored --nocapture --test-threads=1
@@ -484,7 +498,7 @@ jobs:
           export CARGO_HOME="${CARGO_HOME:-${HOME}/.cargo}"
           export RUSTUP_HOME="${RUSTUP_HOME:-${HOME}/.rustup}"
           export CARGO_TARGET_DIR="${RUNNER_TEMP}/xfrm-target"
-          sudo env \
+          sudo env "TMPDIR=${TMPDIR}" \
             "PATH=${PATH}" \
             "CARGO_HOME=${CARGO_HOME}" \
             "RUSTUP_HOME=${RUSTUP_HOME}" \
@@ -501,7 +515,7 @@ jobs:
           export CARGO_HOME="${CARGO_HOME:-${HOME}/.cargo}"
           export RUSTUP_HOME="${RUSTUP_HOME:-${HOME}/.rustup}"
           export CARGO_TARGET_DIR="${RUNNER_TEMP}/xfrm-target"
-          sudo env \
+          sudo env "TMPDIR=${TMPDIR}" \
             "PATH=${PATH}" \
             "CARGO_HOME=${CARGO_HOME}" \
             "RUSTUP_HOME=${RUSTUP_HOME}" \
@@ -518,7 +532,7 @@ jobs:
           export CARGO_HOME="${CARGO_HOME:-${HOME}/.cargo}"
           export RUSTUP_HOME="${RUSTUP_HOME:-${HOME}/.rustup}"
           export CARGO_TARGET_DIR="${RUNNER_TEMP}/xfrm-target"
-          sudo env \
+          sudo env "TMPDIR=${TMPDIR}" \
             "PATH=${PATH}" \
             "CARGO_HOME=${CARGO_HOME}" \
             "RUSTUP_HOME=${RUSTUP_HOME}" \
@@ -559,7 +573,7 @@ jobs:
           export CARGO_HOME="${CARGO_HOME:-${HOME}/.cargo}"
           export RUSTUP_HOME="${RUSTUP_HOME:-${HOME}/.rustup}"
           export CARGO_TARGET_DIR="${RUNNER_TEMP}/xfrm-target"
-          sudo env \
+          sudo env "TMPDIR=${TMPDIR}" \
             "PATH=${PATH}" \
             "CARGO_HOME=${CARGO_HOME}" \
             "RUSTUP_HOME=${RUSTUP_HOME}" \
@@ -576,7 +590,7 @@ jobs:
           export CARGO_HOME="${CARGO_HOME:-${HOME}/.cargo}"
           export RUSTUP_HOME="${RUSTUP_HOME:-${HOME}/.rustup}"
           export CARGO_TARGET_DIR="${RUNNER_TEMP}/xfrm-target"
-          sudo env \
+          sudo env "TMPDIR=${TMPDIR}" \
             "PATH=${PATH}" \
             "CARGO_HOME=${CARGO_HOME}" \
             "RUSTUP_HOME=${RUSTUP_HOME}" \
@@ -604,7 +618,7 @@ jobs:
           export CARGO_HOME="${CARGO_HOME:-${HOME}/.cargo}"
           export RUSTUP_HOME="${RUSTUP_HOME:-${HOME}/.rustup}"
           export CARGO_TARGET_DIR="${RUNNER_TEMP}/xfrm-target"
-          sudo env \
+          sudo env "TMPDIR=${TMPDIR}" \
             "PATH=${PATH}" \
             "CARGO_HOME=${CARGO_HOME}" \
             "RUSTUP_HOME=${RUSTUP_HOME}" \
@@ -615,6 +629,10 @@ jobs:
               ip link set lo up
               cargo test --locked -p opc-ipsec-xfrm --test xfrm_peer_observation_privileged -- --ignored --nocapture
             '
+
+      - name: Remove disk-backed scratch
+        if: always() && env.OPC_CI_DISK_TMPDIR != ''
+        run: bash ci/disk-scratch.sh cleanup --privileged
 
   ebpf-object:
     name: XFRM eBPF object rebuild
