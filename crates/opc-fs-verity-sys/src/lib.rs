@@ -1497,7 +1497,9 @@ mod platform {
                 if qualification_required() {
                     panic!(
                         "persistent identity qualification filesystem did not recycle an inode within the bounded test; {}",
-                        inode_reuse_failure_diagnostic(directory.path())
+                        inode_reuse_failure_diagnostic(
+                            path.parent().expect("qualification file has a parent")
+                        )
                     );
                 }
                 eprintln!(
