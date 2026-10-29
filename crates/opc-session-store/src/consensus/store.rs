@@ -22938,24 +22938,42 @@ mod membership_tests {
     #[cfg(all(target_os = "linux", feature = "test-control"))]
     #[tokio::test]
     async fn consumer_scan_restore_records_fence_deadline_is_retryable_availability() {
+        use super::scoped_read_diagnostics::{Outcome, Phase, Trace};
+
         let (_directory, store, scope, _authorization, _key, _lease) =
             consumer_boundary_store().await;
-        crate::consensus::store::test_support::set_consensus_restore_scan_fence_delay_for_test(
-            &store,
-            Some(std::time::Duration::from_millis(100)),
-        );
-        let deadline = tokio::time::Instant::now() + Duration::from_millis(10);
-        let error = store
-            .consumer_scan_restore_records(scope, RestoreScanRequest::all(1), deadline)
+        // #1160: hold the real logical-time fence's admission, rather than
+        // sleeping before its future is polled. Keep the original delay and
+        // the caller's single absolute deadline.
+        let held_fence_admission = Arc::clone(&store.inner.logical_read_time.admission)
+            .acquire_many_owned(
+                u32::try_from(DURABLE_OPENRAFT_LINEARIZABILITY_ADMISSION_CAPACITY)
+                    .expect("logical-read admission capacity fits u32"),
+            )
             .await
-            .expect_err("a consumer fence-phase deadline must be retryable");
+            .expect("hold logical-time fence admission");
+        let release = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            drop(held_fence_admission);
+        });
+        let deadline = tokio::time::Instant::now() + Duration::from_millis(10);
+        let trace = Trace::new(deadline);
+        let result = trace
+            .run(store.consumer_scan_restore_records(scope, RestoreScanRequest::all(1), deadline))
+            .await;
+        release.await.expect("release logical-time fence admission");
+        let error = result.expect_err("a consumer fence-phase deadline must be retryable");
+        trace.emit("consumer_restore_fence_deadline");
+        let observed = trace.snapshot();
+        observed.assert_complete();
+        observed.assert_observed(Phase::LogicalPermit, Outcome::DeadlineElapsed);
         assert!(
             matches!(
-                error,
+                &error,
                 StoreError::BackendUnavailable(message)
-                    if message == "session restore scan deadline exceeded"
+                    if message == "session consensus quorum is unavailable"
             ),
-            "consumer restore scans use the same phase rule as the primary path"
+            "consumer restore scans use the same phase rule as the primary path: {error:?}"
         );
         // The bounded recovery episode retries the same scan and accepts the
         // later exact page without any authority change.
