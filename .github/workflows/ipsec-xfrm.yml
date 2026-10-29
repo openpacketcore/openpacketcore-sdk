@@ -74,6 +74,20 @@ jobs:
             cpio busybox iproute2 qemu-system-x86 python3-cryptography
       - name: Build the SDK dummy sender
         run: cargo build --locked -p opc-ipsec-xfrm --example esp_tfc_dummy
+      - name: Read the pinned kernel checksum
+        id: image-pins
+        run: |
+          python3 - <<'PY'
+          import os, runpy
+          pins = runpy.run_path('ci/qualify-n3-mobike-kernel.py')
+          with open(os.environ['GITHUB_OUTPUT'], 'a') as output:
+              output.write('source=' + pins['SOURCE_SHA'] + '\n')
+          PY
+      - name: Cache the pinned kernel source
+        uses: actions/cache@v5
+        with:
+          path: ${{ runner.temp }}/tfc-cache/linux-n3-mobike.tar.gz
+          key: qualification-image-${{ steps.image-pins.outputs.source }}
       - name: Check the independent wire verifier rejects missing TFC padding
         run: python3 -m unittest discover -s kernel/xfrm-tfc-dummy -p test_verify_wire.py -v
       - name: Qualify the transport sender on the stock kernel
@@ -155,6 +169,29 @@ jobs:
           with open(os.environ['GITHUB_ENV'], 'a') as out:
               out.write('N3_MOBIKE_BINARY=' + binaries[0] + '\n')
           PY
+
+      - name: Read the pinned image checksums
+        id: image-pins
+        run: |
+          python3 - <<'PY'
+          import os, runpy
+          pins = runpy.run_path('ci/qualify-n3-mobike-kernel.py')
+          with open(os.environ['GITHUB_OUTPUT'], 'a') as output:
+              output.write('source=' + pins['SOURCE_SHA'] + '\n')
+              output.write('image=' + pins['IMAGE_SHA'] + '\n')
+          PY
+
+      - name: Cache the pinned kernel source
+        uses: actions/cache@v5
+        with:
+          path: ${{ runner.temp }}/n3-mobike-kernel/linux-n3-mobike.tar.gz
+          key: qualification-image-${{ steps.image-pins.outputs.source }}
+
+      - name: Cache the pinned guest image
+        uses: actions/cache@v5
+        with:
+          path: ${{ runner.temp }}/n3-mobike-kernel/ubuntu-24.04.img
+          key: qualification-image-${{ steps.image-pins.outputs.image }}
 
       - name: Qualify pinned migration-enabled kernel
         run: |

@@ -641,7 +641,16 @@ jobs:
           path: ${{ runner.temp }}/gtpu-nohz-linux68-binaries
           if-no-files-found: error
 
+      - name: Cache the pinned Linux 6.8 guest image
+        id: image-cache
+        uses: actions/cache@v5
+        with:
+          path: ${{ runner.temp }}/ubuntu-24.04-linux68.img
+          key: qualification-image-ffe6203da54deeb6db5d2a98a83f9ec8e55f149d3f7ba622e1abe5fa966ee3d6
+
       - name: Load both classifiers on pinned Linux 6.8
+        env:
+          CI_IMAGE_CACHE_HIT: ${{ steps.image-cache.outputs.cache-hit }}
         run: |
           set -euo pipefail
           sudo apt-get update
@@ -664,9 +673,11 @@ jobs:
           (cd "${package_dir}" && sha256sum wireguard-tools.deb repositories.txt package-versions.txt > SHA256SUMS)
 
           image="${RUNNER_TEMP}/ubuntu-24.04-linux68.img"
-          bash ci/download-image.sh \
-            https://cloud-images.ubuntu.com/releases/noble/release-20260705/ubuntu-24.04-server-cloudimg-amd64.img \
-            "${image}"
+          if [[ "${CI_IMAGE_CACHE_HIT:-false}" != 'true' ]]; then
+            bash ci/download-image.sh \
+              https://cloud-images.ubuntu.com/releases/noble/release-20260705/ubuntu-24.04-server-cloudimg-amd64.img \
+              "${image}"
+          fi
           echo "ffe6203da54deeb6db5d2a98a83f9ec8e55f149d3f7ba622e1abe5fa966ee3d6  ${image}" \
             | sha256sum -c -
 
@@ -1040,7 +1051,16 @@ jobs:
           path: ${{ runner.temp }}/gtpu-nohz-el9-binaries
           if-no-files-found: error
 
+      - name: Cache the pinned EL9 guest image
+        id: image-cache
+        uses: actions/cache@v5
+        with:
+          path: ${{ runner.temp }}/rocky94-el9.qcow2
+          key: qualification-image-2179864f4fa9799f11c0824c439666c2451d6751450494e20034efd4f3fa0559
+
       - name: Load both classifiers on a RHEL 9 kernel
+        env:
+          CI_IMAGE_CACHE_HIT: ${{ steps.image-cache.outputs.cache-hit }}
         run: |
           set -euo pipefail
           sudo apt-get update
@@ -1055,9 +1075,11 @@ jobs:
           image="${RUNNER_TEMP}/rocky94-el9.qcow2"
           # Hosted HTTP/2 transfers from this vault have repeatedly ended with
           # curl error 92 before completion. Use HTTP/1.1 for this pinned image.
-          bash ci/download-image.sh \
-            https://dl.rockylinux.org/vault/rocky/9.4/images/x86_64/Rocky-9-GenericCloud-Base-9.4-20240609.1.x86_64.qcow2 \
-            "${image}"
+          if [[ "${CI_IMAGE_CACHE_HIT:-false}" != 'true' ]]; then
+            bash ci/download-image.sh \
+              https://dl.rockylinux.org/vault/rocky/9.4/images/x86_64/Rocky-9-GenericCloud-Base-9.4-20240609.1.x86_64.qcow2 \
+              "${image}"
+          fi
           echo "2179864f4fa9799f11c0824c439666c2451d6751450494e20034efd4f3fa0559  ${image}" \
             | sha256sum -c -
 
@@ -1524,9 +1546,17 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y cloud-image-utils qemu-system-x86 openssh-client
 
+      - name: Cache the pinned nohz guest image
+        id: image-cache
+        uses: actions/cache@v5
+        with:
+          path: ${{ runner.temp }}/gtpu-nohz/private/guest.qcow2
+          key: qualification-image-${{ matrix.profile == 'linux68' && 'ffe6203da54deeb6db5d2a98a83f9ec8e55f149d3f7ba622e1abe5fa966ee3d6' || '2179864f4fa9799f11c0824c439666c2451d6751450494e20034efd4f3fa0559' }}
+
       - name: Require production TFT fallback with GLOBAL absent
         env:
           TFT_NOHZ_PROFILE: ${{ matrix.profile }}
+          CI_IMAGE_CACHE_HIT: ${{ steps.image-cache.outputs.cache-hit }}
         run: |
           set -euo pipefail
           mkdir -p "${RUNNER_TEMP}/gtpu-nohz/evidence"

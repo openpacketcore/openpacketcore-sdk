@@ -65,10 +65,10 @@ def kernel(cache, output, jobs):
                 and digest(config) == previous["config_sha256"]):
             (output / "kernel-build.json").write_text(json.dumps(previous, indent=2) + "\n")
             return image
+    archive = cache / "linux-n3-mobike.tar.gz"
+    download(f"https://codeload.github.com/torvalds/linux/tar.gz/{COMMIT}", archive, SOURCE_SHA)
     with tempfile.TemporaryDirectory(prefix="n3-kernel-build-", dir=cache) as temporary:
         root = Path(temporary)
-        archive = root / "source.tar.gz"
-        download(f"https://codeload.github.com/torvalds/linux/tar.gz/{COMMIT}", archive, SOURCE_SHA)
         with tarfile.open(archive) as source:
             source.extractall(root, filter="data")
         source = root / f"linux-{COMMIT}"
