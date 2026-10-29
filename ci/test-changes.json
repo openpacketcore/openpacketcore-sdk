@@ -1302,6 +1302,18 @@
       "kind": "fixture-setup-changed",
       "reason": "P4 removes the RUSTSEC-2026-0387 legacy exception. Replace self.assertIn('cannot verify the locked crypto-bigint 0.5.5 dependency path', result.stderr); self.assertIn('legacy crypto path ends before the vendored DTLS consumer', result.stderr) with self.assertIn('is not accepted for crypto-bigint 0.5.5', result.stderr). The version floor now refuses every 0.5.5 graph before the former consumer-confinement diagnostics. Preserve the same invalid graph fixtures and every other assertion; no vulnerable graph becomes accepted. The migrated-stack regression separately requires both advisory ignores to be absent.",
       "issue": 1532
+    },
+    {
+      "test": "rust:crates/opc-session-store::lib=lib::sqlite::consensus::tests::native::roster::export::native_roster_snapshot_signed_v1_and_v2_share_exact_history_across_cold_reopen",
+      "kind": "fixture-setup-changed",
+      "reason": "Update the intermediate retirement checkpoint to the bounded multi-epoch contract: replace the expectation of one remaining V1 roster row with zero rows, because both eligible profiles retire in one command. Replace the retained floor with retired_through=3 by no floor and a canonical witness retired_terminal_sequence=7; also require no remaining admissions or retirement cursors. Keep all shared-history, native/SQLite parity, mutation combinations and cold-reopen assertions, including the following idle maintenance command.",
+      "issue": 1307
+    },
+    {
+      "test": "rust:crates/opc-session-store::test=dynamic_membership::root_preserving_three_to_five_reactivates_profile_and_accepts_successor_signed_roster",
+      "kind": "fixture-setup-changed",
+      "reason": "Keep autonomous maintenance enabled and wait within the existing operation budget for durable retirement of the expired D5 terminal. Replace the exact retained D5 compacted row with row absence backed by the canonical witness frontier and original admission fence. Replace authenticated Recorded(Compacted{..}) status with Rejected(RecoveryRequired), and terminalization Rejected(Conflict) with Rejected(RecoveryRequired); retired history remains non-definitive. Observe retirement on both leader and snapshot target before isolation, replacing the compacted target setup with retired-to-retired snapshot installation and cold reopen. The separately tracked lagging-follower recovery design is outside this fixture. Preserve predecessor and successor scope checks, stale ingress rejection, all topology assertions, and fresh successor signed-roster acceptance.",
+      "issue": 1307
     }
   ]
 }
