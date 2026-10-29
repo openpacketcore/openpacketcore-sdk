@@ -138,6 +138,24 @@ pub fn set_consensus_restore_scan_fence_delay_for_test(
         .unwrap_or_else(std::sync::PoisonError::into_inner) = delay;
 }
 
+/// Apply the one-shot #1160 delay inside the consumer's real fence wait.
+/// The caller retains its original absolute deadline around this future.
+pub(super) async fn with_restore_scan_fence_delay_for_test<F: std::future::Future>(
+    store: &ConsensusSessionStore,
+    fence: F,
+) -> F::Output {
+    let delay = store
+        .inner
+        .restore_scan_fence_delay_for_test
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .take();
+    if let Some(delay) = delay {
+        tokio::time::sleep(delay).await;
+    }
+    fence.await
+}
+
 /// Number of restore scans that reached the armed dispatch fault.
 pub fn consensus_restore_scan_rejections_for_test(store: &ConsensusSessionStore) -> u64 {
     store

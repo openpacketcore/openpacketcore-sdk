@@ -271,9 +271,13 @@ async fn native_public_active_cancellation_and_restore_deadline_retire_without_f
             "detached work does not hold State"
         );
         if deadline {
+            // #1160: a wall-clock deadline is retryable availability; only
+            // genuine fixed-work exhaustion is terminal.
             assert_eq!(
                 task.await.unwrap(),
-                Err(StoreError::RestoreScanWorkBudgetExceeded)
+                Err(StoreError::BackendUnavailable(
+                    "session restore scan deadline exceeded".into()
+                ))
             );
         } else {
             task.abort();

@@ -998,6 +998,18 @@
       "kind": "fixture-setup-changed",
       "reason": "Keep autonomous maintenance enabled and wait within the existing operation budget for durable retirement of the expired D5 terminal. Require its canonical witness frontier and original admission fence before accepting row absence. Observe retirement on both the leader and snapshot target before isolating the target, so the snapshot tests retired-to-retired history. The separately tracked lagging-follower recovery design is outside this fixture. After real snapshot installation and cold reopen, require the same retirement authority and authenticated non-definitive status/terminal refusal. Preserve predecessor and successor scope checks, stale ingress rejection, all topology assertions, and fresh successor signed-roster acceptance.",
       "issue": 1307
+    },
+    {
+      "test": "rust:crates/opc-session-store::lib=lib::consensus::store::membership_tests::consumer_scan_restore_records_fence_deadline_is_retryable_availability",
+      "kind": "fixture-setup-changed",
+      "reason": "Issue #1160 requires a slow consumer logical-time fence to use the original absolute deadline and return retryable availability. The old fixture armed a primary-scan-only delay, so the consumer never consumed it and returned a successful page instead of exercising a fence deadline. Apply that same one-shot 100 ms test-control delay inside the real consumer fence future. Preserve the original 10 ms deadline, exact BackendUnavailable(\"session restore scan deadline exceeded\") assertion, existing later recovery call, complete-page assertion and shutdown; additionally require the consumer to consume the fault. No production error policy, work limit, timeout or retry changes.",
+      "issue": 1160
+    },
+    {
+      "test": "rust:crates/opc-session-store::lib=lib::sqlite::consensus::tests::native::basis::public_reads::native_public_active_cancellation_and_restore_deadline_retire_without_fencing",
+      "kind": "fixture-setup-changed",
+      "reason": "Issue #1160 makes a wall-clock restore deadline retryable availability, while true fixed-work exhaustion remains terminal. Replace only the stale expected Err(RestoreScanWorkBudgetExceeded) in the wall-deadline branch with exact Err(BackendUnavailable(\"session restore scan deadline exceeded\")). Retain the original 100 ms absolute deadline, active-cancellation branch, detached-State assertion, worker-reservation retention and retirement checks, later authoritative read, barrier and shutdown. Fixed-work exhaustion expectations are unchanged.",
+      "issue": 1160
     }
   ]
 }
