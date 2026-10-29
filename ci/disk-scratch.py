@@ -67,7 +67,7 @@ def prepare():
     # Resolve a runner's stable setup path once. Cleanup never resolves this
     # potentially symlinked spelling: it uses the pinned, recorded parent.
     canonical_parts(runner)
-    runner = os.path.realpath(runner, strict=True)
+    runner = str(Path(runner).resolve(strict=True))
     with open_parent(runner, os.getuid()) as (parent, _):
         name = "opc-disk-scratch." + "".join(secrets.choice(string.ascii_letters + string.digits) for _ in range(8))
         os.mkdir(name, 0o700, dir_fd=parent)

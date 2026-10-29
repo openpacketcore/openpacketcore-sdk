@@ -219,6 +219,20 @@ class HelperTests(unittest.TestCase):
         self.assertNotEqual(result.returncode, 0)
         self.assertEqual(marker.read_text(), "foreign")
 
+        with self.subTest(component="intermediate"):
+            scratch = self.runner / "opc-disk-scratch.Ab12Cd34"
+            scratch.mkdir()
+            marker = scratch / "keep"
+            marker.write_text("owned")
+            alias.unlink()
+            alias.symlink_to(self.root, target_is_directory=True)
+            parent = alias / self.runner.name
+            env = self.identity_env(parent, parent / scratch.name)
+            result = self.run_helper("cleanup", env=env)
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("Not a directory", result.stderr)
+            self.assertEqual(marker.read_text(), "owned")
+
     def test_dotdot_parent_is_refused_with_a_valid_scratch_basename(self):
         scratch = self.root / "opc-disk-scratch.Ab12Cd34"
         scratch.mkdir()
