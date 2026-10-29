@@ -1010,6 +1010,12 @@
       "kind": "fixture-setup-changed",
       "reason": "Issue #1160 makes a wall-clock restore deadline retryable availability, while true fixed-work exhaustion remains terminal. Replace only the stale expected Err(RestoreScanWorkBudgetExceeded) in the wall-deadline branch with exact Err(BackendUnavailable(\"session restore scan deadline exceeded\")). Retain the original 100 ms absolute deadline, active-cancellation branch, detached-State assertion, worker-reservation retention and retirement checks, later authoritative read, barrier and shutdown. Fixed-work exhaustion expectations are unchanged.",
       "issue": 1160
+    },
+    {
+      "test": "rust:crates/opc-session-store::lib=lib::consensus::store::membership_tests::consumer_scan_restore_records_fence_deadline_is_retryable_availability",
+      "kind": "fixture-setup-changed",
+      "reason": "Issue #1160 distinguishes retryable fence deadlines from terminal fixed-work exhaustion. Replace the synthetic pre-fence sleep and its BackendUnavailable(\"session restore scan deadline exceeded\") expectation with a held real logical-time admission wait and its exact BackendUnavailable(\"session consensus quorum is unavailable\") result. Retain the original 100 ms release delay and single 10 ms absolute caller deadline. Require LogicalPermit/DeadlineElapsed in the bounded scoped-read trace, replacing the synthetic hook-consumption check with proof the real fence entered and timed out; await release before the unchanged recovery scan, complete-page assertion and shutdown. No production error policy, timeout, retry or fixed-work assertion changes.",
+      "issue": 1160
     }
   ]
 }

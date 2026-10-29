@@ -123,7 +123,7 @@ pub fn set_consensus_restore_scan_unavailable_for_test(
         .store(unavailable, Ordering::Release);
 }
 
-/// Delay the logical-time fence phase of the next restore scan by `delay`.
+/// Delay the logical-time fence phase of the next primary or consumer restore scan.
 ///
 /// This deterministically places the caller's absolute operation deadline in
 /// the fence phase without changing any deadline or production behavior.
@@ -138,7 +138,7 @@ pub fn set_consensus_restore_scan_fence_delay_for_test(
         .unwrap_or_else(std::sync::PoisonError::into_inner) = delay;
 }
 
-/// Apply the one-shot #1160 delay inside the consumer's real fence wait.
+/// Apply the one-shot #1160 delay before polling the consumer's fence future.
 /// The caller retains its original absolute deadline around this future.
 pub(super) async fn with_restore_scan_fence_delay_for_test<F: std::future::Future>(
     store: &ConsensusSessionStore,
