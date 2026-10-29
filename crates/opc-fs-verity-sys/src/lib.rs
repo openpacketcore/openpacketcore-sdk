@@ -1496,7 +1496,8 @@ mod platform {
             let Some((reused_inode, previous, replacement)) = replacement else {
                 if qualification_required() {
                     panic!(
-                        "persistent identity qualification filesystem did not recycle an inode within the bounded test"
+                        "persistent identity qualification filesystem did not recycle an inode within the bounded test; {}",
+                        inode_reuse_failure_diagnostic(directory.path())
                     );
                 }
                 eprintln!(
@@ -1520,6 +1521,113 @@ mod platform {
             assert_ne!(
                 previous, replacement,
                 "recreated inode retained a prior durable file handle"
+            );
+        }
+
+        // Collect only after the bounded search fails. Do not print mount roots,
+        // sources, path-valued options, or uname's hostname/build information.
+        fn inode_reuse_failure_diagnostic(path: &std::path::Path) -> String {
+            let kernel = std::fs::read_to_string("/proc/sys/kernel/osrelease")
+                .map(|release| release.trim().to_owned())
+                .unwrap_or_else(|_| "unavailable".to_owned());
+            let mut filesystem = "unavailable".to_owned();
+            let mut inodes = "free=unavailable total=unavailable".to_owned();
+            let mut options = "unavailable".to_owned();
+            if let Ok(directory) = File::open(path) {
+                if let Some(magic) = filesystem_type(directory.as_fd()) {
+                    filesystem = format!("magic=0x{magic:08x}");
+                }
+                // SAFETY: the initialized C-compatible buffer is writable and
+                // the directory descriptor stays open throughout fstatvfs.
+                let mut stats = unsafe { std::mem::zeroed::<libc::statvfs>() };
+                // SAFETY: stats is valid output storage for this held fd.
+                if unsafe { libc::fstatvfs(directory.as_raw_fd(), &mut stats) } == 0 {
+                    inodes = format!("free={} total={}", stats.f_ffree, stats.f_files);
+                }
+                // Match the held directory's mount ID, not a textual path
+                // prefix that could select an unrelated or overmounted entry.
+                let mount_id =
+                    std::fs::read_to_string(format!("/proc/self/fdinfo/{}", directory.as_raw_fd()))
+                        .ok()
+                        .and_then(|info| {
+                            info.lines().find_map(|line| {
+                                line.strip_prefix("mnt_id:")?.trim().parse::<u64>().ok()
+                            })
+                        });
+                if let (Some(mount_id), Ok(mounts)) =
+                    (mount_id, std::fs::read_to_string("/proc/self/mountinfo"))
+                {
+                    options = inode_reuse_mount_options(&mounts, mount_id)
+                        .unwrap_or_else(|| "unavailable".to_owned());
+                }
+            }
+            format!(
+                "tempdir={path:?}; filesystem={filesystem}; mount_options={options}; kernel_release={kernel:?}; inodes {inodes}"
+            )
+        }
+
+        fn inode_reuse_mount_options(mounts: &str, mount_id: u64) -> Option<String> {
+            mounts.lines().find_map(|line| {
+                let fields: Vec<_> = line.split_whitespace().collect();
+                if fields.first()?.parse::<u64>().ok()? != mount_id {
+                    return None;
+                }
+                let separator = fields.iter().position(|field| *field == "-")?;
+                Some(format!(
+                    "mount=[{}] super=[{}]",
+                    inode_reuse_safe_options(fields.get(5)?),
+                    inode_reuse_safe_options(fields.get(separator + 3)?)
+                ))
+            })
+        }
+
+        fn inode_reuse_safe_options(options: &str) -> String {
+            options
+                .split(',')
+                .map(|option| {
+                    let (key, value) = option
+                        .split_once('=')
+                        .map_or((option, None), |(key, value)| (key, Some(value)));
+                    if key.is_empty()
+                        || !key
+                            .bytes()
+                            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'))
+                    {
+                        return "<redacted>".to_owned();
+                    }
+                    match value {
+                        None => key.to_owned(),
+                        Some(value)
+                            if (!value.is_empty()
+                                && value.bytes().all(|byte| byte.is_ascii_digit()))
+                                || matches!(
+                                    (key, value),
+                                    ("errors", "continue" | "remount-ro" | "panic")
+                                        | ("data", "journal" | "ordered" | "writeback")
+                                ) =>
+                        {
+                            format!("{key}={value}")
+                        }
+                        Some(_) => format!("{key}=<redacted>"),
+                    }
+                })
+                .collect::<Vec<_>>()
+                .join(",")
+        }
+
+        #[test]
+        fn inode_reuse_diagnostic_selects_the_mount_and_redacts_private_options() {
+            let mounts = "41 1 8:1 /private/root /other rw - ext4 /private/device rw\n\
+                          42 1 8:2 /private/root /temp rw,nosuid - overlay host.invalid:/private/source rw,lowerdir=/private/layer,upperdir=/private/upper,addr=host.invalid,size=4096,data=ordered,errors=remount-ro\n";
+            assert_eq!(
+                inode_reuse_mount_options(mounts, 42).as_deref(),
+                Some("mount=[rw,nosuid] super=[rw,lowerdir=<redacted>,upperdir=<redacted>,addr=<redacted>,size=4096,data=ordered,errors=remount-ro]")
+            );
+            assert_eq!(inode_reuse_mount_options(mounts, 43), None);
+            assert_eq!(inode_reuse_mount_options("42 malformed", 42), None);
+            assert_eq!(
+                inode_reuse_safe_options("rw,/private/path,context=private-label"),
+                "rw,<redacted>,context=<redacted>"
             );
         }
 
