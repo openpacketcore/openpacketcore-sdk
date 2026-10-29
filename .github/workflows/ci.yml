@@ -297,6 +297,9 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v7
 
+      - name: Prepare disk-backed scratch
+        run: bash ci/disk-scratch.sh prepare
+
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
         with:
@@ -353,6 +356,10 @@ jobs:
         if: matrix.shard == 'misc'
         run: python3 ci/test-shards.py verify-heavy
 
+      - name: Remove disk-backed scratch
+        if: always()
+        run: bash ci/disk-scratch.sh cleanup
+
   # Mixed O0/O1 precheck took 38 minutes on hosted heavy-1; leader progress
   # projects another 27 minutes. One proof per runner, with a 90-minute job
   # budget for compilation, reopen and host variance. Test deadlines are intact.
@@ -372,6 +379,9 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v7
+
+      - name: Prepare disk-backed scratch
+        run: bash ci/disk-scratch.sh prepare
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
@@ -403,6 +413,10 @@ jobs:
             echo "::endgroup::"
           done 3< shard-commands.txt
 
+      - name: Remove disk-backed scratch
+        if: always()
+        run: bash ci/disk-scratch.sh cleanup
+
 
   # Spread the ordinary library work with headroom below the 60-minute cap.
   # All runners preserve workspace feature unification and the O0 profile;
@@ -422,6 +436,9 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v7
+
+      - name: Prepare disk-backed scratch
+        run: bash ci/disk-scratch.sh prepare
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
@@ -457,6 +474,10 @@ jobs:
           path: ${{ runner.temp }}/library-test-map.json
           if-no-files-found: error
 
+      - name: Remove disk-backed scratch
+        if: always()
+        run: bash ci/disk-scratch.sh cleanup
+
   rust-persist:
     name: Rust opc-persist contract
     runs-on: ubuntu-latest
@@ -468,6 +489,9 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v7
+
+      - name: Prepare disk-backed scratch
+        run: bash ci/disk-scratch.sh prepare
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
@@ -499,6 +523,10 @@ jobs:
       - name: Run consensus e2e tests (serial)
         run: cargo test --locked -p opc-persist --all-features --quiet -- --test-threads=1
 
+      - name: Remove disk-backed scratch
+        if: always()
+        run: bash ci/disk-scratch.sh cleanup
+
   rust-gtpu-cfg:
     name: Rust GTP-U unsupported-platform cfg
     runs-on: ubuntu-latest
@@ -510,6 +538,9 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v7
+
+      - name: Prepare disk-backed scratch
+        run: bash ci/disk-scratch.sh prepare
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
@@ -563,6 +594,10 @@ jobs:
           /usr/bin/time -v cargo test --locked -p opc-linux-gtpu-sys -p opc-gtpu-dataplane --no-default-features --quiet --lib -- --test-threads=1 --exact "$selector" --nocapture || selector_exit=$?
           selector_resources || :
           exit "$selector_exit"
+
+      - name: Remove disk-backed scratch
+        if: always()
+        run: bash ci/disk-scratch.sh cleanup
 
   # This required Rust-workspace lane executes the ignored fixture in a fresh,
   # root-created private network namespace. It proves cold SCTP connectx over
@@ -740,6 +775,9 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v7
 
+      - name: Prepare disk-backed scratch
+        run: bash ci/disk-scratch.sh prepare
+
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
 
@@ -840,6 +878,10 @@ jobs:
             ${{ runner.temp }}/local-kernel-lifecycle-cleanup-regressions
             ${{ runner.temp }}/local-kernel-lifecycle-supervision-regressions
           if-no-files-found: error
+
+      - name: Remove disk-backed scratch
+        if: always()
+        run: bash ci/disk-scratch.sh cleanup --privileged
 
   rust:
     name: Rust workspace
@@ -981,6 +1023,9 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v7
+
+      - name: Prepare disk-backed scratch
+        run: bash ci/disk-scratch.sh prepare
 
       - name: Install 32-bit system toolchain
         run: |
@@ -1169,6 +1214,10 @@ jobs:
         run: |
           cargo test --locked -p opc-protocol -p opc-proto-gtpv2c --all-features --target i686-unknown-linux-gnu --quiet -- --test-threads=4
           cargo test --locked -p opc-sqlite-file-control-sys --all-features --target i686-unknown-linux-gnu --quiet -- --test-threads=4
+
+      - name: Remove disk-backed scratch
+        if: always()
+        run: bash ci/disk-scratch.sh cleanup --privileged
 
   # Keep the existing required-check job key and display name stable while
   # requiring both library shards, integrations and contracts to succeed.

@@ -655,7 +655,7 @@ class WorkflowTests(unittest.TestCase):
             "cargo test --locked -p opc-gtpu-dataplane --test ebpf_gtpu_privileged -- --ignored --nocapture --test-threads=1 --skip workload_strict_reset_ --skip workload_exclusive_reset_": "privileged-gtpu",
             "cargo test --locked -p opc-gtpu-dataplane --test ebpf_gtpu_privileged -- --ignored --nocapture --test-threads=1 workload_strict_reset_ workload_exclusive_reset_": "privileged-gtpu-resets",
             "cargo test --locked -p opc-gtpu-dataplane --lib -- --ignored --nocapture --test-threads=1 " + library_filters: "privileged-gtpu-regressions",
-            'sudo unshare -n -- bash ci/qualify-gtpu-control-native.sh': "privileged-gtpu-regressions",
+            'sudo env "TMPDIR=${TMPDIR}" unshare -n -- bash ci/qualify-gtpu-control-native.sh': "privileged-gtpu-regressions",
         }
         for command, owner in selections.items():
             with self.subTest(command=command):
@@ -990,6 +990,20 @@ class QualificationTests(unittest.TestCase):
         self.assertIsNone(record["source_unchanged"])
         self.assertEqual(record["source"], self.record["source"])
         self.assertEqual(record["build_kernel"], {"release": "build-host"})
+
+    def test_native_cases_keep_configured_scratch_after_sudo(self):
+        scratch = str(self.root / "private disk scratch")
+        with patch.dict(RUNNER.os.environ, {"TMPDIR": scratch}), \
+                patch.object(RUNNER.os, "geteuid", return_value=1000):
+            code, record, invocations = self.run_guest()
+        self.assertEqual(code, 0)
+        self.assertTrue(record["complete"] and record["passed"])
+        self.assertEqual(len(invocations), 2)
+        for command in invocations:
+            self.assertEqual(command[:2], ["sudo", "-n"])
+            self.assertIn("TMPDIR=" + scratch, command)
+            self.assertLess(command.index("env"), command.index("TMPDIR=" + scratch))
+            self.assertLess(command.index("TMPDIR=" + scratch), command.index("unshare"))
 
     def test_guest_failure_is_retained_and_stops_the_suite(self):
         code, record, invocations = self.run_guest(code=101)

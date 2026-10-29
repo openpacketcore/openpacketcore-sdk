@@ -293,6 +293,9 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v7
 
+      - name: Prepare disk-backed scratch
+        run: bash ci/disk-scratch.sh prepare
+
       - name: Install stable Rust
         uses: dtolnay/rust-toolchain@stable
         with:
@@ -359,6 +362,10 @@ jobs:
         if: always()
         run: bash ci/egress-fence-cleanup.sh
 
+      - name: Remove disk-backed scratch
+        if: always()
+        run: bash ci/disk-scratch.sh cleanup --privileged
+
   host-tests:
     name: Egress fence Rust tests (${{ matrix.shard }})
     needs: changes
@@ -372,6 +379,9 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v7
+
+      - name: Prepare disk-backed scratch
+        run: bash ci/disk-scratch.sh prepare
 
       - name: Install stable Rust
         uses: dtolnay/rust-toolchain@stable
@@ -410,6 +420,10 @@ jobs:
         if: always()
         run: bash ci/egress-fence-cleanup.sh
 
+      - name: Remove disk-backed scratch
+        if: always()
+        run: bash ci/disk-scratch.sh cleanup --privileged
+
   # Each full-bound proof runs whole on its own runner. The leader's build
   # plus conservative proposal projection is 93 minutes; its 120-minute
   # budget includes setup, reopen and variation. Other log proofs retain 75;
@@ -427,6 +441,9 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v7
+
+      - name: Prepare disk-backed scratch
+        run: bash ci/disk-scratch.sh prepare
 
       - name: Install stable Rust
         uses: dtolnay/rust-toolchain@stable
@@ -465,6 +482,10 @@ jobs:
         if: always()
         run: bash ci/egress-fence-cleanup.sh
 
+      - name: Remove disk-backed scratch
+        if: always()
+        run: bash ci/disk-scratch.sh cleanup --privileged
+
   host-proofs:
     name: Egress fence isolated and O1 proofs
     needs: changes
@@ -474,6 +495,9 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v7
+
+      - name: Prepare disk-backed scratch
+        run: bash ci/disk-scratch.sh prepare
 
       - name: Install stable Rust
         uses: dtolnay/rust-toolchain@stable
@@ -502,6 +526,10 @@ jobs:
       - name: Require complete privileged cleanup
         if: always()
         run: bash ci/egress-fence-cleanup.sh
+
+      - name: Remove disk-backed scratch
+        if: always()
+        run: bash ci/disk-scratch.sh cleanup --privileged
 
   # Preserve the old branch-protection check name. A failed, cancelled or
   # missing matrix member makes host-tests unsuccessful and blocks this gate.

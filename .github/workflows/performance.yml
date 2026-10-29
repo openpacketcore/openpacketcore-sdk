@@ -38,6 +38,9 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v7
 
+      - name: Prepare disk-backed scratch
+        run: bash ci/disk-scratch.sh prepare
+
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
 
@@ -47,11 +50,6 @@ jobs:
           sudo apt-get update
           sudo apt-get install --yes --no-install-recommends gcc-multilib
           rustup target add i686-unknown-linux-gnu
-
-      - name: Prepare ordinary disk scratch
-        run: |
-          scratch="$(mktemp -d "${RUNNER_TEMP}/cnf-performance.XXXXXX")"
-          printf 'TMPDIR=%s\n' "$scratch" >> "$GITHUB_ENV"
 
       - name: Cache Rust dependencies
         uses: Swatinem/rust-cache@v2
@@ -78,6 +76,10 @@ jobs:
           name: cnf-performance-${{ matrix.profile }}
           path: performance-results/
           if-no-files-found: error
+
+      - name: Remove disk-backed scratch
+        if: always()
+        run: bash ci/disk-scratch.sh cleanup --privileged
 
   report-nightly:
     name: Report nightly latency qualification failure

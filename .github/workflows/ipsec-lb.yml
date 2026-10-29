@@ -50,6 +50,9 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v7
 
+      - name: Prepare disk-backed scratch
+        run: bash ci/disk-scratch.sh prepare
+
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
         with:
@@ -124,6 +127,10 @@ jobs:
               --exact \
               "stateless_quorum_consumer::$timing_contract"
           done
+
+      - name: Remove disk-backed scratch
+        if: always()
+        run: bash ci/disk-scratch.sh cleanup
 
   docs:
     name: Rust docs

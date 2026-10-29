@@ -22,6 +22,9 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v7
 
+      - name: Prepare disk-backed scratch
+        run: bash ci/disk-scratch.sh prepare
+
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
         with:
@@ -87,6 +90,10 @@ jobs:
         with:
           name: openpacketcore-sdk-release-evidence
           path: release-artifacts/
+
+      - name: Remove disk-backed scratch
+        if: always()
+        run: bash ci/disk-scratch.sh cleanup
 
   # crates.io publishing is staged but not yet enabled. To enable:
   #   1. Add a CARGO_REGISTRY_TOKEN repository secret (a crates.io API token

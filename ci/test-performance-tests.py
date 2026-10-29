@@ -258,5 +258,112 @@ class PerformanceNightlyTests(unittest.TestCase):
             api.assert_not_called()
 
 
+class DurableScratchWorkflowTests(unittest.TestCase):
+    # These jobs execute file-backed persistence/recovery tests, including the
+    # ordinary, unsupported and qualification owners of the durable selector.
+    jobs = {
+        "ci.yml": ("rust-tests", "rust-native-log-proofs", "rust-libraries",
+                   "rust-persist", "rust-gtpu-cfg", "session-net-i686-tests",
+                   "rust-local-kernel-lifecycle"),
+        "egress-fence.yml": ("host-tests", "host-native-log-proofs", "host-proofs", "installer"),
+        "ipsec-lb.yml": ("conformance",),
+        "ipsec-xfrm.yml": ("conformance", "privileged"),
+        "gtpu-privileged.yml": ("privileged-gtpu-regressions", "privileged-gtpu-resets", "privileged-gtpu"),
+        "release.yml": ("validate",),
+        "performance.yml": ("latency",),
+        "realtime-qualification.yml": ("qualification",),
+    }
+
+    @classmethod
+    def setUpClass(cls):
+        # Keep positive fixtures on the checkout disk even if /tmp is tmpfs.
+        (Path(__file__).resolve().parents[1] / "target").mkdir(exist_ok=True)
+
+    def test_durable_jobs_keep_private_disk_scratch_until_unconditional_cleanup(self):
+        root = Path(__file__).resolve().parents[1]
+        for filename, names in self.jobs.items():
+            workflow = yaml.load((root / ".github/workflows" / filename).read_text(), Loader=yaml.BaseLoader)
+            for name in names:
+                with self.subTest(workflow=filename, job=name), tempfile.TemporaryDirectory(dir=root / "target") as temporary:
+                    steps = workflow["jobs"][name]["steps"]
+                    prepare = [(i, s) for i, s in enumerate(steps) if s.get("name") == "Prepare disk-backed scratch"]
+                    cleanup = [(i, s) for i, s in enumerate(steps) if s.get("name") == "Remove disk-backed scratch"]
+                    self.assertEqual(len(prepare), 1, "durable job needs job-scoped disk scratch")
+                    self.assertEqual(len(cleanup), 1, "durable job must remove its scratch")
+                    before, setup = prepare[0]
+                    after, teardown = cleanup[0]
+                    self.assertEqual(before, 1, "prepare immediately after checkout, before any gate")
+                    self.assertEqual(after, len(steps) - 1, "keep scratch through every test/artifact step")
+                    self.assertEqual(teardown.get("if"), "always()", "remove scratch even after a failed test")
+                    self.assertNotIn("if", setup)
+                    self.assertNotIn("continue-on-error", setup)
+                    self.assertNotIn("continue-on-error", teardown)
+                    runner = Path(temporary)
+                    github_env = runner / "github-env"
+                    env = dict(os.environ, RUNNER_TEMP=str(runner), GITHUB_ENV=str(github_env))
+                    subprocess.run(["bash", "-e", "-o", "pipefail", "-c", setup["run"]], cwd=root, env=env, check=True)
+                    exported = dict(line.split("=", 1) for line in github_env.read_text().splitlines())
+                    scratch = Path(exported["TMPDIR"])
+                    self.assertEqual(scratch.parent, runner)
+                    self.assertEqual(scratch.stat().st_mode & 0o777, 0o700)
+                    self.assertEqual(exported["OPC_CI_DISK_TMPDIR"], str(scratch))
+                    # Exercise real child inheritance and cleanup, not source-line spelling.
+                    env.update(exported)
+                    observed = subprocess.check_output(["python3", "-c", "import tempfile; print(tempfile.gettempdir())"], env=env, text=True).strip()
+                    self.assertEqual(observed, str(scratch))
+                    (scratch / "test-output").write_text("retained until job cleanup")
+                    subprocess.run(["bash", "-e", "-o", "pipefail", "-c", teardown["run"]], cwd=root, env=env, check=True)
+                    self.assertFalse(scratch.exists())
+                    self.assertTrue(github_env.exists(), "cleanup must not remove its runner parent")
+
+    def test_every_fsverity_gate_also_keeps_mutable_scratch_on_disk(self):
+        root = Path(__file__).resolve().parents[1]
+        for path in (root / ".github/workflows").glob("*.yml"):
+            workflow = yaml.load(path.read_text(), Loader=yaml.BaseLoader)
+            for name, job in workflow.get("jobs", {}).items():
+                if any("ci/setup-fsverity-tmp.sh" in step.get("shell", "") for step in job.get("steps", [])):
+                    self.assertIn(name, self.jobs.get(path.name, ()), (path.name, name))
+
+    def test_job_cleanup_preserves_another_jobs_private_scratch(self):
+        root = Path(__file__).resolve().parents[1]
+        with tempfile.TemporaryDirectory(dir=root / "target") as temporary:
+            runner = Path(temporary)
+            prepared = []
+            for index in range(2):
+                github_env = runner / f"github-env-{index}"
+                env = dict(os.environ, RUNNER_TEMP=str(runner), GITHUB_ENV=str(github_env))
+                subprocess.run(["bash", "ci/disk-scratch.sh", "prepare"], cwd=root, env=env, check=True)
+                prepared.append(dict(line.split("=", 1) for line in github_env.read_text().splitlines()))
+            first, second = (Path(record["TMPDIR"]) for record in prepared)
+            self.assertNotEqual(first, second)
+            for record, retired, remaining in ((prepared[0], first, second), (prepared[1], second, github_env)):
+                subprocess.run(["bash", "ci/disk-scratch.sh", "cleanup"], cwd=root,
+                               env=dict(os.environ, RUNNER_TEMP=str(runner), **record), check=True)
+                self.assertFalse(retired.exists())
+                self.assertTrue(remaining.exists())
+
+    def test_prepare_rejects_ram_backed_runner_scratch(self):
+        root = Path(__file__).resolve().parents[1]
+        with tempfile.TemporaryDirectory(dir="/dev/shm") as temporary:
+            runner = Path(temporary)
+            env = dict(os.environ, RUNNER_TEMP=str(runner), GITHUB_ENV=str(runner / "github-env"))
+            result = subprocess.run(["bash", "ci/disk-scratch.sh", "prepare"], cwd=root, env=env, capture_output=True, text=True)
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("disk-backed", result.stderr)
+            self.assertEqual(list(runner.iterdir()), [], "reject and clean up before exporting a RAM directory")
+
+    def test_cleanup_cannot_remove_an_unrelated_runner_directory(self):
+        root = Path(__file__).resolve().parents[1]
+        with tempfile.TemporaryDirectory() as temporary:
+            runner = Path(temporary)
+            sentinel = runner / "other-job"
+            sentinel.mkdir()
+            (sentinel / "keep").write_text("foreign output")
+            env = dict(os.environ, RUNNER_TEMP=str(runner), OPC_CI_DISK_TMPDIR=str(sentinel))
+            result = subprocess.run(["bash", "ci/disk-scratch.sh", "cleanup"], cwd=root, env=env, capture_output=True, text=True)
+            self.assertNotEqual(result.returncode, 0)
+            self.assertTrue((sentinel / "keep").exists())
+
+
 if __name__ == "__main__":
     unittest.main()
