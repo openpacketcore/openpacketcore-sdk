@@ -251,6 +251,7 @@ struct NetworkQuorum {
     pki: Pki,
     manifest: Arc<SessionReplicationManifest>,
     identity: ConfigConsensusIdentity,
+    replicas: [u16; 3],
     stores: Vec<Arc<ConsensusConfigStore>>,
     paths: BTreeMap<(usize, usize), Arc<NetworkPath>>,
     servers: Vec<SessionConsensusServerHandle>,
@@ -276,7 +277,14 @@ impl NetworkQuorum {
         let activity = Arc::new(tokio::sync::Notify::new());
         let checkpoints = Arc::new(Checkpoints::default());
         let admissions = Arc::new(AtomicU64::new(0));
-        let bindings = [1, 2, 3].map(|replica| manifest.bind_local(replica_id(replica)).unwrap());
+        // Installation-qualified hashes can reorder logical replica labels.
+        // Assign scenario slots by the fixed-profile bootstrap order, keeping
+        // slot 0 as the initial leader and slots 1/2 as its election survivors.
+        let mut replicas = [1, 2, 3];
+        replicas.sort_unstable_by_key(|replica| {
+            manifest.consensus_node_id(&replica_id(*replica)).unwrap()
+        });
+        let bindings = replicas.map(|replica| manifest.bind_local(replica_id(replica)).unwrap());
         let nodes = bindings
             .each_ref()
             .map(|binding| binding.local_consensus_node_id());
@@ -300,10 +308,10 @@ impl NetworkQuorum {
                     remote: RemoteSessionConsensusPeer::new_profiled_with_resolver(
                         binding
                             .clone()
-                            .bind_remote(replica_id(target as u16 + 1))
+                            .bind_remote(replica_id(replicas[target]))
                             .unwrap(),
                         resolver(address.clone()),
-                        pki.client(source as u16 + 1),
+                        pki.client(replicas[source]),
                     ),
                     enabled: AtomicBool::new(true),
                     activity: activity.clone(),
@@ -367,7 +375,7 @@ impl NetworkQuorum {
                     activity: activity.clone(),
                     source_gates: source_gates.clone(),
                 }),
-                pki.server(index as u16 + 1),
+                pki.server(replicas[index]),
                 binding,
             )
             .listen("127.0.0.1:0".parse().unwrap())
@@ -382,6 +390,7 @@ impl NetworkQuorum {
             pki,
             manifest,
             identity,
+            replicas,
             stores,
             paths,
             servers,
@@ -390,6 +399,15 @@ impl NetworkQuorum {
             activity,
             source_gates,
         }
+    }
+
+    fn replica_handler(&self, replica: u16) -> Arc<dyn ConsensusRpcHandler> {
+        let index = self
+            .replicas
+            .iter()
+            .position(|candidate| *candidate == replica)
+            .expect("fixture contains the logical replica");
+        self.stores[index].rpc_handler()
     }
 
     async fn leader_except(&self, excluded: Option<usize>) -> usize {
@@ -648,7 +666,7 @@ async fn required_running_terminal_debt_survives_authenticated_voter_leadership_
             assert_authentication_controls(
                 &quorum.pki,
                 &quorum.manifest,
-                quorum.stores[1].rpc_handler(),
+                quorum.replica_handler(2),
             )
             .await;
             let (one, two, three) = tokio::join!(
