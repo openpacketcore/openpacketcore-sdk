@@ -809,13 +809,16 @@ async fn repair_transfer_verifies_once_within_the_original_attempt_deadline() {
     let mut cluster = ThreeNodeCluster::start().await;
     let tx = TxId::new();
     let payload_bytes = 2 * 1024 * 1024;
-    // Keep the same aggregate snapshot payload while each individual command
-    // fits the existing 1 MiB replication admission limit.
+    // Keep the same aggregate snapshot payload, but bound each durable setup
+    // write separately from the multi-chunk repair's original attempt budget.
+    const SETUP_CHUNKS: usize = 8;
     let mut parent = None;
-    for (index, transaction) in [TxId::new(), TxId::new(), TxId::new(), tx]
-        .into_iter()
-        .enumerate()
-    {
+    for index in 0..SETUP_CHUNKS {
+        let transaction = if index + 1 == SETUP_CHUNKS {
+            tx
+        } else {
+            TxId::new()
+        };
         cluster.stores[cluster.leader()]
             .append_commit_idempotent(
                 ConfigConsensusRequestId::from_bytes([0x51 + index as u8; 16]),
@@ -823,7 +826,7 @@ async fn repair_transfer_verifies_once_within_the_original_attempt_deadline() {
                     transaction,
                     parent,
                     index as u64 + 1,
-                    payload_bytes / 4,
+                    payload_bytes / SETUP_CHUNKS,
                 ),
             )
             .await
