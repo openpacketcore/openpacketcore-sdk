@@ -150,9 +150,22 @@ impl DnsQuery {
     ///
     /// # Errors
     /// Returns [`DnsError::InvalidQuery`] for an invalid DNS name or an IP
-    /// literal. Configure IP-literal endpoints as static peers instead.
+    /// literal. Address mode requires RFC 1123 host labels; service modes
+    /// retain underscore labels. Configure IP-literal endpoints as static peers.
     pub fn new(mut input: ServiceDiscoveryInput) -> Result<Self, DnsError> {
         let name = DnsName::new(input.target.as_str())?;
+        if input.mode == crate::ServiceDiscoveryMode::Address
+            && name.as_str().trim_end_matches('.').split('.').any(|label| {
+                label.is_empty()
+                    || label.starts_with('-')
+                    || label.ends_with('-')
+                    || label
+                        .bytes()
+                        .any(|c| !(c.is_ascii_alphanumeric() || c == b'-'))
+            })
+        {
+            return Err(DnsError::InvalidQuery);
+        }
         if name
             .as_str()
             .trim_end_matches('.')
@@ -663,8 +676,8 @@ pub enum DnsError {
     /// one root target (RFC 2782, Target and Usage rules). No SOA is invented.
     ServiceUnavailable {
         /// Absolute SRV/CNAME-chain deadline in the cache clock domain.
-        /// Publication also applies the cache's negative TTL cap. Last-good
-        /// data remains stale, but consumers can observe this withdrawal.
+        /// Publication also applies the cache's negative TTL cap and replaces
+        /// any prior positive answer for this query.
         expires_at: PeerDiscoveryTime,
     },
     /// S-NAPTR branch refusal or root no-match. Only root no-match reasons

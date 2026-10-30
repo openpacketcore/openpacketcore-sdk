@@ -91,12 +91,22 @@ fn cbc_canonical_header_matches_the_committed_empty_acknowledgement_encoder() {
                 )
                 .unwrap();
             let record = prepared.record().clone();
-            let ordinary = record.inbound().unwrap().response().unwrap();
+            let ordinary = record
+                .inbound()
+                .unwrap()
+                .response()
+                .unwrap()
+                .single_packet()
+                .unwrap();
             assert_eq!(&canonical[..32], &ordinary[..32]);
             let commit = prepared.commit_after_durable(&record).unwrap();
             assert_eq!(window.apply_committed(commit).unwrap(), Some(Bytes::new()));
             assert_eq!(
-                f.restore(&record).replay_response(&work).unwrap().bytes(),
+                f.restore(&record)
+                    .replay_response(&work)
+                    .unwrap()
+                    .bytes()
+                    .unwrap(),
                 ordinary
             );
             primitive.delete();

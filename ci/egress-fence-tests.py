@@ -63,9 +63,9 @@ ROSTER_WORK_LIB = tuple(
     for backend in ("native", "sqlite")
 )
 # Only these eight added timing proofs leave host-proofs; the two backend
-# work proofs leave their ordinary shards. Shard 10 already
-# builds O1 for its unchanged full-bound proof and has measured headroom;
-# reusing that runner avoids adding an O1 compilation to an ordinary shard.
+# work proofs leave their ordinary shards. Shard 10 has headroom for a
+# separate checked O1 build of these proofs alongside its unchanged
+# full-bound proof; the runtime projection includes that compilation cost.
 ROSTER_TIMING_SHARD = 10
 OPTIMIZED_LIB = (
     "sqlite::consensus::tests::protected_roster_retirement_uses_a_1024_row_global_prefix_then_final_partial_batch",

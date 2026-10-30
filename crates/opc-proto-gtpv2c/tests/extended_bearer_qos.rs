@@ -173,3 +173,53 @@ fn bearer_qos_wire_rates_use_all_forty_bits_and_reject_overflow_in_each_field() 
             .is_err());
     }
 }
+
+#[test]
+fn review_arp_spares_do_not_reject_create_or_update_bearer() {
+    let update = update_request(&qos_ie(&PREFIX));
+    let create = include_bytes!("fixtures/spec/create_bearer_request_s2b.bin").to_vec();
+    for original in [create, update] {
+        let marker = original
+            .windows(4)
+            .position(|w| w == [80, 0, 22, 0])
+            .unwrap()
+            + 4;
+        for spare in [0x02, 0x80, 0x82] {
+            let mut received = original.clone();
+            received[marker] |= spare;
+            for level in [
+                ValidationLevel::Structural,
+                ValidationLevel::Strict,
+                ValidationLevel::ProcedureAware,
+            ] {
+                let context = DecodeContext {
+                    validation_level: level,
+                    ..DecodeContext::default()
+                };
+                let (_, expected) = S2bMessage::decode(&original, context).unwrap();
+                let (_, decoded) = S2bMessage::decode(&received, context)
+                    .expect("TS 29.274 7.7.8: ARP spare bits must not reject a bearer request");
+                assert_eq!(
+                    decoded.as_view().unwrap().ies,
+                    expected.as_view().unwrap().ies
+                );
+                let mut canonical = BytesMut::new();
+                decoded
+                    .encode(&mut canonical, EncodeContext::default())
+                    .unwrap();
+                assert_eq!(canonical.as_ref(), original);
+                let mut raw = BytesMut::new();
+                decoded
+                    .encode(
+                        &mut raw,
+                        EncodeContext {
+                            raw_preserving: true,
+                            ..EncodeContext::default()
+                        },
+                    )
+                    .unwrap();
+                assert_eq!(raw.as_ref(), received);
+            }
+        }
+    }
+}

@@ -81,25 +81,41 @@ for the exact crash cut, credential handling and remaining limits.
 
 ## Implemented boundary
 
-- Direct TLS/TCP completes mutually authenticated TLS 1.3 before any Diameter
-  byte is read or written.
+- Direct TLS/TCP completes mutually authenticated TLS before any Diameter byte
+  is read or written. TLS 1.3 is the default; explicit compatibility admits TLS 1.2.
 - In-band TLS/TCP uses consuming typestates to permit one canonical CER/CEA
   exchange and then immediately upgrades that same unbuffered TCP stream.
 - Direct DTLS/SCTP completes mutually authenticated DTLS 1.2 before any
   Diameter byte. The in-band typestates permit exactly one canonical
   cleartext CER/CEA, seal that prelude, and complete DTLS on the same SCTP
   association before application traffic. Exactly one DTLS record travels
-  per ordered stream-0 SCTP user message with PPID 47 (RFC 6083 sections 4.1
+  per SCTP user message with PPID 47 (RFC 6083 sections 4.1
   and 4.4; PPID 47 is registered by RFC 6733 section 11.5). Any cleartext or
   foreign-PPID input after the prelude fails closed.
+- Diameter receives authenticated application records on any negotiated SCTP
+  stream, ordered or unordered, as required by RFC 6733 section 2.1.1. DTLS
+  Handshake, CCS and Alert records remain ordered on stream zero. Sequential
+  `send_message_on_stream` selects an application stream; the kernel enforces
+  its negotiated range. Default sends and the concurrent peer runtime use
+  ordered stream zero and retain its head-of-line blocking tradeoff. The
+  generic RFC 6083 API retains its explicitly configured ordered-stream policy.
 - The DTLS engine is the audited workspace-vendored `dimpl` fork, compiled
-  only with its pure-Rust `rust-crypto` provider. The transport selects that
+  with its `rust-crypto` provider (RustCrypto EC/record operations and ring
+  RSA signatures). The transport selects that
   provider explicitly, so a process-global `dimpl` default installed by
   unrelated code cannot replace its crypto authority. Its RFC 6083 profile
   is DTLS-1.2-only, disables datagram replay filtering and flight
-  retransmission in favor of reliable ordered SCTP, and admits the typed
-  ECDHE-ECDSA AES-GCM and ChaCha20-Poly1305 suites reported in connection
-  evidence.
+  retransmission in favor of reliable SCTP, and admits the typed
+  ECDHE-ECDSA AES-GCM and ChaCha20-Poly1305 suites by default. RSA leaf
+  certificates can use `EcdheRsaAes128GcmSha256`, `EcdheRsaAes256GcmSha384`
+  or `DheRsaAes128GcmSha256` (FFDHE4096 preferred, FFDHE2048 fallback)
+  through `with_allowed_ciphers`; RSA-PSS-RSAE is preferred over PKCS#1,
+  with SHA-256/384 only. DHE-RSA is an explicit legacy Release 18 exception
+  prohibited by RFC 10015 and TS 33.210 Release 19. Default servers request
+  and accept only ECDSA client authentication; enabling an RSA suite also
+  enables RSA client authentication. Default ClientHello groups omit FFDHE.
+  Connection evidence records the negotiated suite. The separate
+  `NdsAfEcdsa` certificate profile remains ECDSA-only.
 - Complete peer certificate chains are bounded, checked for leaf-to-root
   order, validated with rustls-webpki against trust anchors scoped to the
   expected SPIFFE trust domain, and required to contain the exact configured
@@ -226,6 +242,39 @@ The SDK does not configure or attest an external IPsec deployment. A consumer
 may select `CompatibilityUnprotected` only after applying its own separate
 IPsec policy and evidence; the SDK still reports that association as
 unprotected and it never satisfies protected-transport readiness.
+
+`DiameterTlsPolicy::tls12_compatibility(frame_limits)` permits TLS 1.3 and TLS
+1.2; also enable `TlsConfigBuilder::with_compat_mode(true)` on the supplied
+authenticated config. TLS 1.3 remains preferred. TLS 1.2 permits ECDHE-ECDSA
+and ECDHE-RSA with AES-128/256-GCM and requires Extended Master Secret in both
+roles. DHE-RSA needs `TlsConfigBuilder::with_legacy_dhe_rsa(true)` plus
+`DiameterTlsPolicy::tls12_legacy_dhe_rsa(frame_limits)` or an explicit DHE
+cipher allowlist. It uses FFDHE4096 (preferred) or FFDHE2048 as a legacy
+Release 18 exception. Normal compatibility follows the RFC 10015 / TS 33.210
+Release 19 prohibition on TLS 1.2 FFDHE. Static RSA key exchange, CBC and
+obsolete versions remain excluded.
+
+`with_allowed_ciphers` filters the handshake before admission; a TLS 1.2
+suite under the default TLS 1.3-only policy returns `CipherVersionMismatch`.
+`policy.version()` reports the minimum allowed version; connection evidence
+reports the negotiated version and suite. Identity checks, material epochs,
+retirement and frame budgets apply to both. This is not complete 3GPP endpoint
+or validated-module qualification. See [cipher policy and alert deviations](../../docs/spec-compliance-dispositions.md#tls-and-dtls-cipher-policy-in-1353).
+
+Unparseable fixed Diameter framing causes wire SCTP ABORT on protected
+receivers and both cleartext DTLS/SCTP prelude roles. TLS/TCP terminal close
+currently sends FIN via `shutdown(Shutdown::Both)`; it does not implement the
+TCP RST required by RFC 6733 section 2.1. The concurrent runtime sends on
+ordered stream zero and does not expose inbound stream metadata. Initial
+unordered application delivery overtaking Finished remains a qualification gap.
+
+Application-owned SWm overload, DRMP and redirect AVPs are delivered through
+the typed protocol/correlation boundary. The peer runtime does not advertise
+DOIC capabilities, maintain overload reports, schedule by DRMP, or own a
+redirect routing cache. Its control/application queue separation protects base
+peer procedures; it is not an implementation of those application policies.
+Consumers that advertise DOIC must implement the corresponding abatement and
+expiry behavior before submitting affected traffic.
 
 The RFC 6083 profile deliberately rejects DTLS 1.3. RFC 6083's key transition
 is defined around the DTLS 1.2 Finished boundary; this SDK does not substitute

@@ -134,10 +134,89 @@ impl<'a> Wire<'a> {
     }
 
     pub fn open(&self, wire: &[u8]) -> Result<Packet, WireError> {
+        self.open_frame(wire, false)
+    }
+
+    /// Independent whole-message oracle: no SDK recovery/reassembly code is used.
+    pub fn open_message(
+        &self,
+        message: &opc_proto_ikev2::recovery::Ikev2ProtectedMessage,
+    ) -> Result<Packet, WireError> {
+        use std::collections::BTreeMap;
+        if let [packet] = message.packets() {
+            if packet.get(16) == Some(&46) {
+                return self.open(packet);
+            }
+        }
+        let invalid = WireError::AuthenticationOrFraming;
+        let mut parts = BTreeMap::new();
+        for wire in message.packets() {
+            let (number, total, packet) = self.open_fragment(wire)?;
+            if usize::from(total) != message.packets().len()
+                || total > 256
+                || parts.insert(number, packet).is_some()
+            {
+                return Err(invalid);
+            }
+        }
+        let first = parts.get(&1).ok_or(invalid)?;
+        let header = first.header.clone();
+        let first_payload = first.first;
+        let mut body = Vec::new();
+        // This identity is only compared by the peer model; it is never transmitted.
+        let mut identity = b"fragment-set\0".to_vec();
+        for (index, (number, part)) in parts.into_iter().enumerate() {
+            if usize::from(number) != index + 1
+                || part.header.message_id != header.message_id
+                || part.header.exchange_type != header.exchange_type
+                || part.header.flags != header.flags
+                || (number != 1 && part.first != PayloadType::NoNext)
+            {
+                return Err(invalid);
+            }
+            if body
+                .len()
+                .checked_add(part.body.len())
+                .is_none_or(|size| size > 65_536)
+            {
+                return Err(invalid);
+            }
+            body.extend_from_slice(&part.body);
+            identity.extend_from_slice(
+                &u32::try_from(part.wire.len())
+                    .map_err(|_| invalid)?
+                    .to_be_bytes(),
+            );
+            identity.extend_from_slice(&part.wire);
+        }
+        PayloadChain::new(first_payload, &body)
+            .validate(DecodeContext {
+                max_message_len: 65_536,
+                ..DecodeContext::default()
+            })
+            .map_err(|_| invalid)?;
+        Ok(Packet {
+            header,
+            first: first_payload,
+            body: body.into(),
+            wire: identity.into(),
+        })
+    }
+
+    pub fn open_fragment(&self, wire: &[u8]) -> Result<(u16, u16, Packet), WireError> {
+        let packet = self.open_frame(wire, true)?;
+        let number = u16::from_be_bytes(wire[32..34].try_into().unwrap());
+        let total = u16::from_be_bytes(wire[34..36].try_into().unwrap());
+        Ok((number, total, packet))
+    }
+
+    fn open_frame(&self, wire: &[u8], fragment: bool) -> Result<Packet, WireError> {
         let (rest, message) = Message::decode(wire, DecodeContext::default())
             .map_err(|_| WireError::AuthenticationOrFraming)?;
         let header = &message.header;
-        if !rest.is_empty() || header.next_payload != 46 || !matches!(header.exchange_type, 35..=37)
+        if !rest.is_empty()
+            || header.next_payload != if fragment { 53 } else { 46 }
+            || !matches!(header.exchange_type, 35..=37)
         {
             return Err(WireError::AuthenticationOrFraming);
         }
@@ -167,9 +246,11 @@ impl<'a> Wire<'a> {
             return Err(WireError::AuthenticationOrFraming);
         }
         let opened = &opened[0];
-        PayloadChain::new(opened.first_inner_payload, &opened.cleartext)
-            .validate(DecodeContext::default())
-            .map_err(|_| WireError::AuthenticationOrFraming)?;
+        if !fragment {
+            PayloadChain::new(opened.first_inner_payload, &opened.cleartext)
+                .validate(DecodeContext::default())
+                .map_err(|_| WireError::AuthenticationOrFraming)?;
+        }
         Ok(Packet {
             header: header.clone(),
             first: opened.first_inner_payload,

@@ -82,6 +82,10 @@ pub trait RecoveryProfile: Clone + Copy + Default + PartialEq + Eq + Send + Sync
     ) -> Result<Bytes, Error>;
     fn check_local_ordinary(packet: &Ordinary<Self>, epoch: &Self::Epoch) -> Result<(), Error>;
     fn check_sync_evidence(record: &SyncRecord<Self>, epoch: &Self::Epoch) -> Result<(), Error>;
+    fn check_packet_evidence(
+        evidence: &Self::SyncEvidence,
+        epoch: &Self::Epoch,
+    ) -> Result<(), Error>;
     fn check_next_sync_attempt(
         previous: &mut Self::SyncValidation,
         packet: &AuthenticatedSync<Self>,

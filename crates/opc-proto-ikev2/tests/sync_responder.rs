@@ -4,11 +4,12 @@ use opc_proto_ikev2::{
     recovery::{
         Ikev2AuthenticatedOrdinary as Ordinary, Ikev2CommittedExchangeRecord as ExchangeRecord,
         Ikev2CommittedWindow as Window, Ikev2CommittedWindowDomain as Domain,
-        Ikev2CommittedWindowRecord as Record, Ikev2PreparedSyncResponse as Prepared,
-        Ikev2ReservationRetry as Retry, Ikev2ReservationRetryError as RetryError,
-        Ikev2ReservationRetryPolicy as Policy, Ikev2ReservationRetryRecord as RetryRecord,
-        Ikev2SyncCommit as Commit, Ikev2SyncDisposition as Disposition,
-        Ikev2SyncResponderRecord as SyncRecord, Ikev2WindowError as Error,
+        Ikev2CommittedWindowRecord as Record, Ikev2LivenessProbePolicy as ProbePolicy,
+        Ikev2PreparedSyncResponse as Prepared, Ikev2ReservationRetry as Retry,
+        Ikev2ReservationRetryError as RetryError, Ikev2ReservationRetryPolicy as Policy,
+        Ikev2ReservationRetryRecord as RetryRecord, Ikev2SyncCommit as Commit,
+        Ikev2SyncDisposition as Disposition, Ikev2SyncResponderRecord as SyncRecord,
+        Ikev2WindowError as Error,
     },
     seal_ikev2_sa_init_protected_payload, Header, HeaderFlags, Ikev2AesGcmIvAllocator as Allocator,
     Ikev2AesGcmIvLimits as Limits, Ikev2AesGcmIvPurpose as Purpose,
@@ -113,6 +114,8 @@ impl Fixture {
             1,
             Some(counters.next_send),
             Some(counters.next_receive),
+            None,
+            None,
             None,
             None,
         )
@@ -1045,10 +1048,19 @@ fn exhausted_counter_or_generation_never_becomes_a_successful_sync() {
         ));
         assert_eq!(window.record(), &original);
     }
-    let record = Record::from_persisted(f.domain.clone(), u64::MAX, Some(0), Some(0), None, None)
-        .unwrap()
-        .with_sync_state(*original.sync_state().unwrap())
-        .unwrap();
+    let record = Record::from_persisted(
+        f.domain.clone(),
+        u64::MAX,
+        Some(0),
+        Some(0),
+        None,
+        None,
+        None,
+        None,
+    )
+    .unwrap()
+    .with_sync_state(*original.sync_state().unwrap())
+    .unwrap();
     let mut exhausted = f.restore(&record, &f.iv_record(0));
     assert!(matches!(
         exhausted.begin_sync_response(
@@ -1220,6 +1232,8 @@ fn cutover_restore_retains_reply_and_retired_packet_iv_bounds() {
                         Some(3),
                         Some(outbound),
                         Some(inbound),
+                        None,
+                        None,
                     )
                     .unwrap()
                     .with_sync_state(
@@ -1254,6 +1268,8 @@ fn cutover_restore_retains_reply_and_retired_packet_iv_bounds() {
                     record.generation(),
                     record.next_send(),
                     record.next_receive(),
+                    None,
+                    None,
                     None,
                     None,
                 )
@@ -1359,10 +1375,19 @@ fn persisted_minimum_iv_end_must_fit_the_allocator_range_and_cover_empty_caches(
         128,
     )
     .unwrap();
-    let record = Record::from_persisted(f.domain.clone(), 1, Some(0), Some(0), None, None)
-        .unwrap()
-        .with_sync_state(state)
-        .unwrap();
+    let record = Record::from_persisted(
+        f.domain.clone(),
+        1,
+        Some(0),
+        Some(0),
+        None,
+        None,
+        None,
+        None,
+    )
+    .unwrap()
+    .with_sync_state(state)
+    .unwrap();
     assert!(matches!(
         Window::restore(&f.domain, f.profile, &f.keys, &record, &f.iv_record(127),),
         Err(Error::InvalidRecord)
@@ -1418,22 +1443,30 @@ fn exhausted_windows_drop_duplicate_sync_before_returning_fresh_exhaustion_inten
                     Some(u32::MAX),
                 )
             };
-            let record =
-                Record::from_persisted(f.domain.clone(), 1, send, receive, outbound, inbound)
-                    .unwrap()
-                    .with_sync_state(
-                        SyncRecord::from_persisted(
-                            f.agreement,
-                            local,
-                            peer,
-                            None,
-                            None,
-                            Disposition::Continue,
-                            0,
-                        )
-                        .unwrap(),
-                    )
-                    .unwrap();
+            let record = Record::from_persisted(
+                f.domain.clone(),
+                1,
+                send,
+                receive,
+                outbound,
+                inbound,
+                None,
+                None,
+            )
+            .unwrap()
+            .with_sync_state(
+                SyncRecord::from_persisted(
+                    f.agreement,
+                    local,
+                    peer,
+                    None,
+                    None,
+                    Disposition::Continue,
+                    0,
+                )
+                .unwrap(),
+            )
+            .unwrap();
             let mut window = f.restore(&record, &f.iv_record(1));
             for m1 in [0, peer.unwrap()] {
                 let duplicate = f.peer_sync(Sync::new(NONCE, m1, 0));
@@ -1475,15 +1508,21 @@ fn unexpected_pending_request_and_unnegotiated_observation_drop() {
 }
 
 #[test]
-fn peer_sync_while_a_volatile_probe_is_outstanding_is_outcome_uncertain() {
+fn peer_sync_fences_a_volatile_probe_without_uncertain_application_work() {
     for algorithm in ENCRYPTIONS {
         for role in ROLES {
             let f = Fixture::new(algorithm, role);
             let (mut window, mut allocator, _) = f.start(Counters::new(0, 0));
+            ordinary_commit(window.prepare_liveness(4).unwrap());
             let durable_before = window.record().clone();
-            let allocation = allocator.allocate(Purpose::Ordinary).unwrap();
             let probe = window
-                .send_empty_request(f.profile, &f.keys, allocation)
+                .start_empty_probe(
+                    f.profile,
+                    &f.keys,
+                    &mut allocator,
+                    ProbePolicy::new(1_000, 4, 10).unwrap(),
+                    100,
+                )
                 .unwrap();
             let probe_id = probe.message_id();
             drop(probe);
@@ -1491,8 +1530,8 @@ fn peer_sync_while_a_volatile_probe_is_outstanding_is_outcome_uncertain() {
             assert_eq!(window.record(), &durable_before);
 
             // The peer's own counters are below our burned probe ID; the
-            // responder must advertise the volatile advance and treat the
-            // outstanding probe as unresolved outbound work.
+            // responder must preserve the volatile advance. A liveness probe
+            // has no application outcome to mark uncertain.
             let wire = f.peer_sync(Sync::new(NONCE, 0, 0));
             let admitted = window
                 .begin_sync_response(f.profile, &f.keys, &wire, None, None)
@@ -1502,38 +1541,51 @@ fn peer_sync_while_a_volatile_probe_is_outstanding_is_outcome_uncertain() {
             let candidate = prepared.record().clone();
             assert_eq!(
                 candidate.sync_state().unwrap().disposition(),
-                Disposition::OutcomeUncertain
+                Disposition::Continue
             );
             assert!(
-                candidate.next_send().unwrap() >= probe_id + 1,
+                candidate.next_send().unwrap() > probe_id,
                 "cutover must not commit below the burned probe ID"
             );
 
             let token = prepared.commit_after_durable(&candidate).unwrap();
             assert_eq!(window.record(), &candidate);
-            // The terminal cutover fences the outstanding probe.
+            // The committed cutover fences the outstanding probe.
             assert_eq!(window.pending_empty_request_message_id(), None);
-            assert!(window.record().next_send().unwrap() >= probe_id + 1);
+            assert!(window.record().next_send().unwrap() > probe_id);
             let (_, disposition) = window.release_sync_response(token).unwrap().into_parts();
-            assert_eq!(disposition, Disposition::OutcomeUncertain);
+            assert_eq!(disposition, Disposition::Continue);
         }
     }
 }
 
 #[test]
-fn peer_sync_after_abandon_before_persist_keeps_the_burned_probe_floor() {
+fn peer_sync_after_answer_before_persist_keeps_the_burned_probe_floor() {
     for algorithm in ENCRYPTIONS {
         for role in ROLES {
             let f = Fixture::new(algorithm, role);
             let (mut window, mut allocator, _) = f.start(Counters::new(0, 0));
+            ordinary_commit(window.prepare_liveness(4).unwrap());
             let durable_before = window.record().clone();
-            let allocation = allocator.allocate(Purpose::Ordinary).unwrap();
             let probe = window
-                .send_empty_request(f.profile, &f.keys, allocation)
+                .start_empty_probe(
+                    f.profile,
+                    &f.keys,
+                    &mut allocator,
+                    ProbePolicy::new(1_000, 4, 10).unwrap(),
+                    100,
+                )
                 .unwrap();
             let probe_id = probe.message_id();
             drop(probe);
-            assert_eq!(window.abandon_empty_request().unwrap(), Some(probe_id));
+            let response = f.wire(
+                f.header(true, Exchange::Informational, probe_id, true),
+                empty(),
+                Kind::Encrypted,
+                101,
+            );
+            let response = window.open_peer(f.profile, &f.keys, &response).unwrap();
+            window.complete_empty_probe(&response, 101).unwrap();
             assert_eq!(window.record(), &durable_before);
 
             // No probe is pending now, so the cutover is not terminal; the
@@ -1550,11 +1602,11 @@ fn peer_sync_after_abandon_before_persist_keeps_the_burned_probe_floor() {
                 Disposition::Continue
             );
             assert!(
-                candidate.next_send().unwrap() >= probe_id + 1,
-                "synchronization must fold the abandoned probe advance"
+                candidate.next_send().unwrap() > probe_id,
+                "synchronization must fold the answered probe advance"
             );
             let token = prepared.commit_after_durable(&candidate).unwrap();
-            assert!(window.record().next_send().unwrap() >= probe_id + 1);
+            assert!(window.record().next_send().unwrap() > probe_id);
             let (_, disposition) = window.release_sync_response(token).unwrap().into_parts();
             assert_eq!(disposition, Disposition::Continue);
         }

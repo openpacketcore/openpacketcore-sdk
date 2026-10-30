@@ -94,6 +94,7 @@ fn build_input() -> CanonicalInput {
             module: "example".to_string(),
             kind: SchemaNodeKind::Container,
             config: true,
+            presence: Some("Enable DNS configuration".into()),
             child_paths: vec!["/ex:system/ex:dns/ex:server".to_string()],
             source: source.clone(),
             ..Default::default()
@@ -486,6 +487,7 @@ tokio = {{ version = "1", features = ["macros", "rt", "sync", "io-util", "time"]
 
     let status = Command::new("cargo")
         .arg("test")
+        .arg("--no-fail-fast")
         .env("RUSTFLAGS", "-Dwarnings")
         .current_dir(dir.path())
         .status()

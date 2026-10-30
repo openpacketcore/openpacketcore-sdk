@@ -172,7 +172,13 @@ fn handle_delete(
 }
 
 fn decode_s2b(encoded: &[u8]) -> Result<S2bMessage<'_>, Box<dyn std::error::Error>> {
-    let (tail, message) = S2bMessage::decode(encoded, DecodeContext::default())?;
+    let (tail, message) = S2bMessage::decode(
+        encoded,
+        DecodeContext {
+            validation_level: opc_protocol::ValidationLevel::ProcedureAware,
+            ..DecodeContext::default()
+        },
+    )?;
     if tail.is_empty() {
         Ok(message)
     } else {

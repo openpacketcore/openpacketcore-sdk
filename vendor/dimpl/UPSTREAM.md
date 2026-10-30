@@ -27,6 +27,33 @@ tar -xOf dimpl-0.7.2.crate dimpl-0.7.2/.cargo_vcs_info.json
 OpenPacketCore carries a security-scoped patch with the following intentional
 changes:
 
+- The RustCrypto ECDSA/ECDH backend uses P-256/P-384 0.14 and ECDSA 0.17,
+  with an explicit `crypto-bigint >= 0.7.10` constraint for downstream resolution
+  (RUSTSEC-2026-0387). Ephemeral generation uses the fallible OS RNG interface;
+  public points remain uncompressed SEC1, and certificate parsing retains its
+  existing bounded DER path. This arithmetic migration preserves the suite,
+  group and signature encodings described below.
+- DTLS 1.2 adds ECDHE-RSA AES-128/256-GCM and legacy DHE-RSA AES-128-GCM.
+  Both built-in providers use ring for RSA-PSS-RSAE and PKCS#1 SHA-256/384;
+  ClientHello signature capabilities include those schemes alongside ECDSA.
+  CertificateRequest types/schemes and CertificateVerify admission follow
+  configured suite families: an ECDSA-only policy does not authorize RSA
+  client authentication. Client suite offers are independent of the client's
+  certificate key, while PSK/certificate mode separation remains enforced.
+- Legacy DHE uses RFC 7919 FFDHE4096/2048, fresh 512-bit exponents, signed
+  parameter validation and bounded public-value checks. Provider admission
+  requires a matching key-exchange family. DTLS 1.3 excludes FFDHE; SDK DTLS
+  defaults also exclude it from ClientHello groups unless a DHE suite is
+  enabled. RSA/DHE known-answer and retained OpenSSL tests cover both roles.
+  RFC 10015 / TS 33.210 Release 19 prohibit TLS 1.2 FFDHE: SDK DHE support is
+  an explicit legacy exception. The engine still fails closed without fatal
+  DH alerts; it does not claim complete RFC 7919 alert compliance.
+- The standalone lockfile also updates `time` past RUSTSEC-2026-0009, with a
+  manifest minimum of 0.3.47. The fork's MSRV is now 1.88, below the SDK's 1.89
+  floor. Equivalent divisibility/chunk operations and short-circuit let chains
+  retain strict Clippy checks at this MSRV; protocol guards and their evaluation
+  order are unchanged.
+
 - The explicit mutual-certificate SCTP profile supports a bounded RFC 6066
   server name. It emits and validates a single host_name/empty acknowledgement,
   keeps the configured name through rekey, and rejects missing, malformed,

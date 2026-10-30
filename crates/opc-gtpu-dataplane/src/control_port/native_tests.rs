@@ -3,7 +3,7 @@
 use super::*;
 use crate::GtpuReassemblySocket;
 use std::{
-    net::{Ipv4Addr, UdpSocket},
+    net::{Ipv4Addr, SocketAddrV4, UdpSocket},
     time::{Duration, Instant},
 };
 
@@ -44,13 +44,36 @@ fn control_socket_native_preserves_tuple_budget_and_exact_socket() {
     let request = [0x32, 1, 0, 4, 0, 0, 0, 0, 0xab, 0xcd, 0, 0];
     let mut reply = [0; 1024];
     assert!(socket.try_receive_datagram(1024).unwrap().is_none());
+    assert_eq!(
+        socket
+            .send_echo_request(destination.into(), service.local_addr().unwrap(), 0xabcd)
+            .unwrap(),
+        request.len()
+    );
+    let (n, from) = service.recv_from(&mut reply).unwrap();
+    assert_eq!(from, SocketAddr::from(destination));
+    assert_eq!(&reply[..n], request);
+    let response = [0x32, 2, 0, 6, 0, 0, 0, 0, 0xab, 0xcd, 0, 0, 14, 0];
+    service.send_to(&response, from).unwrap();
+    let echo_response = receive(&socket, 1024);
+    assert_eq!(echo_response.sequence_number(), Some(0xabcd));
+    assert_eq!(
+        echo_response.echo_response(budget).unwrap_err(),
+        GtpuControlPortError::WrongProcedure
+    );
+    assert_eq!(
+        other.send_echo_request(destination.into(), service.local_addr().unwrap(), 1),
+        Err(GtpuControlPortError::InvalidTuple)
+    );
+    assert_eq!(
+        socket.send_echo_request(destination.into(), peer.local_addr().unwrap(), 1),
+        Err(GtpuControlPortError::InvalidTuple)
+    );
+    assert!(service.recv_from(&mut reply).is_err());
     peer.send_to(&request, destination).unwrap();
     let event = receive(&socket, 1024);
-    assert_eq!(event.local(), destination);
-    assert_eq!(
-        std::net::SocketAddr::V4(event.peer()),
-        peer.local_addr().unwrap()
-    );
+    assert_eq!(event.local(), SocketAddr::V4(destination));
+    assert_eq!(event.peer(), peer.local_addr().unwrap());
     assert_eq!(
         event.provenance().ingress_ifindex(),
         socket.ingress_ifindex()
@@ -189,6 +212,11 @@ fn control_socket_native_preserves_tuple_budget_and_exact_socket() {
         socket.try_receive_datagram(1024),
         Err(GtpuControlPortError::Io { .. })
     ));
+    assert!(matches!(
+        socket.send_echo_request(destination.into(), service.local_addr().unwrap(), 1),
+        Err(GtpuControlPortError::Io { .. })
+    ));
+    assert!(service.recv_from(&mut reply).is_err());
     assert!(peer.recv_from(&mut reply).is_err());
     println!("native shared GTP-U control socket: exact tuple, bounded response, required extension, single queue verified");
 }

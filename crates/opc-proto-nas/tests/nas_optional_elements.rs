@@ -179,7 +179,7 @@ fn length_variant(ie: &Ie, total: usize) -> Vec<u8> {
 }
 
 #[test]
-fn every_table_length_bound_is_enforced_under_strict_and_procedure_aware() {
+fn table_minima_are_enforced_and_extensions_ignored_under_strict_and_procedure_aware() {
     for message in fixtures::MESSAGES {
         for ie in message.ies.iter().filter(|ie| ie.header_len > 1) {
             for level in [ValidationLevel::Strict, ValidationLevel::ProcedureAware] {
@@ -216,13 +216,13 @@ fn every_table_length_bound_is_enforced_under_strict_and_procedure_aware() {
                 let physical_max = if ie.header_len == 2 { 257 } else { 65538 };
                 if ie.max_len < physical_max {
                     let wire = length_variant(ie, ie.max_len + 1);
-                    assert_eq!(
+                    let decoded =
                         decode_mm_message_body(message.kind, &body_with(message, &wire), ctx)
-                            .unwrap_err(),
-                        invalid_length(0, ie.section),
-                        "kind={:02x} ie={:02x} above maximum",
-                        message.kind,
-                        ie.wire[0],
+                            .unwrap();
+                    assert_eq!(optional_ies(&decoded)[0].raw.as_ref(), wire);
+                    assert_eq!(
+                        optional_ies(&decoded)[0].value.len(),
+                        ie.max_len - ie.header_len
                     );
                 }
             }
@@ -315,14 +315,14 @@ fn every_registered_ie_rejects_duplicates_including_different_half_octet_values(
 }
 
 #[test]
-fn half_octet_duplicate_first_and_last_policies_preserve_the_selected_wire_value() {
+fn half_octet_duplicates_preserve_the_first_wire_value_for_both_receiver_policies() {
     for message in fixtures::MESSAGES {
         for ie in message.ies.iter().filter(|ie| ie.wire[0] >= 0x80) {
             let first = ie.wire[0];
             let last = first ^ 0x0f;
             for (policy, wanted) in [
                 (DuplicateIePolicy::First, first),
-                (DuplicateIePolicy::Last, last),
+                (DuplicateIePolicy::Last, first),
             ] {
                 let ctx = DecodeContext {
                     duplicate_ie_policy: policy,
@@ -357,21 +357,68 @@ fn fixture_contains(message: &Message, octet: u8) -> bool {
 }
 
 #[test]
+fn receiver_rules_apply_to_every_optional_table_at_every_validation_level() {
+    for message in fixtures::MESSAGES {
+        for level in [
+            ValidationLevel::HeaderOnly,
+            ValidationLevel::Structural,
+            ValidationLevel::Strict,
+            ValidationLevel::ProcedureAware,
+        ] {
+            let ctx = DecodeContext {
+                validation_level: level,
+                max_message_len: 70_000,
+                ..DecodeContext::default()
+            };
+            for ie in message.ies {
+                let mut wire = ie.wire.to_vec();
+                let mut second = ie.wire.to_vec();
+                if ie.header_len == 1 || second.len() > ie.header_len {
+                    *second.last_mut().unwrap() ^= 1;
+                }
+                wire.extend_from_slice(&second);
+                let decoded =
+                    decode_mm_message_body(message.kind, &body_with(message, &wire), ctx).unwrap();
+                assert_eq!(optional_ies(&decoded).len(), 1);
+                assert_eq!(optional_ies(&decoded)[0].raw.as_ref(), ie.wire);
+                let physical_max = if ie.header_len == 2 { 257 } else { 65538 };
+                if ie.header_len > 1 && ie.max_len < physical_max {
+                    let extended = length_variant(ie, ie.max_len + 1);
+                    let decoded =
+                        decode_mm_message_body(message.kind, &body_with(message, &extended), ctx)
+                            .unwrap();
+                    assert_eq!(
+                        optional_ies(&decoded)[0].value.len(),
+                        ie.max_len - ie.header_len
+                    );
+                    assert_eq!(optional_ies(&decoded)[0].raw.as_ref(), extended);
+                }
+            }
+            // TS 24.501 R19 adds these non-critical elements to older tables.
+            for wire in [&[0x63, 1, 0x11][..], &[0x64, 1, 0x22], &[0x81]] {
+                if fixture_contains(message, wire[0]) {
+                    continue;
+                }
+                let body = body_with(message, wire);
+                let decoded = decode_mm_message_body(message.kind, &body, ctx).unwrap();
+                assert_eq!(optional_ies(&decoded)[0].raw.as_ref(), wire);
+                let drop = DecodeContext {
+                    unknown_ie_policy: UnknownIePolicy::Drop,
+                    ..ctx
+                };
+                assert!(
+                    optional_ies(&decode_mm_message_body(message.kind, &body, drop).unwrap())
+                        .is_empty()
+                );
+            }
+        }
+    }
+}
+
+#[test]
 fn foreign_message_elements_are_rejected_under_all_rejecting_contexts() {
     let rejecting = [
         DecodeContext::conservative(),
-        DecodeContext {
-            unknown_ie_policy: UnknownIePolicy::Preserve,
-            ..DecodeContext::conservative()
-        },
-        DecodeContext {
-            unknown_ie_policy: UnknownIePolicy::Drop,
-            ..DecodeContext::conservative()
-        },
-        DecodeContext {
-            validation_level: ValidationLevel::ProcedureAware,
-            ..DecodeContext::default()
-        },
         DecodeContext {
             unknown_ie_policy: UnknownIePolicy::Reject,
             ..DecodeContext::default()
@@ -436,7 +483,7 @@ fn unknown_half_octet_duplicates_use_the_high_nibble_in_permissive_contexts() {
     let wire = [0x80, 0x91, 0x8f];
     for (policy, expected) in [
         (DuplicateIePolicy::First, [0x80, 0x91]),
-        (DuplicateIePolicy::Last, [0x91, 0x8f]),
+        (DuplicateIePolicy::Last, [0x80, 0x91]),
     ] {
         let ctx = DecodeContext {
             duplicate_ie_policy: policy,
@@ -511,6 +558,7 @@ fn every_full_octet_identifier_outside_the_table_is_rejected_by_rejecting_contex
         DecodeContext::conservative(),
         DecodeContext {
             validation_level: ValidationLevel::ProcedureAware,
+            unknown_ie_policy: UnknownIePolicy::Reject,
             ..DecodeContext::default()
         },
         DecodeContext {
@@ -568,6 +616,45 @@ fn unknown_comprehension_required_identifiers_fail_closed_in_all_six_bodies() {
 }
 
 #[test]
+fn unknown_critical_elements_after_a_valid_prefix_report_the_exact_offset_at_every_level() {
+    // TS 24.501 §§7.5.1/7.6.1 and TS 24.007 §§11.2.4/11.2.5: a
+    // comprehension-required IE remains an error even in HeaderOnly decoding.
+    for message in fixtures::MESSAGES {
+        // Configuration Update Complete has no known optional IEs. A permitted
+        // non-critical unknown TLV provides the preceding element in that body.
+        let prefix = message.ies.first().map_or(&[0x4d, 0][..], |ie| ie.wire);
+        for validation_level in [
+            ValidationLevel::HeaderOnly,
+            ValidationLevel::Structural,
+            ValidationLevel::Strict,
+            ValidationLevel::ProcedureAware,
+        ] {
+            for unknown_ie_policy in [UnknownIePolicy::Preserve, UnknownIePolicy::Drop] {
+                let ctx = DecodeContext {
+                    validation_level,
+                    unknown_ie_policy,
+                    ..DecodeContext::default()
+                };
+                assert!(
+                    decode_mm_message_body(message.kind, &body_with(message, prefix), ctx).is_ok()
+                );
+                for critical in (0..=0x0f).chain([0x7e, 0x7f]) {
+                    let mut optional = prefix.to_vec();
+                    optional.extend_from_slice(&[critical, 0, 0]);
+                    assert_eq!(
+                        decode_mm_message_body(message.kind, &body_with(message, &optional), ctx)
+                            .unwrap_err(),
+                        expected_error(DecodeErrorCode::UnknownCriticalIe, prefix.len(), "7.5"),
+                        "kind={:02x} ie={critical:02x} ctx={ctx:?}",
+                        message.kind,
+                    );
+                }
+            }
+        }
+    }
+}
+
+#[test]
 fn same_identifier_uses_the_selected_messages_length_bounds() {
     // LADN information permits an empty value in Configuration update command,
     // but Registration accept requires at least ten value octets.
@@ -610,15 +697,14 @@ fn same_identifier_uses_the_selected_messages_length_bounds() {
         .len(),
         1
     );
-    assert_eq!(
-        decode_mm_message_body(
-            0x5d,
-            &body_with(&fixtures::SECURITY_COMMAND, &long_pei),
-            DecodeContext::conservative()
-        )
-        .unwrap_err(),
-        invalid_length(0, "9.11.2.2"),
-    );
+    let decoded = decode_mm_message_body(
+        0x5d,
+        &body_with(&fixtures::SECURITY_COMMAND, &long_pei),
+        DecodeContext::conservative(),
+    )
+    .unwrap();
+    assert_eq!(optional_ies(&decoded)[0].value.len(), 1500);
+    assert_eq!(optional_ies(&decoded)[0].raw.as_ref(), long_pei);
 }
 
 #[test]

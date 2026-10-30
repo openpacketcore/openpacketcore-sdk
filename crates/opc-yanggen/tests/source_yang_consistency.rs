@@ -75,6 +75,10 @@ fn system_ordered_models_keep_all_generated_file_digests() {
     // and #1272 bounded NETCONF content projection. Every generated
     // file stays pinned across the four source models.
     // All pins also include #1274 generated-lint repairs and shared statement formatting.
+    // #1363 pins follow byte-verified baselines: exact decimal64 codecs/types
+    // and RFC 6243 trim semantics. All complete-file assertions remain.
+    // RFC 6241 existence-error pins were reverified before the correction; only
+    // netconf_xml_edit.rs changes, with all thirteen full-file checks retained.
     // base/gnmi_json.rs: #1269 authorized sensitive keys and #1270 XPath literals.
     // comments/gnmi_json.rs: #1269 authorized sensitive keys and #1270 XPath literals.
     // enum/gnmi_json.rs: #1270 shared literal predicate construction.

@@ -3920,6 +3920,9 @@ where
 
 #[cfg(test)]
 mod tests {
+    #[path = "restore_scan_deadline_tests.rs"]
+    mod restore_scan_deadline_tests;
+
     use super::*;
     use crate::protocol::{
         ensure_frame_fits, ensure_restore_scan_success_frame_fits, read_frame, write_frame,

@@ -61,6 +61,7 @@ pub struct TlsBootstrap {
     peer_policy: PeerPolicy,
     alpn_protocols: Vec<Vec<u8>>,
     compat_tls12: bool,
+    legacy_dhe_rsa: bool,
 }
 
 impl TlsBootstrap {
@@ -72,6 +73,7 @@ impl TlsBootstrap {
             peer_policy,
             alpn_protocols: Vec::new(),
             compat_tls12: false,
+            legacy_dhe_rsa: false,
         }
     }
 
@@ -82,10 +84,20 @@ impl TlsBootstrap {
         self
     }
 
-    /// Enables TLS 1.2 alongside TLS 1.3. This is the explicit compatibility
-    /// opt-in the spec requires; the default (off) is TLS 1.3 only.
+    /// Enable TLS 1.2 ECDHE AEAD suites alongside preferred TLS 1.3.
+    /// Both TLS 1.2 roles require Extended Master Secret. The default is TLS
+    /// 1.3 only; legacy DHE requires [`Self::with_legacy_dhe_rsa`] as well.
     pub fn with_tls12_compat(mut self, enabled: bool) -> Self {
         self.compat_tls12 = enabled;
+        self
+    }
+
+    /// Permit legacy TLS 1.2 DHE-RSA when [`Self::with_tls12_compat`] is enabled.
+    ///
+    /// This explicit Release 18 exception is prohibited by RFC 10015 and the
+    /// TS 33.210 Release 19 cipher policy targeted by the defaults.
+    pub fn with_legacy_dhe_rsa(mut self, enabled: bool) -> Self {
+        self.legacy_dhe_rsa = enabled;
         self
     }
 
@@ -112,7 +124,8 @@ impl TlsBootstrap {
 
         let mut builder = TlsConfigBuilder::new(identity)
             .with_policy(self.peer_policy)
-            .with_compat_mode(self.compat_tls12);
+            .with_compat_mode(self.compat_tls12)
+            .with_legacy_dhe_rsa(self.legacy_dhe_rsa);
         if unconstrained {
             builder = builder.allow_any_trusted_peer();
         }
@@ -260,6 +273,44 @@ mod tests {
             .with_alpn([vec![b'a'; MAX_ALPN_PROTOCOL_LEN + 1]])
             .build_server_config(no_identity());
         assert_eq!(oversized.err(), Some(TransportError::InvalidAlpnProtocol));
+    }
+
+    #[test]
+    fn review_management_tls12_compatibility_excludes_legacy_dhe() {
+        let config = TlsBootstrap::new(RuntimeMode::Production, constrained_policy())
+            .with_tls12_compat(true)
+            .build_server_config(no_identity())
+            .unwrap();
+        assert!(config.require_ems);
+        assert!(config
+            .crypto_provider()
+            .kx_groups
+            .iter()
+            .all(|group| !(256..512).contains(&u16::from(group.name()))));
+    }
+
+    #[test]
+    fn review_management_legacy_dhe_is_separate_and_reversible() {
+        for (compatibility, legacy, expected) in [
+            (false, true, false),
+            (true, true, true),
+            (true, false, false),
+        ] {
+            let config = TlsBootstrap::new(RuntimeMode::Production, constrained_policy())
+                .with_tls12_compat(compatibility)
+                .with_legacy_dhe_rsa(legacy)
+                .build_server_config(no_identity())
+                .unwrap();
+            assert_eq!(
+                config
+                    .crypto_provider()
+                    .kx_groups
+                    .iter()
+                    .any(|group| (256..512).contains(&u16::from(group.name()))),
+                expected
+            );
+            assert_eq!(config.require_ems, compatibility);
+        }
     }
 
     #[test]

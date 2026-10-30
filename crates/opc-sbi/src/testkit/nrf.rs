@@ -258,13 +258,13 @@ impl MockNrf {
                 query
                     .plmn
                     .as_ref()
-                    .is_none_or(|plmn| p.plmn_list.contains(plmn))
+                    .is_none_or(|plmn| p.plmn_list.iter().any(|value| &value.0 == plmn))
             })
             .filter(|p| {
                 query
                     .s_nssai
                     .as_ref()
-                    .is_none_or(|snssai| p.s_nssais.contains(snssai))
+                    .is_none_or(|snssai| p.s_nssais.iter().any(|value| &value.0 == snssai))
             })
             .filter(|p| {
                 // If the query requests specific services, the NF must advertise at least one.
@@ -273,13 +273,15 @@ impl MockNrf {
                 }
                 p.nf_services
                     .iter()
-                    .any(|svc| requested_services.contains(svc.as_str()))
+                    .any(|svc| requested_services.contains(svc.service_name.as_str()))
             })
             .cloned()
             .collect();
 
         if matches.is_empty() {
-            return DiscoveryResult::NotFound;
+            return DiscoveryResult::NotFound {
+                valid_for: Duration::MAX,
+            };
         }
 
         // Sort by priority ascending, then capacity descending.
@@ -289,7 +291,10 @@ impl MockNrf {
                 .then_with(|| b.capacity.cmp(&a.capacity))
         });
 
-        DiscoveryResult::Found(matches)
+        DiscoveryResult::Found {
+            profiles: matches,
+            valid_for: Duration::MAX,
+        }
     }
 
     /// Pre-configure a discovery response for a specific query key.
@@ -396,6 +401,21 @@ impl TokenFixture {
     }
 }
 
+/// Build a deterministic v1 HTTPS service fixture for the mock NRF.
+pub fn test_service(name: &str) -> crate::nrf::NfService {
+    crate::nrf::NfService::new(
+        format!("test-{name}"),
+        name.into(),
+        vec![crate::nrf::NfServiceVersion {
+            api_version_in_uri: "v1".into(),
+            api_full_version: "1.0.0".into(),
+            expiry: None,
+        }],
+        "https".into(),
+        crate::nrf::NfServiceStatus::Registered,
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -409,8 +429,8 @@ mod tests {
             nf_status: NfStatus::Registered,
             ipv4_addresses: vec!["10.0.0.1".into()],
             fqdn: None,
-            plmn_list: vec![PlmnId::new("001", "01").unwrap()],
-            s_nssais: vec![Snssai::new(1, Some("010203")).unwrap()],
+            plmn_list: vec![PlmnId::new("001", "01").unwrap().into()],
+            s_nssais: vec![Snssai::new(1, Some("010203")).unwrap().into()],
             nf_services: vec![],
             priority,
             capacity,
@@ -424,9 +444,12 @@ mod tests {
             nf_status: NfStatus::Registered,
             ipv4_addresses: vec!["10.0.0.1".into()],
             fqdn: None,
-            plmn_list: vec![PlmnId::new("001", "01").unwrap()],
-            s_nssais: vec![Snssai::new(1, Some("010203")).unwrap()],
-            nf_services: services.iter().map(|s| s.to_string()).collect(),
+            plmn_list: vec![PlmnId::new("001", "01").unwrap().into()],
+            s_nssais: vec![Snssai::new(1, Some("010203")).unwrap().into()],
+            nf_services: services
+                .iter()
+                .map(|s| crate::testkit::nrf::test_service(s))
+                .collect(),
             priority: 10,
             capacity: 100,
         }
@@ -511,6 +534,7 @@ mod tests {
 
         let query = DiscoveryQuery {
             target_nf_type: NfType::new("amf").unwrap(),
+            requester_nf_type: NfType::new("smf").unwrap(),
             requester_nf_instance_id: None,
             plmn: Some(PlmnId::new("001", "01").unwrap()),
             s_nssai: None,
@@ -519,7 +543,7 @@ mod tests {
 
         let result = nrf.discover(&query);
         match result {
-            DiscoveryResult::Found(profiles) => {
+            DiscoveryResult::Found { profiles, .. } => {
                 assert_eq!(profiles.len(), 2);
                 // Lower priority first, then higher capacity.
                 assert_eq!(profiles[0].nf_instance_id.as_str(), "amf-02");
@@ -550,13 +574,14 @@ mod tests {
         // Query for NAMF-COMM should return both AMFs.
         let query_comm = DiscoveryQuery {
             target_nf_type: NfType::new("amf").unwrap(),
+            requester_nf_type: NfType::new("smf").unwrap(),
             requester_nf_instance_id: None,
             plmn: Some(PlmnId::new("001", "01").unwrap()),
             s_nssai: None,
             service_names: vec!["namf-comm".into()],
         };
         match nrf.discover(&query_comm) {
-            DiscoveryResult::Found(profiles) => {
+            DiscoveryResult::Found { profiles, .. } => {
                 assert_eq!(profiles.len(), 2);
             }
             other => panic!("expected Found 2 AMFs, got {other:?}"),
@@ -565,13 +590,14 @@ mod tests {
         // Query for NAMF-MT should return only amf-01.
         let query_mt = DiscoveryQuery {
             target_nf_type: NfType::new("amf").unwrap(),
+            requester_nf_type: NfType::new("smf").unwrap(),
             requester_nf_instance_id: None,
             plmn: Some(PlmnId::new("001", "01").unwrap()),
             s_nssai: None,
             service_names: vec!["namf-mt".into()],
         };
         match nrf.discover(&query_mt) {
-            DiscoveryResult::Found(profiles) => {
+            DiscoveryResult::Found { profiles, .. } => {
                 assert_eq!(profiles.len(), 1);
                 assert_eq!(profiles[0].nf_instance_id.as_str(), "amf-01");
             }
@@ -581,13 +607,14 @@ mod tests {
         // Query for NSMF-PDUSESSION with target NF type SMF should return smf-01.
         let query_smf = DiscoveryQuery {
             target_nf_type: NfType::smf(),
+            requester_nf_type: NfType::new("smf").unwrap(),
             requester_nf_instance_id: None,
             plmn: Some(PlmnId::new("001", "01").unwrap()),
             s_nssai: None,
             service_names: vec!["nsmf-pdusession".into()],
         };
         match nrf.discover(&query_smf) {
-            DiscoveryResult::Found(profiles) => {
+            DiscoveryResult::Found { profiles, .. } => {
                 assert_eq!(profiles.len(), 1);
                 assert_eq!(profiles[0].nf_instance_id.as_str(), "smf-01");
             }
@@ -597,12 +624,18 @@ mod tests {
         // Query for a non-existent service should return NotFound.
         let query_missing = DiscoveryQuery {
             target_nf_type: NfType::new("amf").unwrap(),
+            requester_nf_type: NfType::new("smf").unwrap(),
             requester_nf_instance_id: None,
             plmn: Some(PlmnId::new("001", "01").unwrap()),
             s_nssai: None,
             service_names: vec!["nbsf-management".into()],
         };
-        assert_eq!(nrf.discover(&query_missing), DiscoveryResult::NotFound);
+        assert_eq!(
+            nrf.discover(&query_missing),
+            DiscoveryResult::NotFound {
+                valid_for: Duration::MAX
+            }
+        );
     }
 
     #[test]
@@ -610,6 +643,7 @@ mod tests {
         let nrf = MockNrf::new();
         let query = DiscoveryQuery {
             target_nf_type: NfType::new("nrf").unwrap(),
+            requester_nf_type: NfType::new("smf").unwrap(),
             requester_nf_instance_id: None,
             plmn: None,
             s_nssai: None,
@@ -637,6 +671,7 @@ mod tests {
 
         let query = DiscoveryQuery {
             target_nf_type: NfType::new("amf").unwrap(),
+            requester_nf_type: NfType::new("smf").unwrap(),
             requester_nf_instance_id: None,
             plmn: None,
             s_nssai: None,

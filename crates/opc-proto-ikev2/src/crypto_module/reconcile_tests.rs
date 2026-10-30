@@ -455,7 +455,13 @@ pub(super) fn monitor(module: &CountingModule) {
                 )
                 .unwrap();
             assert_eq!(
-                &prepared.record().outbound().unwrap().request()[32..40],
+                &prepared
+                    .record()
+                    .outbound()
+                    .unwrap()
+                    .request()
+                    .single_packet()
+                    .unwrap()[32..40],
                 &5_u64.to_be_bytes()
             );
             drop(prepared);

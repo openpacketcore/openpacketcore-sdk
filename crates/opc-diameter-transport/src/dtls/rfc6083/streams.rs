@@ -7,6 +7,7 @@ use super::super::{parse_dtls_record_bounds, DiameterTlsError, SctpUserMessage};
 pub(in crate::dtls) struct RecordStreams {
     count: u16,
     capacity: usize,
+    allow_unordered_application: bool,
     pending: BTreeMap<(u16, u64), u16>,
     pub(in crate::dtls) outbound: u16,
 }
@@ -22,9 +23,22 @@ impl RecordStreams {
         Self {
             count,
             capacity,
+            allow_unordered_application: false,
             pending: BTreeMap::new(),
             outbound: 0,
         }
+    }
+
+    pub(in crate::dtls) fn diameter(capacity: usize) -> Self {
+        // RFC 6733 accepts any peer-selected stream; SCTP enforces negotiation.
+        Self {
+            allow_unordered_application: true,
+            ..Self::new(u16::MAX, capacity)
+        }
+    }
+
+    pub(in crate::dtls) fn allows_unordered_application(&self) -> bool {
+        self.allow_unordered_application
     }
 
     pub(in crate::dtls) fn count(&self) -> u16 {
@@ -155,7 +169,8 @@ mod tests {
                 columns[4] == "control",
                 columns[4] == "notification",
             );
-            let result = crate::dtls::validate_received_record_on_streams(&message, 66, count);
+            let result =
+                crate::dtls::validate_received_record_on_streams(&message, 66, count, false);
             let actual = match result {
                 Ok(_) => "framing-admitted".to_owned(),
                 Err(error) => crate::rfc6083::Error::from(error).to_string(),

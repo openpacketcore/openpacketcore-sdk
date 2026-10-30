@@ -542,7 +542,7 @@ async fn concurrent_child_progress(
     let mut sibling_context = lab.child.entries()[0].context().clone();
     sibling_context.ms_address = lab.sibling.entries()[0].context().ms_address;
     sibling_context.local_teid = Teid::new(0x2001).unwrap();
-    sibling_context.peer_teid = crate::PeerTeid::new(0x2002);
+    sibling_context.peer_teid = Teid::new(0x2002).unwrap().into();
     let sibling_child = GtpuSessionGroup::new(
         GtpuSessionGroupId::new([4; 16]).unwrap(),
         lab.sibling.device_id(),
@@ -767,7 +767,9 @@ async fn durable_bearer_phase_profile(concurrent: bool, active_parent: bool) {
         let children: [GtpuSessionGroup; 2] = std::array::from_fn(|index| {
             let mut context = parents[index].entries()[0].context().clone();
             context.local_teid = Teid::new(0x2000 + u32::from(cycle) * 2 + index as u32).unwrap();
-            context.peer_teid = crate::PeerTeid::new(0x4000 + u32::from(cycle) * 2 + index as u32);
+            context.peer_teid = Teid::new(0x4000 + u32::from(cycle) * 2 + index as u32)
+                .unwrap()
+                .into();
             context.bearer_mark = Some(crate::GtpBearerMark::new(6).unwrap());
             GtpuSessionGroup::new(
                 GtpuSessionGroupId::new([3 + cycle * 2 + index as u8; 16]).unwrap(),

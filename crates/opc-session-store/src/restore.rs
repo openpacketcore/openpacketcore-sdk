@@ -24,6 +24,19 @@ use crate::{
     StoredSessionRecord,
 };
 
+pub(crate) fn record_scan_failure(
+    error: &StoreError,
+    phase: &'static str,
+    started: std::time::Instant,
+) {
+    tracing::warn!(
+        failure_variant = error.variant_name(),
+        phase,
+        elapsed_millis = started.elapsed().as_millis(),
+        "session restore scan failed"
+    );
+}
+
 /// Default maximum restore scan page size.
 pub const RESTORE_SCAN_DEFAULT_PAGE_SIZE: usize = 256;
 

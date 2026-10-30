@@ -1,0 +1,1 @@
+{"cryptography": "49.0.0", "fixture_sha256": "4665a102384dc0d852a6aed61dc8e3872b26f82b6c26a9d4644938121d7a6cf4", "mutated_packets_rejected": 6456, "openssl": "OpenSSL 4.0.1 9 Jun 2026", "python": "3.14.5", "reference_sha256": "791b4428914a6e0770bc8e00a1f63f2257bb584bc8906bfe7e2da827ce6a22e6", "sdk_export_verified": true, "vectors": 12}

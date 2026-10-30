@@ -236,6 +236,14 @@ synthetic schedules, native checks and N2 support limits.
 
 ### Multihoming path events and health
 
+Bounded static address sets may mix IPv4 and IPv6. Every set still shares one
+port and cannot combine wildcard and concrete addresses. A configured local
+set must share at least one IP family with the remote set. Mixed sets select
+an explicitly dual-stack socket regardless of the first address or the host's
+`bindv6only` default; single-family socket policy remains unchanged. IPv4-mapped
+readback and notifications identify the same path as native IPv4, while port
+and nonzero IPv6 scope remain significant.
+
 `SctpAssociation::recv` returns notifications in wire order through
 `InboundMessage::event`. Linux `SCTP_PEER_ADDR_CHANGE` notifications decode to
 `SctpEvent::PeerAddrChange`, including the typed transition, kernel error, and
@@ -357,6 +365,19 @@ negotiate AUTH. FORWARD-TSN authentication is an explicit addition for a
 caller using partial reliability. Ordinary `bind` and `connect` remain
 unchanged and do not enable these requirements.
 
+`SctpAuthenticationConfig::data().with_sha256_preference()` requests HMAC IDs
+`[3, 1]`: SHA-256 first, followed by RFC 4895's mandatory SHA-1 fallback.
+Failure to configure or read back that exact order rejects setup. Without
+the option, kernel preference is retained. Local authenticated-chunk readback
+is checked before bind/connect and after association establishment, and is
+available through `SctpAssociation::local_authenticated_chunks()`.
+
+HMAC preference is verified on the endpoint before listen/connect. Linux
+`accept` creates a fresh endpoint whose `SCTP_HMAC_IDENT` reports defaults,
+not the established association's inherited list. It must not be used to
+infer or change that association's negotiation. Association-specific local
+and peer chunk requirements are still verified after acceptance.
+
 An RFC 6083 exporter result is admitted only through the exact-width helper:
 
 ```rust,no_run
@@ -408,6 +429,22 @@ This API is a prerequisite for RFC 6083 DTLS/SCTP shutdown and key changes; it
 is not DTLS. It does not derive exporter keys, validate certificates or peer
 identity, carry DTLS records, emit PPID 47, or satisfy protected-Diameter
 readiness by itself.
+
+`association.abort_handle().abort_on_wire()` performs RFC 6458 section 8.1.4
+abortive close on Linux. It discards queued DATA and closes the owned descriptor
+synchronously, including while other handles or pending I/O futures remain
+alive. It emits the kernel's User-Initiated Abort cause without custom text.
+The legacy `abort()` operation uses SHUT_RDWR and initiates graceful SCTP
+shutdown. Normal drop also lets the kernel drain queued sends; neither path
+promises delivery through a peer or network failure. Applications can use the
+existing sender-dry barrier when they need confirmation of prior send drain.
+The DTLS Diameter adapter uses wire ABORT for unparseable fixed Diameter
+framing in protected receivers and both cleartext prelude roles, and retains
+reciprocal close-notify for normal close. `DiameterSctpAssociation::abort_handle`
+exposes the same close authority to unprotected Diameter callers. That facade
+validates SCTP metadata and returns opaque payload bytes; the caller owns
+Diameter parsing and must invoke `abort_on_wire` for an unparseable frame.
+Its sends use ordered stream zero, and its receive API omits stream metadata.
 
 ### Legacy Diameter PPID 0 interoperability
 

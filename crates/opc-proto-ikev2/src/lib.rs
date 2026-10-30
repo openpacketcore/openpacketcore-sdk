@@ -240,10 +240,13 @@ pub use ike_auth_signature::{
     compute_ike_auth_signature, verify_ike_auth_signature, verify_local_ike_auth_signature,
     Ikev2LocalAuthSelfVerificationAuthorization, Ikev2SignatureAuthKey, Ikev2SignatureAuthMethod,
     Ikev2SignatureKeyError, Ikev2SignaturePublicKey, IKEV2_AUTH_METHOD_DIGITAL_SIGNATURE,
-    IKEV2_AUTH_METHOD_RSA_DIGITAL_SIGNATURE, RFC7427_ALGORITHM_IDENTIFIER_ECDSA_SHA2_256,
-    RFC7427_ALGORITHM_IDENTIFIER_ECDSA_SHA2_384, RFC7427_ALGORITHM_IDENTIFIER_RSA_PSS_SHA2_256,
+    IKEV2_AUTH_METHOD_ECDSA_SHA2_256, IKEV2_AUTH_METHOD_ECDSA_SHA2_384,
+    IKEV2_AUTH_METHOD_ECDSA_SHA2_512, IKEV2_AUTH_METHOD_RSA_DIGITAL_SIGNATURE,
+    RFC7427_ALGORITHM_IDENTIFIER_ECDSA_SHA2_256, RFC7427_ALGORITHM_IDENTIFIER_ECDSA_SHA2_384,
+    RFC7427_ALGORITHM_IDENTIFIER_ECDSA_SHA2_512, RFC7427_ALGORITHM_IDENTIFIER_RSA_PSS_SHA2_256,
     RFC7427_ALGORITHM_IDENTIFIER_RSA_PSS_SHA2_384, RFC7427_ALGORITHM_IDENTIFIER_RSA_PSS_SHA2_512,
-    RFC7427_ALGORITHM_IDENTIFIER_RSA_SHA2_256,
+    RFC7427_ALGORITHM_IDENTIFIER_RSA_SHA2_256, RFC8420_ALGORITHM_IDENTIFIER_ED25519,
+    RFC8420_ALGORITHM_IDENTIFIER_ED448,
 };
 pub use ike_sa_rekey::{
     build_ike_sa_rekey_request, build_ike_sa_rekey_response, decode_ike_sa_rekey_request,
@@ -336,10 +339,10 @@ pub use pre_admission::{
     IKEV2_PRE_ADMISSION_PKCS8_DER_MAX_LEN,
 };
 pub use protected_payload_crypto::{
-    decrypt_ikev2_sa_init_protected_payload, ikev2_aes_cbc_padding_len,
-    ikev2_aes_cbc_protected_body_len, ikev2_aes_cbc_protected_payload_len,
-    ikev2_aes_gcm_protected_body_len, ikev2_aes_gcm_protected_payload_len,
-    seal_ikev2_sa_init_aes_cbc_protected_payload,
+    decrypt_ikev2_sa_init_protected_payload, ikev2_aead_protected_body_len,
+    ikev2_aead_protected_payload_len, ikev2_aes_cbc_padding_len, ikev2_aes_cbc_protected_body_len,
+    ikev2_aes_cbc_protected_payload_len, ikev2_aes_gcm_protected_body_len,
+    ikev2_aes_gcm_protected_payload_len, seal_ikev2_sa_init_aes_cbc_protected_payload,
     seal_ikev2_sa_init_aes_cbc_protected_payload_with_iv_for_test_vector,
     seal_ikev2_sa_init_aes_cbc_protected_payload_with_rng, seal_ikev2_sa_init_protected_payload,
     seal_ikev2_sa_init_protected_payload_with_iv_counter, Ikev2AesGcmExplicitIvCounter,

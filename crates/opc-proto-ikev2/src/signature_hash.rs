@@ -92,7 +92,10 @@ impl Ikev2SignatureHashAlgorithm {
     /// algorithm to be admitted by the installed process crypto module.
     #[must_use]
     pub const fn is_sdk_supported(self) -> bool {
-        matches!(self, Self::Sha2_256 | Self::Sha2_384)
+        matches!(
+            self,
+            Self::Sha2_256 | Self::Sha2_384 | Self::Sha2_512 | Self::Identity
+        )
     }
 
     fn from_wire(value: u16) -> Result<Self, Ikev2SignatureHashNegotiationError> {
@@ -768,13 +771,25 @@ fn signature_algorithms_for_hash(
 ) -> &'static [IkeSignatureAlgorithm] {
     const SHA2_256: &[IkeSignatureAlgorithm] = &[
         IkeSignatureAlgorithm::RsaPkcs1V15Sha2_256,
+        IkeSignatureAlgorithm::RsaPssSha2_256,
         IkeSignatureAlgorithm::EcdsaP256Sha2_256,
         IkeSignatureAlgorithm::EcdsaP384Sha2_256,
     ];
-    const SHA2_384: &[IkeSignatureAlgorithm] = &[IkeSignatureAlgorithm::EcdsaP384Sha2_384];
+    const SHA2_384: &[IkeSignatureAlgorithm] = &[
+        IkeSignatureAlgorithm::EcdsaP384Sha2_384,
+        IkeSignatureAlgorithm::RsaPssSha2_384,
+    ];
+    const SHA2_512: &[IkeSignatureAlgorithm] = &[
+        IkeSignatureAlgorithm::EcdsaP521Sha2_512,
+        IkeSignatureAlgorithm::RsaPssSha2_512,
+    ];
+    const IDENTITY: &[IkeSignatureAlgorithm] =
+        &[IkeSignatureAlgorithm::Ed25519, IkeSignatureAlgorithm::Ed448];
     match hash {
         Ikev2SignatureHashAlgorithm::Sha2_256 => SHA2_256,
         Ikev2SignatureHashAlgorithm::Sha2_384 => SHA2_384,
+        Ikev2SignatureHashAlgorithm::Sha2_512 => SHA2_512,
+        Ikev2SignatureHashAlgorithm::Identity => IDENTITY,
         _ => &[],
     }
 }

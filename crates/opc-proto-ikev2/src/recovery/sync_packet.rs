@@ -114,5 +114,6 @@ pub(super) fn seal_message<P: RecoveryProfile>(
         sealing,
         domain.header(Ikev2ExchangeKind::Informational, 0, response),
         PayloadChain::new(first, &cleartext),
+        None,
     )
 }

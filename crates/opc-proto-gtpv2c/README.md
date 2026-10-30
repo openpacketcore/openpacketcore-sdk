@@ -89,7 +89,9 @@ control-plane stack.
 - `decode_typed_ie_sequence` applies `DecodeContext::unknown_ie_policy` at
   every top-level and Bearer Context scope. `Drop` omits unsupported IEs from
   the typed view, `Preserve` retains byte-exact `TypedIeValue::Raw` entries,
-  and `Reject` fails with `UnknownCriticalIe`. `TypedIe::decode_from_raw`
+  and `Reject` fails with `UnknownCriticalIe`. `Reject` is diagnostic and is
+  not a conformant network-receive policy for unknown optional IEs (TS 29.274
+  §7.7.1); use `Preserve` or `Drop`. `TypedIe::decode_from_raw`
   necessarily returns one value, so callers needing omission use the sequence
   API. Neither `decode_typed_ie_sequence` nor `TypedIe::decode_sequence`
   receives a release, interface, procedure or direction, so neither can

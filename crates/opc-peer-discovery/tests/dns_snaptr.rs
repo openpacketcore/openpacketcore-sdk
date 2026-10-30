@@ -841,7 +841,7 @@ async fn rrset_ttl_is_normalized_before_filtering_and_duplicate_removal() {
         assert!(cache.finish_refresh(token, Ok(answer), now()));
         if ttl != 1 {
             let status = cache.lookup(&query().cache_key(), now());
-            assert!(matches!(status.result, DnsCachedResult::Stale { .. }));
+            assert_eq!(status.result, DnsCachedResult::Miss);
             assert!(status.retry_at.unwrap() > now());
         }
     }
@@ -1594,9 +1594,11 @@ async fn no_match_uses_existing_last_good_fencing_and_clearing_lifecycle() {
     let token = start(&mut cache, &q, time(3_000));
     assert!(cache.finish_refresh(token, response.result, time(3_000)));
     let status = cache.lookup(&q.cache_key(), time(3_000));
-    assert!(
-        matches!(status.result,DnsCachedResult::Stale{answer:ref retained,..} if retained==&answer)
-    );
+    assert!(matches!(
+        status.result,
+        DnsCachedResult::Negative(DnsError::Snaptr { .. })
+    ));
+    assert_eq!(status.fresh_until, None);
     assert_eq!(status.retry_at, Some(time(13_000)));
     assert!(matches!(
         status.last_error,
@@ -1618,6 +1620,10 @@ async fn no_match_uses_existing_last_good_fencing_and_clearing_lifecycle() {
     assert_eq!(
         cache.lookup(&q.cache_key(), time(13_000)).last_error,
         Some(DnsError::ServFail)
+    );
+    assert_eq!(
+        cache.lookup(&q.cache_key(), time(13_000)).result,
+        DnsCachedResult::Miss
     );
     let old = start(&mut cache, &q, time(60_000));
     assert!(cache.remove(&q.cache_key()));

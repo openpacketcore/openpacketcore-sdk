@@ -1,0 +1,174 @@
+Subject: [PATCH] xfrm: submit RFC 4303 dummies through a socket policy
+SPDX-License-Identifier: GPL-2.0-only
+
+Generate tunnel-mode ESP Next Header 59 on an existing SA while
+retaining normal kernel sequence allocation, encryption and lifetime
+enforcement. Only a required single ESP template may opt in through a
+per-socket policy; reject stacked transforms and hardware offload before
+output. Dummy requests cannot acquire a missing SA. Normal policies
+retain their existing behavior.
+
+Advertise the provisional OPCTFC01 ABI through GETSADINFO so callers can
+reject unpatched kernels before using the otherwise ignored policy flag.
+This local patch has not been submitted upstream.
+
+---
+--- a/include/uapi/linux/xfrm.h
++++ b/include/uapi/linux/xfrm.h
+@@ -345,6 +345,7 @@
+ 	XFRMA_SAD_UNSPEC,
+ 	XFRMA_SAD_CNT,
+ 	XFRMA_SAD_HINFO,
++	XFRMA_SAD_TFC_DUMMY, /* OPCTFC01 followed by native u32 AF mask */
+ 	__XFRMA_SAD_MAX
+ 
+ #define XFRMA_SAD_MAX (__XFRMA_SAD_MAX - 1)
+@@ -446,6 +447,7 @@
+ 	/* Automatically expand selector to include matching ICMP payloads. */
+ #define XFRM_POLICY_ICMP	2
+ #define XFRM_POLICY_CPU_ACQUIRE	4
++#define XFRM_POLICY_TFC_DUMMY	8 /* per-socket RFC 4303 dummy output */
+ 	__u8				share;
+ };
+ 
+--- a/net/xfrm/xfrm_user.c
++++ b/net/xfrm/xfrm_user.c
+@@ -1743,12 +1743,18 @@
+ {
+ 	return NLMSG_ALIGN(4)
+ 	       + nla_total_size(sizeof(struct xfrmu_sadhinfo))
+-	       + nla_total_size(4); /* XFRMA_SAD_CNT */
++	       + nla_total_size(4) /* XFRMA_SAD_CNT */
++	       + nla_total_size(12); /* XFRMA_SAD_TFC_DUMMY */
+ }
+ 
+ static int build_sadinfo(struct sk_buff *skb, struct net *net,
+ 			 u32 portid, u32 seq, u32 flags)
+ {
++	const struct {
++		char magic[8];
++		u32 families;
++	} tfc_dummy = { "OPCTFC01", (IS_ENABLED(CONFIG_INET_ESP) ? 1 : 0) |
++		(IS_ENABLED(CONFIG_INET6_ESP) ? 2 : 0) };
+ 	struct xfrmk_sadinfo si;
+ 	struct xfrmu_sadhinfo sh;
+ 	struct nlmsghdr *nlh;
+@@ -1769,6 +1775,9 @@
+ 	err = nla_put_u32(skb, XFRMA_SAD_CNT, si.sadcnt);
+ 	if (!err)
+ 		err = nla_put(skb, XFRMA_SAD_HINFO, sizeof(sh), &sh);
++	if (!err)
++		err = nla_put(skb, XFRMA_SAD_TFC_DUMMY, sizeof(tfc_dummy),
++			      &tfc_dummy);
+ 	if (err) {
+ 		nlmsg_cancel(skb, nlh);
+ 		return err;
+@@ -2248,6 +2257,10 @@
+ 	err = verify_newpolicy_info(p, extack);
+ 	if (err)
+ 		return err;
++	if (p->flags & XFRM_POLICY_TFC_DUMMY) {
++		NL_SET_ERR_MSG(extack, "TFC dummy requires a per-socket policy");
++		return -EOPNOTSUPP;
++	}
+ 	err = verify_sec_ctx_len(attrs, extack);
+ 	if (err)
+ 		return err;
+@@ -3911,6 +3924,17 @@
+ 	if (p->dir > XFRM_POLICY_OUT)
+ 		return NULL;
+ 
++	if (p->flags & XFRM_POLICY_TFC_DUMMY) {
++		if (p->flags != XFRM_POLICY_TFC_DUMMY ||
++		    p->dir != XFRM_POLICY_OUT || p->action != XFRM_POLICY_ALLOW ||
++		    p->sel.proto != IPPROTO_NONE || p->sel.sport || p->sel.dport ||
++		    p->sel.sport_mask || p->sel.dport_mask || nr != 1 ||
++		    len != sizeof(*p) + sizeof(*ut) ||
++		    ut->id.proto != IPPROTO_ESP || !ut->id.spi || ut->optional ||
++		    (ut->mode != XFRM_MODE_TRANSPORT && ut->mode != XFRM_MODE_TUNNEL))
++			return NULL;
++	}
++
+ 	xp = xfrm_policy_alloc(net, GFP_ATOMIC);
+ 	if (xp == NULL) {
+ 		*dir = -ENOBUFS;
+--- a/net/xfrm/xfrm_output.c
++++ b/net/xfrm/xfrm_output.c
+@@ -489,6 +489,39 @@
+ EXPORT_SYMBOL_GPL(pktgen_xfrm_outer_mode_output);
+ #endif
+ 
++static bool xfrm_tfc_dummy(const struct dst_entry *dst)
++{
++	const struct xfrm_dst *xdst = (const struct xfrm_dst *)dst;
++	int i;
++
++	for (i = 0; i < xdst->num_pols; i++)
++		if (xdst->pols[i]->flags & XFRM_POLICY_TFC_DUMMY)
++			return true;
++	return false;
++}
++
++/* Keep dummy traffic on the normal software ESP sequence/crypto path. */
++static bool xfrm_tfc_dummy_valid(struct sk_buff *skb, struct xfrm_state *x)
++{
++	const struct xfrm_dst *xdst = (const struct xfrm_dst *)skb_dst(skb);
++
++	if (xdst->num_pols != 1 || xdst->num_xfrms != 1 ||
++	    xfrm_dst_child(skb_dst(skb))->xfrm || x->id.proto != IPPROTO_ESP ||
++	    (x->props.mode != XFRM_MODE_TRANSPORT && x->props.mode != XFRM_MODE_TUNNEL) ||
++	    x->xso.type != XFRM_DEV_OFFLOAD_UNSPECIFIED || skb_is_gso(skb))
++		return false;
++
++	switch (skb->protocol) {
++	case htons(ETH_P_IP):
++		return ip_hdr(skb)->ihl == 5 && !ip_is_fragment(ip_hdr(skb)) &&
++		       ip_hdr(skb)->protocol == IPPROTO_NONE;
++	case htons(ETH_P_IPV6):
++		return ipv6_hdr(skb)->nexthdr == IPPROTO_NONE;
++	default:
++		return false;
++	}
++}
++
+ static int xfrm_output_one(struct sk_buff *skb, int err)
+ {
+ 	struct dst_entry *dst = skb_dst(skb);
+@@ -512,6 +545,9 @@
+ 			XFRM_INC_STATS(net, LINUX_MIB_XFRMOUTSTATEMODEERROR);
+ 			goto error_nolock;
+ 		}
++
++		if (xfrm_tfc_dummy(skb_dst(skb)))
++			*skb_mac_header(skb) = IPPROTO_NONE;
+ 
+ 		spin_lock_bh(&x->lock);
+ 
+@@ -747,6 +783,12 @@
+ 	int family;
+ 	int err;
+ 
++	if (xfrm_tfc_dummy(skb_dst(skb)) && !xfrm_tfc_dummy_valid(skb, x)) {
++		XFRM_INC_STATS(net, LINUX_MIB_XFRMOUTERROR);
++		kfree_skb(skb);
++		return -EOPNOTSUPP;
++	}
++
+ 	family = (x->xso.type != XFRM_DEV_OFFLOAD_PACKET) ? x->outer_mode.family
+ 		: skb_dst(skb)->ops->family;
+ 
+--- a/net/xfrm/xfrm_state.c
++++ b/net/xfrm/xfrm_state.c
+@@ -1496,6 +1496,12 @@
+ 	if (!(pol->flags & XFRM_POLICY_CPU_ACQUIRE) ||
+ 	    (best && (best->pcpu_num == pcpu_id)))
+ 		x = best;
++
++	/* A dummy must never request a new SA from a key manager. */
++	if (!x && (pol->flags & XFRM_POLICY_TFC_DUMMY)) {
++		error = -ESRCH;
++		goto out;
++	}
+ 
+ 	if (!x && !error && !acquire_in_progress) {
+ 		if (tmpl->id.spi &&

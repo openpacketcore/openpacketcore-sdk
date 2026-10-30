@@ -62,6 +62,137 @@ fn seed(cache: &mut DnsCache, q: &DnsQuery, ttl: u32) {
 }
 
 #[test]
+fn stale_dns_answers_expire_after_the_default_maximum_stale_timer() {
+    let mut cache = DnsCache::default();
+    let q = query("peer.example");
+    seed(&mut cache, &q, 1);
+    let token = start(&mut cache, &q, 1_000);
+    assert!(cache.finish_refresh(token, Err(DnsError::Timeout), t(1_000)));
+    assert!(matches!(
+        cache.lookup(&q.cache_key(), t(2_000)).result,
+        DnsCachedResult::Stale { .. }
+    ));
+    assert_eq!(
+        cache.lookup(&q.cache_key(), t(1_000 + 86_400_000)).result,
+        DnsCachedResult::Miss
+    );
+    assert_eq!(
+        cache
+            .lookup(&q.cache_key(), t(1_000 + 86_400_000))
+            .fresh_until,
+        None
+    );
+}
+
+#[test]
+fn authoritative_denials_replace_last_good_even_without_a_cacheable_ttl() {
+    for error in [
+        DnsError::NxDomain {
+            soa: Some(NegativeSoa::new(30, 30, t(1_000))),
+        },
+        DnsError::NoData {
+            soa: Some(NegativeSoa::new(30, 30, t(1_000))),
+        },
+        DnsError::NxDomain { soa: None },
+        DnsError::NoData { soa: None },
+        DnsError::ServiceUnavailable {
+            expires_at: t(31_000),
+        },
+    ] {
+        let mut cache = DnsCache::default();
+        let q = query("peer.example");
+        seed(&mut cache, &q, 1);
+        let token = start(&mut cache, &q, 1_000);
+        assert!(cache.finish_refresh(token, Err(error), t(1_000)));
+        let expected = if matches!(
+            error,
+            DnsError::NxDomain { soa: None } | DnsError::NoData { soa: None }
+        ) {
+            DnsCachedResult::Miss
+        } else {
+            DnsCachedResult::Negative(error)
+        };
+        assert_eq!(cache.lookup(&q.cache_key(), t(1_001)).result, expected);
+        assert_eq!(
+            cache.lookup(&q.cache_key(), t(31_000)).result,
+            DnsCachedResult::Miss
+        );
+    }
+}
+
+#[test]
+fn zero_ttl_dns_records_are_not_stored_for_later_transactions() {
+    let mut cache = DnsCache::default();
+    let q = query("peer.example");
+    seed(&mut cache, &q, 0);
+    assert_eq!(
+        cache.lookup(&q.cache_key(), t(0)).result,
+        DnsCachedResult::Miss
+    );
+}
+
+#[test]
+fn address_queries_require_host_labels_but_service_queries_allow_underscores() {
+    for invalid in [
+        "-host.example",
+        "host-.example",
+        "host._invalid",
+        "_host.example",
+        ".",
+    ] {
+        assert_eq!(
+            DnsQuery::new(input(invalid)).unwrap_err(),
+            DnsError::InvalidQuery
+        );
+    }
+    assert!(DnsQuery::new(input("3gpp.example")).is_ok());
+    assert!(DnsQuery::new(input("host-name.example")).is_ok());
+    let mut service = input("_diameter._sctp.example");
+    service.mode = ServiceDiscoveryMode::Service;
+    assert!(DnsQuery::new(service).is_ok());
+}
+
+#[test]
+fn configured_stale_limit_is_not_extended_by_failures_and_expired_slots_are_reclaimed() {
+    let q = query("peer.example");
+    let other = query("other.example");
+    let mut cache =
+        DnsCache::new(1, DnsRetryPolicy::default()).with_stale_limit(Duration::from_secs(2));
+    seed(&mut cache, &q, 1);
+    let token = start(&mut cache, &q, 1_000);
+    assert!(cache.finish_refresh(token, Err(DnsError::ServFail), t(1_000)));
+    let token = start(&mut cache, &q, 2_000);
+    assert!(cache.finish_refresh(token, Err(DnsError::Timeout), t(2_000)));
+    assert!(matches!(
+        cache.lookup(&q.cache_key(), t(2_999)).result,
+        DnsCachedResult::Stale { .. }
+    ));
+    assert_eq!(
+        cache.lookup(&q.cache_key(), t(3_000)).result,
+        DnsCachedResult::Miss
+    );
+    let retry_at = cache
+        .lookup(&q.cache_key(), t(3_000))
+        .retry_at
+        .unwrap()
+        .as_millis();
+    let _ = start(&mut cache, &other, retry_at.max(3_000));
+    assert_eq!(cache.len(), 1);
+    assert_eq!(cache.lookup(&q.cache_key(), t(4_000)).last_error, None);
+
+    let mut cache = DnsCache::default().with_stale_limit(Duration::ZERO);
+    seed(&mut cache, &q, 1);
+    assert!(matches!(
+        cache.lookup(&q.cache_key(), t(999)).result,
+        DnsCachedResult::Fresh(_)
+    ));
+    assert_eq!(
+        cache.lookup(&q.cache_key(), t(1_000)).result,
+        DnsCachedResult::Miss
+    );
+}
+
+#[test]
 fn names_are_canonical_and_every_query_dimension_separates_keys() {
     let q = query("PEER.Example.");
     assert_eq!(q.cache_key(), query("peer.example").cache_key());
@@ -150,8 +281,9 @@ fn zero_ttl_never_becomes_fresh_and_overflow_cannot_create_infinite_freshness() 
     let q = query("peer.example");
     let mut cache = DnsCache::default();
     seed(&mut cache, &q, 0);
-    assert!(
-        matches!(cache.lookup(&q.cache_key(), t(0)).result, DnsCachedResult::Stale { age, .. } if age.is_zero())
+    assert_eq!(
+        cache.lookup(&q.cache_key(), t(0)).result,
+        DnsCachedResult::Miss
     );
     assert!(matches!(
         cache
@@ -280,7 +412,7 @@ fn retries_are_bounded_jittered_and_reset_by_success() {
 }
 
 #[test]
-fn every_failure_preserves_last_good_without_time_cutoff() {
+fn transient_failures_preserve_last_good_only_within_stale_limit() {
     for error in [
         DnsError::Timeout,
         DnsError::ServFail,
@@ -289,22 +421,20 @@ fn every_failure_preserves_last_good_without_time_cutoff() {
         DnsError::SourceUnavailable,
         DnsError::Unavailable,
         DnsError::LegacyNotFound,
-        DnsError::NxDomain {
-            soa: Some(NegativeSoa::new(3, 4, t(0))),
-        },
-        DnsError::NoData {
-            soa: Some(NegativeSoa::new(3, 4, t(0))),
-        },
     ] {
         let mut cache = DnsCache::default();
         let q = query("peer.example");
         seed(&mut cache, &q, 1);
         let token = start(&mut cache, &q, 1_000);
         assert!(cache.finish_refresh(token, Err(error), t(1_000)));
-        let status = cache.lookup(&q.cache_key(), t(u64::MAX));
+        let status = cache.lookup(&q.cache_key(), t(2_000));
         assert_eq!(status.last_error, Some(error));
         assert!(
             matches!(status.result, DnsCachedResult::Stale { answer: a, .. } if a == answer(1, 0))
+        );
+        assert_eq!(
+            cache.lookup(&q.cache_key(), t(u64::MAX)).result,
+            DnsCachedResult::Miss
         );
     }
 }
@@ -375,12 +505,13 @@ fn concurrent_callers_share_one_refresh_and_completion() {
 fn abandoned_refresh_times_out_and_late_completion_cannot_replace_success() {
     let mut cache = DnsCache::default();
     let q = query("peer.example");
-    seed(&mut cache, &q, 0);
+    seed(&mut cache, &q, 1);
     let first_due = cache
         .lookup(&q.cache_key(), t(0))
-        .retry_at
+        .fresh_until
         .unwrap()
         .as_millis();
+    assert_eq!(first_due, 1_000);
     let old = start(&mut cache, &q, first_due);
     let expired_at = first_due + 1_000;
     assert!(matches!(
@@ -391,9 +522,10 @@ fn abandoned_refresh_times_out_and_late_completion_cannot_replace_success() {
     ));
     let status = cache.lookup(&q.cache_key(), t(expired_at));
     assert_eq!(status.last_error, Some(DnsError::Timeout));
+    assert_eq!(status.fresh_until, Some(t(1_000)));
     assert!(
         matches!(status.result, DnsCachedResult::Stale { answer: retained, age }
-        if retained == answer(0, 0) && age == Duration::from_millis(expired_at))
+        if retained == answer(1, 0) && age == Duration::from_millis(expired_at - 1_000))
     );
     let due = status.retry_at.unwrap().as_millis();
     let new = start(&mut cache, &q, due);

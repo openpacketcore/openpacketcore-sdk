@@ -463,6 +463,50 @@ async fn corrupt_pdr_ownership_is_malformed() {
 }
 
 #[tokio::test]
+async fn ipv6_control_observation_never_uses_ipv4_tunnel_authority() {
+    let (runtime, _backend, _authority, _group, scope) =
+        grouped_fixture(vec![grouped_v4_entry(LOCAL_TEID, 0x2001)]).await;
+    let mut counters = GtpuDownlinkCounters::default();
+    let receive = || {
+        GtpuControlDatagram::received(
+            gpdu(LOCAL_TEID, &inner_ipv4(UE, b"ipv6-observation")).into(),
+            crate::control_port::GtpuControlProvenance::new(
+                "[2001:db8::2]:2152".parse().unwrap(),
+                (ipv6_local(), 2152).into(),
+                S2BU_IFINDEX,
+            )
+            .unwrap(),
+            Arc::new(()),
+        )
+    };
+    let process = |counters: &mut GtpuDownlinkCounters| {
+        event(process_downlink_datagram(
+            runtime.as_ref(),
+            scope,
+            receive(),
+            counters,
+        ))
+    };
+    assert!(matches!(
+        process(&mut counters),
+        GtpuDownlinkEvent::UnknownTunnel(_)
+    ));
+    let mut key = [0_u8; GTPU_SESSION_DOWNLINK_KEY_LEN];
+    key[0] = 6;
+    key[1] = 4;
+    key[4..8].copy_from_slice(&LOCAL_TEID.to_be_bytes());
+    runtime
+        .state()
+        .session_downlink_index
+        .insert((S2BU_IFINDEX, key), [0x44; GTPU_SESSION_GROUP_REF_LEN]);
+    assert_eq!(
+        expect_drop(process(&mut counters)),
+        GtpuDownlinkDrop::BindingMismatch(DownlinkBindingMismatch::Invalid)
+    );
+    assert_eq!(counters.decapsulated, 0);
+}
+
+#[tokio::test]
 async fn closed_traffic_gate_and_foreign_grouped_index_fail_closed() {
     let (_backend, runtime) = ordinary_fixture(context()).await;
     runtime
@@ -2236,4 +2280,52 @@ async fn grouped_inner_ipv4_header_checksum_is_validated() {
     );
     assert_eq!(counters.decapsulated, 1);
     assert_eq!(counters.malformed, 1);
+}
+
+#[tokio::test]
+async fn reassembled_multihoming_matches_tc_peer_policy_and_other_checks() {
+    for policy in [
+        crate::GtpuPeerSourcePolicy::BackendDefault,
+        crate::GtpuPeerSourcePolicy::TeidAndLocal,
+    ] {
+        for marked in [false, true] {
+            let mut desired = context();
+            desired.downlink_peer_source_policy = policy;
+            desired.downlink_source_port_policy = crate::GtpuSourcePortPolicy::Exact(2152);
+            if marked {
+                desired.bearer_mark = GtpBearerMark::new(7);
+            }
+            let (_backend, runtime) = ordinary_fixture(desired.clone()).await;
+            let inner = inner_ipv4(UE, b"multi-home");
+            let mut counters = GtpuDownlinkCounters::default();
+            let result = event(process_downlink_datagram(
+                &*runtime,
+                ordinary_scope(),
+                datagram_from(gpdu(LOCAL_TEID, &inner), Ipv4Addr::new(192, 0, 2, 11), 2152),
+                &mut counters,
+            ));
+            if policy == crate::GtpuPeerSourcePolicy::BackendDefault {
+                assert_eq!(
+                    expect_drop(result),
+                    GtpuDownlinkDrop::BindingMismatch(DownlinkBindingMismatch::PeerAddress)
+                );
+            } else {
+                let GtpuDownlinkEvent::Decapsulated(packet) = result else {
+                    panic!("alternate source must decapsulate");
+                };
+                assert_eq!(packet.inner_packet(), inner);
+                assert_eq!(packet.bearer_mark(), desired.bearer_mark);
+                let result = event(process_downlink_datagram(
+                    &*runtime,
+                    ordinary_scope(),
+                    datagram_from(gpdu(LOCAL_TEID, &inner), Ipv4Addr::new(192, 0, 2, 11), 2153),
+                    &mut counters,
+                ));
+                assert_eq!(
+                    expect_drop(result),
+                    GtpuDownlinkDrop::BindingMismatch(DownlinkBindingMismatch::SourcePort)
+                );
+            }
+        }
+    }
 }

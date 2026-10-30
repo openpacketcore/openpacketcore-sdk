@@ -13,6 +13,8 @@ on:
       - "scripts/build-ipsec-xfrm-ebpf.sh"
       - "ci/download-image.sh"
       - "ci/qualify-n3-mobike-kernel.py"
+      - "ci/qualify-esp-tfc.py"
+      - "kernel/xfrm-tfc-dummy/**"
       - "scripts/n3iwf_child_sa_relocation_reference.py"
       - "crates/opc-n3iwf-fixtures/oracles/child-sa-relocation.json"
       - "docs/n3-child-sa-mobike.md"
@@ -32,6 +34,8 @@ on:
       - "scripts/build-ipsec-xfrm-ebpf.sh"
       - "ci/download-image.sh"
       - "ci/qualify-n3-mobike-kernel.py"
+      - "ci/qualify-esp-tfc.py"
+      - "kernel/xfrm-tfc-dummy/**"
       - "scripts/n3iwf_child_sa_relocation_reference.py"
       - "crates/opc-n3iwf-fixtures/oracles/child-sa-relocation.json"
       - "docs/n3-child-sa-mobike.md"
@@ -48,6 +52,67 @@ env:
   RUST_BACKTRACE: "1"
 
 jobs:
+  tfc-kernel:
+    name: ESP dummy transmission on the shared SA
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      CARGO_INCREMENTAL: "0"
+      CARGO_BUILD_JOBS: "2"
+      CARGO_PROFILE_DEV_DEBUG: "0"
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+      - name: Cache Rust build output
+        uses: Swatinem/rust-cache@v2
+      - name: Install isolated kernel qualification tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential flex bison libelf-dev libssl-dev bc \
+            cpio busybox iproute2 qemu-system-x86 python3-cryptography
+      - name: Build the SDK dummy sender
+        run: cargo build --locked -p opc-ipsec-xfrm --example esp_tfc_dummy
+      - name: Check the independent wire verifier rejects missing TFC padding
+        run: python3 -m unittest discover -s kernel/xfrm-tfc-dummy -p test_verify_wire.py -v
+      - name: Qualify the transport sender on the stock kernel
+        run: |
+          set -euo pipefail
+          mkdir -p "${RUNNER_TEMP}/tfc-evidence"
+          sudo python3 kernel/xfrm-tfc-dummy/selftest.py --transport-only \
+            --sender target/debug/examples/esp_tfc_dummy | tee "${RUNNER_TEMP}/tfc-evidence/stock-serial.log" > /dev/null
+          printf 'OPC_TFC_PROBE_EXIT=0\n' >> "${RUNNER_TEMP}/tfc-evidence/stock-serial.log"
+          python3 kernel/xfrm-tfc-dummy/verify-wire.py --transport-only \
+            "${RUNNER_TEMP}/tfc-evidence/stock-serial.log" > "${RUNNER_TEMP}/tfc-evidence/stock-verification.json"
+      - name: Reject tunnel mode on the stock kernel before opening a sender
+        run: |
+          python3 - <<'PYCODE'
+          import subprocess
+          for source, destination in (("192.0.2.10", "192.0.2.20"), ("2001:db8::10", "2001:db8::20")):
+              result = subprocess.run(["sudo", "-n", "target/debug/examples/esp_tfc_dummy",
+                                       "tunnel", source, destination, "1197056", "42", "32", "1"],
+                                      capture_output=True, text=True, timeout=10)
+              assert result.returncode != 0 and "esp_tunnel_tfc_dummy_v1" in result.stderr, result.stderr
+          PYCODE
+      - name: Qualify encrypted dummy and ordinary traffic together
+        run: |
+          python3 ci/qualify-esp-tfc.py --binary target/debug/examples/esp_tfc_dummy \
+            --cache "${RUNNER_TEMP}/tfc-cache" --output "${RUNNER_TEMP}/tfc-evidence"
+      - name: Upload kernel and independent wire evidence
+        if: always()
+        uses: actions/upload-artifact@v6
+        with:
+          name: esp-tfc-kernel-evidence
+          path: |
+            ${{ runner.temp }}/tfc-evidence/build.json
+            ${{ runner.temp }}/tfc-evidence/config
+            ${{ runner.temp }}/tfc-evidence/kernel-build.log
+            ${{ runner.temp }}/tfc-evidence/guest-serial.log
+            ${{ runner.temp }}/tfc-evidence/wire-verification.json
+            ${{ runner.temp }}/tfc-evidence/stock-serial.log
+            ${{ runner.temp }}/tfc-evidence/stock-verification.json
+
   mobike-kernel:
     name: Supported Linux whole-roster MOBIKE
     runs-on: ubuntu-latest
@@ -66,6 +131,10 @@ jobs:
 
       - name: Install isolated kernel build and VM tooling
         run: |
+          # Reuse the SCTP job's HTTPS mirror; Azure HTTP stalls these downloads.
+          if [[ -f /etc/apt/apt-mirrors.txt ]]; then
+            sudo sed -i 's|http://azure.archive.ubuntu.com/ubuntu|https://archive.ubuntu.com/ubuntu|g' /etc/apt/apt-mirrors.txt
+          fi
           sudo apt-get update
           sudo apt-get install -y build-essential flex bison libelf-dev libssl-dev bc pkg-config \
             cloud-image-utils qemu-system-x86 qemu-utils openssh-client patchelf
@@ -464,6 +533,25 @@ jobs:
           grep -Fq 'SA_KEY_SNAPSHOT_ACQUIRE_PROOF_OK' "${RUNNER_TEMP}/xfrm-sa-key-snapshot.log"
           grep -Fq 'SA_KEY_SNAPSHOT_PROOF_OK' "${RUNNER_TEMP}/xfrm-sa-key-snapshot.log"
           grep -Eq '^test result: ok. 1 passed; 0 failed; 0 ignored;' "${RUNNER_TEMP}/xfrm-sa-key-snapshot.log"
+
+      - name: Run native TFC padding install and rekey readback proof
+        run: |
+          set -euo pipefail
+          export CARGO_HOME="${CARGO_HOME:-${HOME}/.cargo}"
+          export RUSTUP_HOME="${RUSTUP_HOME:-${HOME}/.rustup}"
+          export CARGO_TARGET_DIR="${RUNNER_TEMP}/xfrm-target"
+          sudo env \
+            "PATH=${PATH}" \
+            "CARGO_HOME=${CARGO_HOME}" \
+            "RUSTUP_HOME=${RUSTUP_HOME}" \
+            "CARGO_TARGET_DIR=${CARGO_TARGET_DIR}" \
+            "OPC_GTPU_RUN_PRIVILEGED=1" \
+            unshare -n -- bash -euxo pipefail -c '
+              ip link set lo up
+              cargo test --locked -p opc-ipsec-xfrm --features ikev2 --lib linux::tests::tfc_tests::native_tfc_install_readback_and_ignored_update_are_reported_exactly -- --exact --ignored --nocapture
+            ' 2>&1 | tee "${RUNNER_TEMP}/xfrm-tfc-padding.log"
+          grep -Fq 'TFC_PADDING_PROOF_OK' "${RUNNER_TEMP}/xfrm-tfc-padding.log"
+          grep -Eq '^test result: ok. 1 passed; 0 failed; 0 ignored;' "${RUNNER_TEMP}/xfrm-tfc-padding.log"
 
       - name: Run authenticated-only ESP pass and tamper-rejection proof
         run: |

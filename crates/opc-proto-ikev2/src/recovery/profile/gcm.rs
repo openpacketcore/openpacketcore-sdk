@@ -10,7 +10,8 @@ type Gcm = Ikev2GcmRecoveryProfile;
 // below requires authenticated GCM evidence, a successfully sealed GCM packet,
 // or a runtime whose retained packets have already passed that validation.
 fn sending_iv_end(wire: &[u8]) -> Result<u64, Error> {
-    let start = HEADER_LEN + GENERIC_PAYLOAD_HEADER_LEN;
+    let start =
+        HEADER_LEN + GENERIC_PAYLOAD_HEADER_LEN + if wire.get(16) == Some(&53) { 4 } else { 0 };
     let iv = wire
         .get(start..start + IKEV2_AES_GCM_EXPLICIT_IV_LEN)
         .ok_or(Error::InvalidRecord)?;
@@ -63,13 +64,24 @@ impl RecoveryProfile for Gcm {
             .map_err(Error::Iv)
     }
     fn check_local_ordinary(packet: &Ordinary<Self>, epoch: &Self::Epoch) -> Result<(), Error> {
-        if sending_iv_end(&packet.wire)? > epoch.exclusive_end() {
-            return Err(Error::InvalidRecord);
+        for wire in packet.wire.packets() {
+            if sending_iv_end(wire)? > epoch.exclusive_end() {
+                return Err(Error::InvalidRecord);
+            }
         }
         Ok(())
     }
     fn check_sync_evidence(record: &SyncRecord<Self>, epoch: &Self::Epoch) -> Result<(), Error> {
         if epoch.exclusive_end() < record.minimum_send_iv_end() {
+            return Err(Error::InvalidRecord);
+        }
+        Ok(())
+    }
+    fn check_packet_evidence(
+        evidence: &Self::SyncEvidence,
+        epoch: &Self::Epoch,
+    ) -> Result<(), Error> {
+        if epoch.exclusive_end() < evidence.minimum_send_iv_end {
             return Err(Error::InvalidRecord);
         }
         Ok(())
@@ -93,26 +105,32 @@ impl RecoveryProfile for Gcm {
         let Some(sync) = &mut target.sync else {
             return Ok(());
         };
+        sync.packet_evidence.minimum_send_iv_end = sync
+            .packet_evidence
+            .minimum_send_iv_end
+            .max(source.packet_evidence.minimum_send_iv_end);
         let ordinary = source
             .record
             .outbound
             .as_ref()
-            .map(|entry| entry.request.as_ref())
+            .map(|entry| entry.request.packets())
             .into_iter()
             .chain(
                 source
                     .record
                     .inbound
                     .as_ref()
-                    .and_then(|entry| entry.response.as_deref()),
+                    .and_then(|entry| entry.response.as_ref().map(|message| message.packets())),
             );
+        let ordinary = ordinary.flatten().map(Bytes::as_ref);
         let attempts = source.record.recovery.iter().flat_map(|recovery| {
             recovery
                 .attempts()
                 .iter()
                 .map(|attempt| attempt.request_bytes())
         });
-        for wire in ordinary.chain(attempts) {
+        let probe = source.send.latest_probe.iter().map(bytes::Bytes::as_ref);
+        for wire in ordinary.chain(attempts).chain(probe) {
             sync.packet_evidence.minimum_send_iv_end = sync
                 .packet_evidence
                 .minimum_send_iv_end

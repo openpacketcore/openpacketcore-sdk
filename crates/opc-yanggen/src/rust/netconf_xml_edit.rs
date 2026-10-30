@@ -226,9 +226,8 @@ fn apply_children_fn(
                             match child.operation {
                                 EditOperation::Delete => {
                                     if value.#field_ident.is_absent() {
-                                        return Err(NetconfEditError::OperationNotSupported {
+                                        return Err(NetconfEditError::DataMissing {
                                             path: child.schema_path,
-                                            operation: child.operation,
                                             kind: NodeKind::Leaf,
                                         });
                                     }
@@ -241,9 +240,8 @@ fn apply_children_fn(
                                 }
                                 EditOperation::Create => {
                                     if !value.#field_ident.is_absent() {
-                                        return Err(NetconfEditError::OperationNotSupported {
+                                        return Err(NetconfEditError::DataExists {
                                             path: child.schema_path,
-                                            operation: child.operation,
                                             kind: NodeKind::Leaf,
                                         });
                                     }
@@ -264,9 +262,8 @@ fn apply_children_fn(
                             match child.operation {
                                 EditOperation::Delete => {
                                     if value.#field_ident.is_absent() {
-                                        return Err(NetconfEditError::OperationNotSupported {
+                                        return Err(NetconfEditError::DataMissing {
                                             path: child.schema_path,
-                                            operation: child.operation,
                                             kind: NodeKind::Leaf,
                                         });
                                     }
@@ -279,9 +276,8 @@ fn apply_children_fn(
                                 }
                                 EditOperation::Create => {
                                     if !value.#field_ident.is_absent() {
-                                        return Err(NetconfEditError::OperationNotSupported {
+                                        return Err(NetconfEditError::DataExists {
                                             path: child.schema_path,
-                                            operation: child.operation,
                                             kind: NodeKind::Leaf,
                                         });
                                     }
@@ -328,6 +324,12 @@ fn apply_children_fn(
                     #child_path_lit => {
                         match child.operation {
                             EditOperation::Delete => {
+                                if value.#field_ident.is_none() {
+                                    return Err(NetconfEditError::DataMissing {
+                                        path: child.schema_path,
+                                        kind: NodeKind::Container,
+                                    });
+                                }
                                 value.#field_ident = None;
                             }
                             EditOperation::Remove => {
@@ -337,9 +339,8 @@ fn apply_children_fn(
                             }
                             EditOperation::Create => {
                                 if value.#field_ident.is_some() {
-                                    return Err(NetconfEditError::OperationNotSupported {
+                                    return Err(NetconfEditError::DataExists {
                                         path: child.schema_path,
-                                        operation: child.operation,
                                         kind: NodeKind::Container,
                                     });
                                 }
@@ -638,9 +639,8 @@ fn apply_leaf_list_fn(
                     }
                     EditOperation::Create => {
                         if !current_keys.insert(key) {
-                            return Err(NetconfEditError::OperationNotSupported {
+                            return Err(NetconfEditError::DataExists {
                                 path: #path,
-                                operation,
                                 kind: NodeKind::LeafList,
                             });
                         }
@@ -648,9 +648,8 @@ fn apply_leaf_list_fn(
                     }
                     EditOperation::Delete => {
                         if !current_keys.remove(&key) {
-                            return Err(NetconfEditError::OperationNotSupported {
+                            return Err(NetconfEditError::DataMissing {
                                 path: #path,
-                                operation,
                                 kind: NodeKind::LeafList,
                             });
                         }
@@ -696,10 +695,7 @@ fn leaf_list_value_key_expr(
         | Some(TypeRef::Uint32) => Ok(quote! { value.to_string() }),
         Some(TypeRef::Uint64) => Ok(quote! { value.0.to_string() }),
         Some(TypeRef::Int64) => Ok(quote! { value.0.to_string() }),
-        Some(TypeRef::Decimal64) => Ok(quote! {
-            let bits = if value.0 == 0.0 { 0_u64 } else { value.0.to_bits() };
-            bits.to_string()
-        }),
+        Some(TypeRef::Decimal64 { .. }) => Ok(quote! { value.to_string() }),
         Some(TypeRef::Empty) => Ok(quote! { String::new() }),
         Some(TypeRef::String | TypeRef::RestrictedString { .. })
         | Some(TypeRef::IdentityRef { .. })
@@ -890,9 +886,8 @@ fn apply_list_fn(
             match node.operation {
                 EditOperation::Delete => {
                     if map.remove(&parsed_key).is_none() {
-                        return Err(NetconfEditError::OperationNotSupported {
+                        return Err(NetconfEditError::DataMissing {
                             path: node.schema_path,
-                            operation: node.operation,
                             kind: NodeKind::List,
                         });
                     }
@@ -902,9 +897,8 @@ fn apply_list_fn(
                 }
                 EditOperation::Create => {
                     if map.contains_key(&parsed_key) {
-                        return Err(NetconfEditError::OperationNotSupported {
+                        return Err(NetconfEditError::DataExists {
                             path: node.schema_path,
-                            operation: node.operation,
                             kind: NodeKind::List,
                         });
                     }
@@ -1009,12 +1003,8 @@ fn parse_leaf_value_expr(
             let parsed = YangInt64(_v.trim().parse::<i64>().map_err(|_| NetconfEditError::InvalidValue { path: #path })?);
             #int64_range_check
         },
-        Some(TypeRef::Decimal64) => quote! {
-            let decimal = _v.trim().parse::<f64>().map_err(|_| NetconfEditError::InvalidValue { path: #path })?;
-            if !decimal.is_finite() {
-                return Err(NetconfEditError::InvalidValue { path: #path });
-            }
-            let parsed = YangDecimal64(decimal);
+        Some(TypeRef::Decimal64 { fraction_digits }) => quote! {
+            let parsed = _v.parse::<YangDecimal64<#fraction_digits>>().map_err(|_| NetconfEditError::InvalidValue { path: #path })?;
         },
         Some(TypeRef::Empty) => quote! {
             if !_v.trim().is_empty() {
@@ -1156,7 +1146,7 @@ fn raw_type_internal(
         Some(TypeRef::Uint32) => quote! { u32 },
         Some(TypeRef::Uint64) => quote! { YangUint64 },
         Some(TypeRef::Int64) => quote! { YangInt64 },
-        Some(TypeRef::Decimal64) => quote! { YangDecimal64 },
+        Some(TypeRef::Decimal64 { fraction_digits }) => quote! { YangDecimal64<#fraction_digits> },
         Some(TypeRef::Empty) => quote! { YangEmpty },
         Some(TypeRef::IdentityRef { .. }) | Some(TypeRef::LeafRef { .. }) => quote! { String },
         Some(TypeRef::Custom { name }) => {

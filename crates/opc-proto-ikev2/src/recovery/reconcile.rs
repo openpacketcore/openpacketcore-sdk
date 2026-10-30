@@ -55,8 +55,7 @@ impl<P: RecoveryProfile> Window<P> {
     /// or completion token is created. Restore durable outcomes idempotently.
     ///
     /// Every attempt fences all old completion tokens and any live local sync
-    /// proposal, even at the same generation; it likewise fences a pending
-    /// volatile empty-INFORMATIONAL probe. A pending proposal therefore needs
+    /// proposal, even at the same generation. A pending proposal therefore needs
     /// its existing bounded higher-proposal retry, spending another attempt.
     /// Clock and latched-close knowledge survive. Valid lifecycle states succeed;
     /// [`Self::ready`] reports pending sync, uncertain outcome or closure afterward.
@@ -94,6 +93,9 @@ impl<P: RecoveryProfile> Window<P> {
             crate::canonical::invalidate_profile(&record.domain);
             crate::canonical::invalidate_profile(&P::from_epoch(epoch));
             self.receive.discard_replies();
+            self.send.discard();
+            self.fragments.cutover();
+            self.packet_evidence = P::SyncEvidence::default();
             self.witness = None;
             self.reconcile_terminal = true;
             return Err(error);
@@ -123,7 +125,13 @@ impl<P: RecoveryProfile> Window<P> {
             return Err(Error::InvalidRecord);
         };
         P::check_epoch_transition(&self.canonical_binding, epoch)?;
+        P::check_packet_evidence(&self.packet_evidence, epoch)?;
         Self::validate_record(&self.record.domain, profile, keys, record, epoch)?;
+        if let Some(wire) = &self.send.latest_probe {
+            let probe = super::packet::open(&self.record.domain, profile, keys, wire, false)
+                .map_err(|_| Error::InvalidRecord)?;
+            P::check_local_ordinary(&probe, epoch)?;
+        }
         // Even a candidate that did not land consumed acknowledged IVs. Its
         // response-only sync IV is represented by minimum_send_iv_end.
         if let Some(witness) = &self.witness {
@@ -140,17 +148,16 @@ impl<P: RecoveryProfile> Window<P> {
         // No fallible operation may follow retirement and precede publication.
         // Retain the applicable last reply for unchanged/outbound readback.
         self.receive.retire_readback(next, boundary)?;
-        // Fence a volatile empty probe for the same reason as any other send
-        // claim: its response is stale after readback. The consumed send ID
-        // stays burned in this runtime and the next committed record persists it.
-        self.probe.pending = None;
         self.record = record.clone();
+        self.send.adopt(record, kind == Some(Kind::Sync));
         self.canonical_binding = epoch.clone();
         if boundary {
             self.receive.adopt_boundary(next);
         }
         if kind == Some(Kind::Sync) {
             self.observed_peer_request.set(None);
+            self.fragments.cutover();
+            self.packet_evidence = P::SyncEvidence::default();
         }
         self.sync_last_observed_unix_ms = self.sync_last_observed_unix_ms.max(
             record

@@ -45,8 +45,10 @@ pub const MAX_SCTP_AUTH_KEY_BYTES: usize = u16::MAX as usize;
 pub enum AddressFamily {
     /// IPv4 socket.
     Ipv4,
-    /// IPv6 socket.
+    /// IPv6 socket with the host's existing IPv6-only policy.
     Ipv6,
+    /// Explicit dual-stack IPv6 socket with native IPv4 address readback.
+    Ipv6DualStack,
 }
 
 /// SCTP socket style.
@@ -246,8 +248,8 @@ pub fn bind(fd: BorrowedFd<'_>, addr: &SocketAddr) -> io::Result<()> {
 
 /// Atomically bind an SCTP socket to a bounded set of local addresses.
 ///
-/// All addresses must use one family and port. Callers that have exactly one
-/// address should use [`bind`] to preserve the ordinary socket path.
+/// All addresses must use one port. Mixed IPv4/IPv6 sets require a dual-stack
+/// socket. Callers with exactly one address should use [`bind`].
 pub fn bind_addresses(fd: BorrowedFd<'_>, addrs: &[SocketAddr]) -> io::Result<()> {
     platform::bind_addresses(fd, addrs)
 }
@@ -269,8 +271,8 @@ pub fn connect(fd: BorrowedFd<'_>, addr: &SocketAddr) -> io::Result<ConnectStatu
 
 /// Start a nonblocking SCTP connect using a bounded peer address set.
 ///
-/// All addresses must use one family and port. Callers that have exactly one
-/// address should use [`connect`] to preserve the ordinary socket path.
+/// All addresses must use one port. Mixed IPv4/IPv6 sets require a dual-stack
+/// socket. Callers with exactly one address should use [`connect`].
 pub fn connect_addresses(fd: BorrowedFd<'_>, addrs: &[SocketAddr]) -> io::Result<ConnectStatus> {
     platform::connect_addresses(fd, addrs)
 }
@@ -379,6 +381,27 @@ pub fn peer_authenticated_chunks(fd: BorrowedFd<'_>, assoc_id: AssocId) -> io::R
     platform::peer_authenticated_chunks(fd, assoc_id)
 }
 
+/// Configure SCTP-AUTH HMAC preference before forming any association.
+///
+/// Supports SHA-1 (1) and SHA-256 (3), without duplicates. RFC 4895 requires
+/// SHA-1 in every list; the first identifier has highest preference.
+pub fn set_hmac_identifiers(fd: BorrowedFd<'_>, identifiers: &[u16]) -> io::Result<()> {
+    platform::set_hmac_identifiers(fd, identifiers)
+}
+
+/// Read back the endpoint's configured HMAC identifiers in preference order.
+///
+/// Read before connect/listen: an accepted Linux socket has a fresh endpoint,
+/// so this option does not prove the existing association's inherited list.
+pub fn hmac_identifiers(fd: BorrowedFd<'_>) -> io::Result<Vec<u16>> {
+    platform::hmac_identifiers(fd)
+}
+
+/// Read the chunk types that the local endpoint requires authenticated.
+pub fn local_authenticated_chunks(fd: BorrowedFd<'_>, assoc_id: AssocId) -> io::Result<Vec<u8>> {
+    platform::local_authenticated_chunks(fd, assoc_id)
+}
+
 /// Enable or disable one notification for a specific association.
 ///
 /// The association identifier is ignored for one-to-one sockets.
@@ -427,6 +450,12 @@ pub fn delete_auth_key(fd: BorrowedFd<'_>, assoc_id: AssocId, key_id: u16) -> io
 /// failures terminal rather than leaving a live association behind.
 pub fn shutdown_both(fd: BorrowedFd<'_>) -> io::Result<()> {
     platform::shutdown_both(fd)
+}
+
+/// Select abortive close for a one-to-one SCTP socket using zero SO_LINGER.
+/// The caller must then deregister and close its owned descriptor.
+pub fn set_abort_on_close(fd: BorrowedFd<'_>) -> io::Result<()> {
+    platform::set_abort_on_close(fd)
 }
 
 /// Send one SCTP message with stream/PPID metadata.

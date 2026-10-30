@@ -32,6 +32,14 @@ ensure_plaintext_permitted(RuntimeMode::Lab)?;
 `TlsBootstrap` rejects unconstrained peer policy in fail-closed modes such as
 `Production` and `Conformance`. Plaintext is allowed only for `Dev` and `Lab`.
 
+`with_tls12_compat(true)` adds TLS 1.2 ECDHE AEAD suites with mandatory
+Extended Master Secret. Management peers omitting EMS are now rejected.
+DHE-RSA requires the separate `with_legacy_dhe_rsa(true)` option as well;
+it is a legacy TS 33.210 Release 18 exception prohibited by RFC 10015 and
+Release 19. Normal compatibility targets the Release 19 cipher restrictions.
+See the [standards position](../../docs/spec-compliance-dispositions.md#tls-and-dtls-cipher-policy-in-1353)
+for the limits of that target and the legacy alert deviations.
+
 ## Relationships
 
 - Depends on `opc-tls` for certificate, identity, and server-config mechanics.
