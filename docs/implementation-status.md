@@ -612,14 +612,14 @@ qualification remain product and deployment responsibilities.
 
 `opc-proto-gtpu` now models the TS 29.281 Release 18 codec boundary for Echo
 Request/Response, Recovery, Error Indication, Supported Extension Headers
-Notification, and End Marker. The typed decoder enforces message flags and
-TEIDs, mandatory/singleton IE cardinality, ascending IE order, exact fixed and
+Notification, Tunnel Status, and End Marker. The typed decoder enforces message flags and
+TEIDs, mandatory IE presence, first-wins singleton handling, ascending IE order, exact fixed and
 TLV lengths, IPv4/IPv6 peer-address widths, unique supported-header lists
 (including the specification-permitted empty list), and configured message/IE
 limits. Recovery and receiver-ignored
 sequence values are not promoted into application state; canonical Echo
-Response always emits `Recovery=0`. Unknown TLVs follow the shared
-preserve/drop/reject policy, while unknown TV IEs fail closed because there is
+Response always emits `Recovery=0`. Unknown TLVs are preserved or skipped
+(`Reject` behaves as `Drop`); unexpected defined IEs are skipped. Unknown TV IEs fail closed because there is
 no safe length boundary. TEIDs, peer addresses, private/unknown values, and raw
 extension data are redacted from typed diagnostics.
 

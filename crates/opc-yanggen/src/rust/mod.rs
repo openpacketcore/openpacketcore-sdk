@@ -228,7 +228,12 @@ impl<'a> NodeIndex<'a> {
     }
 
     fn legacy_or_resolved(&self, node: &'a SchemaNode) -> &'a SchemaNode {
-        if self.expanded_profile {
+        if self.expanded_profile
+            || matches!(
+                self.scalar_node(node).type_ref,
+                Some(TypeRef::Decimal64 { .. })
+            )
+        {
             return self.scalar_node(node);
         }
         if let Some(TypeRef::LeafRef { target_path }) = &node.type_ref {
@@ -240,7 +245,12 @@ impl<'a> NodeIndex<'a> {
     }
 
     fn patch_scalar_node(&self, node: &'a SchemaNode) -> &'a SchemaNode {
-        if self.expanded_profile {
+        if self.expanded_profile
+            || matches!(
+                self.scalar_node(node).type_ref,
+                Some(TypeRef::Decimal64 { .. })
+            )
+        {
             self.scalar_node(node)
         } else {
             node
@@ -757,14 +767,14 @@ fn validate_supported_input(input: &CanonicalInput) -> Result<&SchemaNode, RustG
     let nodes = NodeIndex::new(&input.nodes);
     for node in &input.nodes {
         validate_supported_node(input, node)?;
-        validate_integer_default(node, &nodes)?;
+        validate_numeric_default(node, &nodes)?;
     }
     validate_rust_identifier_collisions(input)?;
 
     Ok(root)
 }
 
-fn validate_integer_default(
+fn validate_numeric_default(
     node: &SchemaNode,
     nodes: &NodeIndex<'_>,
 ) -> Result<(), RustGenerationError> {
@@ -772,6 +782,16 @@ fn validate_integer_default(
         return Ok(());
     };
     let scalar = nodes.scalar_node(node);
+    if let Some(TypeRef::Decimal64 { fraction_digits }) = scalar.type_ref {
+        return opc_mgmt_schema::Decimal64::parse(default, fraction_digits)
+            .map(|_| ())
+            .map_err(|_| {
+                RustGenerationError::new(format!(
+                    "decimal64 default at {} is outside its type or scale",
+                    node.path
+                ))
+            });
+    }
     let Some((min, max)) = scalar.type_ref.as_ref().and_then(TypeRef::integer_bounds) else {
         return Ok(());
     };
@@ -862,6 +882,16 @@ fn validate_supported_node(
     input: &CanonicalInput,
     node: &SchemaNode,
 ) -> Result<(), RustGenerationError> {
+    node.validate_cardinality()
+        .map_err(RustGenerationError::new)?;
+    if let Some(TypeRef::Decimal64 { fraction_digits }) = node.type_ref {
+        if !(1..=18).contains(&fraction_digits) {
+            return Err(RustGenerationError::new(format!(
+                "decimal64 at {} requires fraction-digits in 1..=18",
+                node.path
+            )));
+        }
+    }
     if !node.path.starts_with('/') {
         return Err(RustGenerationError::new(format!(
             "node path {} is not absolute",
@@ -898,7 +928,7 @@ fn validate_supported_node(
                 | TypeRef::Uint16
                 | TypeRef::Uint32
                 | TypeRef::Int64
-                | TypeRef::Decimal64
+                | TypeRef::Decimal64 { .. }
                 | TypeRef::Empty
                 | TypeRef::IdentityRef { .. }
                 | TypeRef::LeafRef { .. }

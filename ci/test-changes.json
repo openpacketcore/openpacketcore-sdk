@@ -618,7 +618,7 @@
     {
       "test": "rust:crates/opc-gtpu-dataplane::test=ebpf_gtpu_privileged::ebpf_gtpu_downlink_oversized_dont_fragment_is_fragmented_inside_the_tunnel",
       "kind": "assertions-decreased",
-      "reason": "Restore main\u2019s successful live default-limit update instead of the erroneous InvalidLimits expectation. The static count loses unwrap_err(), while assert_eq!(setter_result, Ok(())) and all packet, rate-limit, ESP, silence and deadline assertions remain. The per-destination lifetime test independently enforces RFC 6864 section 4.3 across replacements, and the native scenario passes with the restored contract.",
+      "reason": "Restore main’s successful live default-limit update instead of the erroneous InvalidLimits expectation. The static count loses unwrap_err(), while assert_eq!(setter_result, Ok(())) and all packet, rate-limit, ESP, silence and deadline assertions remain. The per-destination lifetime test independently enforces RFC 6864 section 4.3 across replacements, and the native scenario passes with the restored contract.",
       "issue": 1018,
       "replacements": [
         "rust:crates/opc-gtpu-dataplane::lib=lib::reassembly::tests::rate_budget_retention_preserves_lifetime_bound_across_limit_replacement"
@@ -998,6 +998,419 @@
       "kind": "fixture-setup-changed",
       "reason": "Keep autonomous maintenance enabled and wait within the existing operation budget for durable retirement of the expired D5 terminal. Require its canonical witness frontier and original admission fence before accepting row absence. Observe retirement on both the leader and snapshot target before isolating the target, so the snapshot tests retired-to-retired history. The separately tracked lagging-follower recovery design is outside this fixture. After real snapshot installation and cold reopen, require the same retirement authority and authenticated non-definitive status/terminal refusal. Preserve predecessor and successor scope checks, stale ingress rejection, all topology assertions, and fresh successor signed-roster acceptance.",
       "issue": 1307
+    },
+    {
+      "test": "rust:crates/opc-proto-ikev2::lib=lib::recovery::probe::tests::caller_budget_retransmits_exact_bytes_and_abandons_without_a_write",
+      "kind": "removed",
+      "renamed_to": "rust:crates/opc-proto-ikev2::lib=lib::recovery::probe::tests::bounded_retries_preserve_exact_bytes_and_expiry_is_terminal_without_a_write",
+      "reason": "RFC 7296 sections 2.1 and 2.4 require exact exponential retransmission and failed-SA handling. Retain all three retry-byte checks and unchanged durable state, then assert retry exhaustion, fixed-deadline terminal refusal and rejection of a late authenticated response instead of permitting abandonment to release the request slot.",
+      "issue": 1241
+    },
+    {
+      "test": "rust:crates/opc-proto-ikev2::lib=lib::recovery::probe::tests::ordinary_work_is_refused_until_the_probe_is_abandoned",
+      "kind": "removed",
+      "renamed_to": "rust:crates/opc-proto-ikev2::lib=lib::recovery::probe::tests::ordinary_work_is_refused_until_the_probe_is_answered",
+      "reason": "Retain refusal of ordinary work while a probe is outstanding and the next-ID assertion. Release the local request slot only after an authenticated matching response; RFC 7296 sections 2.1 and 2.4 do not allow an unanswered abandoned request to advance an otherwise usable window. Terminal failure is separately covered by a_failed_probe_cannot_release_the_sa_for_another_request.",
+      "issue": 1241
+    },
+    {
+      "test": "rust:crates/opc-proto-ikev2::lib=lib::recovery::probe::tests::restart_without_a_commit_loses_the_lead_as_a_bounded_reuse",
+      "kind": "removed",
+      "renamed_to": "rust:crates/opc-proto-ikev2::lib=lib::recovery::probe::tests::restart_without_a_commit_skips_the_bound_and_requires_synchronization",
+      "reason": "The old assertion allowed reusing an unwritten probe ID for different work after restart. RFC 6311 section 5.1 requires accounting for the whole bounded lead. Keep the same crash setup, assert the stored floor is unchanged and the live floor advances by the durable bound, and require both probe and ordinary preparation to fail until synchronization or scoped retirement.",
+      "issue": 1241
+    },
+    {
+      "test": "rust:crates/opc-proto-ikev2::test=sync_responder::peer_sync_after_abandon_before_persist_keeps_the_burned_probe_floor",
+      "kind": "removed",
+      "renamed_to": "rust:crates/opc-proto-ikev2::test=sync_responder::peer_sync_after_answer_before_persist_keeps_the_burned_probe_floor",
+      "reason": "Retain every original role, GCM key size, unchanged durable row, strict burned-ID floor and Continue disposition assertion. Complete the probe with an authenticated response instead of unsafe abandonment before peer synchronization; RFC 7296 sections 2.1 and 2.4 require failure to retire the SA, while RFC 6311 section 5.1 still requires retaining the unwritten send advance.",
+      "issue": 1241
+    },
+    {
+      "test": "rust:crates/opc-proto-ikev2::test=sync_responder::peer_sync_while_a_volatile_probe_is_outstanding_is_outcome_uncertain",
+      "kind": "removed",
+      "renamed_to": "rust:crates/opc-proto-ikev2::test=sync_responder::peer_sync_fences_a_volatile_probe_without_uncertain_application_work",
+      "reason": "A volatile liveness request has no uncertain application mutation. Under RFC 6311 section 5.1, peer synchronization may fence it while retaining its burned Message ID and IV evidence. Keep both roles, all GCM key sizes, exact no-write checks and strict post-cutover floors, and assert Continue after fencing; existing tests still require OutcomeUncertain for pending durable mutations.",
+      "issue": 1241
+    },
+    {
+      "test": "rust:crates/opc-proto-pfcp::lib=lib::ie::tests::test_ue_ip_address_v4_prefix_spec_bytes",
+      "kind": "removed",
+      "renamed_to": "rust:crates/opc-proto-pfcp::lib=lib::ie::tests::test_ue_ip_address_v6_delegation_spec_bytes",
+      "reason": "Correct the golden vector for TS 29.244 section 8.2.62: the IE defines IPv6 prefix delegation, not an IPv4 prefix-length field. Retain the flag, prefix-field and round-trip assertions using the normative IPv6 layout; independent IPv4, IPv6, dual-stack and allocation vectors are added separately.",
+      "issue": 1513
+    },
+    {
+      "test": "rust:crates/opc-proto-nas::test=nas_optional_elements::every_table_length_bound_is_enforced_under_strict_and_procedure_aware",
+      "kind": "removed",
+      "renamed_to": "rust:crates/opc-proto-nas::test=nas_optional_elements::table_minima_are_enforced_and_extensions_ignored_under_strict_and_procedure_aware",
+      "reason": "Correct receiver expectations per TS 24.501 7.6.3 and TS 24.007 11.4.2: first duplicate wins and extra octets are ignored; retain minimum-length, raw preservation and per-table assertions.",
+      "issue": 1255
+    },
+    {
+      "test": "rust:crates/opc-proto-nas::test=nas_optional_elements::half_octet_duplicate_first_and_last_policies_preserve_the_selected_wire_value",
+      "kind": "removed",
+      "renamed_to": "rust:crates/opc-proto-nas::test=nas_optional_elements::half_octet_duplicates_preserve_the_first_wire_value_for_both_receiver_policies",
+      "reason": "Correct receiver expectations per TS 24.501 7.6.3 and TS 24.007 11.4.2: first duplicate wins and extra octets are ignored; retain minimum-length, raw preservation and per-table assertions.",
+      "issue": 1255
+    },
+    {
+      "test": "rust:crates/opc-proto-gtpu::test=control_messages::unknown_tlv_policy_preserves_drops_or_rejects_without_exposing_value",
+      "kind": "removed",
+      "renamed_to": "rust:crates/opc-proto-gtpu::test=control_messages::unknown_tlv_policy_preserves_or_skips_without_exposing_value",
+      "reason": "Correct GTP-U receiver expectations per TS 29.281 9.1 and TS 29.060 11.1.9, 11.1.11 and 11.1.12: skip unknown TLVs and unexpected IEs; first singleton wins. Retain canonical bytes, mandatory fields, extension and malformed-framing checks.",
+      "issue": 1532
+    },
+    {
+      "test": "rust:crates/opc-proto-gtpu::test=control_messages::duplicate_timestamp_and_supported_type_list_fail_at_datagram_offsets",
+      "kind": "removed",
+      "renamed_to": "rust:crates/opc-proto-gtpu::test=control_messages::duplicate_timestamp_and_supported_type_list_use_first_occurrence",
+      "reason": "Correct GTP-U receiver expectations per TS 29.281 9.1 and TS 29.060 11.1.9, 11.1.11 and 11.1.12: skip unknown TLVs and unexpected IEs; first singleton wins. Retain canonical bytes, mandatory fields, extension and malformed-framing checks.",
+      "issue": 1532
+    },
+    {
+      "test": "rust:crates/opc-proto-gtpu::test=control_messages::unexpected_ie_offset_is_datagram_relative",
+      "kind": "removed",
+      "renamed_to": "rust:crates/opc-proto-gtpu::test=control_messages::unexpected_ie_is_skipped",
+      "reason": "Correct GTP-U receiver expectations per TS 29.281 9.1 and TS 29.060 11.1.9, 11.1.11 and 11.1.12: skip unknown TLVs and unexpected IEs; first singleton wins. Retain canonical bytes, mandatory fields, extension and malformed-framing checks.",
+      "issue": 1532
+    },
+    {
+      "test": "rust:crates/opc-proto-gtpu::test=control_messages::duplicate_udp_extension_and_wrong_procedure_ie_fail_closed",
+      "kind": "removed",
+      "renamed_to": "rust:crates/opc-proto-gtpu::test=control_messages::duplicate_udp_extension_fails_and_wrong_procedure_ie_is_skipped",
+      "reason": "Correct GTP-U receiver expectations per TS 29.281 9.1 and TS 29.060 11.1.9, 11.1.11 and 11.1.12: skip unknown TLVs and unexpected IEs; first singleton wins. Retain canonical bytes, mandatory fields, extension and malformed-framing checks.",
+      "issue": 1532
+    },
+    {
+      "test": "rust:crates/opc-gtpu-dataplane::test=linux_gtpu_privileged::zero_peer_teid_is_installed_and_sent_on_the_wire",
+      "kind": "disabled",
+      "reason": "New privileged packet test needs an isolated Linux network namespace and kernel capabilities, matching this harness. Executed by the privileged native suite with OPC_GTPU_RUN_PRIVILEGED=1: installation/readback and a captured outgoing G-PDU prove peer TEID zero reaches the wire. Shared unit tests retain nonzero local-TEID and exact-authority checks.",
+      "issue": 1346
+    },
+    {
+      "test": "rust:crates/opc-gtpu-dataplane::test=ebpf_gtpu_privileged::ebpf_gtpu_zero_peer_teid_is_sent_on_the_wire",
+      "kind": "disabled",
+      "reason": "New privileged packet test needs an isolated Linux network namespace and kernel capabilities, matching this harness. Executed by the privileged native suite with OPC_GTPU_RUN_PRIVILEGED=1: installation/readback and a captured outgoing G-PDU prove peer TEID zero reaches the wire. Shared unit tests retain nonzero local-TEID and exact-authority checks.",
+      "issue": 1346
+    },
+    {
+      "test": "rust:crates/opc-gtpu-dataplane::test=linux_gtpu_privileged::control_port_refuses_a_removed_kernel_attachment",
+      "kind": "disabled",
+      "reason": "New Linux kernel-GTP proof requires CAP_NET_ADMIN, the GTP module, and an isolated network namespace. The privileged GTP-U workflow runs this entire ignored harness with explicit opt-in. Covers a real retained-socket response and stale-device refusal; ordinary unit tests cover tuple, budget, classification and registration boundaries.",
+      "issue": 1084
+    },
+    {
+      "test": "rust:crates/opc-gtpu-dataplane::test=linux_gtpu_privileged::wildcard_control_reply_preserves_the_original_local_destination",
+      "kind": "disabled",
+      "reason": "New privileged kernel-GTP test requires an isolated network namespace and CAP_NET_ADMIN. The privileged workflow runs the complete ignored harness. Actual loopback receive verifies the wildcard socket preserves the original destination in the response source and Peer Address IE.",
+      "issue": 1084
+    },
+    {
+      "test": "rust:crates/opc-gtpu-dataplane::test=ebpf_gtpu_privileged::ebpf_gtpu_multihoming_is_opt_in_and_survives_restart",
+      "kind": "disabled",
+      "reason": "New privileged packet proof requires CAP_BPF/CAP_NET_ADMIN and an isolated network namespace. Executed by the privileged native suite with OPC_GTPU_RUN_PRIVILEGED=1: strict alternate-source rejection, opt-in delivery before and after backend restart, and rejection of wrong local address, UDP port, TEID and inner PAA. The complete ignored harness runs in privileged CI; host tests cover codecs, ownership and reassembly parity.",
+      "issue": 1347
+    },
+    {
+      "test": "rust:crates/opc-gtpu-dataplane::test=linux_gtpu_privileged::ipv6_control_preserves_tuples_and_rejects_retired_ports",
+      "kind": "disabled",
+      "issue": 341,
+      "reason": "New native IPv6 kernel-GTP control test requires CAP_NET_ADMIN and a private network namespace. Required GTP CI runs every ignored Linux GTP integration case explicitly. Independent wire bytes cover Echo, Error Indication, extension notification, budgets and retired handles."
+    },
+    {
+      "test": "rust:crates/opc-proto-gtpv2c::lib=lib::ie::typed::tests::bearer_qos_decode_rejects_arp_spare_bits",
+      "kind": "removed",
+      "renamed_to": "rust:crates/opc-proto-gtpv2c::lib=lib::ie::typed::tests::bearer_qos_decode_ignores_arp_spare_bits_and_sender_rejects_them",
+      "reason": "TS 29.274 7.7.8 requires receivers to ignore ARP spare bits. Replace the non-conformant whole-IE rejection with all three spare-bit combinations, canonical receive/send equivalence and sender-side rejection; Create/Update Bearer tests also preserve the raw received octet at every validation level.",
+      "issue": 1354
+    },
+    {
+      "test": "rust:crates/opc-proto-gtpv2c::test=arp_priority_polarity::spare_bits_and_out_of_range_levels_stay_rejected",
+      "kind": "removed",
+      "renamed_to": "rust:crates/opc-proto-gtpv2c::test=arp_priority_polarity::spare_bits_are_ignored_and_out_of_range_levels_stay_rejected",
+      "reason": "TS 29.274 7.7.8 requires receiver-ignored ARP spare bits. Check each spare combination with a valid level, retain level-zero and constructor-range rejection, and retain canonical sender-spare validation in the typed QoS unit test.",
+      "issue": 1354
+    },
+    {
+      "test": "rust:crates/opc-gtpu-dataplane::test=linux_gtpu_privileged::unknown_tunnel_wire_capture_and_echo_share_reopened_socket",
+      "kind": "disabled",
+      "reason": "Port the independent Linux wire-capture and outgoing Echo scenario alongside the existing wildcard/known-TEID regression, under a distinct name. It requires a privileged private network namespace and runs in the complete native Linux suite. Reopening preserves the backlog shared generation; attachment removal still revokes both handles.",
+      "issue": 1084
+    },
+    {
+      "test": "rust:crates/opc-gtpu-dataplane::lib=lib::linux::tests::linux_control_port_refuses_nonstandard_port_and_ipv6_bind",
+      "kind": "removed",
+      "renamed_to": "rust:crates/opc-gtpu-dataplane::lib=lib::linux::tests::linux_control_port_refuses_nonstandard_port_and_accepts_ipv6_bind",
+      "reason": "IPv6 control support for #341 replaces the unsupported-bind expectation with exact IPv6 socket tuple acceptance. Preserve the nonstandard-port rejection and add live IPv6 Echo, Error Indication and required-extension notification coverage in the privileged suite.",
+      "issue": 341
+    },
+    {
+      "test": "rust:crates/opc-proto-gtpv2c::test=arp_priority_polarity::spare_bits_are_ignored_and_out_of_range_levels_stay_rejected",
+      "kind": "assertions-decreased",
+      "reason": "Replace three incorrect spare-bit rejection statements with a loop over all three spare-bit combinations. Each combination now proves valid-level equivalence and continued rejection of level zero; constructor bounds and all former zero-level octets remain covered (TS 29.274 7.7.8).",
+      "issue": 1354
+    },
+    {
+      "test": "rust:crates/opc-gtpu-dataplane::test=n3_contract::generic_typed_extensions_do_not_expand_n3_endpoint_comprehension",
+      "kind": "fixture-setup-changed",
+      "reason": "Previously generic Reject accepted parseable required 0x81-0x84 and 0xC0; it now returns UnknownCriticalIe because Endpoint comprehension is separate from wire-format recognition. N3PacketView continues to report UnsupportedExtension, including the valid two-unit Long PDCP form. Preserve/Drop and typed-format coverage remain intact.",
+      "issue": 1529
+    },
+    {
+      "test": "rust:crates/opc-proto-gtpu::test=typed_extensions::short_pdcp_followed_by_psc_decodes_but_unknown_required_still_fails",
+      "kind": "fixture-setup-changed",
+      "reason": "Previously generic Reject decoded the Short PDCP and PSC extensions; it now returns UnknownCriticalIe for Short PDCP. Preserve continues to decode both and retains every typed-content assertion. The existing unknown comprehension-required rejection remains; recognizing a wire format does not imply Endpoint comprehension.",
+      "issue": 1529
+    },
+    {
+      "test": "rust:crates/opc-session-store::lib=lib::consensus::storage::scan_dynamic_snapshot_envelope",
+      "kind": "removed",
+      "replacements": [
+        "rust:crates/opc-session-store::lib=lib::consensus::storage::tests::cancelled_dynamic_current_snapshot_scan_retains_worker_ownership",
+        "rust:crates/opc-session-store::lib=lib::consensus::storage::tests::cancelled_dynamic_snapshot_admission_retains_descriptor_work_ownership",
+        "rust:crates/opc-session-store::lib=lib::consensus::storage::tests::cancelled_dynamic_snapshot_admission_retains_ownership_after_runtime_shutdown",
+        "rust:crates/opc-session-store::lib=lib::consensus::storage::tests::snapshot_is_file_backed_checksummed_and_installs_atomically"
+      ],
+      "reason": "The inventory misclassifies cfg_attr(not(test), allow(unused_variables)) on this production helper as a test. Issue #1371 consolidates the duplicate Dynamic envelope scan into verify_snapshot_envelope_sync on the fully owned admission worker. Footer, size, length and checksum checks and the scan hooks remain. The named tests retain the existing scan/checksum coverage and add descriptor-work and runtime-cancellation ownership coverage; no libtest test is removed.",
+      "issue": 1371
+    },
+    {
+      "test": "rust:crates/opc-session-store::test=fixed_quorum_authority::snapshot_build_failure::failed_local_snapshot_build_is_retried_and_the_engine_keeps_serving",
+      "kind": "removed",
+      "replacements": [
+        "rust:crates/opc-session-store::test=fixed_quorum_authority::snapshot_build_failure::failed_local_snapshot_build_stops_the_engine_without_retry"
+      ],
+      "reason": "Restore the fail-stop contract while #1254/#1243 are deferred until the #1249 retained-log admission foundation exists and is qualified. This test is renamed and its original fault scenario is retained, not deleted or ignored. A single staging failure now reaches Openraft on the first attempt and stops the engine; later proposals and triggers are refused, both staged children are reclaimed, and the existing snapshot bytes/frontier remain unchanged.",
+      "issue": 1254
+    },
+    {
+      "test": "rust:crates/opc-session-store::test=fixed_quorum_authority::snapshot_build_failure::every_local_snapshot_build_failure_degrades_without_stopping_the_engine",
+      "kind": "removed",
+      "replacements": [
+        "rust:crates/opc-session-store::test=fixed_quorum_authority::snapshot_build_failure::persistent_local_snapshot_build_failure_stops_without_degradation"
+      ],
+      "reason": "Restore the fail-stop contract while #1254/#1243 are deferred until the #1249 retained-log admission foundation exists and is qualified. This test is renamed and its original fault scenario is retained, not deleted or ignored. Persistent staging failures now stop on the first attempt without falling back to a previous snapshot or advancing snapshot/purge positions; later local work is refused and staged children are reclaimed. Retry/backoff and continued-serving assertions described deferred recovery, not the restored contract.",
+      "issue": 1254
+    },
+    {
+      "test": "rust:crates/opc-session-store::test=fixed_quorum_authority::snapshot_build_failure::mid_build_indeterminate_publication_stops_the_engine_fatally",
+      "kind": "removed",
+      "replacements": [
+        "rust:crates/opc-session-store::test=fixed_quorum_authority::snapshot_build_failure::mid_build_indeterminate_publication_stops_without_retry"
+      ],
+      "reason": "Restore the fail-stop contract while #1254/#1243 are deferred until the #1249 retained-log admission foundation exists and is qualified. This test is renamed and its original fault scenario is retained, not deleted or ignored. Keep fatal indeterminate-publication coverage at the real sealed-candidate publication boundary. Replace removed retry-diagnostic API assertions with exact storage error class/subject/verb, one consumed fault, unchanged snapshot/purge positions, preserved predecessor bytes, retained candidate ownership and refusal of later local work.",
+      "issue": 1254
+    },
+    {
+      "test": "rust:crates/opc-session-store::test=fixed_quorum_authority::snapshot_build_failure::build_failure_with_no_published_snapshot_stops_the_engine_fatally",
+      "kind": "removed",
+      "replacements": [
+        "rust:crates/opc-session-store::test=fixed_quorum_authority::snapshot_build_failure::first_local_snapshot_build_failure_stops_without_retry"
+      ],
+      "reason": "Restore the fail-stop contract while #1254/#1243 are deferred until the #1249 retained-log admission foundation exists and is qualified. This test is renamed and its original fault scenario is retained, not deleted or ignored. A first-snapshot failure now stops on the first attempt, not after three retries. Replace retired reason/counter API checks with exact one-attempt consumption, storage error class/subject/verb, no claimed snapshot/purge progress, staging cleanup and refused later local work.",
+      "issue": 1254
+    },
+    {
+      "test": "rust:crates/opc-sctp::lib=lib::tests::loopback_dual_stack_multihoming_selects_both_families",
+      "kind": "disabled",
+      "reason": "New native Linux SCTP test requires SCTP and IPv6 loopback. The required SCTP workflow executes it explicitly and checks one passing test. It exercises mixed bindx/connectx in both family orders, address readback, primary-path selection and payload delivery over IPv4 and IPv6. Portable configuration and path-identity tests run normally.",
+      "issue": 1351
+    },
+    {
+      "test": "rust:crates/opc-sctp::lib=lib::tests::loopback_wire_abort_closes_with_live_handles_and_pending_receive",
+      "kind": "disabled",
+      "reason": "New native Linux SCTP abort test needs kernel SCTP. Required SCTP workflow executes it through qualify-sctp-close-wire.py and independently captures a User-Initiated ABORT. It retains handles and a pending receive to prove synchronous closure.",
+      "issue": 1351
+    },
+    {
+      "test": "rust:crates/opc-diameter-transport::lib=lib::dtls_tests::wire_abort::kernel_malformed_diameter_frames_abort_sequential_and_runtime_associations",
+      "kind": "disabled",
+      "reason": "New native SCTP-AUTH test sends three malformed authenticated Diameter frames through each of the sequential receiver, concurrent receiver, client cleartext prelude and server cleartext prelude. Required SCTP workflow runs it through qualify-sctp-close-wire.py and requires twelve actual ABORT associations plus separate graceful-close controls.",
+      "issue": 1351
+    },
+    {
+      "test": "rust:vendor/dimpl::lib=lib::dtls12::message::certificate_request::test::filters_unsupported_rsa_signature_algorithm",
+      "kind": "removed",
+      "issue": 1353,
+      "reason": "Renamed to retains_supported_rsa_and_ecdsa_signature_algorithms for implemented DTLS RSA support. The parser and serializer now preserve modern RSA schemes. The separate unsupported-type test retains DSA and MD5 refusal.",
+      "renamed_to": "rust:vendor/dimpl::lib=lib::dtls12::message::certificate_request::test::retains_supported_rsa_and_ecdsa_signature_algorithms"
+    },
+    {
+      "test": "rust:vendor/dimpl::lib=lib::dtls12::message::extensions::signature_algorithms::tests::default_does_not_advertise_rsa",
+      "kind": "removed",
+      "issue": 1353,
+      "reason": "Renamed to default_advertises_modern_rsa_and_ecdsa_schemes for implemented DTLS RSA support. The wire advertisement now includes only ECDSA and RSA-PSS/PKCS1 SHA-256/384; assertions retain the exact supported set and modern-hash restriction.",
+      "renamed_to": "rust:vendor/dimpl::lib=lib::dtls12::message::extensions::signature_algorithms::tests::default_advertises_modern_rsa_and_ecdsa_schemes"
+    },
+    {
+      "test": "rust:vendor/dimpl::lib=lib::dtls12::message::tests::rsa_signature_algorithms_are_recognized_but_not_supported",
+      "kind": "removed",
+      "issue": 1353,
+      "reason": "Renamed to modern_rsa_signatures_are_supported_but_legacy_hashes_are_not for implemented DTLS RSA support. The former unsupported RSA capability is implemented; explicit SHA-1 and MD5 refusal replaces the obsolete RSA rejection.",
+      "renamed_to": "rust:vendor/dimpl::lib=lib::dtls12::message::tests::modern_rsa_signatures_are_supported_but_legacy_hashes_are_not"
+    },
+    {
+      "test": "rust:vendor/dimpl::lib=lib::dtls12::server::tests::certificate_request_does_not_select_rsa_signatures",
+      "kind": "removed",
+      "issue": 1353,
+      "reason": "Renamed to certificate_request_selects_rsa_and_ecdsa_signatures for implemented DTLS RSA support. Exact intersection assertions now retain RSA and ECDSA; ECDSA selection assertions remain.",
+      "renamed_to": "rust:vendor/dimpl::lib=lib::dtls12::server::tests::certificate_request_selects_rsa_and_ecdsa_signatures"
+    },
+    {
+      "test": "rust:vendor/dimpl::lib=lib::dtls12::server::tests::certificate_request_rejects_rsa_only_signatures",
+      "kind": "removed",
+      "issue": 1353,
+      "reason": "Renamed to certificate_request_accepts_rsa_only_signatures for implemented DTLS RSA support. RSA-only modern offers now work. New CertificateRequest and CertificateVerify tests reject mismatched certificate types and unoffered schemes; independent OpenSSL handshakes exercise both roles with every supported RSA scheme.",
+      "renamed_to": "rust:vendor/dimpl::lib=lib::dtls12::server::tests::certificate_request_accepts_rsa_only_signatures"
+    },
+    {
+      "test": "python:ci/test-test-inventory.py::AdvisoryWorkflowTests.test_reviewed_vendored_legacy_stack_is_accepted",
+      "kind": "removed",
+      "issue": 1532,
+      "reason": "The DTLS arithmetic migration removes the RUSTSEC-2026-0387 exception. The same formerly accepted 0.5.5 dependency graph must now fail before any audit. Retain the graph fixture and strengthen it to require explicit rejection; the separate migrated-stack regression also requires both advisory ignore lists to exclude 0386 and 0387.",
+      "renamed_to": "python:ci/test-test-inventory.py::AdvisoryWorkflowTests.test_reviewed_vendored_legacy_stack_is_rejected"
+    },
+    {
+      "test": "python:ci/test-test-inventory.py::AdvisoryWorkflowTests.test_standalone_checked_in_fork_is_the_only_allowed_terminal_dimpl",
+      "kind": "removed",
+      "issue": 1532,
+      "reason": "The standalone vendored DTLS workspace no longer has an exception for crypto-bigint 0.5.5. Retain both standalone and root-lock fixtures and require rejection before auditing the vulnerable graph, while preserving the successful root audit before a later vendor-lock failure.",
+      "renamed_to": "python:ci/test-test-inventory.py::AdvisoryWorkflowTests.test_standalone_checked_in_fork_also_rejects_legacy_crypto"
+    },
+    {
+      "test": "python:ci/test-test-inventory.py::AdvisoryWorkflowTests.test_additional_legacy_consumer_is_rejected_at_every_boundary",
+      "kind": "fixture-setup-changed",
+      "reason": "Removing the RUSTSEC-2026-0387 legacy exception (#1532) changes the rejection diagnostic. Replace self.assertIn(f'unaccepted legacy crypto dependency: extra -> {target}', result.stderr) with self.assertIn('is not accepted for crypto-bigint 0.5.5', result.stderr). The version floor now refuses every 0.5.5 graph before the former consumer-confinement diagnostics. Preserve the same invalid graph fixtures and every other assertion; no vulnerable graph becomes accepted. The migrated-stack regression separately requires both advisory ignores to be absent.",
+      "issue": 1532
+    },
+    {
+      "test": "python:ci/test-test-inventory.py::AdvisoryWorkflowTests.test_optional_locked_consumer_cannot_hide_outside_enabled_metadata",
+      "kind": "fixture-setup-changed",
+      "reason": "Removing the RUSTSEC-2026-0387 legacy exception (#1532) changes the rejection diagnostic. Replace self.assertIn('unaccepted legacy crypto dependency: optional -> crypto-bigint', result.stderr) with self.assertIn('is not accepted for crypto-bigint 0.5.5', result.stderr). The version floor now refuses every 0.5.5 graph before the former consumer-confinement diagnostics. Preserve the same invalid graph fixtures and every other assertion; no vulnerable graph becomes accepted. The migrated-stack regression separately requires both advisory ignores to be absent.",
+      "issue": 1532
+    },
+    {
+      "test": "python:ci/test-test-inventory.py::AdvisoryWorkflowTests.test_similarly_named_registry_or_unvendored_fork_is_rejected",
+      "kind": "fixture-setup-changed",
+      "reason": "Removing the RUSTSEC-2026-0387 legacy exception (#1532) changes the rejection diagnostic. Replace self.assertIn(f'must use the checked-in {name}', result.stderr) with self.assertIn('is not accepted for crypto-bigint 0.5.5', result.stderr). The version floor now refuses every 0.5.5 graph before the former consumer-confinement diagnostics. Preserve the same invalid graph fixtures and every other assertion; no vulnerable graph becomes accepted. The migrated-stack regression separately requires both advisory ignores to be absent.",
+      "issue": 1532
+    },
+    {
+      "test": "python:ci/test-test-inventory.py::AdvisoryWorkflowTests.test_unresolved_or_disconnected_legacy_copy_is_rejected",
+      "kind": "fixture-setup-changed",
+      "reason": "Removing the RUSTSEC-2026-0387 legacy exception (#1532) changes the rejection diagnostic. Replace self.assertIn('cannot verify the locked crypto-bigint 0.5.5 dependency path', result.stderr); self.assertIn('legacy crypto path ends before the vendored DTLS consumer', result.stderr) with self.assertIn('is not accepted for crypto-bigint 0.5.5', result.stderr). The version floor now refuses every 0.5.5 graph before the former consumer-confinement diagnostics. Preserve the same invalid graph fixtures and every other assertion; no vulnerable graph becomes accepted. The migrated-stack regression separately requires both advisory ignores to be absent.",
+      "issue": 1532
+    },
+    {
+      "test": "rust:crates/opc-peer-discovery::test=dns_contracts::every_failure_preserves_last_good_without_time_cutoff",
+      "kind": "removed",
+      "renamed_to": "rust:crates/opc-peer-discovery::test=dns_contracts::transient_failures_preserve_last_good_only_within_stale_limit",
+      "reason": "RFC 8767 requires a maximum stale timer and authoritative refreshes replace prior data. Retain transient-error last-good assertions within the timer, add expiry assertions, and separately test authoritative negatives with and without SOA TTLs.",
+      "issue": 1355
+    },
+    {
+      "test": "rust:crates/opc-api-nnrf::test=compat_sbi::sbi_nf_profile_deserializes_into_generated_type",
+      "kind": "assertions-decreased",
+      "reason": "Remove sbi_value_to_generated, whose assertion-bearing normalization helper concealed invalid NRF wire JSON. Both tests now deserialize the actual serialized SBI payload directly into the generated TS 29.510 schema; existing identity, PLMN, slice and service field assertions remain. Literal wire-format regressions in opc-sbi cover the corrected representation.",
+      "issue": 1362
+    },
+    {
+      "test": "rust:crates/opc-api-nnrf::test=compat_sbi::sbi_nf_profile_round_trip_preserves_identity",
+      "kind": "assertions-decreased",
+      "reason": "Remove sbi_value_to_generated, whose assertion-bearing normalization helper concealed invalid NRF wire JSON. Both tests now deserialize the actual serialized SBI payload directly into the generated TS 29.510 schema; existing identity, PLMN, slice and service field assertions remain. Literal wire-format regressions in opc-sbi cover the corrected representation.",
+      "issue": 1362
+    },
+    {
+      "test": "rust:crates/opc-proto-diameter::test=app_dictionaries::rf_grouped_mscc_rejects_excessive_nesting_depth",
+      "kind": "removed",
+      "renamed_to": "rust:crates/opc-proto-diameter::test=app_dictionaries::rf_grouped_service_data_rejects_excessive_nesting_depth",
+      "reason": "Replace the nonconforming online MSCC shape in Rf with Service-Information / PS-Information / Service-Data-Container. Retains the nesting-limit assertion and checks the exact DepthExceeded category at the offline container boundary.",
+      "issue": 1361
+    },
+    {
+      "test": "rust:crates/opc-ipsec-xfrm::lib=lib::tfc::tests::tfc_dummy_payload_has_rfc4303_trailer_and_separate_alignment_padding",
+      "kind": "removed",
+      "reason": "Remove the unused plaintext-only esp_dummy_payload API and its dedicated construction tests. Kernel-SA dummy transmission is provided by EspTfcDummySender and qualified by the independent encrypted-wire matrix; the deleted plaintext API had no repository consumer.",
+      "issue": 1344,
+      "behavior_deleted": true,
+      "deleting_change": "Remove crates/opc-ipsec-xfrm/src/tfc.rs and its public export; Breaking CHANGELOG entry for #1344."
+    },
+    {
+      "test": "rust:crates/opc-ipsec-xfrm::lib=lib::tfc::tests::tfc_dummy_payload_rejects_invalid_alignment",
+      "kind": "removed",
+      "reason": "Remove the unused plaintext-only esp_dummy_payload API and its dedicated construction tests. Kernel-SA dummy transmission is provided by EspTfcDummySender and qualified by the independent encrypted-wire matrix; the deleted plaintext API had no repository consumer.",
+      "issue": 1344,
+      "behavior_deleted": true,
+      "deleting_change": "Remove crates/opc-ipsec-xfrm/src/tfc.rs and its public export; Breaking CHANGELOG entry for #1344."
+    },
+    {
+      "test": "rust:crates/opc-proto-ikev2::lib=lib::recovery::probe::tests::unknown_ids_nonempty_shapes_and_failed_integrity_do_not_complete",
+      "kind": "removed",
+      "renamed_to": "rust:crates/opc-proto-ikev2::lib=lib::recovery::probe::tests::unknown_ids_wrong_exchange_and_failed_integrity_do_not_complete",
+      "reason": "RFC 7296 section 1.4 permits payloads in an authenticated INFORMATIONAL response to an empty probe. Replace the nonempty-response refusal with positive completion and returned-payload coverage across all profiles, roles and recovery modes; retain wrong ID, direction, exchange, integrity and duplicate refusals with exact errors.",
+      "issue": 1241
+    },
+    {
+      "test": "rust:crates/opc-libsctp-sys::lib=lib::linux::tests::packed_address_sets_are_contiguous_and_bounded",
+      "kind": "fixture-setup-changed",
+      "reason": "Replace refusal of a mixed IPv4/IPv6 address set with successful packing and exact 16-byte/28-byte concatenation checks in both family orders. Keep empty, mixed-port, wildcard and count-limit refusals. Mixed-family static multihoming is now supported.",
+      "issue": 1351
+    },
+    {
+      "test": "rust:crates/opc-sctp::lib=lib::tests::endpoint_config_accepts_bounded_same_family_multihoming",
+      "kind": "fixture-setup-changed",
+      "reason": "Replace InvalidConfig(address_family) for adding [::1]:38412 to bounded IPv4 local addresses with successful validation of the mixed-family set. Retain successful same-family admission and the separate port, wildcard and count-limit refusal tests.",
+      "issue": 1351
+    },
+    {
+      "test": "rust:crates/opc-sctp::lib=lib::tests::connect_config_validates_every_local_and_remote_address",
+      "kind": "fixture-setup-changed",
+      "reason": "Replace the invalid-input setup that added [::1]:38412 and expected InvalidConfig(address_family) with [::1]:38413 and InvalidConfig(remote_addrs). Mixed-family peers are now valid; the new port deliberately differs from the existing remote port. Keep successful local/remote validation and the separate no-common-family refusal.",
+      "issue": 1351
+    },
+    {
+      "test": "rust:vendor/dimpl::lib=lib::crypto::validation::tests_aws_lc_rs::test_default_provider_has_cipher_suites",
+      "kind": "fixture-setup-changed",
+      "reason": "Replace the exact default-provider supported cipher-suite count of 4 with 7 after enabling modern ECDHE-RSA and DHE-RSA suites. Retain the ECDSA-specific suite membership assertions and executable-provider validation.",
+      "issue": 1353
+    },
+    {
+      "test": "rust:vendor/dimpl::lib=lib::crypto::validation::tests_aws_lc_rs::test_default_provider_has_kx_groups",
+      "kind": "fixture-setup-changed",
+      "reason": "Replace the exact default-provider key-exchange group count of 3 with 5: retain X25519, P-256 and P-384 and add FFDHE4096 and FFDHE2048. Retain provider validation and independent public/shared-secret vector checks.",
+      "issue": 1353
+    },
+    {
+      "test": "rust:vendor/dimpl::lib=lib::crypto::validation::tests_rust_crypto::test_default_provider_has_cipher_suites",
+      "kind": "fixture-setup-changed",
+      "reason": "Replace the exact default-provider supported cipher-suite count of 4 with 7 after enabling modern ECDHE-RSA and DHE-RSA suites. Retain the ECDSA-specific suite membership assertions and executable-provider validation.",
+      "issue": 1353
+    },
+    {
+      "test": "rust:vendor/dimpl::lib=lib::crypto::validation::tests_rust_crypto::test_default_provider_has_kx_groups",
+      "kind": "fixture-setup-changed",
+      "reason": "Replace the exact default-provider key-exchange group count of 3 with 5: retain X25519, P-256 and P-384 and add FFDHE4096 and FFDHE2048. Retain provider validation and independent public/shared-secret vector checks.",
+      "issue": 1353
+    },
+    {
+      "test": "rust:vendor/dimpl::lib=lib::dtls12::message::certificate_request::test::filters_unsupported_types",
+      "kind": "fixture-setup-changed",
+      "reason": "Replace the expectation that RSA_SIGN is filtered and only ECDSA_SIGN remains (length 1, ECDSA at index 0) with length 2, RSA_SIGN at index 0 and ECDSA_SIGN at index 1. Keep DSS_SIGN and unsupported MD5/RSA and SHA384/DSA input and refusal coverage; modern RSA certificate types are now supported.",
+      "issue": 1353
+    },
+    {
+      "test": "rust:vendor/dimpl::lib=lib::dtls12::message::extensions::signature_algorithms::tests::test_signature_algorithms_extension",
+      "kind": "fixture-setup-changed",
+      "reason": "Replace parsing only one ECDSA entry from the serialized ECDSA/SHA256 and RSA/SHA256 extension with parsing both entries and equality with the original algorithm list. Keep the exact serialized wire bytes and the ECDSA-first assertion; modern RSA algorithms are now supported.",
+      "issue": 1353
+    },
+    {
+      "test": "rust:vendor/dimpl::lib=lib::dtls12::message::extensions::supported_groups::tests::test_supported_groups_parse_provided_bytes",
+      "kind": "fixture-setup-changed",
+      "reason": "Replace the parsed group list [X25519, P-256, P-384] with [X25519, P-256, P-384, FFDHE2048] for the unchanged literal wire vector. The formerly filtered 0x0100 is now supported; unsupported 0x0101 remains filtered, with ordering and empty remainder checks retained.",
+      "issue": 1353
     }
   ]
 }

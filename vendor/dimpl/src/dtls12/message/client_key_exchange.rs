@@ -15,6 +15,7 @@ pub struct ClientKeyExchange {
 #[derive(Debug, PartialEq, Eq)]
 pub enum ExchangeKeys {
     Ecdh(ClientEcdhKeys),
+    Dhe(Range<usize>),
     Psk(ClientPskKeys),
 }
 
@@ -73,6 +74,20 @@ impl ClientKeyExchange {
                 let (input, ecdh_keys) = ClientEcdhKeys::parse(input, base_offset)?;
                 (input, ExchangeKeys::Ecdh(ecdh_keys))
             }
+            KeyExchangeAlgorithm::DHE => {
+                let (rest, len) = nom::number::complete::be_u16(input)?;
+                if len == 0 {
+                    return Err(Err::Failure(Error::new(
+                        input,
+                        nom::error::ErrorKind::LengthValue,
+                    )));
+                }
+                let (rest, _) = take(len)(rest)?;
+                (
+                    rest,
+                    ExchangeKeys::Dhe(base_offset + 2..base_offset + 2 + usize::from(len)),
+                )
+            }
             KeyExchangeAlgorithm::PSK => {
                 let (input, psk_keys) = ClientPskKeys::parse(input, base_offset)?;
                 (input, ExchangeKeys::Psk(psk_keys))
@@ -86,8 +101,14 @@ impl ClientKeyExchange {
     pub fn serialize(&self, buf: &[u8], output: &mut Buf) {
         match &self.exchange_keys {
             ExchangeKeys::Ecdh(ecdh_keys) => ecdh_keys.serialize(buf, output),
+            ExchangeKeys::Dhe(range) => Self::serialize_dhe(&buf[range.clone()], output),
             ExchangeKeys::Psk(psk_keys) => psk_keys.serialize(buf, output),
         }
+    }
+
+    pub fn serialize_dhe(public_key: &[u8], output: &mut Buf) {
+        output.extend_from_slice(&(public_key.len() as u16).to_be_bytes());
+        output.extend_from_slice(public_key);
     }
 
     /// Helper to serialize directly from public key bytes (for sending)
@@ -145,6 +166,27 @@ mod test {
     use super::super::KeyExchangeAlgorithm;
     use super::*;
     use crate::buffer::Buf;
+
+    #[test]
+    fn dhe_client_key_uses_a_uint16_vector() {
+        let public = vec![0xab; 512];
+        let mut wire = Buf::new();
+        ClientKeyExchange::serialize_dhe(&public, &mut wire);
+        assert_eq!(&wire[..2], &[2, 0]);
+        let (rest, key) = ClientKeyExchange::parse(&wire, 0, KeyExchangeAlgorithm::DHE).unwrap();
+        assert!(rest.is_empty());
+        let ExchangeKeys::Dhe(range) = &key.exchange_keys else {
+            panic!("DHE")
+        };
+        assert_eq!(&wire[range.clone()], public);
+        let mut out = Buf::new();
+        key.serialize(&wire, &mut out);
+        assert_eq!(out.as_ref(), wire.as_ref());
+        for len in 0..wire.len() {
+            assert!(ClientKeyExchange::parse(&wire[..len], 0, KeyExchangeAlgorithm::DHE).is_err());
+        }
+        assert!(ClientKeyExchange::parse(&[0, 0], 0, KeyExchangeAlgorithm::DHE).is_err());
+    }
 
     const ECDH_MESSAGE: &[u8] = &[
         0x04, // Public key length

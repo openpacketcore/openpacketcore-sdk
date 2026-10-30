@@ -233,6 +233,101 @@ async fn native_public_dispatch_ignores_sql_lanes_and_rejects_retained_closed_ow
         .is_err());
 }
 
+#[tokio::test]
+async fn native_consensus_restore_late_delivery_preserves_terminal_cursor_error() {
+    struct CompletionWake(std::sync::mpsc::Sender<()>);
+    impl futures_util::task::ArcWake for CompletionWake {
+        fn wake_by_ref(arc_self: &Arc<Self>) {
+            let _ = arc_self.0.send(());
+        }
+    }
+
+    let (_directory, backend, core, wal) = backend(Arc::new(|_| Ok(()))).await;
+    let writer = Arc::clone(&wal);
+    tokio::task::spawn_blocking(move || {
+        let entries = [formation()];
+        writer.submit(append(&entries)).unwrap().wait().unwrap();
+        writer
+            .submit(Operation::Committed(Some(log_id(0))))
+            .unwrap()
+            .wait()
+            .unwrap();
+        writer.native_apply_committed(&entries).unwrap();
+    })
+    .await
+    .unwrap();
+    if let Some(lane) = core.proactive_checkpoint_lane() {
+        lane.shutdown().await;
+    }
+    if let Some(lane) = core.consensus_log_prune_lane() {
+        lane.shutdown().await;
+    }
+    let request = RestoreScanRequest {
+        cursor: Some(crate::restore::RestoreScanCursor::from_offset(1)),
+        ..RestoreScanRequest::all(1)
+    };
+    assert_eq!(
+        backend
+            .consensus_scan_restore_records_at(
+                request.clone(),
+                timestamp(1),
+                tokio::time::Instant::now() + Duration::from_secs(1),
+            )
+            .await,
+        Err(StoreError::RestoreScanCursorStale)
+    );
+    tokio::time::pause();
+    let budget = Duration::from_secs(1);
+    let deadline = tokio::time::Instant::now() + budget;
+    let mut operation =
+        Box::pin(backend.consensus_scan_restore_records_at(request, timestamp(1), deadline));
+    let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+    let waker = futures_util::task::waker(Arc::new(CompletionWake(ready_tx)));
+    let mut context = std::task::Context::from_waker(&waker);
+    assert!(std::future::Future::poll(operation.as_mut(), &mut context).is_pending());
+    ready_rx
+        .recv_timeout(Duration::from_secs(5))
+        .expect("the completed native read wakes its caller");
+    assert_eq!(backend.restore_scan_workers.available_permits(), 1);
+    tokio::time::advance(budget).await;
+    assert_eq!(
+        operation.await,
+        Err(StoreError::RestoreScanCursorStale),
+        "a terminal scan result stays terminal when delivery crosses the deadline"
+    );
+    tokio::time::resume();
+    tokio::task::spawn_blocking(move || wal.shutdown().unwrap())
+        .await
+        .unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn native_consensus_restore_deadline_while_waiting_for_worker_is_retryable() {
+    let (_directory, backend, _core, wal) = backend(Arc::new(|_| Ok(()))).await;
+    let held_permit = Arc::clone(&backend.restore_scan_workers)
+        .acquire_owned()
+        .await
+        .unwrap();
+    let result = backend
+        .consensus_scan_restore_records_at(
+            RestoreScanRequest::all(1),
+            timestamp(1),
+            tokio::time::Instant::now() + Duration::from_millis(25),
+        )
+        .await;
+    assert_eq!(
+        result,
+        Err(StoreError::BackendUnavailable(
+            "native session state is unavailable".into()
+        ))
+    );
+    drop(held_permit);
+    assert!(backend.native_read_task(|_, _| Ok(())).await.is_ok());
+    tokio::task::spawn_blocking(move || wal.shutdown().unwrap())
+        .await
+        .unwrap();
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn native_public_active_cancellation_and_restore_deadline_retire_without_fencing() {
     for deadline in [false, true] {
@@ -273,7 +368,9 @@ async fn native_public_active_cancellation_and_restore_deadline_retire_without_f
         if deadline {
             assert_eq!(
                 task.await.unwrap(),
-                Err(StoreError::RestoreScanWorkBudgetExceeded)
+                Err(StoreError::BackendUnavailable(
+                    "native session state is unavailable".into()
+                ))
             );
         } else {
             task.abort();

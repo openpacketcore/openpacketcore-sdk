@@ -1284,8 +1284,10 @@ fn dtls13_only_functional_signature_schemes_advertised() {
 
     // Extract all advertised scheme codes
     let advertised: Vec<u16> = schemes
-        .chunks_exact(2)
-        .map(|scheme| u16::from_be_bytes([scheme[0], scheme[1]]))
+        .as_chunks::<2>()
+        .0
+        .iter()
+        .map(|scheme| u16::from_be_bytes(*scheme))
         .collect();
 
     // Only ECDSA P-256 (0x0403) and P-384 (0x0503) should be advertised.

@@ -1974,7 +1974,34 @@ impl GtpuSocketHandle {
         if let Some(socket) = &self._test_socket {
             return Some(std::os::fd::AsFd::as_fd(socket));
         }
-        self._socket.as_ref().map(GtpuUdpSocket::as_fd)
+        #[cfg(not(opc_linux_gtpu_sys_force_unsupported))]
+        {
+            self._socket.as_ref().map(GtpuUdpSocket::as_fd)
+        }
+        #[cfg(opc_linux_gtpu_sys_force_unsupported)]
+        {
+            None
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    fn socket_cookie(&self) -> std::io::Result<u64> {
+        // The forced-unsupported profile disables the production GTP sys
+        // backend. Its injected UDP test sockets still need the real kernel
+        // identity so every lifetime and descriptor-replacement proof runs.
+        #[cfg(all(test, opc_linux_gtpu_sys_force_unsupported))]
+        if let Some(socket) = &self._test_socket {
+            let cookie = rustix::net::sockopt::socket_cookie(socket)?;
+            return if cookie == 0 {
+                Err(std::io::Error::from(std::io::ErrorKind::InvalidData))
+            } else {
+                Ok(cookie)
+            };
+        }
+        let fd = self
+            .linux_as_fd()
+            .ok_or_else(|| std::io::Error::from(std::io::ErrorKind::Unsupported))?;
+        opc_linux_gtpu_sys::socket_kernel_identity(fd).map(|identity| identity.socket_cookie())
     }
 }
 
@@ -2448,6 +2475,11 @@ fn validate_device(device: &GtpDevice) -> Result<(), GtpuError> {
 }
 
 fn validate_pdp_context(context: &GtpPdpContext) -> Result<(), GtpuError> {
+    if context.downlink_peer_source_policy != crate::GtpuPeerSourcePolicy::BackendDefault {
+        return Err(GtpuError::UnsupportedFeature {
+            feature: "downlink_peer_source_policy",
+        });
+    }
     if context.bearer_mark.is_some() {
         return Err(GtpuError::UnsupportedFeature {
             feature: "per_bearer_marking",
@@ -2917,6 +2949,7 @@ fn parse_pdp_context_response(
         ms_address,
         peer_address,
         link_ifindex,
+        downlink_peer_source_policy: crate::GtpuPeerSourcePolicy::BackendDefault,
         downlink_source_port_policy: crate::GtpuSourcePortPolicy::Any,
         gtp_version: GtpVersion::V1,
         bearer_mark: None,
@@ -4025,6 +4058,7 @@ mod tests {
             ms_address: IpAddr::V4(Ipv4Addr::new(10, 23, 0, 2)),
             peer_address: IpAddr::V4(Ipv4Addr::new(192, 0, 2, 10)),
             link_ifindex: 42,
+            downlink_peer_source_policy: crate::GtpuPeerSourcePolicy::BackendDefault,
             downlink_source_port_policy: crate::GtpuSourcePortPolicy::Any,
             gtp_version: GtpVersion::V1,
             bearer_mark: None,
@@ -4415,6 +4449,18 @@ mod tests {
     }
 
     #[test]
+    fn kernel_backend_rejects_unretained_multihoming_policy_before_mutation() {
+        let mut context = pdp_context();
+        context.downlink_peer_source_policy = crate::GtpuPeerSourcePolicy::TeidAndLocal;
+        assert!(matches!(
+            validate_pdp_context(&context),
+            Err(GtpuError::UnsupportedFeature {
+                feature: "downlink_peer_source_policy"
+            })
+        ));
+    }
+
+    #[test]
     fn kernel_backend_rejects_bounded_source_port_policy_without_sending_it() {
         for policy in [
             crate::GtpuSourcePortPolicy::Exact(21_152),
@@ -4685,6 +4731,20 @@ mod tests {
             attr_payload(attributes, GTPA_I_TEI),
             Some(&context.local_teid.get().to_ne_bytes()[..])
         );
+    }
+
+    #[test]
+    fn pdp_readback_accepts_zero_peer_teid() {
+        let selector_context = pdp_context();
+        let selector = PdpContextSelector::LocalTeid(
+            PdpContextLocalTeidSelector::from_context(&selector_context).unwrap(),
+        );
+        let mut zero_peer = selector_context;
+        zero_peer.peer_teid = PeerTeid::ZERO;
+        let received =
+            parse_pdp_context_response(&pdp_response(&zero_peer, true), &selector, 31).unwrap();
+        assert_eq!(received.peer_teid, PeerTeid::ZERO);
+        assert!(validate_pdp_context(&received).is_ok());
     }
 
     #[test]
@@ -8903,7 +8963,7 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     #[tokio::test]
-    async fn linux_control_port_refuses_nonstandard_port_and_ipv6_bind() {
+    async fn linux_control_port_refuses_nonstandard_port_and_accepts_ipv6_bind() {
         let transport = control_transport();
         let backend = LinuxGtpuDataplaneBackend::with_transport(transport);
         let mut request = CreateGtpDeviceRequest::new("gtp-port");
@@ -8918,12 +8978,7 @@ mod tests {
         let mut request = CreateGtpDeviceRequest::new("gtp-v6");
         request.bind_address = IpAddr::V6(Ipv6Addr::LOCALHOST);
         let device = backend.create_device(request).await.unwrap();
-        assert!(matches!(
-            backend.open_gtpu_control_port(&device).await,
-            Err(GtpuError::UnsupportedFeature {
-                feature: "gtpu_control_port_ipv6"
-            })
-        ));
+        assert!(backend.open_gtpu_control_port(&device).await.is_ok());
     }
 
     #[cfg(target_os = "linux")]
@@ -9083,6 +9138,7 @@ mod tests {
         let peer = std::net::UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
         peer.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
         let _guard = backend.inner.pdp_operation_lock.lock().unwrap();
+        let _registry = backend.inner.device_sockets.lock().unwrap();
         assert!(port.try_receive_datagram(64).unwrap().is_none());
         let plan = receive_control_echo_plan(port.as_ref(), &peer, address);
         assert_eq!(port.send_control_response(plan).unwrap(), 14);
@@ -9298,22 +9354,19 @@ mod tests {
         assert_eq!(datagram.bytes(), gpdu);
         assert_eq!(
             datagram.local(),
-            std::net::SocketAddrV4::new(address, GTPU_PORT)
+            std::net::SocketAddr::from((address, GTPU_PORT))
         );
-        assert_eq!(
-            std::net::SocketAddr::V4(datagram.peer()),
-            trigger.local_addr().unwrap()
-        );
+        assert_eq!(datagram.peer(), trigger.local_addr().unwrap());
         let plan = datagram
             .unknown_tunnel_error(GtpuControlResponseBudget::new(28, 4).unwrap())
             .unwrap();
         assert_eq!(
             plan.source(),
-            std::net::SocketAddrV4::new(address, GTPU_PORT)
+            std::net::SocketAddr::from((address, GTPU_PORT))
         );
         assert_eq!(
             plan.destination(),
-            std::net::SocketAddrV4::new(peer_address, GTPU_PORT)
+            std::net::SocketAddr::from((peer_address, GTPU_PORT))
         );
         assert_eq!(port.send_control_response(plan).unwrap(), 28);
         let mut received = [0; 64];
@@ -9347,7 +9400,12 @@ mod tests {
             else {
                 panic!()
             };
-            setsockopt(&handle.linux_as_fd().unwrap(), sockopt::IpRecvTos, &true).unwrap();
+            // Exceed the shared IPv4/IPv6 packet-info and overflow buffer;
+            // TOS alone fits now that both address families are supported.
+            let fd = handle.linux_as_fd().unwrap();
+            setsockopt(&fd, sockopt::IpRecvTos, &true).unwrap();
+            setsockopt(&fd, sockopt::Ipv4RecvTtl, &true).unwrap();
+            setsockopt(&fd, sockopt::ReceiveTimestampns, &true).unwrap();
         }
         let peer = std::net::UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
         peer.send_to(

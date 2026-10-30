@@ -14,6 +14,7 @@ use std::time::{Duration, Instant};
 struct CacheEntry {
     value: CacheValue,
     inserted_at: Instant,
+    valid_for: Duration,
     config_version: ConfigVersion,
     /// Monotonic sequence number for FIFO eviction.
     sequence: u64,
@@ -97,6 +98,22 @@ impl DiscoveryCache {
 
     /// Insert a positive discovery result at a specific instant.
     pub fn insert_at(&mut self, key: CacheKey, profiles: Vec<NfProfile>, now: Instant) {
+        self.insert_with_validity_at(key, profiles, Duration::MAX, now);
+    }
+
+    /// Insert with a server-authorized lifetime that also caps stale reuse.
+    /// Zero lifetime evicts any old entry and does not store the new value.
+    pub fn insert_with_validity_at(
+        &mut self,
+        key: CacheKey,
+        profiles: Vec<NfProfile>,
+        valid_for: Duration,
+        now: Instant,
+    ) {
+        if valid_for.is_zero() {
+            self.remove(&key);
+            return;
+        }
         let seq = self.next_sequence;
         self.next_sequence += 1;
         self.entries.insert(
@@ -104,6 +121,7 @@ impl DiscoveryCache {
             CacheEntry {
                 value: CacheValue::Positive(profiles),
                 inserted_at: now,
+                valid_for,
                 config_version: self.config_version,
                 sequence: seq,
             },
@@ -118,6 +136,21 @@ impl DiscoveryCache {
 
     /// Insert a negative (not-found) discovery result at a specific instant.
     pub fn insert_negative_at(&mut self, key: CacheKey, now: Instant) {
+        self.insert_negative_with_validity_at(key, Duration::MAX, now);
+    }
+
+    /// Cache an authoritative absence for at most this server lifetime.
+    /// Zero lifetime evicts an old positive/negative entry without storage.
+    pub fn insert_negative_with_validity_at(
+        &mut self,
+        key: CacheKey,
+        valid_for: Duration,
+        now: Instant,
+    ) {
+        if valid_for.is_zero() {
+            self.remove(&key);
+            return;
+        }
         let seq = self.next_sequence;
         self.next_sequence += 1;
         self.entries.insert(
@@ -125,6 +158,7 @@ impl DiscoveryCache {
             CacheEntry {
                 value: CacheValue::Negative,
                 inserted_at: now,
+                valid_for,
                 config_version: self.config_version,
                 sequence: seq,
             },
@@ -154,7 +188,10 @@ impl DiscoveryCache {
             return CacheLookup::Miss;
         }
 
-        let age = now.duration_since(entry.inserted_at);
+        let age = now.saturating_duration_since(entry.inserted_at);
+        if age >= entry.valid_for {
+            return CacheLookup::Miss;
+        }
 
         match &entry.value {
             CacheValue::Positive(profiles) => {
@@ -249,8 +286,8 @@ mod tests {
             nf_status: super::super::NfStatus::Registered,
             ipv4_addresses: vec!["10.0.0.1".into()],
             fqdn: None,
-            plmn_list: vec![PlmnId::new("001", "01").unwrap()],
-            s_nssais: vec![Snssai::new(1, Some("010203")).unwrap()],
+            plmn_list: vec![PlmnId::new("001", "01").unwrap().into()],
+            s_nssais: vec![Snssai::new(1, Some("010203")).unwrap().into()],
             nf_services: vec![],
             priority: 10,
             capacity: 100,
@@ -260,6 +297,7 @@ mod tests {
     fn sample_key(tag: &str) -> CacheKey {
         CacheKey {
             target_nf_type: NfType::new(tag).unwrap(),
+            requester_nf_type: NfType::new("smf").unwrap(),
             requester_nf_instance_id: None,
             plmn: None,
             s_nssai: None,
@@ -408,6 +446,7 @@ mod tests {
 
         let key_a = CacheKey {
             target_nf_type: NfType::new("amf").unwrap(),
+            requester_nf_type: NfType::new("smf").unwrap(),
             requester_nf_instance_id: None,
             plmn: None,
             s_nssai: None,
@@ -415,6 +454,7 @@ mod tests {
         };
         let key_b = CacheKey {
             target_nf_type: NfType::smf(),
+            requester_nf_type: NfType::new("smf").unwrap(),
             requester_nf_instance_id: None,
             plmn: None,
             s_nssai: None,
@@ -422,6 +462,7 @@ mod tests {
         };
         let key_c = CacheKey {
             target_nf_type: NfType::new("pcf").unwrap(),
+            requester_nf_type: NfType::new("smf").unwrap(),
             requester_nf_instance_id: None,
             plmn: None,
             s_nssai: None,

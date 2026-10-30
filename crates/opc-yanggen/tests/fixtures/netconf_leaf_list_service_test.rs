@@ -642,6 +642,47 @@ async fn leaf_list_existence_errors_keep_netconf_error_distinctions() {
     }
 }
 
+async fn check_existence_errors(present: System, absent: System, element: &str) {
+    for target in ["running", "candidate", "startup"] {
+        for (operation, config, tag) in [
+            ("create", present.clone(), "data-exists"),
+            ("delete", absent.clone(), "data-missing"),
+        ] {
+            let fixture = Fixture::new(config, false, true).await;
+            let body = format!("<ex:system>{}</ex:system>", element.replace("OPERATION", operation));
+            fixture.rejected(&edit(target, &body, "merge"), tag, &MgmtLimits::default()).await;
+        }
+    }
+}
+
+#[tokio::test]
+async fn review_scalar_existence_errors_keep_netconf_error_distinctions() {
+    check_existence_errors(complete_config(), System::default(),
+        "<ex:hostname nc:operation=\"OPERATION\">fixture-system</ex:hostname>").await;
+}
+
+#[tokio::test]
+async fn review_sensitive_leaf_existence_errors_keep_netconf_error_distinctions() {
+    let mut present = complete_config();
+    present.secret = SecretLeaf::new(LeafPresence::Explicit("fixture-private".into()));
+    check_existence_errors(present, complete_config(),
+        "<ex:secret nc:operation=\"OPERATION\">fixture-private</ex:secret>").await;
+}
+
+#[tokio::test]
+async fn review_presence_container_existence_errors_keep_netconf_error_distinctions() {
+    let mut present = complete_config();
+    present.dns = Some(Dns::default());
+    check_existence_errors(present, complete_config(),
+        "<ex:dns nc:operation=\"OPERATION\"/>").await;
+}
+
+#[tokio::test]
+async fn review_keyed_list_existence_errors_keep_netconf_error_distinctions() {
+    check_existence_errors(complete_config(), System::default(),
+        "<ex:gateways nc:operation=\"OPERATION\"><ex:id>7</ex:id></ex:gateways>").await;
+}
+
 #[tokio::test]
 async fn unauthorized_unsupported_and_over_limit_edits_never_commit() {
     let denied = Fixture::new(System::default(), true, true).await;

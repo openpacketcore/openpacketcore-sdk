@@ -128,21 +128,18 @@ The `nix::unistd::dup` entry intentionally keeps Clippy's unreachable-function
 warning when nix is built without `fs`. That build cannot call `dup`; keeping
 the warning also preserves diagnostics for a misspelled path when `fs` is on.
 
-## Rust advisory exception scope
+## Rust advisory audit scope
 
 The security workflow audits every tracked production, example, fuzz and
 standalone-consumer lockfile, using the same fixture exclusion as Rust gates.
-Each graph must resolve with its lock intact. The crypto-bigint advisory ignore
-is ID-wide in the scanner configurations, so the workflow first rejects affected
-versions other than the accepted 0.5.5 and checks every incoming dependency edge
-of that legacy copy through the pinned RustCrypto stack to the checked-in dimpl
-fork and its Diameter transport consumer, including optional lockfile edges that
-are absent from enabled metadata. The fork's own checked-in test workspace is
-also accepted; other standalone consumers are not. A new consumer, changed
-legacy stack or different fork location fails the gate. The IKE manifest must
-also require a patched release, because SDK consumers use their own lockfiles. Regression
-fixtures in `ci/test-test-inventory.py` execute this workflow step with vulnerable
-locks, unexpected consumers and scanner failures.
+Each graph must resolve with its lock intact. Every locked crypto-bigint copy
+must use the registry source and a patched stable version, including optional
+dependencies absent from enabled metadata. The IKE manifest must also require a
+patched release, because SDK consumers use their own lockfiles. The vendored
+DTLS arithmetic migration and owned Tokio reactor registration replace the
+RUSTSEC-2026-0387 and RUSTSEC-2026-0386 exceptions; neither advisory is ignored.
+Regression fixtures in `ci/test-test-inventory.py` execute this workflow step
+with vulnerable locks, unexpected sources and scanner failures.
 
 ## Secret scan scope
 

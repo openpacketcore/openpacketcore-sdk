@@ -192,5 +192,6 @@ fn native_tfc_install_readback_and_ignored_update_are_reported_exactly() {
                 backend.query_sa(query).await,
                 Err(XfrmError::NotFound)
             ));
+            println!("TFC_PADDING_PROOF_OK");
         });
 }

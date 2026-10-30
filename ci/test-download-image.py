@@ -87,8 +87,8 @@ class DownloadTests(unittest.TestCase):
                     cache_snapshots.append(target.read_bytes() if target.exists() else None)
                 action = replies[min(len(requests) - 1, len(replies) - 1)]
                 self.close_connection = True
-                if action == "404":
-                    self.send_error(404)
+                if action in ("404", "429"):
+                    self.send_error(int(action))
                     return
                 if action == "empty":
                     return
@@ -209,10 +209,12 @@ class DownloadTests(unittest.TestCase):
             # Bytes left by an earlier invocation/profile cannot seed this one.
             (["ok"], 0, [None], b"stale image prefix", ()),
             (["404", "ok"], 0, [None, None], b"", (22,)),
+            (["429", "ok"], 0, [None, None], b"", (22,)),
             (["empty", "ok"], 0, [None, None], b"", (52,)),
             (["partial"] * 4, 18,
              [None, "bytes=65536-", "bytes=131072-", "bytes=196608-"], b"", (18,)),
             (["404"] * 4, 22, [None] * 4, b"", (22,)),
+            (["429"] * 4, 22, [None] * 4, b"", (22,)),
             (["corrupt"], 1, [None], b"", ()),
             (["partial", "corrupt"], 1, [None, "bytes=65536-"], b"", (18,)),
             (["partial", "ignore-range", "ok"], 0,

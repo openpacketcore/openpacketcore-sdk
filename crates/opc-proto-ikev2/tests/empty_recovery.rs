@@ -417,7 +417,13 @@ fn empty_then_nonempty_repairs_the_floor_without_a_dpd_write() {
                 let committed = prepared.record().clone();
                 assert_eq!(committed.next_receive(), Some(6));
                 assert_eq!(
-                    &committed.inbound().unwrap().response().unwrap()[32..40],
+                    &committed
+                        .inbound()
+                        .unwrap()
+                        .response()
+                        .unwrap()
+                        .single_packet()
+                        .unwrap()[32..40],
                     &u64::from(current).to_be_bytes()
                 );
                 let token = prepared.commit_after_durable(&committed).unwrap();
@@ -432,8 +438,14 @@ fn empty_then_nonempty_repairs_the_floor_without_a_dpd_write() {
                     Ok(Disposition::CachedResponse)
                 );
                 assert_eq!(
-                    window.replay_response(&request).unwrap().bytes(),
-                    committed.inbound().unwrap().response().unwrap()
+                    window.replay_response(&request).unwrap().bytes().unwrap(),
+                    committed
+                        .inbound()
+                        .unwrap()
+                        .response()
+                        .unwrap()
+                        .single_packet()
+                        .unwrap()
                 );
                 assert_eq!(
                     window.reply_empty(&f.request(6)).unwrap().observation(),
@@ -542,8 +554,14 @@ fn reconstruction_ignores_older_replays_and_commits_the_first_nonempty_error_onc
         Ok(Disposition::CachedResponse)
     );
     assert_eq!(
-        restored.replay_response(&request).unwrap().bytes(),
-        committed.inbound().unwrap().response().unwrap()
+        restored.replay_response(&request).unwrap().bytes().unwrap(),
+        committed
+            .inbound()
+            .unwrap()
+            .response()
+            .unwrap()
+            .single_packet()
+            .unwrap()
     );
     window.delete();
 }
@@ -1093,8 +1111,17 @@ fn failed_record_rebuild_requires_the_explicit_epoch_teardown_hook() {
     window.reply_empty(&f.request(0)).unwrap();
     drop(window);
     assert_eq!(
-        Record::from_persisted(Domain::from_iv_record(&f.iv), 1, None, Some(0), None, None)
-            .unwrap_err(),
+        Record::from_persisted(
+            Domain::from_iv_record(&f.iv),
+            1,
+            None,
+            Some(0),
+            None,
+            None,
+            None,
+            None,
+        )
+        .unwrap_err(),
         Error::InvalidRecord
     );
     let still_live = start(&f, &original);
@@ -1435,8 +1462,14 @@ fn newer_admitted_work_retires_an_ordinary_cached_reply_without_a_write() {
     let committed = prepared.record().clone();
     let _commit = prepared.commit_after_durable(&committed).unwrap();
     assert_eq!(
-        window.replay_response(&request).unwrap().bytes(),
-        committed.inbound().unwrap().response().unwrap()
+        window.replay_response(&request).unwrap().bytes().unwrap(),
+        committed
+            .inbound()
+            .unwrap()
+            .response()
+            .unwrap()
+            .single_packet()
+            .unwrap()
     );
     assert_eq!(
         window.request_disposition(&work(&f, 1)),
@@ -1544,13 +1577,18 @@ fn volatile_empty_probe_public_api_retransmits_completes_and_never_writes() {
                 encryption,
                 direction,
             );
-            let allocation = f
-                .allocator
-                .allocate(Purpose::Ordinary)
-                .expect("committed probe IV block");
+            let prepared = f.window.prepare_liveness(4).unwrap();
+            let row = prepared.record().clone();
+            let _commit = prepared.commit_after_durable(&row).unwrap();
             let request = f
                 .window
-                .send_empty_request(f.profile, &f.keys, allocation)
+                .start_empty_probe(
+                    f.profile,
+                    &f.keys,
+                    &mut f.allocator,
+                    opc_proto_ikev2::recovery::Ikev2LivenessProbePolicy::new(1_000, 4, 10).unwrap(),
+                    100,
+                )
                 .unwrap();
             let id = request.message_id();
             let bytes = request.bytes().to_vec();
@@ -1558,8 +1596,8 @@ fn volatile_empty_probe_public_api_retransmits_completes_and_never_writes() {
 
             let durable_before = f.window.record().clone();
             assert_eq!(
-                f.window.retransmit_empty_request().unwrap(),
-                Some(bytes.as_slice())
+                f.window.retry_empty_probe(110).unwrap().bytes(),
+                bytes.as_slice()
             );
             assert_eq!(f.window.record(), &durable_before);
 
@@ -1572,8 +1610,7 @@ fn volatile_empty_probe_public_api_retransmits_completes_and_never_writes() {
                 0x4000,
             );
             let opened = f.window.open_peer(f.profile, &f.keys, &response).unwrap();
-            let completion = f.window.complete_empty_request(&opened).unwrap();
-            assert_eq!(completion.message_id(), id);
+            f.window.complete_empty_probe(&opened, 111).unwrap();
             assert_eq!(f.window.pending_empty_request_message_id(), None);
             assert_eq!(f.window.record(), &durable_before);
         }

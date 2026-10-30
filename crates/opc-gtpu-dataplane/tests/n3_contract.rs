@@ -9,7 +9,7 @@ use opc_gtpu_dataplane::n3::{
 use opc_gtpu_dataplane::EbpfGtpuDataplaneBackend;
 use opc_gtpu_dataplane::{
     GtpBearerMark, GtpuCapability, GtpuDataplaneBackend, LinuxGtpuDataplaneBackend,
-    MockGtpuDataplaneBackend, PeerTeid, Teid, UnsupportedGtpuDataplaneBackend,
+    MockGtpuDataplaneBackend, Teid, UnsupportedGtpuDataplaneBackend,
 };
 use opc_protocol::{DecodeContext, DuplicateIePolicy, UnknownIePolicy, ValidationLevel};
 use sha2::{Digest, Sha256};
@@ -29,15 +29,18 @@ fn unhex(text: &str) -> Vec<u8> {
 }
 
 fn insertion(qfi: u8) -> N3UplinkEncapsulation {
-    let tunnel =
-        ReceivedN3UplinkTnl::new("192.0.2.1".parse().unwrap(), PeerTeid::new(0x1122_3344)).unwrap();
+    let tunnel = ReceivedN3UplinkTnl::new(
+        "192.0.2.1".parse().unwrap(),
+        Teid::new(0x1122_3344).unwrap(),
+    )
+    .unwrap();
     N3UplinkEncapsulation::new(tunnel, N3Qfi::new(qfi).unwrap())
 }
 
 #[test]
 fn ppi_receive_uses_ts_38415_high_bits() {
     // PPP=1, RQI=1, QFI=9; PPI=5 in bits 7..5, with spare bits set.
-    let wire = unhex("34ff000d11223344000000850200c9a300000000aa");
+    let wire = unhex("34ff000d11223344000000850200c9bc00000000aa");
     let view =
         N3PacketView::decode(&wire, N3Direction::Downlink, DecodeContext::default()).unwrap();
     assert_eq!(view.qos().ppi(), Some(5));
@@ -72,7 +75,7 @@ fn qos_monitoring_without_tpdu_has_a_specific_refusal() {
 fn independent_reference_packets() {
     assert_eq!(
         &Sha256::digest(REFERENCE.as_bytes())[..],
-        unhex("87583b7b1a6474d0dc7ea46196bddcc915a3676c809ef6b642cb5273728703f2")
+        unhex("3706c33835e665078c54ea2c3b37d6a31aa3d804b393a16165d711134d67db38")
     );
     let mut counts = [0, 0];
     for row in REFERENCE.lines().filter(|line| !line.starts_with('#')) {
@@ -109,13 +112,16 @@ fn independent_reference_packets() {
             assert!(result.is_err(), "synthetic case {} accepted", columns[0]);
         }
     }
-    assert_eq!(counts, [1511, 1093]);
+    assert_eq!(counts, [1487, 1117]);
 }
 
 #[test]
 fn n3_uplink_insertion_matches_independent_wire() {
-    let tunnel =
-        ReceivedN3UplinkTnl::new("192.0.2.1".parse().unwrap(), PeerTeid::new(0x1122_3344)).unwrap();
+    let tunnel = ReceivedN3UplinkTnl::new(
+        "192.0.2.1".parse().unwrap(),
+        Teid::new(0x1122_3344).unwrap(),
+    )
+    .unwrap();
     let insertion = N3UplinkEncapsulation::new(tunnel, N3Qfi::new(9).unwrap());
     let mut dst = BytesMut::from(&b"prefix"[..]);
     insertion.encode_gpdu(&[0xab], &mut dst, 17).unwrap();
@@ -352,8 +358,11 @@ fn receive_is_borrowed_and_allocates_nothing() {
 
 #[test]
 fn directional_tunnel_and_marking_intent_is_explicit_and_redacted() {
-    let uplink =
-        ReceivedN3UplinkTnl::new("192.0.2.1".parse().unwrap(), PeerTeid::new(0x1122_3344)).unwrap();
+    let uplink = ReceivedN3UplinkTnl::new(
+        "192.0.2.1".parse().unwrap(),
+        Teid::new(0x1122_3344).unwrap(),
+    )
+    .unwrap();
     let downlink = LocalN3DownlinkTnl::new(
         "2001:db8::2".parse().unwrap(),
         Teid::new(0x5566_7788).unwrap(),
@@ -427,4 +436,47 @@ fn every_shipped_backend_refuses_n3_forwarding_capability() {
             GtpuCapability::Missing
         );
     }
+}
+
+#[test]
+fn generic_typed_extensions_do_not_expand_n3_endpoint_comprehension() {
+    use opc_protocol::BorrowDecode;
+    for kind in [0x81, 0x83, 0x84, 0xc0] {
+        let wire = [
+            0x34, 255, 0, 13, 0, 0, 0, 1, 0, 0, 0, kind, 1, 0, 0, 0x85, 1, 0, 9, 0, 0x45,
+        ];
+        let ctx = DecodeContext {
+            unknown_ie_policy: UnknownIePolicy::Reject,
+            ..DecodeContext::default()
+        };
+        assert_eq!(
+            opc_proto_gtpu::GtpuMessage::decode(&wire, ctx)
+                .unwrap_err()
+                .code(),
+            &opc_protocol::DecodeErrorCode::UnknownCriticalIe
+        );
+        assert_eq!(
+            N3PacketView::decode(&wire, N3Direction::Downlink, ctx).unwrap_err(),
+            N3PacketError::UnsupportedExtension
+        );
+    }
+    let long = unhex("34ff0011000000010000008202000000000000850100090045");
+    let reject = DecodeContext {
+        unknown_ie_policy: UnknownIePolicy::Reject,
+        ..DecodeContext::default()
+    };
+    assert_eq!(
+        opc_proto_gtpu::GtpuMessage::decode(&long, reject)
+            .unwrap_err()
+            .code(),
+        &opc_protocol::DecodeErrorCode::UnknownCriticalIe
+    );
+    assert_eq!(
+        N3PacketView::decode(&long, N3Direction::Downlink, reject).unwrap_err(),
+        N3PacketError::UnsupportedExtension
+    );
+    assert_eq!(
+        N3PacketView::decode(&long, N3Direction::Downlink, DecodeContext::default()).unwrap_err(),
+        N3PacketError::UnsupportedExtension
+    );
 }

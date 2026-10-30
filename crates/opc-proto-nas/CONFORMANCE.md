@@ -83,11 +83,11 @@ Decodes IE *content* (caller strips IEI/length framing):
   length-validated, raw preservation only.
 
 ### 3. Message-Type Registries (Tables 9.7.1 / 9.7.2)
-- 5GMM: 29 message types, Registration Request (0x41) through DL NAS
-  Transport (0x68), with typed-or-raw body dispatch through
+- 5GMM: 37 message names, Registration Request (0x41) through Relay
+  Authentication Response (0x6D), with typed-or-raw body dispatch through
   `decode_mm_message_body` / `PlainMm::decode_body`.
-- 5GSM: 16 message types, PDU Session Establishment Request (0xC1) through
-  5GSM Status (0xD6), with raw-preserving first-CNF body dispatch through
+- 5GSM: 20 message names, PDU Session Establishment Request (0xC1) through
+  Remote UE Report Response (0xDB), with raw-preserving first-CNF body dispatch through
   `decode_sm_message_body` / `Sm::decode_body`.
 - Unknown code points do not fail decoding; `from_u8` returns `None` and
   the raw code remains available on the header.
@@ -104,20 +104,44 @@ Decodes IE *content* (caller strips IEI/length framing):
 
 ### 5. IE-Level Message Bodies And Dispatch (v2)
 
+The registration, algorithm and message-type registries are checked against
+[TS 24.501 V19.8.0](https://www.etsi.org/deliver/etsi_ts/124500_124599/124501/19.08.00_60/ts_124501v190800p.pdf),
+Tables 9.11.3.7.1, 9.11.3.34.1 and 9.7.1/2 (#1515, #1526, #1527).
+NSSAA, relay, service-level authentication and remote-UE message codes have
+names; their bodies retain the existing raw `Unknown` dispatch. This does not
+claim implementation of those procedures or complete Release 19 support.
+Downstream exhaustive enum matches must handle the added variants.
+
 #### 5.1 Registration Request (§8.2.6)
 - Mandatory IEs decoded: 5GS registration type, follow-on-request pending
   bit, ngKSI, and 5GS mobile identity (via the existing identity decoder).
+- Registration types 1–7 are named, including SNPN onboarding and disaster
+  roaming. Received unused value 0 means initial registration at every
+  validation level (§9.11.3.7). `raw_first_octet` retains the received value
+  for byte-exact forwarding with `EncodeContext::raw_preserving`. Canonical
+  encoding uses the typed registration type, follow-on-request bit and ngKSI;
+  typed `InitialRegistration` sends value 1. An ngKSI value above 7 fails before
+  writing output. Mobile-identity and optional-element bytes remain retained.
 - All remaining bytes are parsed as optional IEs and preserved raw so that
-  unknown or future IEs round-trip byte-exactly when the context permits them.
+  non-critical unknown or future IEs round-trip byte-exactly when the context
+  permits them. Unknown comprehension-required IEs fail at every level,
+  including HeaderOnly.
 - Its own table registers all 42 optional elements, with type-1, fixed-length
   type-3 TV, TLV, and TLV-E framing and message-specific length bounds.
 
 #### 5.2 Registration Accept (§8.2.7)
 - Mandatory 5GS registration result decoded (LV, length must be 1).
+- Canonical encoding uses the typed access result and SMS/NSSAA/emergency
+  flags, retains the defined disaster-roaming flag from `raw_upper_bits`, and
+  clears the spare bit (§9.11.3.6). Raw-preserving encoding emits the original
+  result LV. Both modes retain optional-element bytes.
 - Its own table registers all 60 optional elements and preserves their bytes.
 
 #### 5.3 Security Mode Command (§8.2.25)
 - Mandatory selected NAS security algorithms decoded into NIA/NEA enums.
+- Defined NIA/NEA identifiers 0–7 decode; reserved identifiers 8–15 fail.
+  Naming 4–7 does not enable cryptography: the bundled providers return
+  `NasSecurityError::UnsupportedAlgorithm` for unimplemented identifiers.
 - Mandatory ngKSI decoded and raw-preserved.
 - Mandatory replayed UE security capability LV decoded and raw-preserved;
   zero-length capabilities and truncated LV values are rejected.
@@ -131,9 +155,9 @@ Decodes IE *content* (caller strips IEI/length framing):
 #### 5.5 Configuration Update Command/Complete (§8.2.19/§8.2.20)
 - `ConfigurationUpdateCommand` frames all 44 optional elements from its table,
   including network names, fixed-length time-zone/time values, and containers.
-- `ConfigurationUpdateComplete` has an empty optional-element table. Strict,
-  ProcedureAware, and `UnknownIePolicy::Reject` require an empty body;
-  permissive contexts can preserve or drop framed unknown elements.
+- `ConfigurationUpdateComplete` has an empty optional-element table. Explicit
+  `UnknownIePolicy::Reject` requires an empty body; other policies preserve or
+  drop framed non-critical unknown elements at every validation level.
 - Both types expose `optional_ies`, implement borrowed/owned decoding and
   raw-preserving encoding, check context limits, and redact values in Debug.
 - **API migration:** `MmMessageBody::ConfigurationUpdateCommand` and
@@ -161,12 +185,16 @@ bit 8 set is a one-octet IE (TS 24.007 §11.2.4); table lookup and duplicate
 detection use `iei & 0xf0`, while `OptionalIe.iei` and `raw` retain the original
 octet. Type-1 `value` is empty. Other values exclude identifier/length octets.
 
-Strict and ProcedureAware enforce the table's total wire-length bounds and
-reject unregistered elements even if Preserve or Drop was requested.
-`UnknownIePolicy::Reject` also rejects unregistered elements at other levels.
-Structural and HeaderOnly retain framing-only behavior for registered lengths.
-Permissive unknown framing is described under Known Limitations. Duplicate
-First/Last/Reject policy and element-count limits apply to all six bodies;
+Strict and ProcedureAware enforce each known element's minimum wire length.
+All levels accept framed extensions beyond the table maximum, exposing only
+the supported prefix in `value` while retaining the complete IE in `raw`
+(TS 24.007 §11.4.2). Non-critical unknown elements follow `UnknownIePolicy`
+at every validation level. The pinned R18 tables can therefore receive R19
+additions such as 0x63, 0x64 and 0x8- without reclassifying them as malformed.
+`UnknownIePolicy::Reject` is an explicit diagnostic override, not the default
+receiver policy. Repeated elements keep the first occurrence (§7.6.3), including
+when the shared context says `Last`; explicit `DuplicateIePolicy::Reject`
+remains a diagnostic override. Element-count limits apply to all six bodies;
 dropped unknown elements still count toward the limit. Framing failures cite
 the known element's clause, while non-critical unknown, duplicate, and count
 failures cite the message clause. Unknown identifiers coded as comprehension
@@ -208,21 +236,17 @@ The examples qualify framing only, not semantic validity of opaque IE values.
 
 ## Known Limitations
 
-- For the six per-message tables, permissive decoding of non-critical unknown
-  IEIs retains the existing heuristic: `0x70–0x7D` are treated as TLV-E,
-  `0x80–0xFF` as one-octet type-1 IEs, and all others as TLV. Unknown
-  fixed-length type-3 IEs need an explicit message-table entry to frame
-  correctly. Strict/ProcedureAware and Reject contexts never use this guess.
-- These six bodies frame and bound optional elements; unlike the authentication
-  bodies they do not apply all receiver rules of TS 24.501 clause 7. The default
-  duplicate policy keeps the last repetition; §7.6.3 keeps the first, so a
-  receiver selects `DuplicateIePolicy::First`. Element order is not checked
-  (§7.6.2). Strict and ProcedureAware reject the whole message for a non-critical
-  out-of-table element, a short element, or a type 4 or type 6 element longer
-  than the table maximum, where §7.6.1, §7.7.1 and TS 24.007 §11.4.2 tell a
-  receiver to ignore the element or its extra octets. They check sender
-  conformance against the pinned edition and are not a receiver acceptance
-  test; a later release can add elements or lengths that they reject.
+- Unknown non-critical IE framing follows TS 24.007 §11.2.4: `0x70–0x7D`
+  use TLV-E, `0x80–0xFF` occupy one octet, and others use TLV. A known
+  fixed-length type-3 IE still needs its message-table entry.
+- The six table-driven bodies do not enforce element order (§7.6.2).
+  Strict and ProcedureAware retain diagnostic rejection of short or truncated
+  optional elements; they do not implement the §7.7.1 procedure of ignoring
+  malformed optional elements and continuing message processing. Applications
+  own procedure handling. First-occurrence selection, unknown non-critical
+  elements and extended lengths obey receiver rules independently of these
+  diagnostics. Authentication bodies additionally normalize typed values and
+  apply their documented ordering/presence checks.
 - The Registration Result `SMS over NAS` flag (bit 4 of the result value)
   is not surfaced separately; the raw value is preserved for byte-exact
   re-encode.
@@ -288,8 +312,8 @@ optional IEs do not cause missing/unexpected-presence errors. A Failure ignores
 AUTS unless cause=21; Result accepts EAP-Success without ABBA (TS 24.501
 §5.4.1.2.5.2), and Reject accepts a syntactically valid optional EAP packet.
 Per TS 24.007 §11.4.2, excess AUTN/RES*/AUTS octets are discarded; RFC 3748
-§4.1 EAP padding beyond its embedded Length is also discarded. Strict levels
-require exact lengths. The EAP packet itself must remain 4–1500 octets, fit
+§4.1 EAP padding beyond its embedded Length is also discarded at every
+validation level. The EAP packet itself must remain 4–1500 octets, fit
 inside its IE and obey its code's header size. Mandatory ngKSI, ABBA and EAP
 remain checked at all levels.
 

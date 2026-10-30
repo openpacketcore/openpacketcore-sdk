@@ -146,11 +146,13 @@ use std::fmt::Debug;
 use std::panic::{RefUnwindSafe, UnwindSafe};
 use std::sync::OnceLock;
 
+#[cfg(feature = "_crypto-common")]
+use crate::CertificateError;
+use crate::CryptoError;
 use crate::buffer::{Buf, TmpBuf};
 use crate::crypto::{Aad, Nonce};
 use crate::dtls12::message::Dtls12CipherSuite;
 use crate::types::{Dtls13CipherSuite, HashAlgorithm, NamedGroup, SignatureAlgorithm};
-use crate::{CertificateError, CryptoError};
 
 /// OID for the P-256 elliptic curve (secp256r1 / prime256v1).
 #[cfg(feature = "_crypto-common")]
@@ -208,6 +210,29 @@ pub trait HashContext: CryptoSafe {
 
 /// Signing key for generating digital signatures.
 pub trait SigningKey: CryptoSafe {
+    /// Whether this key can execute a TLS 1.2 signature scheme.
+    fn supports_scheme(&self, scheme: crate::types::SignatureScheme) -> bool {
+        let alg = crate::dtls12::message::SignatureAndHashAlgorithm::from_u16(scheme.as_u16());
+        alg.signature == self.algorithm() && self.supported_hash_algorithms().contains(&alg.hash)
+    }
+
+    /// Sign with an explicitly negotiated scheme. Legacy providers retain their hash/signature pair.
+    fn sign_with_scheme(
+        &mut self,
+        data: &[u8],
+        scheme: crate::types::SignatureScheme,
+        out: &mut Buf,
+    ) -> Result<(), CryptoError> {
+        let alg = crate::dtls12::message::SignatureAndHashAlgorithm::from_u16(scheme.as_u16());
+        if !self.supports_scheme(scheme) {
+            return Err(CryptoError::UnsupportedSignaturePair {
+                signature: alg.signature,
+                hash: alg.hash,
+            });
+        }
+        self.sign(data, alg.hash, out)
+    }
+
     /// Sign data using the specified hash algorithm and return the signature.
     fn sign(
         &mut self,
@@ -324,6 +349,18 @@ pub trait SupportedKxGroup: CryptoSafe {
 
 /// Signature verification against certificates.
 pub trait SignatureVerifier: CryptoSafe {
+    /// Verify a negotiated signature scheme, including schemes with intrinsic hashes.
+    fn verify_with_scheme(
+        &self,
+        cert: &[u8],
+        data: &[u8],
+        signature: &[u8],
+        scheme: crate::types::SignatureScheme,
+    ) -> Result<(), CryptoError> {
+        let alg = crate::dtls12::message::SignatureAndHashAlgorithm::from_u16(scheme.as_u16());
+        self.verify_signature(cert, data, signature, alg.hash, alg.signature)
+    }
+
     /// Verify a signature on data using a DER-encoded X.509 certificate.
     fn verify_signature(
         &self,

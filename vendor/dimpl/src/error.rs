@@ -628,6 +628,8 @@ pub enum CryptoProviderValidationError {
     NoCipherSuites,
     /// The provider has ECDH cipher suites but no key exchange groups.
     EcdhCipherSuitesWithoutKeyExchangeGroups,
+    /// The provider has DHE cipher suites but no finite-field groups.
+    DheCipherSuitesWithoutKeyExchangeGroups,
     /// The provider has no DTLS 1.3 cipher suites.
     NoDtls13CipherSuites,
     /// A DTLS 1.2 suite reported parameters inconsistent with its identifier.
@@ -1426,6 +1428,10 @@ impl fmt::Display for CryptoProviderValidationError {
             Self::EcdhCipherSuitesWithoutKeyExchangeGroups => write!(
                 f,
                 "CryptoProvider has ECDH cipher suites but no supported key exchange groups"
+            ),
+            Self::DheCipherSuitesWithoutKeyExchangeGroups => write!(
+                f,
+                "CryptoProvider has DHE cipher suites but no supported finite-field groups"
             ),
             Self::NoDtls13CipherSuites => {
                 write!(f, "CryptoProvider has no DTLS 1.3 cipher suites")

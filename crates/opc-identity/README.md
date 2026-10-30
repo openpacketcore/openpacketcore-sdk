@@ -13,8 +13,19 @@ for TLS and service clients.
 - `extract_spiffe_id_from_cert_der` extracts exactly one canonical SPIFFE URI
   SAN from a leaf certificate; missing, malformed, duplicate, or ambiguous URI
   SANs fail closed. `WorkloadIdentity::from_cert_der` uses the same primitive.
-- `build_identity_state` validates the leaf chain against active trust bundles
-  and checks that the private key matches the leaf.
+- `build_identity_state` validates the leaf chain for both TLS roles against
+  active trust bundles and checks that the private key matches the leaf. A
+  present EKU must contain both clientAuth and serverAuth, as X.509-SVID requires.
+- `extract_spiffe_id_from_pki_cert_der` is an explicit general-PKI alternative:
+  exactly one SPIFFE URI may coexist with non-SPIFFE URI SANs. Duplicate or
+  noncanonical SPIFFE URIs still fail; parsing alone does not establish trust.
+- `validate_local_pki_identity` checks a general-PKI chain, private key and
+  trust-domain bundle for `LocalPkiUsage::Client`, `Server`, or `ClientAndServer`.
+  This permits clientAuth-only material for a client, including additional
+  service URI SANs. It returns the local SPIFFE ID, not reloadable SVID state.
+  General-PKI consumers own reload, revocation, peer authorization and TLS
+  configuration. The SVID sources and `opc-tls` material controller keep their
+  strict profile. This is not a complete TS 33.310 certificate-profile validator.
 - `SvidWatcher::new(socket_path, initial_bundles)` reads length-prefixed JSON
   SVID updates from a SPIRE-like Unix socket and emits reload events.
 - `FileSvidSource::new(cert_path, key_path, bundle_paths, poll_interval)` polls

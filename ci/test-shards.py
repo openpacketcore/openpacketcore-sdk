@@ -100,9 +100,9 @@ QUIESCENT_VOID_LIB_TESTS = (
     "consumer_void_unavailable_row_advances_past_status_resolvable_rows_and_wraps",
     "consumer_void_available_rows_drain_in_one_sweep_after_cursor_wrap",
 )
-# These 180-tick arrival-rate proofs measure signed production work with
-# controlled logical arrivals, independent of host pacing. Keep
-# their literal load and backlog bounds in the checked O1 timing profile.
+# These controlled-turn signed progress proofs make no arrival-rate or
+# physical latency claim. Keep their backlog assertions and operation budgets
+# in the checked O1 timing profile.
 # The completion-congestion proofs also retain their literal operation budgets
 # while draining a deliberately held wave of signed requests.
 QUIESCENT_ROSTER_LIB_MODULE = "consensus::store::sequential_wal_sdk_tests"

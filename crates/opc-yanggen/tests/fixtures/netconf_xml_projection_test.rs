@@ -168,7 +168,8 @@ fn selected_container_without_leaf_descendant_does_not_emit_siblings() {
 
 #[test]
 fn denied_leaf_omitted() {
-    let system = sample_config();
+    let mut system = sample_config();
+    system.enabled = LeafPresence::Explicit(false);
     let xml = renderer()
         .render_running_config(
             &system,
@@ -181,7 +182,7 @@ fn denied_leaf_omitted() {
         )
         .unwrap();
     assert!(xml.contains("<ex:hostname>"));
-    assert!(xml.contains("<ex:enabled>true</ex:enabled>"));
+    assert!(xml.contains("<ex:enabled>false</ex:enabled>"));
     assert!(!xml.contains("<ex:secret>"));
     assert!(!xml.contains("hunter2"));
 }
@@ -275,6 +276,11 @@ fn trim_omits_schema_default_values() {
     assert!(xml.contains("<ex:hostname>router1</ex:hostname>"));
     assert!(!xml.contains("<ex:enabled>"));
     assert!(!xml.contains("<ex:server>"));
+    system.enabled = LeafPresence::Explicit(true);
+    let xml = renderer().render_running_config(&system, &["/ex:system/ex:enabled"], DefaultReport::Trim).unwrap();
+    assert!(!xml.contains("<ex:enabled>"));
+    let xml = renderer().render_running_config(&system, &["/ex:system/ex:enabled"], DefaultReport::Explicit).unwrap();
+    assert!(xml.contains("<ex:enabled>true</ex:enabled>"));
 }
 
 #[test]

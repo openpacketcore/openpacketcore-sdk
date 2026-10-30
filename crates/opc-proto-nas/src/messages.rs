@@ -47,6 +47,12 @@ pub enum RegistrationType {
     PeriodicRegistrationUpdating = 0x03,
     /// Emergency registration (100).
     EmergencyRegistration = 0x04,
+    /// SNPN onboarding registration (101).
+    SnpnOnboardingRegistration = 0x05,
+    /// Disaster roaming mobility registration updating (110).
+    DisasterRoamingMobilityRegistrationUpdating = 0x06,
+    /// Disaster roaming initial registration (111).
+    DisasterRoamingInitialRegistration = 0x07,
 }
 
 impl RegistrationType {
@@ -57,6 +63,9 @@ impl RegistrationType {
             0x02 => Self::MobilityRegistrationUpdating,
             0x03 => Self::PeriodicRegistrationUpdating,
             0x04 => Self::EmergencyRegistration,
+            0x05 => Self::SnpnOnboardingRegistration,
+            0x06 => Self::DisasterRoamingMobilityRegistrationUpdating,
+            0x07 => Self::DisasterRoamingInitialRegistration,
             _ => return None,
         })
     }
@@ -89,7 +98,8 @@ impl RegistrationResult {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RegistrationResultFlags {
     /// Raw flag bits from the registration-result octet, excluding bits 1-3
-    /// used by [`RegistrationResult`].
+    /// used by [`RegistrationResult`]. Canonical encoding uses bit 7 for the
+    /// disaster-roaming result, the typed booleans for bits 4-6, and clears bit 8.
     pub raw_upper_bits: u8,
     /// `true` when SMS over NAS transport is allowed.
     pub sms_allowed: bool,
@@ -436,9 +446,10 @@ impl Encode for ConfigurationUpdateCommand {
 
 /// Decoded Configuration Update Complete body (TS 24.501 §8.2.20).
 ///
-/// Table 8.2.20.1.1 has no optional elements. Strict and ProcedureAware decoding,
-/// and [`UnknownIePolicy::Reject`], therefore require an empty body. Structural
-/// decoding can preserve or drop unknown elements according to the context.
+/// Table 8.2.20.1.1 has no optional elements. Non-critical unknown elements
+/// follow [`UnknownIePolicy`] at every validation level; only its `Reject`
+/// policy requires an empty body. Comprehension-required unknown elements
+/// are rejected at every level, including [`ValidationLevel::HeaderOnly`].
 /// Debug output reports only the element count.
 #[derive(Clone, PartialEq, Eq)]
 pub struct ConfigurationUpdateComplete {
@@ -612,7 +623,8 @@ pub struct OptionalIe {
     /// Original information-element identifier octet, including the low-nibble
     /// value for type-1 IEs. Their lookup and duplicate key is `iei & 0xF0`.
     pub iei: u8,
-    /// Value bytes excluding IEI and length octets.
+    /// Value bytes excluding IEI and length octets and, for known elements,
+    /// any extension beyond the supported table length. `raw` retains extensions.
     ///
     /// For type-1 half-octet IEs this is empty because the value is part of
     /// the same octet as the IEI.
@@ -659,10 +671,6 @@ fn unknown_optional_ie_format(iei: u8) -> OptionalIeFormat {
 
 fn rejects_unknown_optional_ie(ctx: DecodeContext) -> bool {
     matches!(ctx.unknown_ie_policy, UnknownIePolicy::Reject)
-        || matches!(
-            ctx.validation_level,
-            ValidationLevel::Strict | ValidationLevel::ProcedureAware
-        )
 }
 
 fn decode_optional_ies(
@@ -742,10 +750,16 @@ fn decode_optional_ies(
             return Err(DecodeError::new(DecodeErrorCode::Truncated, offset)
                 .with_spec_ref(message_spec_ref(section)));
         }
+        // TS 24.501 §7.6.3: only the first occurrence has semantic effect.
+        if duplicate {
+            rest = &rest[total..];
+            offset += total;
+            continue;
+        }
         if matches!(
             ctx.validation_level,
             ValidationLevel::Strict | ValidationLevel::ProcedureAware
-        ) && descriptor.is_some_and(|ie| !(ie.min_len..=ie.max_len).contains(&total))
+        ) && descriptor.is_some_and(|ie| total < ie.min_len)
         {
             return Err(DecodeError::new(
                 DecodeErrorCode::InvalidLength {
@@ -757,27 +771,16 @@ fn decode_optional_ies(
         }
         let ie = OptionalIe {
             iei,
-            value: Bytes::copy_from_slice(&rest[header_len..total]),
+            // TS 24.007 §11.4.2: ignore extra octets in an extensible IE.
+            value: Bytes::copy_from_slice(
+                &rest[header_len..descriptor.map_or(total, |ie| total.min(ie.max_len))],
+            ),
             raw: Bytes::copy_from_slice(&rest[..total]),
         };
         rest = &rest[total..];
         offset += total;
         if descriptor.is_none() && matches!(ctx.unknown_ie_policy, UnknownIePolicy::Drop) {
             continue;
-        }
-        if duplicate {
-            match ctx.duplicate_ie_policy {
-                DuplicateIePolicy::First => continue,
-                DuplicateIePolicy::Last => {
-                    if let Some(position) = out
-                        .iter()
-                        .position(|existing| optional_ie_key(existing.iei) == duplicate_key)
-                    {
-                        out.remove(position);
-                    }
-                }
-                DuplicateIePolicy::Reject => unreachable!("duplicate reject handled before parse"),
-            }
         }
         seen[usize::from(duplicate_key)] = true;
         out.push(ie);
@@ -793,7 +796,7 @@ fn decode_optional_ies(
 /// (two-octet length + value). All remaining bytes are optional IEs.
 #[derive(Clone, PartialEq, Eq)]
 pub struct RegistrationRequest {
-    /// 5GS registration type.
+    /// 5GS registration type; unused received values mean initial registration.
     pub registration_type: RegistrationType,
     /// Follow-on request pending bit (bit 4 of the first body octet).
     pub follow_on_request: bool,
@@ -801,7 +804,8 @@ pub struct RegistrationRequest {
     pub ng_ksi: NasKeySetIdentifier,
     /// Decoded 5GS mobile identity.
     pub mobile_identity: MobileIdentity,
-    /// Original first body octet (registration type + ngKSI).
+    /// Original first body octet (registration type + ngKSI), used only when
+    /// [`EncodeContext::raw_preserving`] is set. Otherwise typed fields are used.
     pub raw_first_octet: u8,
     /// Original LV-E bytes for the mobile identity (length + value).
     pub raw_mobile_identity_lv: Bytes,
@@ -838,17 +842,9 @@ impl RegistrationRequest {
         }
 
         let raw_first_octet = input[0];
-        let registration_type =
-            RegistrationType::from_u8(raw_first_octet & 0x07).ok_or_else(|| {
-                DecodeError::new(
-                    DecodeErrorCode::InvalidEnumValue {
-                        field: "5gs_registration_type",
-                        value: u64::from(raw_first_octet & 0x07),
-                    },
-                    0,
-                )
-                .with_spec_ref(message_spec_ref("9.11.3.7"))
-            })?;
+        // TS 24.501 §9.11.3.7 requires the network to interpret unused values as initial.
+        let registration_type = RegistrationType::from_u8(raw_first_octet & 0x07)
+            .unwrap_or(RegistrationType::InitialRegistration);
         let follow_on_request = (raw_first_octet & 0x08) != 0;
         let ng_ksi = NasKeySetIdentifier {
             value: (raw_first_octet >> 4) & 0x07,
@@ -916,7 +912,15 @@ impl Encode for RegistrationRequest {
         let len = self.wire_len(ctx)?;
         ctx.check_capacity(len)?;
         dst.reserve(len);
-        dst.put_u8(self.raw_first_octet);
+        let first = if ctx.raw_preserving {
+            self.raw_first_octet
+        } else {
+            (u8::from(self.ng_ksi.no_key_available) << 7)
+                | (self.ng_ksi.value << 4)
+                | (u8::from(self.follow_on_request) << 3)
+                | self.registration_type as u8
+        };
+        dst.put_u8(first);
         dst.extend_from_slice(&self.raw_mobile_identity_lv);
         for ie in &self.optional_ies {
             dst.extend_from_slice(&ie.raw);
@@ -924,7 +928,14 @@ impl Encode for RegistrationRequest {
         Ok(())
     }
 
-    fn wire_len(&self, _ctx: EncodeContext) -> Result<usize, EncodeError> {
+    fn wire_len(&self, ctx: EncodeContext) -> Result<usize, EncodeError> {
+        if !ctx.raw_preserving && self.ng_ksi.value > 7 {
+            return Err(EncodeError::new(
+                opc_protocol::EncodeErrorCode::Structural {
+                    reason: "NAS key set identifier exceeds three bits",
+                },
+            ));
+        }
         let mut len = 1usize.saturating_add(self.raw_mobile_identity_lv.len());
         for ie in &self.optional_ies {
             len = len.saturating_add(ie.raw.len());
@@ -943,7 +954,8 @@ pub struct RegistrationAccept {
     pub registration_result: RegistrationResult,
     /// Flag bits carried alongside the registration result value.
     pub registration_result_flags: RegistrationResultFlags,
-    /// Original LV bytes for the registration result.
+    /// Original LV bytes for the registration result, used only when
+    /// [`EncodeContext::raw_preserving`] is set. Otherwise typed fields are used.
     pub raw_registration_result_lv: Bytes,
     /// Optional IEs in message order, raw-preserved.
     pub optional_ies: Vec<OptionalIe>,
@@ -1026,15 +1038,30 @@ impl Encode for RegistrationAccept {
         let len = self.wire_len(ctx)?;
         ctx.check_capacity(len)?;
         dst.reserve(len);
-        dst.extend_from_slice(&self.raw_registration_result_lv);
+        if ctx.raw_preserving {
+            dst.extend_from_slice(&self.raw_registration_result_lv);
+        } else {
+            let flags = self.registration_result_flags;
+            // §9.11.3.6: bit 7 is disaster roaming; only bit 8 is spare.
+            let result = self.registration_result as u8
+                | (u8::from(flags.sms_allowed) << 3)
+                | (u8::from(flags.nssaa_to_be_performed) << 4)
+                | (u8::from(flags.emergency_registered) << 5)
+                | (flags.raw_upper_bits & 0x40);
+            dst.extend_from_slice(&[1, result]);
+        }
         for ie in &self.optional_ies {
             dst.extend_from_slice(&ie.raw);
         }
         Ok(())
     }
 
-    fn wire_len(&self, _ctx: EncodeContext) -> Result<usize, EncodeError> {
-        let mut len = self.raw_registration_result_lv.len();
+    fn wire_len(&self, ctx: EncodeContext) -> Result<usize, EncodeError> {
+        let mut len = if ctx.raw_preserving {
+            self.raw_registration_result_lv.len()
+        } else {
+            2
+        };
         for ie in &self.optional_ies {
             len = len.saturating_add(ie.raw.len());
         }
@@ -1120,7 +1147,15 @@ pub fn decode_mm_message_body(
             | MmMessageType::DeregistrationAcceptUeOriginating
             | MmMessageType::DeregistrationRequestUeTerminated
             | MmMessageType::DeregistrationAcceptUeTerminated
-            | MmMessageType::ControlPlaneServiceRequest,
+            | MmMessageType::ControlPlaneServiceRequest
+            | MmMessageType::NetworkSliceSpecificAuthenticationCommand
+            | MmMessageType::NetworkSliceSpecificAuthenticationComplete
+            | MmMessageType::NetworkSliceSpecificAuthenticationResult
+            | MmMessageType::RelayKeyRequest
+            | MmMessageType::RelayKeyAccept
+            | MmMessageType::RelayKeyReject
+            | MmMessageType::RelayAuthenticationRequest
+            | MmMessageType::RelayAuthenticationResponse,
         )
         | None => MmMessageBody::Unknown(raw_body(body)),
     })
@@ -1185,7 +1220,13 @@ pub fn decode_sm_message_body(
             SmMessageBody::PduSessionReleaseComplete(raw_body(body))
         }
         Some(SmMessageType::Status5gsm) => SmMessageBody::Status5gsm(raw_body(body)),
-        None => SmMessageBody::Unknown(raw_body(body)),
+        Some(
+            SmMessageType::ServiceLevelAuthenticationCommand
+            | SmMessageType::ServiceLevelAuthenticationComplete
+            | SmMessageType::RemoteUeReport
+            | SmMessageType::RemoteUeReportResponse,
+        )
+        | None => SmMessageBody::Unknown(raw_body(body)),
     })
 }
 
@@ -1353,7 +1394,7 @@ mod tests {
             validation_level: ValidationLevel::Strict,
             ..DecodeContext::default()
         };
-        assert!(decode_optional_ies(unknown_type4_guess, strict_preserve, message_type).is_err());
+        assert!(decode_optional_ies(unknown_type4_guess, strict_preserve, message_type).is_ok());
     }
 
     #[test]
@@ -1375,7 +1416,7 @@ mod tests {
         };
         let (_, last_ies) = decode_optional_ies(duplicate, last, message_type).unwrap();
         assert_eq!(last_ies.len(), 1);
-        assert_eq!(&last_ies[0].value[..], &[0xBB]);
+        assert_eq!(&last_ies[0].value[..], &[0xAA]);
 
         let reject = DecodeContext {
             duplicate_ie_policy: DuplicateIePolicy::Reject,

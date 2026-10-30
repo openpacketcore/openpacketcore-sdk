@@ -19,6 +19,8 @@ use crate::{
 
 impl<P: RecoveryProfile> Window<P> {
     fn sync_open(&self) -> Result<(), Error> {
+        self.send.check_terminal()?;
+        self.fragments.ready()?;
         if self.quiescent {
             return Err(Error::CommitUncertain);
         }
@@ -43,12 +45,11 @@ impl<P: RecoveryProfile> Window<P> {
     fn sync_counters(&self) -> Result<Counters, Error> {
         let state = self.record.sync_state().ok_or(Error::Drop)?;
         let mut counters = Counters::new(
-            // Advertise the volatile empty-probe advance too. The peer takes the
-            // maximum of these values, so a burned probe ID is never skipped.
-            self.effective_next_send().ok_or(Error::SyncClosed)?,
+            self.next_send().ok_or(Error::SyncClosed)?,
             self.next_receive().ok_or(Error::SyncClosed)?,
         );
-        counters.highest_local_request = state.highest_local_request();
+        counters.highest_local_request =
+            state.highest_local_request().max(self.send.highest_probe());
         counters.highest_peer_request = state
             .highest_peer_request()
             .max(self.observed_peer_request.get());
@@ -113,11 +114,14 @@ impl<P: RecoveryProfile> Window<P> {
         clock: Clock,
         pending_inbound: Option<&Ordinary<P>>,
     ) -> Result<Ikev2AdmittedSyncInitiation<'_, P>, Error> {
-        self.ready()?;
+        match self.ready() {
+            Ok(()) | Err(Error::LivenessRecoveryRequired) => {}
+            Err(error) => return Err(error),
+        }
         self.sync_open()?;
-        if pending_inbound.is_some()
+        if self.send.outstanding.is_some()
+            || pending_inbound.is_some()
             || self.receive.pending.borrow().is_some()
-            || self.probe.pending.is_some()
             || self
                 .record
                 .outbound
@@ -250,6 +254,7 @@ impl<P: RecoveryProfile> Window<P> {
                 }
             })?;
         let mut record = self.record.clone();
+        self.fold_live_send(&mut record);
         record.generation = record.generation.checked_add(1).ok_or(Error::Exhausted)?;
         record.next_send = Some(next.next_send);
         record.next_receive = Some(next.next_receive);
@@ -308,6 +313,7 @@ impl<P: RecoveryProfile> Window<P> {
             return Err(Error::Drop);
         }
         let mut record = self.record.clone();
+        self.fold_live_send(&mut record);
         record.generation = record.generation.checked_add(1).ok_or(Error::Exhausted)?;
         record
             .sync
@@ -424,6 +430,7 @@ impl<'a, P: RecoveryProfile> Ikev2AdmittedSyncInitiation<'a, P> {
             Status::Pending,
         )?;
         let mut record = self.window.record.clone();
+        self.window.fold_live_send(&mut record);
         record.generation = record.generation.checked_add(1).ok_or(Error::Exhausted)?;
         record.next_send = Some(value.expected_send_req_message_id());
         record.next_receive = Some(value.expected_recv_req_message_id());
@@ -486,6 +493,9 @@ impl<P: RecoveryProfile> Ikev2PreparedSyncInitiation<'_, P> {
         let policy = self.record.sync_recovery().map(|record| record.policy());
         let check_clock = matches!(self.action, Ikev2SyncInitiatorAction::SendRequest(_));
         self.window.record = self.record;
+        self.window.send.adopt(&self.window.record, true);
+        self.window.fragments.cutover();
+        self.window.packet_evidence = P::SyncEvidence::default();
         self.window.quiescent = false;
         self.window.observed_peer_request.set(None);
         self.window.sync_live = false;

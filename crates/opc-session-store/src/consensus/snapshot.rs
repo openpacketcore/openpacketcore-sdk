@@ -4003,6 +4003,14 @@ impl SessionSnapshotFile {
     /// Attach a diagnostic path to an already-open regular snapshot handle.
     pub(crate) async fn from_file(file: tokio::fs::File, path: PathBuf) -> io::Result<Self> {
         let metadata = file.metadata().await?;
+        Self::from_metadata(file, path, metadata)
+    }
+
+    fn from_metadata(
+        file: tokio::fs::File,
+        path: PathBuf,
+        metadata: std::fs::Metadata,
+    ) -> io::Result<Self> {
         ensure_regular_file(&metadata)?;
         Ok(Self {
             file,
@@ -4031,6 +4039,32 @@ impl SessionSnapshotFile {
     /// Convert an already-open standard file without resolving its path again.
     pub(crate) async fn from_std(file: std::fs::File, path: PathBuf) -> io::Result<Self> {
         Self::from_file(tokio::fs::File::from_std(file), path).await
+    }
+
+    /// Finish admission on its owning blocking worker, including metadata and
+    /// rewind. Constructing the Tokio handle itself dispatches no file I/O.
+    pub(crate) fn from_std_rewound(mut file: std::fs::File, path: PathBuf) -> io::Result<Self> {
+        let metadata = file.metadata()?;
+        std::io::Seek::rewind(&mut file)?;
+        Self::from_metadata(tokio::fs::File::from_std(file), path, metadata)
+    }
+
+    /// Retain the verified-read authority while completing the transfer
+    /// handle on the admission worker, without an asynchronous metadata read.
+    pub(crate) fn from_pinned_rewound(pinned: PinnedSqliteFile, path: PathBuf) -> io::Result<Self> {
+        if !pinned.has_immutable_generation() {
+            return Err(invalid_data("snapshot transfer has no integrity authority"));
+        }
+        #[cfg(target_os = "linux")]
+        let portable = pinned.portable.clone();
+        let snapshot = Self::from_std_rewound(pinned.into_file()?, path)?;
+        #[cfg(target_os = "linux")]
+        let snapshot = {
+            let mut snapshot = snapshot;
+            snapshot.portable = portable;
+            snapshot
+        };
+        Ok(snapshot)
     }
 
     /// Transfer a pinned image without dropping its verified-read authority.

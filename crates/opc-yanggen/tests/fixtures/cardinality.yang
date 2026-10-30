@@ -1,0 +1,25 @@
+module cardinality {
+  yang-version 1.1;
+  namespace "urn:example:cardinality";
+  prefix c;
+  container root {
+    leaf required { type boolean; mandatory true; }
+    leaf optional { type boolean; mandatory false; }
+    container plain { leaf inside { type string; mandatory true; } }
+    container enabled {
+      presence "Enable the feature";
+      leaf token { type string; mandatory true; }
+      leaf-list labels { type string; min-elements 2; max-elements 3; }
+    }
+    list server {
+      key name;
+      min-elements 1;
+      max-elements 2;
+      leaf name { type string; }
+      leaf port { type uint16; mandatory true; }
+      container details { leaf online { type boolean; mandatory true; } }
+    }
+    leaf-list codes { type string; min-elements 1; max-elements 2; ordered-by user; }
+    leaf-list api-token { type string; min-elements 1; max-elements 2; }
+  }
+}

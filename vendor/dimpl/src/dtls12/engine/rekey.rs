@@ -146,19 +146,19 @@ impl Engine {
     }
 
     pub(super) fn write_context(&self, epoch: u16) -> &CryptoContext {
-        if epoch == self.sequence_epoch_0.epoch {
-            if let Some(previous) = &self.previous_crypto_context {
-                return previous;
-            }
+        if epoch == self.sequence_epoch_0.epoch
+            && let Some(previous) = &self.previous_crypto_context
+        {
+            return previous;
         }
         &self.crypto_context
     }
 
     pub(super) fn write_context_mut(&mut self, epoch: u16) -> &mut CryptoContext {
-        if epoch == self.sequence_epoch_0.epoch {
-            if let Some(previous) = &mut self.previous_crypto_context {
-                return previous;
-            }
+        if epoch == self.sequence_epoch_0.epoch
+            && let Some(previous) = &mut self.previous_crypto_context
+        {
+            return previous;
         }
         &mut self.crypto_context
     }

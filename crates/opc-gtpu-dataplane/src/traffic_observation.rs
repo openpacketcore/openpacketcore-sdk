@@ -1686,10 +1686,11 @@ mod tests {
         let device_id = GtpuSessionDeviceId::new([2; 16]).unwrap();
         let context = GtpPdpContext {
             local_teid: Teid::new(1).unwrap(),
-            peer_teid: crate::PeerTeid::new(2),
+            peer_teid: Teid::new(2).unwrap().into(),
             ms_address: IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)),
             peer_address: IpAddr::V4(Ipv4Addr::new(192, 0, 2, 1)),
             link_ifindex: 7,
+            downlink_peer_source_policy: crate::GtpuPeerSourcePolicy::BackendDefault,
             downlink_source_port_policy: GtpuSourcePortPolicy::Any,
             gtp_version: GtpVersion::V1,
             bearer_mark: None,
@@ -1707,10 +1708,11 @@ mod tests {
         let device_id = GtpuSessionDeviceId::new([2; 16]).unwrap();
         let context = GtpPdpContext {
             local_teid: Teid::new(3).unwrap(),
-            peer_teid: crate::PeerTeid::new(4),
+            peer_teid: Teid::new(4).unwrap().into(),
             ms_address: IpAddr::V4(Ipv4Addr::new(10, 0, 0, 2)),
             peer_address: IpAddr::V4(Ipv4Addr::new(192, 0, 2, 3)),
             link_ifindex: 7,
+            downlink_peer_source_policy: crate::GtpuPeerSourcePolicy::BackendDefault,
             downlink_source_port_policy: GtpuSourcePortPolicy::Any,
             gtp_version: GtpVersion::V1,
             bearer_mark: None,
@@ -1744,10 +1746,11 @@ mod tests {
     ) -> GtpuTrafficProofAuthority {
         let context = GtpPdpContext {
             local_teid: Teid::new(1).unwrap(),
-            peer_teid: crate::PeerTeid::new(2),
+            peer_teid: Teid::new(2).unwrap().into(),
             ms_address: IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)),
             peer_address: IpAddr::V4(Ipv4Addr::new(192, 0, 2, 1)),
             link_ifindex: 7,
+            downlink_peer_source_policy: crate::GtpuPeerSourcePolicy::BackendDefault,
             downlink_source_port_policy,
             gtp_version: GtpVersion::V1,
             bearer_mark: None,
@@ -1777,10 +1780,11 @@ mod tests {
         };
         let context = GtpPdpContext {
             local_teid: Teid::new(1).unwrap(),
-            peer_teid: crate::PeerTeid::new(2),
+            peer_teid: Teid::new(2).unwrap().into(),
             ms_address,
             peer_address,
             link_ifindex: 7,
+            downlink_peer_source_policy: crate::GtpuPeerSourcePolicy::BackendDefault,
             downlink_source_port_policy: GtpuSourcePortPolicy::Any,
             gtp_version: GtpVersion::V1,
             bearer_mark: None,
@@ -1800,10 +1804,11 @@ mod tests {
     fn ipv6_authority() -> GtpuTrafficProofAuthority {
         let context = GtpPdpContext {
             local_teid: Teid::new(3).unwrap(),
-            peer_teid: crate::PeerTeid::new(4),
+            peer_teid: Teid::new(4).unwrap().into(),
             ms_address: IpAddr::V6(Ipv6Addr::new(0x2001, 0xdb8, 0x45, 0, 0, 0, 0, 2)),
             peer_address: IpAddr::V6(Ipv6Addr::new(0x2001, 0xdb8, 2, 0, 0, 0, 0, 1)),
             link_ifindex: 7,
+            downlink_peer_source_policy: crate::GtpuPeerSourcePolicy::BackendDefault,
             downlink_source_port_policy: GtpuSourcePortPolicy::Any,
             gtp_version: GtpVersion::V1,
             bearer_mark: None,
@@ -2398,10 +2403,11 @@ mod tests {
             vec![GtpuSessionEntry::new(
                 GtpPdpContext {
                     local_teid: Teid::new(1).unwrap(),
-                    peer_teid: crate::PeerTeid::new(2),
+                    peer_teid: Teid::new(2).unwrap().into(),
                     ms_address: IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)),
                     peer_address: IpAddr::V4(Ipv4Addr::new(192, 0, 2, 1)),
                     link_ifindex: 7,
+                    downlink_peer_source_policy: crate::GtpuPeerSourcePolicy::BackendDefault,
                     downlink_source_port_policy: GtpuSourcePortPolicy::Any,
                     gtp_version: GtpVersion::V1,
                     bearer_mark: None,

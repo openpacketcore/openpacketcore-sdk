@@ -20,6 +20,10 @@ mod driver;
 mod envelope;
 #[path = "recovery_profile/foundation.rs"]
 mod foundation;
+#[path = "support/fragmentation.rs"]
+mod fragmentation_fixtures;
+#[path = "recovery_profile/fragmentation_tests.rs"]
+mod fragmentation_tests;
 #[path = "recovery_profile/initial_contact.rs"]
 mod initial_contact;
 #[path = "recovery_profile/inputs.rs"]
@@ -116,3 +120,6 @@ mod contact_tests;
 
 #[path = "recovery_profile/terminal_process.rs"]
 mod terminal_process;
+
+#[path = "recovery_profile/liveness_tests.rs"]
+mod liveness_tests;

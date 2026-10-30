@@ -27,8 +27,8 @@ use super::VENDOR_ID_3GPP;
 use crate::avp::dictionary::Redacted;
 use crate::base;
 use crate::dictionary::{
-    ApplicationDefinition, AvpDataType, AvpDefinition, AvpFlagRules, AvpKey, CommandDefinition,
-    CommandKind, Dictionary, FlagRequirement,
+    ApplicationDefinition, AvpCardinality, AvpDataType, AvpDefinition, AvpFlagRules, AvpKey,
+    CommandAvpRule, CommandDefinition, CommandKind, Dictionary, FlagRequirement,
 };
 use crate::{ApplicationId, AvpCode, AvpHeader, CommandCode, Message, OwnedMessage};
 
@@ -40,22 +40,20 @@ pub const COMMAND_ACCOUNTING: CommandCode = CommandCode::new(271);
 
 /// Accounting-Record-Type AVP code (RFC 6733 §9.8.1).
 pub const AVP_ACCOUNTING_RECORD_TYPE: AvpCode = AvpCode::new(480);
-/// Accounting-Record-Number AVP code (RFC 6733 §9.8.2).
+/// Accounting-Record-Number AVP code (RFC 6733 §9.8.3).
 pub const AVP_ACCOUNTING_RECORD_NUMBER: AvpCode = AvpCode::new(485);
 /// Event-Timestamp AVP code (RFC 6733 §5.3.2).
 pub const AVP_EVENT_TIMESTAMP: AvpCode = AvpCode::new(55);
-/// Multiple-Services-Credit-Control grouped AVP code (RFC 4006 §8.16).
-pub const AVP_MULTIPLE_SERVICES_CREDIT_CONTROL: AvpCode = AvpCode::new(456);
-/// Used-Service-Unit grouped AVP code (RFC 4006 §8.19).
-pub const AVP_USED_SERVICE_UNIT: AvpCode = AvpCode::new(446);
-/// CC-Time AVP code (RFC 4006 §8.21).
-pub const AVP_CC_TIME: AvpCode = AvpCode::new(420);
-/// CC-Total-Octets AVP code (RFC 4006 §8.22).
-pub const AVP_CC_TOTAL_OCTETS: AvpCode = AvpCode::new(421);
-/// CC-Input-Octets AVP code (RFC 4006 §8.23).
-pub const AVP_CC_INPUT_OCTETS: AvpCode = AvpCode::new(412);
-/// CC-Output-Octets AVP code (RFC 4006 §8.24).
-pub const AVP_CC_OUTPUT_OCTETS: AvpCode = AvpCode::new(414);
+/// Service-Information grouped AVP (TS 32.299 section 7.2.192).
+pub const AVP_SERVICE_INFORMATION: AvpCode = AvpCode::new(873);
+/// Service-Data-Container grouped AVP (TS 32.299 section 7.2.189).
+pub const AVP_SERVICE_DATA_CONTAINER: AvpCode = AvpCode::new(2040);
+/// Accounting-Input-Octets (RFC 4005 section 8.1).
+pub const AVP_ACCOUNTING_INPUT_OCTETS: AvpCode = AvpCode::new(363);
+/// Accounting-Output-Octets (RFC 4005 section 8.2).
+pub const AVP_ACCOUNTING_OUTPUT_OCTETS: AvpCode = AvpCode::new(364);
+/// Time-Usage (TS 32.299 section 7.2.232).
+pub const AVP_TIME_USAGE: AvpCode = AvpCode::new(2045);
 /// Rating-Group AVP code (RFC 4006 §8.29).
 pub const AVP_RATING_GROUP: AvpCode = AvpCode::new(432);
 /// Service-Identifier AVP code (RFC 4006 §8.28).
@@ -70,9 +68,9 @@ pub const AVP_3GPP_CHARGING_ID: AvpCode = AvpCode::new(2);
 /// 3GPP-PDP-Type AVP code (3GPP TS 32.299).
 pub const AVP_3GPP_PDP_TYPE: AvpCode = AvpCode::new(3);
 /// SGSN-Address AVP code (3GPP TS 32.299).
-pub const AVP_3GPP_SGSN_ADDRESS: AvpCode = AvpCode::new(6);
+pub const AVP_SGSN_ADDRESS: AvpCode = AvpCode::new(1228);
 /// GGSN-Address AVP code (3GPP TS 32.299).
-pub const AVP_3GPP_GGSN_ADDRESS: AvpCode = AvpCode::new(7);
+pub const AVP_GGSN_ADDRESS: AvpCode = AvpCode::new(847);
 
 /// 3GPP Rf accounting application definition.
 pub const APPLICATION: ApplicationDefinition = ApplicationDefinition::new(
@@ -102,7 +100,42 @@ pub const COMMAND_ACCOUNTING_ANSWER: CommandDefinition = CommandDefinition::new(
     SpecRef::new("ietf", "RFC6733", "7"),
 );
 
-const RF_AVPS: [AvpDefinition; 20] = [
+// TS 32.299 sections 7.2.192 and 7.2.158 distinguish repeatable groups and
+// addresses from optional singleton fields, including under duplicate rejection.
+const SERVICE_INFORMATION_RULES: [CommandAvpRule; 2] = [
+    CommandAvpRule::new(
+        AvpKey::ietf(AVP_SUBSCRIPTION_ID),
+        AvpCardinality::ZeroOrMore,
+    ),
+    CommandAvpRule::new(
+        AvpKey::vendor(AVP_PS_INFORMATION, VENDOR_ID_3GPP),
+        AvpCardinality::ZeroOrOne,
+    ),
+];
+const PS_INFORMATION_RULES: [CommandAvpRule; 5] = [
+    CommandAvpRule::new(
+        AvpKey::vendor(AVP_3GPP_CHARGING_ID, VENDOR_ID_3GPP),
+        AvpCardinality::ZeroOrOne,
+    ),
+    CommandAvpRule::new(
+        AvpKey::vendor(AVP_3GPP_PDP_TYPE, VENDOR_ID_3GPP),
+        AvpCardinality::ZeroOrOne,
+    ),
+    CommandAvpRule::new(
+        AvpKey::vendor(AVP_SGSN_ADDRESS, VENDOR_ID_3GPP),
+        AvpCardinality::ZeroOrMore,
+    ),
+    CommandAvpRule::new(
+        AvpKey::vendor(AVP_GGSN_ADDRESS, VENDOR_ID_3GPP),
+        AvpCardinality::ZeroOrMore,
+    ),
+    CommandAvpRule::new(
+        AvpKey::vendor(AVP_SERVICE_DATA_CONTAINER, VENDOR_ID_3GPP),
+        AvpCardinality::ZeroOrMore,
+    ),
+];
+
+const RF_AVPS: [AvpDefinition; 19] = [
     AvpDefinition::new(
         AvpKey::ietf(AVP_ACCOUNTING_RECORD_TYPE),
         "Accounting-Record-Type",
@@ -115,7 +148,7 @@ const RF_AVPS: [AvpDefinition; 20] = [
         "Accounting-Record-Number",
         AvpDataType::Unsigned32,
         AvpFlagRules::base_mandatory(),
-        SpecRef::new("ietf", "RFC6733", "9.8.2"),
+        SpecRef::new("ietf", "RFC6733", "9.8.3"),
     ),
     AvpDefinition::new(
         AvpKey::ietf(AVP_EVENT_TIMESTAMP),
@@ -165,46 +198,40 @@ const RF_AVPS: [AvpDefinition; 20] = [
         SpecRef::new("ietf", "RFC4006", "8.48"),
     ),
     AvpDefinition::new(
-        AvpKey::ietf(AVP_USED_SERVICE_UNIT),
-        "Used-Service-Unit",
+        AvpKey::vendor(AVP_SERVICE_INFORMATION, VENDOR_ID_3GPP),
+        "Service-Information",
         AvpDataType::Grouped,
-        AvpFlagRules::base_optional(),
-        SpecRef::new("ietf", "RFC4006", "8.19"),
+        AvpFlagRules::vendor_specific(),
+        SpecRef::new("3gpp", "TS32299", "7.2.192"),
+    )
+    .with_grouped_avp_rules(&SERVICE_INFORMATION_RULES),
+    AvpDefinition::new(
+        AvpKey::vendor(AVP_SERVICE_DATA_CONTAINER, VENDOR_ID_3GPP),
+        "Service-Data-Container",
+        AvpDataType::Grouped,
+        AvpFlagRules::vendor_specific(),
+        SpecRef::new("3gpp", "TS32299", "7.2.189"),
     ),
     AvpDefinition::new(
-        AvpKey::ietf(AVP_CC_TIME),
-        "CC-Time",
+        AvpKey::ietf(AVP_ACCOUNTING_INPUT_OCTETS),
+        "Accounting-Input-Octets",
+        AvpDataType::Unsigned64,
+        AvpFlagRules::base_mandatory(),
+        SpecRef::new("ietf", "RFC4005", "8.1"),
+    ),
+    AvpDefinition::new(
+        AvpKey::ietf(AVP_ACCOUNTING_OUTPUT_OCTETS),
+        "Accounting-Output-Octets",
+        AvpDataType::Unsigned64,
+        AvpFlagRules::base_mandatory(),
+        SpecRef::new("ietf", "RFC4005", "8.2"),
+    ),
+    AvpDefinition::new(
+        AvpKey::vendor(AVP_TIME_USAGE, VENDOR_ID_3GPP),
+        "Time-Usage",
         AvpDataType::Unsigned32,
-        AvpFlagRules::base_optional(),
-        SpecRef::new("ietf", "RFC4006", "8.21"),
-    ),
-    AvpDefinition::new(
-        AvpKey::ietf(AVP_CC_TOTAL_OCTETS),
-        "CC-Total-Octets",
-        AvpDataType::Unsigned64,
-        AvpFlagRules::base_optional(),
-        SpecRef::new("ietf", "RFC4006", "8.22"),
-    ),
-    AvpDefinition::new(
-        AvpKey::ietf(AVP_CC_INPUT_OCTETS),
-        "CC-Input-Octets",
-        AvpDataType::Unsigned64,
-        AvpFlagRules::base_optional(),
-        SpecRef::new("ietf", "RFC4006", "8.23"),
-    ),
-    AvpDefinition::new(
-        AvpKey::ietf(AVP_CC_OUTPUT_OCTETS),
-        "CC-Output-Octets",
-        AvpDataType::Unsigned64,
-        AvpFlagRules::base_optional(),
-        SpecRef::new("ietf", "RFC4006", "8.24"),
-    ),
-    AvpDefinition::new(
-        AvpKey::ietf(AVP_MULTIPLE_SERVICES_CREDIT_CONTROL),
-        "Multiple-Services-Credit-Control",
-        AvpDataType::Grouped,
-        AvpFlagRules::base_optional(),
-        SpecRef::new("ietf", "RFC4006", "8.16"),
+        AvpFlagRules::vendor_specific(),
+        SpecRef::new("3gpp", "TS32299", "7.2.232"),
     ),
     AvpDefinition::new(
         AvpKey::ietf(AVP_RATING_GROUP),
@@ -225,35 +252,44 @@ const RF_AVPS: [AvpDefinition; 20] = [
         "PS-Information",
         AvpDataType::Grouped,
         AvpFlagRules::vendor_specific(),
-        SpecRef::new("3gpp", "TS32299", "PS-Information"),
-    ),
+        SpecRef::new("3gpp", "TS32299", "7.2.158"),
+    )
+    .with_grouped_avp_rules(&PS_INFORMATION_RULES),
     AvpDefinition::new(
         AvpKey::vendor(AVP_3GPP_CHARGING_ID, VENDOR_ID_3GPP),
         "3GPP-Charging-Id",
-        AvpDataType::Unsigned32,
-        AvpFlagRules::vendor_specific(),
-        SpecRef::new("3gpp", "TS32299", "3GPP-Charging-Id"),
+        AvpDataType::OctetString,
+        AvpFlagRules::new(
+            FlagRequirement::MustBeSet,
+            FlagRequirement::MustBeSet,
+            FlagRequirement::MayBeSet,
+        ),
+        SpecRef::new("3gpp", "TS32299", "7.2.0"),
     ),
     AvpDefinition::new(
         AvpKey::vendor(AVP_3GPP_PDP_TYPE, VENDOR_ID_3GPP),
         "3GPP-PDP-Type",
-        AvpDataType::Unsigned32,
-        AvpFlagRules::vendor_specific(),
-        SpecRef::new("3gpp", "TS32299", "3GPP-PDP-Type"),
+        AvpDataType::Enumerated,
+        AvpFlagRules::new(
+            FlagRequirement::MustBeSet,
+            FlagRequirement::MustBeSet,
+            FlagRequirement::MayBeSet,
+        ),
+        SpecRef::new("3gpp", "TS32299", "7.2.0"),
     ),
     AvpDefinition::new(
-        AvpKey::vendor(AVP_3GPP_SGSN_ADDRESS, VENDOR_ID_3GPP),
+        AvpKey::vendor(AVP_SGSN_ADDRESS, VENDOR_ID_3GPP),
         "SGSN-Address",
         AvpDataType::Address,
         AvpFlagRules::vendor_specific(),
-        SpecRef::new("3gpp", "TS32299", "SGSN-Address"),
+        SpecRef::new("3gpp", "TS32299", "7.2.199"),
     ),
     AvpDefinition::new(
-        AvpKey::vendor(AVP_3GPP_GGSN_ADDRESS, VENDOR_ID_3GPP),
+        AvpKey::vendor(AVP_GGSN_ADDRESS, VENDOR_ID_3GPP),
         "GGSN-Address",
         AvpDataType::Address,
         AvpFlagRules::vendor_specific(),
-        SpecRef::new("3gpp", "TS32299", "GGSN-Address"),
+        SpecRef::new("3gpp", "TS32299", "7.2.68"),
     ),
 ];
 
@@ -309,24 +345,15 @@ impl AccountingRecordType {
     }
 }
 
-/// Used-Service-Unit grouped AVP (RFC 4006 §8.19).
+/// Offline per-service usage (TS 32.299 section 7.2.189).
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct UsedServiceUnit {
-    /// CC-Time in seconds.
-    pub cc_time: Option<u32>,
-    /// CC-Total-Octets.
-    pub cc_total_octets: Option<u64>,
-    /// CC-Input-Octets.
-    pub cc_input_octets: Option<u64>,
-    /// CC-Output-Octets.
-    pub cc_output_octets: Option<u64>,
-}
-
-/// Multiple-Services-Credit-Control grouped AVP (RFC 4006 §8.16).
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct MultipleServicesCreditControl {
-    /// Used-Service-Unit child.
-    pub used_service_unit: Option<UsedServiceUnit>,
+pub struct ServiceDataContainer {
+    /// Uplink octets during this reporting interval.
+    pub accounting_input_octets: Option<u64>,
+    /// Downlink octets during this reporting interval.
+    pub accounting_output_octets: Option<u64>,
+    /// Effective service usage in seconds.
+    pub time_usage: Option<u32>,
     /// Rating-Group.
     pub rating_group: Option<u32>,
     /// Service-Identifier.
@@ -340,10 +367,12 @@ pub struct PsInformation {
     pub charging_id: Option<u32>,
     /// 3GPP-PDP-Type.
     pub pdp_type: Option<u32>,
-    /// SGSN-Address (redacted in diagnostic output).
-    pub sgsn_address: Option<Redacted<IpAddr>>,
-    /// GGSN-Address (redacted in diagnostic output).
-    pub ggsn_address: Option<Redacted<IpAddr>>,
+    /// Repeated SGSN-Address values, in wire order (redacted in diagnostics).
+    pub sgsn_addresses: Vec<Redacted<IpAddr>>,
+    /// Repeated GGSN-Address values, in wire order (redacted in diagnostics).
+    pub ggsn_addresses: Vec<Redacted<IpAddr>>,
+    /// Repeated offline per-service usage containers.
+    pub service_data_containers: Vec<ServiceDataContainer>,
 }
 
 /// Rf Accounting-Request (ACR) for START, INTERIM, STOP, and EVENT records.
@@ -373,11 +402,9 @@ pub struct RfAccountingRequest {
     pub event_timestamp: Option<u32>,
     /// Service-Context-Id.
     pub service_context_id: String,
-    /// Subscription-Id grouped AVPs.
+    /// Subscription-Id groups nested in Service-Information.
     pub subscription_ids: Vec<SubscriptionId>,
-    /// Multiple-Services-Credit-Control grouped AVPs.
-    pub multiple_services_credit_controls: Vec<MultipleServicesCreditControl>,
-    /// PS-Information grouped AVP.
+    /// PS-Information nested in Service-Information.
     pub ps_information: Option<PsInformation>,
 }
 
@@ -567,14 +594,20 @@ pub fn build_rf_accounting_request(
         true,
         ctx,
     )?;
-    for subscription_id in &request.subscription_ids {
-        append_subscription_id_avp(&mut raw_avps, subscription_id, ctx)?;
-    }
-    for mscc in &request.multiple_services_credit_controls {
-        append_multiple_services_credit_control_avp(&mut raw_avps, mscc, ctx)?;
-    }
-    if let Some(ps_information) = request.ps_information.as_ref() {
-        append_ps_information_avp(&mut raw_avps, ps_information, ctx)?;
+    if !request.subscription_ids.is_empty() || request.ps_information.is_some() {
+        let mut service_information = BytesMut::new();
+        for subscription_id in &request.subscription_ids {
+            append_subscription_id_avp(&mut service_information, subscription_id, ctx)?;
+        }
+        if let Some(ps_information) = request.ps_information.as_ref() {
+            append_ps_information_avp(&mut service_information, ps_information, ctx)?;
+        }
+        builder_helpers::append_avp(
+            &mut raw_avps,
+            AvpHeader::vendor(AVP_SERVICE_INFORMATION, VENDOR_ID_3GPP, true),
+            &service_information,
+            ctx,
+        )?;
     }
     builder_helpers::build_message(
         builder_helpers::app_request_flags(),
@@ -612,9 +645,7 @@ pub fn parse_rf_accounting_request(
     let mut origin_state_id = None;
     let mut event_timestamp = None;
     let mut service_context_id = None;
-    let mut subscription_ids = Vec::new();
-    let mut multiple_services_credit_controls = Vec::new();
-    let mut ps_information = None;
+    let mut service_information = None;
     builder_helpers::for_each_avp(
         message.raw_avps,
         ctx,
@@ -624,10 +655,10 @@ pub fn parse_rf_accounting_request(
             let value_offset = builder_helpers::offset_add(offset, avp.header.header_len(), "7")?;
             let code = avp.header.code;
             if let Some(vendor_id) = avp.header.vendor_id {
-                if code == AVP_PS_INFORMATION && vendor_id == VENDOR_ID_3GPP {
+                if code == AVP_SERVICE_INFORMATION && vendor_id == VENDOR_ID_3GPP {
                     builder_helpers::set_once(
-                        &mut ps_information,
-                        parse_ps_information(avp.value, ctx, value_offset, 1)?,
+                        &mut service_information,
+                        parse_service_information(avp.value, ctx, value_offset, 1)?,
                         offset,
                         "TS32299",
                     )?;
@@ -670,8 +701,8 @@ pub fn parse_rf_accounting_request(
                     "9.8.1",
                 )?;
             } else if code == AVP_ACCOUNTING_RECORD_NUMBER {
-                let value = builder_helpers::parse_u32_value(avp.value, value_offset, "9.8.2")?;
-                builder_helpers::set_once(&mut accounting_record_number, value, offset, "9.8.2")?;
+                let value = builder_helpers::parse_u32_value(avp.value, value_offset, "9.8.3")?;
+                builder_helpers::set_once(&mut accounting_record_number, value, offset, "9.8.3")?;
             } else if code == base::AVP_ACCT_APPLICATION_ID {
                 let value = builder_helpers::parse_u32_value(avp.value, value_offset, "6.9")?;
                 builder_helpers::set_once(&mut acct_application_id, value, offset, "6.9")?;
@@ -687,16 +718,6 @@ pub fn parse_rf_accounting_request(
             } else if code == AVP_SERVICE_CONTEXT_ID {
                 let value = builder_helpers::parse_string_value(avp.value, value_offset, "8.6")?;
                 builder_helpers::set_once(&mut service_context_id, value, offset, "8.6")?;
-            } else if code == AVP_SUBSCRIPTION_ID {
-                validate_subscription_id_outer_flags(&avp.header, offset)?;
-                subscription_ids.push(parse_subscription_id(avp.value, ctx, value_offset, 1)?);
-            } else if code == AVP_MULTIPLE_SERVICES_CREDIT_CONTROL {
-                multiple_services_credit_controls.push(parse_multiple_services_credit_control(
-                    avp.value,
-                    ctx,
-                    value_offset,
-                    1,
-                )?);
             } else {
                 builder_helpers::handle_unknown_avp(ctx, &avp, offset, "7")?;
             }
@@ -718,6 +739,7 @@ pub fn parse_rf_accounting_request(
         )
         .with_spec_ref(SpecRef::new("ietf", "RFC6733", "7")));
     }
+    let (subscription_ids, ps_information) = service_information.unwrap_or_default();
     Ok(RfAccountingRequest {
         session_id: builder_helpers::require_field(session_id, "Rf ACR requires Session-Id", "7")?,
         origin_host: builder_helpers::require_field(
@@ -756,7 +778,6 @@ pub fn parse_rf_accounting_request(
             "7",
         )?,
         subscription_ids,
-        multiple_services_credit_controls,
         ps_information,
     })
 }
@@ -920,8 +941,8 @@ pub fn parse_rf_accounting_answer(
                     "9.8.1",
                 )?;
             } else if code == AVP_ACCOUNTING_RECORD_NUMBER {
-                let value = builder_helpers::parse_u32_value(avp.value, value_offset, "9.8.2")?;
-                builder_helpers::set_once(&mut accounting_record_number, value, offset, "9.8.2")?;
+                let value = builder_helpers::parse_u32_value(avp.value, value_offset, "9.8.3")?;
+                builder_helpers::set_once(&mut accounting_record_number, value, offset, "9.8.3")?;
             } else if code == base::AVP_ACCT_APPLICATION_ID {
                 let value = builder_helpers::parse_u32_value(avp.value, value_offset, "6.9")?;
                 builder_helpers::set_once(&mut acct_application_id, value, offset, "6.9")?;
@@ -985,158 +1006,137 @@ pub fn parse_rf_accounting_answer(
     })
 }
 
-fn append_used_service_unit_avp(
-    dst: &mut BytesMut,
-    usu: &UsedServiceUnit,
-    ctx: EncodeContext,
-) -> Result<(), EncodeError> {
-    let mut value = BytesMut::new();
-    if let Some(cc_time) = usu.cc_time {
-        builder_helpers::append_u32_avp(&mut value, AVP_CC_TIME, cc_time, true, ctx)?;
-    }
-    if let Some(cc_total_octets) = usu.cc_total_octets {
-        builder_helpers::append_u64_avp(
-            &mut value,
-            AVP_CC_TOTAL_OCTETS,
-            cc_total_octets,
-            true,
-            ctx,
-        )?;
-    }
-    if let Some(cc_input_octets) = usu.cc_input_octets {
-        builder_helpers::append_u64_avp(
-            &mut value,
-            AVP_CC_INPUT_OCTETS,
-            cc_input_octets,
-            true,
-            ctx,
-        )?;
-    }
-    if let Some(cc_output_octets) = usu.cc_output_octets {
-        builder_helpers::append_u64_avp(
-            &mut value,
-            AVP_CC_OUTPUT_OCTETS,
-            cc_output_octets,
-            true,
-            ctx,
-        )?;
-    }
-    builder_helpers::append_avp(
-        dst,
-        AvpHeader::ietf(AVP_USED_SERVICE_UNIT, true),
-        &value,
-        ctx,
-    )
-}
-
-fn parse_used_service_unit(
+fn parse_service_information(
     value: &[u8],
     ctx: DecodeContext,
     base_offset: usize,
     depth: usize,
-) -> Result<UsedServiceUnit, DecodeError> {
-    let mut cc_time = None;
-    let mut cc_total_octets = None;
-    let mut cc_input_octets = None;
-    let mut cc_output_octets = None;
+) -> Result<(Vec<SubscriptionId>, Option<PsInformation>), DecodeError> {
+    let mut subscription_ids = Vec::new();
+    let mut ps_information = None;
     builder_helpers::for_each_avp(value, ctx, base_offset, depth, |offset, avp| {
-        let value_offset = builder_helpers::offset_add(offset, avp.header.header_len(), "8.19")?;
-        let code = avp.header.code;
-        if avp.header.vendor_id.is_some() {
-            return builder_helpers::handle_unknown_avp(ctx, &avp, offset, "8.19");
-        }
-        if code == AVP_CC_TIME {
-            let value = builder_helpers::parse_u32_value(avp.value, value_offset, "8.21")?;
-            builder_helpers::set_once(&mut cc_time, value, offset, "8.19")?;
-        } else if code == AVP_CC_TOTAL_OCTETS {
-            let value = builder_helpers::parse_u64_value(avp.value, value_offset, "8.22")?;
-            builder_helpers::set_once(&mut cc_total_octets, value, offset, "8.19")?;
-        } else if code == AVP_CC_INPUT_OCTETS {
-            let value = builder_helpers::parse_u64_value(avp.value, value_offset, "8.23")?;
-            builder_helpers::set_once(&mut cc_input_octets, value, offset, "8.19")?;
-        } else if code == AVP_CC_OUTPUT_OCTETS {
-            let value = builder_helpers::parse_u64_value(avp.value, value_offset, "8.24")?;
-            builder_helpers::set_once(&mut cc_output_octets, value, offset, "8.19")?;
-        } else {
-            builder_helpers::handle_unknown_avp(ctx, &avp, offset, "8.19")?;
-        }
-        Ok(())
-    })?;
-    Ok(UsedServiceUnit {
-        cc_time,
-        cc_total_octets,
-        cc_input_octets,
-        cc_output_octets,
-    })
-}
-
-fn append_multiple_services_credit_control_avp(
-    dst: &mut BytesMut,
-    mscc: &MultipleServicesCreditControl,
-    ctx: EncodeContext,
-) -> Result<(), EncodeError> {
-    let mut value = BytesMut::new();
-    if let Some(usu) = mscc.used_service_unit.as_ref() {
-        append_used_service_unit_avp(&mut value, usu, ctx)?;
-    }
-    if let Some(rating_group) = mscc.rating_group {
-        builder_helpers::append_u32_avp(&mut value, AVP_RATING_GROUP, rating_group, true, ctx)?;
-    }
-    if let Some(service_identifier) = mscc.service_identifier {
-        builder_helpers::append_u32_avp(
-            &mut value,
-            AVP_SERVICE_IDENTIFIER,
-            service_identifier,
-            true,
-            ctx,
-        )?;
-    }
-    builder_helpers::append_avp(
-        dst,
-        AvpHeader::ietf(AVP_MULTIPLE_SERVICES_CREDIT_CONTROL, true),
-        &value,
-        ctx,
-    )
-}
-
-fn parse_multiple_services_credit_control(
-    value: &[u8],
-    ctx: DecodeContext,
-    base_offset: usize,
-    depth: usize,
-) -> Result<MultipleServicesCreditControl, DecodeError> {
-    let mut used_service_unit = None;
-    let mut rating_group = None;
-    let mut service_identifier = None;
-    builder_helpers::for_each_avp(value, ctx, base_offset, depth, |offset, avp| {
-        let value_offset = builder_helpers::offset_add(offset, avp.header.header_len(), "8.16")?;
-        let code = avp.header.code;
-        if avp.header.vendor_id.is_some() {
-            return builder_helpers::handle_unknown_avp(ctx, &avp, offset, "8.16");
-        }
-        if code == AVP_USED_SERVICE_UNIT {
+        let value_offset = builder_helpers::offset_add(offset, avp.header.header_len(), "7.2.192")?;
+        if avp.header.code == AVP_SUBSCRIPTION_ID && avp.header.vendor_id.is_none() {
+            validate_subscription_id_outer_flags(&avp.header, offset)?;
+            subscription_ids.push(parse_subscription_id(
+                avp.value,
+                ctx,
+                value_offset,
+                depth + 1,
+            )?);
+        } else if avp.header.code == AVP_PS_INFORMATION
+            && avp.header.vendor_id == Some(VENDOR_ID_3GPP)
+        {
             builder_helpers::set_once(
-                &mut used_service_unit,
-                parse_used_service_unit(avp.value, ctx, value_offset, depth + 1)?,
+                &mut ps_information,
+                parse_ps_information(avp.value, ctx, value_offset, depth + 1)?,
                 offset,
-                "8.16",
+                "7.2.192",
             )?;
-        } else if code == AVP_RATING_GROUP {
-            let value = builder_helpers::parse_u32_value(avp.value, value_offset, "8.29")?;
-            builder_helpers::set_once(&mut rating_group, value, offset, "8.16")?;
-        } else if code == AVP_SERVICE_IDENTIFIER {
-            let value = builder_helpers::parse_u32_value(avp.value, value_offset, "8.28")?;
-            builder_helpers::set_once(&mut service_identifier, value, offset, "8.16")?;
         } else {
-            builder_helpers::handle_unknown_avp(ctx, &avp, offset, "8.16")?;
+            builder_helpers::handle_unknown_avp(ctx, &avp, offset, "7.2.192")?;
         }
         Ok(())
     })?;
-    Ok(MultipleServicesCreditControl {
-        used_service_unit,
-        rating_group,
-        service_identifier,
-    })
+    Ok((subscription_ids, ps_information))
+}
+
+fn append_service_data_container_avp(
+    dst: &mut BytesMut,
+    usage: &ServiceDataContainer,
+    ctx: EncodeContext,
+) -> Result<(), EncodeError> {
+    let mut value = BytesMut::new();
+    for (code, count) in [
+        (AVP_ACCOUNTING_INPUT_OCTETS, usage.accounting_input_octets),
+        (AVP_ACCOUNTING_OUTPUT_OCTETS, usage.accounting_output_octets),
+    ] {
+        if let Some(count) = count {
+            builder_helpers::append_u64_avp(&mut value, code, count, true, ctx)?;
+        }
+    }
+    for (code, field) in [
+        (AVP_RATING_GROUP, usage.rating_group),
+        (AVP_SERVICE_IDENTIFIER, usage.service_identifier),
+    ] {
+        if let Some(field) = field {
+            builder_helpers::append_u32_avp(&mut value, code, field, true, ctx)?;
+        }
+    }
+    if let Some(time) = usage.time_usage {
+        builder_helpers::append_vendor_u32_avp(
+            &mut value,
+            AVP_TIME_USAGE,
+            VENDOR_ID_3GPP,
+            time,
+            true,
+            ctx,
+        )?;
+    }
+    builder_helpers::append_avp(
+        dst,
+        AvpHeader::vendor(AVP_SERVICE_DATA_CONTAINER, VENDOR_ID_3GPP, true),
+        &value,
+        ctx,
+    )
+}
+
+fn parse_service_data_container(
+    value: &[u8],
+    ctx: DecodeContext,
+    base_offset: usize,
+    depth: usize,
+) -> Result<ServiceDataContainer, DecodeError> {
+    let mut usage = ServiceDataContainer {
+        accounting_input_octets: None,
+        accounting_output_octets: None,
+        time_usage: None,
+        rating_group: None,
+        service_identifier: None,
+    };
+    builder_helpers::for_each_avp(value, ctx, base_offset, depth, |offset, avp| {
+        let value_offset = builder_helpers::offset_add(offset, avp.header.header_len(), "7.2.189")?;
+        let key = match avp.header.vendor_id {
+            Some(vendor) => AvpKey::vendor(avp.header.code, vendor),
+            None => AvpKey::ietf(avp.header.code),
+        };
+        if key == AvpKey::ietf(AVP_ACCOUNTING_INPUT_OCTETS)
+            || key == AvpKey::ietf(AVP_ACCOUNTING_OUTPUT_OCTETS)
+        {
+            let slot = if key.code() == AVP_ACCOUNTING_INPUT_OCTETS {
+                &mut usage.accounting_input_octets
+            } else {
+                &mut usage.accounting_output_octets
+            };
+            builder_helpers::set_once(
+                slot,
+                builder_helpers::parse_u64_value(avp.value, value_offset, "7.2.189")?,
+                offset,
+                "7.2.189",
+            )?;
+        } else if key == AvpKey::ietf(AVP_RATING_GROUP)
+            || key == AvpKey::ietf(AVP_SERVICE_IDENTIFIER)
+            || key == AvpKey::vendor(AVP_TIME_USAGE, VENDOR_ID_3GPP)
+        {
+            let slot = if key.code() == AVP_RATING_GROUP {
+                &mut usage.rating_group
+            } else if key.code() == AVP_SERVICE_IDENTIFIER {
+                &mut usage.service_identifier
+            } else {
+                &mut usage.time_usage
+            };
+            builder_helpers::set_once(
+                slot,
+                builder_helpers::parse_u32_value(avp.value, value_offset, "7.2.189")?,
+                offset,
+                "7.2.189",
+            )?;
+        } else {
+            builder_helpers::handle_unknown_avp(ctx, &avp, offset, "7.2.189")?;
+        }
+        Ok(())
+    })?;
+    Ok(usage)
 }
 
 fn append_ps_information_avp(
@@ -1165,29 +1165,32 @@ fn append_ps_information_avp(
             ctx,
         )?;
     }
-    if let Some(sgsn_address) = ps.sgsn_address.as_ref() {
+    for sgsn_address in &ps.sgsn_addresses {
         let mut address_value = BytesMut::new();
         builder_helpers::encode_address_value(&mut address_value, **sgsn_address);
         builder_helpers::append_vendor_octet_string_avp(
             &mut value,
-            AVP_3GPP_SGSN_ADDRESS,
+            AVP_SGSN_ADDRESS,
             VENDOR_ID_3GPP,
             &address_value,
             true,
             ctx,
         )?;
     }
-    if let Some(ggsn_address) = ps.ggsn_address.as_ref() {
+    for ggsn_address in &ps.ggsn_addresses {
         let mut address_value = BytesMut::new();
         builder_helpers::encode_address_value(&mut address_value, **ggsn_address);
         builder_helpers::append_vendor_octet_string_avp(
             &mut value,
-            AVP_3GPP_GGSN_ADDRESS,
+            AVP_GGSN_ADDRESS,
             VENDOR_ID_3GPP,
             &address_value,
             true,
             ctx,
         )?;
+    }
+    for usage in &ps.service_data_containers {
+        append_service_data_container_avp(&mut value, usage, ctx)?;
     }
     builder_helpers::append_avp(
         dst,
@@ -1205,8 +1208,9 @@ fn parse_ps_information(
 ) -> Result<PsInformation, DecodeError> {
     let mut charging_id = None;
     let mut pdp_type = None;
-    let mut sgsn_address = None;
-    let mut ggsn_address = None;
+    let mut sgsn_addresses = Vec::new();
+    let mut ggsn_addresses = Vec::new();
+    let mut service_data_containers = Vec::new();
     builder_helpers::for_each_avp(value, ctx, base_offset, depth, |offset, avp| {
         let value_offset = builder_helpers::offset_add(offset, avp.header.header_len(), "TS32299")?;
         let code = avp.header.code;
@@ -1217,28 +1221,25 @@ fn parse_ps_information(
         } else if code == AVP_3GPP_PDP_TYPE && vendor_id == Some(VENDOR_ID_3GPP) {
             let value = builder_helpers::parse_u32_value(avp.value, value_offset, "TS32299")?;
             builder_helpers::set_once(&mut pdp_type, value, offset, "TS32299")?;
-        } else if code == AVP_3GPP_SGSN_ADDRESS && vendor_id == Some(VENDOR_ID_3GPP) {
-            builder_helpers::set_once(
-                &mut sgsn_address,
-                Redacted::new(builder_helpers::parse_address_value(
-                    avp.value,
-                    value_offset,
-                    "TS32299",
-                )?),
-                offset,
+        } else if code == AVP_SGSN_ADDRESS && vendor_id == Some(VENDOR_ID_3GPP) {
+            sgsn_addresses.push(Redacted::new(builder_helpers::parse_address_value(
+                avp.value,
+                value_offset,
                 "TS32299",
-            )?;
-        } else if code == AVP_3GPP_GGSN_ADDRESS && vendor_id == Some(VENDOR_ID_3GPP) {
-            builder_helpers::set_once(
-                &mut ggsn_address,
-                Redacted::new(builder_helpers::parse_address_value(
-                    avp.value,
-                    value_offset,
-                    "TS32299",
-                )?),
-                offset,
+            )?));
+        } else if code == AVP_GGSN_ADDRESS && vendor_id == Some(VENDOR_ID_3GPP) {
+            ggsn_addresses.push(Redacted::new(builder_helpers::parse_address_value(
+                avp.value,
+                value_offset,
                 "TS32299",
-            )?;
+            )?));
+        } else if code == AVP_SERVICE_DATA_CONTAINER && vendor_id == Some(VENDOR_ID_3GPP) {
+            service_data_containers.push(parse_service_data_container(
+                avp.value,
+                ctx,
+                value_offset,
+                depth + 1,
+            )?);
         } else {
             builder_helpers::handle_unknown_avp(ctx, &avp, offset, "TS32299")?;
         }
@@ -1247,8 +1248,9 @@ fn parse_ps_information(
     Ok(PsInformation {
         charging_id,
         pdp_type,
-        sgsn_address,
-        ggsn_address,
+        sgsn_addresses,
+        ggsn_addresses,
+        service_data_containers,
     })
 }
 

@@ -78,6 +78,7 @@ EXTERNAL_TYPE_MAP: dict[str, str] = {
 # Local refs that we generate as primitive or local types.
 LOCAL_PRIMITIVE_MAP: dict[str, str] = {
     "#/components/schemas/NFType": "NfType",
+    "#/components/schemas/NFService": "NfService",
     "#/components/schemas/NFStatus": "NfStatus",
     "#/components/schemas/NFServiceStatus": "NfServiceStatus",
     "#/components/schemas/ServiceName": "String",
@@ -289,6 +290,7 @@ def emit_enum(name: str, schema: Any, docs: dict[str, Any]) -> list[str]:
 
     for v, wire in variants:
         lines.extend(doc_comment(None, f"Wire value `{wire}`.", indent="    "))
+        lines.append(f'    #[serde(rename = "{wire}")]')
         lines.append(f"    {v},")
 
     # Add catch-all for extensible enums.
@@ -358,10 +360,29 @@ def emit_struct(name: str, schema: Any, docs: dict[str, Any]) -> list[str]:
                 indent="    ",
             )
         )
+        if ty.startswith("Option<"):
+            lines.append('    #[serde(skip_serializing_if = "Option::is_none")]')
         lines.append(f"    pub {rust_name}: {ty},")
 
     lines.append("}")
     lines.append("")
+    if name == "NfService":
+        lines.extend([
+            "impl NfService {",
+            "    /// Create an NF service with its mandatory TS 29.510 attributes.",
+            "    pub fn new(",
+            "        service_instance_id: String,",
+            "        service_name: String,",
+            "        versions: Vec<NfServiceVersion>,",
+            "        scheme: String,",
+            "        nf_service_status: NfServiceStatus,",
+            "    ) -> Self {",
+            "        Self {",
+        ])
+        for prop_name in sorted(props.keys()):
+            field = sanitize_ident(prop_name)
+            lines.append(f"            {field}," if prop_name in required else f"            {field}: None,")
+        lines.extend(["        }", "    }", "}", ""])
     return lines
 
 

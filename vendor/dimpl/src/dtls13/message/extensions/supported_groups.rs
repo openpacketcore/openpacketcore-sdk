@@ -32,7 +32,7 @@ impl SupportedGroupsExtension {
             let (rest, group) = NamedGroup::parse(group_input)?;
             current_input = rest;
             // Only add supported groups
-            if group.is_supported() {
+            if NamedGroup::supported_dtls13().contains(&group) {
                 groups
                     .try_push(group)
                     .map_err(|_| Err::Failure(Error::new(group_input, ErrorKind::LengthValue)))?;
@@ -107,7 +107,7 @@ mod tests {
         };
         assert_eq!(
             ext.groups.capacity(),
-            NamedGroup::supported().len(),
+            NamedGroup::supported_dtls13().len(),
             "SupportedGroupsExtension capacity must match all supported NamedGroups"
         );
     }
@@ -115,7 +115,7 @@ mod tests {
     #[test]
     fn too_many_supported_groups_are_rejected() {
         let mut bytes = Vec::new();
-        let count = NamedGroup::supported().len() + 1;
+        let count = NamedGroup::supported_dtls13().len() + 1;
         bytes.extend_from_slice(&(count as u16 * 2).to_be_bytes());
         for _ in 0..count {
             bytes.extend_from_slice(&NamedGroup::X25519.as_u16().to_be_bytes());

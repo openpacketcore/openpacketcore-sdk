@@ -59,7 +59,7 @@ pub fn generation_input_from_yang_sources(
 ///
 /// This checks module metadata, preserved source text, imports, node paths,
 /// child relationships, list keys, config/state flags, type references,
-/// defaults, presence markers, ordered-by, data classes, unique constraints,
+/// defaults, mandatory/cardinality, presence markers, ordered-by, data classes, unique constraints,
 /// and the schema digest implied by those source-derived fields.
 ///
 /// # Errors
@@ -341,6 +341,24 @@ fn compare_node(input: &SchemaNode, parsed: &SchemaNode) -> Result<(), Diagnosti
         "numeric range",
         &input.numeric_range,
         &parsed.numeric_range,
+    )?;
+    compare_field(
+        &input.source,
+        "mandatory",
+        &input.mandatory,
+        &parsed.mandatory,
+    )?;
+    compare_field(
+        &input.source,
+        "min-elements",
+        &input.min_elements,
+        &parsed.min_elements,
+    )?;
+    compare_field(
+        &input.source,
+        "max-elements",
+        &input.max_elements,
+        &parsed.max_elements,
     )?;
     compare_vec(
         &input.source,
@@ -645,11 +663,40 @@ fn parse_data_node(
         ..Default::default()
     };
     let mut descendants = Vec::new();
+    let mut seen_cardinality = BTreeSet::new();
 
     for child in &statement.children {
+        if matches!(
+            child.keyword.as_str(),
+            "mandatory" | "min-elements" | "max-elements"
+        ) && !seen_cardinality.insert(child.keyword.as_str())
+        {
+            return Err(invalid_cardinality(
+                child,
+                "duplicate cardinality statement",
+            ));
+        }
+        if matches!(
+            child.keyword.as_str(),
+            "mandatory" | "min-elements" | "max-elements"
+        ) {
+            ensure_type_children_supported(child, &[])?;
+        }
         match child.keyword.as_str() {
-            "description" | "reference" | "status" | "mandatory" | "min-elements"
-            | "max-elements" | "units" | "config" => {}
+            "description" | "reference" | "status" | "units" | "config" => {}
+            "mandatory" => node.mandatory = Some(parse_bool_argument(child, "mandatory")?),
+            "min-elements" => node.min_elements = Some(parse_element_bound(child)?),
+            "max-elements" => {
+                if required_argument(child, "max-elements")? != "unbounded" {
+                    node.max_elements = Some(parse_element_bound(child)?);
+                }
+                if !matches!(kind, SchemaNodeKind::List | SchemaNodeKind::LeafList) {
+                    return Err(invalid_cardinality(
+                        child,
+                        "element bounds require a list or leaf-list",
+                    ));
+                }
+            }
             "presence" => node.presence = Some(required_argument(child, "presence")?.to_string()),
             "ordered-by" => {
                 node.ordered_by = Some(required_argument(child, "ordered-by")?.to_string());
@@ -702,10 +749,34 @@ fn parse_data_node(
         ));
     }
 
+    node.validate_cardinality()
+        .map_err(|message| invalid_cardinality(statement, message))?;
     let mut nodes = Vec::with_capacity(descendants.len() + 1);
     nodes.push(node);
     nodes.extend(descendants);
     Ok(nodes)
+}
+
+fn invalid_cardinality(statement: &Statement, message: &'static str) -> Diagnostic {
+    Diagnostic::new(
+        DiagnosticCode::YangSourceSyntaxError,
+        message,
+        Some(statement.source.clone()),
+        Some("use valid mandatory and element bounds for this node"),
+    )
+}
+
+fn parse_element_bound(statement: &Statement) -> Result<u32, Diagnostic> {
+    let argument = required_argument(statement, &statement.keyword)?;
+    if argument.is_empty() || !argument.bytes().all(|byte| byte.is_ascii_digit()) {
+        return Err(invalid_cardinality(
+            statement,
+            "element bound must be an unsigned decimal integer",
+        ));
+    }
+    argument
+        .parse()
+        .map_err(|_| invalid_cardinality(statement, "element bound exceeds the uint32 domain"))
 }
 
 struct ParsedTypeRef {
@@ -752,8 +823,32 @@ fn parse_type_ref(statement: &Statement) -> Result<ParsedTypeRef, Diagnostic> {
         ),
         "decimal64" => {
             ensure_type_children_supported(statement, &["fraction-digits"])?;
+            let raw = required_child_argument(statement, "fraction-digits")?;
+            let declarations: Vec<_> = statement
+                .children
+                .iter()
+                .filter(|child| child.keyword == "fraction-digits")
+                .collect();
+            let fraction_digits = raw
+                .parse::<u8>()
+                .ok()
+                .filter(|value| (1..=18).contains(value));
+            if declarations.len() != 1
+                || !raw.bytes().all(|b| b.is_ascii_digit())
+                || fraction_digits.is_none()
+            {
+                return Err(Diagnostic::new(
+                    DiagnosticCode::YangSourceSyntaxError,
+                    "decimal64 requires exactly one fraction-digits value in 1..=18",
+                    Some(statement.source.clone()),
+                    Some("supply the decimal64 scale"),
+                ));
+            }
+            ensure_type_children_supported(declarations[0], &[])?;
             Ok(ParsedTypeRef {
-                type_ref: TypeRef::Decimal64,
+                type_ref: TypeRef::Decimal64 {
+                    fraction_digits: fraction_digits.expect("validated scale"),
+                },
                 numeric_range: Vec::new(),
             })
         }

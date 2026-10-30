@@ -8,13 +8,14 @@
 //! evidence prevent a caller from skipping or replaying either transition.
 //!
 //! The RFC 6083 profile is DTLS 1.2 only. It uses the audited, workspace-vendored
-//! `dimpl` fork with its explicitly selected pure-Rust `rust-crypto` provider
-//! and admits only typed ECDHE-ECDSA AEAD suites. An unrelated process-global
+//! `dimpl` fork with its explicitly selected `rust-crypto` provider with ring RSA signatures
+//! and admits only typed ECDHE-ECDSA/RSA AEAD suites. An unrelated process-global
 //! `dimpl` provider cannot replace that authority. The profile disables DTLS
-//! record replay filtering and flight retransmission because reliable, ordered
-//! SCTP owns those properties. Every DTLS record is carried as one ordered SCTP
-//! user message on stream 0 with [`DIAMETER_DTLS_SCTP_PPID`] (47); cleartext or
-//! foreign-PPID input after the in-band prelude fails the association closed.
+//! record replay filtering and flight retransmission because reliable
+//! SCTP owns those properties. Each DTLS record occupies one SCTP user message
+//! with [`DIAMETER_DTLS_SCTP_PPID`] (47). Control uses ordered stream zero;
+//! applications may use any negotiated stream and receive unordered records.
+//! Cleartext or foreign-PPID input after the in-band prelude fails the association closed.
 //! The maximum Diameter plaintext is 16,347 bytes, the conservative
 //! single-record budget across all admitted suites.
 //!
@@ -101,10 +102,9 @@ use crate::{
 /// PPID for "Diameter in a DTLS/SCTP DATA chunk" (RFC 6733 section 11.5).
 pub const DIAMETER_DTLS_SCTP_PPID: u32 = 47;
 
-/// SCTP stream carrying every record of one DTLS connection. RFC 6083
-/// section 4.4 requires ordered stream-0 delivery for Handshake, CCS, and
-/// Alert records; this transport uses ordered stream-0 delivery for
-/// ApplicationData too.
+/// SCTP stream for DTLS control and default application sends. RFC 6083
+/// section 4.4 requires ordered stream-0 Handshake, CCS and Alert records.
+/// Application sends may select another negotiated stream.
 pub const DIAMETER_DTLS_SCTP_STREAM: u16 = 0;
 
 const ENGINE_POLL_BUFFER: usize = 16 * 1024;
@@ -253,10 +253,15 @@ pub(crate) trait SctpTransportClose: Send + Sync {
     /// Close the transport and interrupt in-flight operations.
     fn close(&self);
 
+    /// Abort a compromised association without graceful delivery.
+    fn abort(&self) {
+        self.close();
+    }
+
     /// Whether the sealed carrier has observed a terminal transition.
     fn is_closed(&self) -> bool;
 
-    #[cfg(test)]
+    #[cfg(all(test, target_os = "linux"))]
     fn terminal_changes_for_test(&self) -> tokio::sync::watch::Receiver<()>;
 }
 
@@ -459,6 +464,10 @@ pub struct SctpWireLog {
 
 #[cfg(test)]
 impl SctpWireLog {
+    pub(crate) fn aborted(&self) -> bool {
+        self.shared.aborted.load(Ordering::Acquire)
+    }
+
     /// Snapshot the recorded wire emissions in order.
     pub fn records(&self) -> Vec<SctpWireRecord> {
         match self.records.lock() {
@@ -517,6 +526,7 @@ impl fmt::Debug for SctpWireLog {
 #[cfg(test)]
 struct InMemoryShared {
     closed: AtomicBool,
+    aborted: AtomicBool,
     terminal_changed: tokio::sync::watch::Sender<()>,
     block_a_to_b_dtls: AtomicBool,
     block_b_to_a_dtls: AtomicBool,
@@ -539,6 +549,11 @@ enum PreviousAuthKey {
 
 #[cfg(test)]
 impl SctpTransportClose for InMemoryClose {
+    fn abort(&self) {
+        self.shared.aborted.store(true, Ordering::Release);
+        self.close();
+    }
+
     fn close(&self) {
         self.shared.closed.store(true, Ordering::Release);
         self.shared.terminal_changed.send_replace(());
@@ -549,6 +564,7 @@ impl SctpTransportClose for InMemoryClose {
         self.shared.closed.load(Ordering::Acquire)
     }
 
+    #[cfg(target_os = "linux")]
     fn terminal_changes_for_test(&self) -> tokio::sync::watch::Receiver<()> {
         self.shared.terminal_changed.subscribe()
     }
@@ -930,6 +946,7 @@ pub fn in_memory_sctp_link(
     let (b_tx, a_rx) = mpsc::channel(capacity.max(1));
     let shared = Arc::new(InMemoryShared {
         closed: AtomicBool::new(false),
+        aborted: AtomicBool::new(false),
         terminal_changed: tokio::sync::watch::Sender::default(),
         block_a_to_b_dtls: AtomicBool::new(false),
         block_b_to_a_dtls: AtomicBool::new(false),
@@ -980,17 +997,28 @@ struct KernelSctpClose {
 
 impl SctpTransportClose for KernelSctpClose {
     fn close(&self) {
-        self.terminal.store(true, Ordering::Release);
+        if self.terminal.swap(true, Ordering::AcqRel) {
+            return;
+        }
+        self.abort.abort();
         #[cfg(test)]
         self.terminal_changed.send_replace(());
-        self.abort.abort();
+    }
+
+    fn abort(&self) {
+        if self.terminal.swap(true, Ordering::AcqRel) {
+            return;
+        }
+        let _ = self.abort.abort_on_wire();
+        #[cfg(test)]
+        self.terminal_changed.send_replace(());
     }
 
     fn is_closed(&self) -> bool {
         self.terminal.load(Ordering::Acquire)
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, target_os = "linux"))]
     fn terminal_changes_for_test(&self) -> tokio::sync::watch::Receiver<()> {
         self.terminal_changed.subscribe()
     }
@@ -1493,13 +1521,13 @@ impl fmt::Debug for DiameterDtlsSctpTransport {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[non_exhaustive]
 pub enum DtlsSctpVersion {
-    /// DTLS 1.2 (RFC 6347) with ECDHE-ECDSA AEAD suites.
+    /// DTLS 1.2 (RFC 6347) with ECDHE-ECDSA/RSA AEAD suites.
     Dtls12,
 }
 
 /// Cipher-suite evidence names admitted by this transport.
 ///
-/// RFC 6083 DTLS 1.2 negotiates these as ECDHE-ECDSA AEAD suites.
+/// RFC 6083 DTLS 1.2 negotiates these as ECDHE-ECDSA/RSA or DHE-RSA AEAD suites.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[non_exhaustive]
 pub enum DtlsSctpCipher {
@@ -1509,13 +1537,23 @@ pub enum DtlsSctpCipher {
     Aes256GcmSha384,
     /// `TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305_SHA256` (`0xCCA9`).
     Chacha20Poly1305Sha256,
+    /// `TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256` (`0xC02F`).
+    EcdheRsaAes128GcmSha256,
+    /// `TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384` (`0xC030`).
+    EcdheRsaAes256GcmSha384,
+    /// `TLS_DHE_RSA_WITH_AES_128_GCM_SHA256` (`0x009E`).
+    /// Legacy Release 18 option, prohibited by RFC 10015 / TS 33.210 Release 19.
+    DheRsaAes128GcmSha256,
 }
 
 impl DtlsSctpCipher {
-    const ALL: [Self; 3] = [
+    const ALL: [Self; 6] = [
         Self::Aes128GcmSha256,
         Self::Aes256GcmSha384,
         Self::Chacha20Poly1305Sha256,
+        Self::EcdheRsaAes128GcmSha256,
+        Self::EcdheRsaAes256GcmSha384,
+        Self::DheRsaAes128GcmSha256,
     ];
 
     const fn index(self) -> usize {
@@ -1523,11 +1561,23 @@ impl DtlsSctpCipher {
             Self::Aes128GcmSha256 => 0,
             Self::Aes256GcmSha384 => 1,
             Self::Chacha20Poly1305Sha256 => 2,
+            Self::EcdheRsaAes128GcmSha256 => 3,
+            Self::EcdheRsaAes256GcmSha384 => 4,
+            Self::DheRsaAes128GcmSha256 => 5,
         }
     }
 
     const fn dtls12_suite(self) -> dimpl::crypto::Dtls12CipherSuite {
         match self {
+            Self::DheRsaAes128GcmSha256 => {
+                dimpl::crypto::Dtls12CipherSuite::DHE_RSA_AES128_GCM_SHA256
+            }
+            Self::EcdheRsaAes128GcmSha256 => {
+                dimpl::crypto::Dtls12CipherSuite::ECDHE_RSA_AES128_GCM_SHA256
+            }
+            Self::EcdheRsaAes256GcmSha384 => {
+                dimpl::crypto::Dtls12CipherSuite::ECDHE_RSA_AES256_GCM_SHA384
+            }
             Self::Aes128GcmSha256 => {
                 dimpl::crypto::Dtls12CipherSuite::ECDHE_ECDSA_AES128_GCM_SHA256
             }
@@ -1562,13 +1612,14 @@ pub const MAX_DTLS_SCTP_MESSAGE_BYTES: usize = DiameterFrameLimits::RFC6083.max_
 /// Typed DTLS/SCTP protocol, cipher, frame, and age policy.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct DtlsSctpPolicy {
-    allowed_ciphers: [bool; 3],
+    allowed_ciphers: [bool; 6],
     frame_limits: DiameterFrameLimits,
     maximum_connection_age: Duration,
 }
 
 impl DtlsSctpPolicy {
-    /// RFC 6083 DTLS 1.2 policy with modern ECDHE-ECDSA AEAD suites.
+    /// RFC 6083 DTLS 1.2 policy defaulting to ECDHE-ECDSA AEAD suites.
+    /// RSA certificate suites can be enabled with `with_allowed_ciphers`.
     ///
     /// DTLS 1.3 is deliberately not exposed as ready: its exporter secret is
     /// not available until the server Finished, while RFC 6083 requires the
@@ -1581,7 +1632,7 @@ impl DtlsSctpPolicy {
             return Err(DiameterTlsPolicyError::FrameLimitExceedsDtlsRecordBudget);
         }
         Ok(Self {
-            allowed_ciphers: [true; 3],
+            allowed_ciphers: [true, true, true, false, false, false],
             frame_limits,
             maximum_connection_age: Duration::from_secs(60 * 60),
         })
@@ -1602,7 +1653,7 @@ impl DtlsSctpPolicy {
         if allowed.is_empty() {
             return Err(DiameterTlsPolicyError::EmptyCipherSet);
         }
-        self.allowed_ciphers = [false; 3];
+        self.allowed_ciphers = [false; 6];
         for cipher in allowed {
             self.allowed_ciphers[cipher.index()] = true;
         }
@@ -1652,12 +1703,19 @@ impl DtlsSctpPolicy {
             .allowed_ciphers()
             .map(DtlsSctpCipher::dtls12_suite)
             .collect();
+        let provider = dimpl::crypto::rust_crypto::default_provider();
+        let allow_ffdhe = dtls12.iter().any(|suite| suite.has_dhe());
+        let groups: Vec<_> = provider
+            .supported_kx_groups()
+            .map(|group| group.name())
+            .filter(|group| !group.is_ffdhe() || allow_ffdhe)
+            .collect();
         let config = dimpl::Config::builder()
             // Bind this transport to the audited RustCrypto implementation.
             // `dimpl` also supports a process-global default provider, but an
             // unrelated dependency must not be able to replace the provider
             // authority for an already configured Diameter boundary.
-            .with_crypto_provider(dimpl::crypto::rust_crypto::default_provider())
+            .with_crypto_provider(provider)
             .require_client_certificate(true)
             // A connector must also prove that the remote server requested
             // and authenticated its local certificate. Verifying only the
@@ -1667,6 +1725,7 @@ impl DtlsSctpPolicy {
             .rfc6083_sctp()
             .dtls13_cipher_suites(&[])
             .dtls12_cipher_suites(&dtls12)
+            .kx_groups(&groups)
             .build()
             .map_err(|_| DiameterTlsError::MaterialNotAdmitted)?;
         Ok(Arc::new(config))
@@ -1676,7 +1735,7 @@ impl DtlsSctpPolicy {
 impl Default for DtlsSctpPolicy {
     fn default() -> Self {
         Self {
-            allowed_ciphers: [true; 3],
+            allowed_ciphers: [true, true, true, false, false, false],
             frame_limits: DiameterFrameLimits::RFC6083,
             maximum_connection_age: Duration::from_secs(60 * 60),
         }
@@ -2144,26 +2203,19 @@ pub fn parse_dtls_record_bounds(frame: &[u8]) -> Option<DtlsRecordBounds> {
 
 #[cfg(test)]
 fn validate_received_dtls_record(message: &SctpUserMessage) -> Result<&[u8], DiameterTlsError> {
-    validate_received_record_for(message, DIAMETER_DTLS_SCTP_PPID)
-}
-
-fn validate_received_record_for(
-    message: &SctpUserMessage,
-    protected_ppid: u32,
-) -> Result<&[u8], DiameterTlsError> {
-    validate_received_record_on_streams(message, protected_ppid, 1)
+    validate_received_record_on_streams(message, DIAMETER_DTLS_SCTP_PPID, 1, false)
 }
 
 fn validate_received_record_on_streams(
     message: &SctpUserMessage,
     protected_ppid: u32,
     stream_count: u16,
+    allow_unordered_application: bool,
 ) -> Result<&[u8], DiameterTlsError> {
     if message.ppid() != protected_ppid {
         return Err(DiameterTlsError::CleartextInput);
     }
     if message.stream_id() >= stream_count
-        || message.order() != SctpDeliveryOrder::Ordered
         || message.truncated()
         || message.control_truncated()
         || message.notification()
@@ -2174,7 +2226,9 @@ fn validate_received_record_on_streams(
     let bounds = parse_dtls_record_bounds(message.payload()).ok_or(DiameterTlsError::Transport)?;
     if bounds.record_bytes != message.payload().len()
         || (message.stream_id() != 0 && (bounds.content_type != Some(23) || bounds.epoch == 0))
-        // This opt-in profile uses DTLS 1.2 record identities. Initial
+        || (message.order() != SctpDeliveryOrder::Ordered
+            && (!allow_unordered_application || bounds.content_type != Some(23) || bounds.epoch == 0))
+        // Multistream profiles use DTLS 1.2 record identities. Initial
         // handshakes may use the DTLS 1.0 compatibility version, but protected
         // records must carry the negotiated DTLS 1.2 version on the wire.
         || (stream_count > 1
@@ -2194,8 +2248,12 @@ fn handle_received_record(
     protected_ppid: u32,
     packet_error: DiameterTlsError,
 ) -> Result<(), DiameterTlsError> {
-    let record =
-        validate_received_record_on_streams(message, protected_ppid, state.streams.count())?;
+    let record = validate_received_record_on_streams(
+        message,
+        protected_ppid,
+        state.streams.count(),
+        state.streams.allows_unordered_application(),
+    )?;
     state.streams.remember(message)?;
     engine.handle_packet(record).map_err(|_| packet_error)
 }
@@ -2373,7 +2431,14 @@ async fn run_transport_handshake(
     validation: &HandshakeValidation,
     deadline: Instant,
 ) -> Result<CompletedHandshake, DiameterTlsError> {
-    run_transport_handshake_with_streams(engine, io, validation, deadline, Default::default()).await
+    run_transport_handshake_with_streams(
+        engine,
+        io,
+        validation,
+        deadline,
+        rfc6083::streams::RecordStreams::diameter(MAX_DTLS_SCTP_RECEIVE_QUEUE_MESSAGES),
+    )
+    .await
 }
 
 async fn run_transport_handshake_with_streams(
@@ -2640,7 +2705,13 @@ async fn receive_inband_cleartext_frame(
     {
         return Err(DiameterTlsError::CleartextInput);
     }
-    decode_wire_frame(Bytes::copy_from_slice(message.payload()), frame_limits)
+    let decoded = decode_wire_frame(Bytes::copy_from_slice(message.payload()), frame_limits);
+    if matches!(decoded, Err(DiameterTlsError::InvalidFrame)) {
+        // RFC 6733 section 2.1 applies before as well as after DTLS. Abort
+        // synchronously, before the lifetime guard can request graceful close.
+        io.close_handle().abort();
+    }
+    decoded
 }
 
 fn wall_expiry_deadline(expiry: Timestamp, now: Instant) -> Instant {
@@ -3489,6 +3560,9 @@ fn finish_association(
         // with the handshake's own state.
         pump_state: PumpState {
             connected: true,
+            streams: rfc6083::streams::RecordStreams::diameter(
+                MAX_DTLS_SCTP_RECEIVE_QUEUE_MESSAGES,
+            ),
             ..PumpState::default()
         },
         poll_buffer: vec![0_u8; ENGINE_POLL_BUFFER],
@@ -3551,6 +3625,10 @@ struct DtlsRuntimeClose {
 impl ProtectedFrameTransportClose for DtlsRuntimeClose {
     fn close(&self) {
         self.close.close();
+    }
+
+    fn abort(&self) {
+        self.close.abort();
     }
 }
 
@@ -3648,6 +3726,7 @@ async fn run_dtls_runtime_actor(
 ) {
     let mut state = PumpState {
         connected: true,
+        streams: rfc6083::streams::RecordStreams::diameter(max_buffered_frames),
         ..PumpState::default()
     };
     let mut buffer = vec![0_u8; ENGINE_POLL_BUFFER];
@@ -3695,6 +3774,9 @@ async fn run_dtls_runtime_actor(
                         .payload;
                     let result = validate_wire_frame(&wire, request.limits).map(|()| wire);
                     let failed = result.is_err();
+                    if failed {
+                        close.abort();
+                    }
                     let _ = request.result.send(result);
                     if failed {
                         return Err(DiameterTlsError::Transport);
@@ -3754,10 +3836,10 @@ async fn run_dtls_runtime_actor(
             tokio::select! {
                 message = io.receive_message() => {
                     let message = message?.ok_or(DiameterTlsError::Transport)?;
-                    let record = validate_received_record_for(&message, io.protected_ppid())?;
-                    engine
-                        .handle_packet(record)
-                        .map_err(|_| DiameterTlsError::Transport)?;
+                    handle_received_record(
+                        &mut engine, &mut state, &message, io.protected_ppid(),
+                        DiameterTlsError::Transport,
+                    )?;
                 }
                 command = sends.recv() => {
                     let Some(command) = command else {
@@ -3774,6 +3856,7 @@ async fn run_dtls_runtime_actor(
                         &mut buffer,
                         command.limits,
                         &command.wire,
+                        0,
                         command.deadline,
                     ).await;
                     let failed = result.is_err();
@@ -3811,12 +3894,12 @@ async fn run_dtls_runtime_actor(
         }
     }
     .await;
+    close.close();
     if let Some(request) = pending_receive {
         let _ = request
             .result
             .send(Err(outcome.err().unwrap_or(DiameterTlsError::Transport)));
     }
-    close.close();
 }
 
 /// An admitted mutually authenticated DTLS/SCTP association bound to one peer
@@ -3911,7 +3994,7 @@ impl DiameterDtlsSctpConnection {
             .capabilities_request_sent_on(self.generation, &message.header)
             .map_err(|_| DiameterTlsError::CapabilitiesExchangeFailed)?;
         self.ensure_active()?;
-        self.write_protected_message(&message, deadline).await?;
+        self.write_protected_message(&message, 0, deadline).await?;
         Ok(admission)
     }
 
@@ -3990,6 +4073,7 @@ impl DiameterDtlsSctpConnection {
             poll_buffer,
             *frame_limits,
             emission.as_bytes(),
+            0,
             deadline,
         )
         .await
@@ -4087,6 +4171,19 @@ impl DiameterDtlsSctpConnection {
         message: &OwnedMessage,
         deadline: Instant,
     ) -> Result<PeerCommandAdmission, DiameterTlsError> {
+        self.send_message_on_stream(message, 0, deadline).await
+    }
+
+    /// Admit and emit an application message on a selected reliable ordered stream.
+    /// SCTP checks the negotiated outbound range; DTLS control stays on stream zero.
+    /// Peers may send replies on a different stream. Failure or cancellation
+    /// during emission closes the association, as with [`Self::send_message`].
+    pub async fn send_message_on_stream(
+        &mut self,
+        message: &OwnedMessage,
+        stream_id: u16,
+        deadline: Instant,
+    ) -> Result<PeerCommandAdmission, DiameterTlsError> {
         self.ensure_active()?;
         if PeerCommandClass::from_header(&message.header) != PeerCommandClass::Application {
             return Err(DiameterTlsError::CommandNotAdmitted);
@@ -4100,7 +4197,8 @@ impl DiameterDtlsSctpConnection {
             )
             .map_err(|_| DiameterTlsError::CommandNotAdmitted)?;
         self.ensure_active()?;
-        self.write_protected_message(message, deadline).await?;
+        self.write_protected_message(message, stream_id, deadline)
+            .await?;
         Ok(admission)
     }
 
@@ -4262,6 +4360,7 @@ impl DiameterDtlsSctpConnection {
     async fn write_protected_message(
         &mut self,
         message: &OwnedMessage,
+        stream_id: u16,
         deadline: Instant,
     ) -> Result<(), DiameterTlsError> {
         self.ensure_active()?;
@@ -4290,6 +4389,7 @@ impl DiameterDtlsSctpConnection {
             poll_buffer,
             *frame_limits,
             &wire,
+            stream_id,
             deadline,
         )
         .await
@@ -4340,6 +4440,9 @@ impl DiameterDtlsSctpConnection {
             {
                 Ok(message) => message,
                 Err(error) => {
+                    if error == DiameterTlsError::InvalidFrame {
+                        close.abort();
+                    }
                     return Err(
                         if retirement_required(
                             material_status,
@@ -4446,6 +4549,7 @@ async fn close_transport_via(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn write_wire_frame_via(
     engine: &mut dimpl::Dtls,
     io: &mut Box<dyn SctpMessageIo>,
@@ -4453,21 +4557,20 @@ async fn write_wire_frame_via(
     poll_buffer: &mut Vec<u8>,
     frame_limits: DiameterFrameLimits,
     wire: &[u8],
+    stream_id: u16,
     deadline: Instant,
 ) -> Result<(), DiameterTlsError> {
     validate_wire_frame(wire, frame_limits)?;
-    write_application_via(engine, io, pump_state, poll_buffer, wire, deadline).await
-}
-
-async fn write_application_via(
-    engine: &mut dimpl::Dtls,
-    io: &mut Box<dyn SctpMessageIo>,
-    pump_state: &mut PumpState,
-    poll_buffer: &mut Vec<u8>,
-    wire: &[u8],
-    deadline: Instant,
-) -> Result<(), DiameterTlsError> {
-    write_application_on_stream_via(engine, io, pump_state, poll_buffer, wire, 0, deadline).await
+    write_application_on_stream_via(
+        engine,
+        io,
+        pump_state,
+        poll_buffer,
+        wire,
+        stream_id,
+        deadline,
+    )
+    .await
 }
 
 async fn write_application_on_stream_via(
@@ -4693,6 +4796,17 @@ mod tests {
             .expect("cipher policy");
         assert!(policy.allows_cipher(DtlsSctpCipher::Aes256GcmSha384));
         assert!(!policy.allows_cipher(DtlsSctpCipher::Aes128GcmSha256));
+        for chosen in DtlsSctpCipher::ALL {
+            let policy = DtlsSctpPolicy::default()
+                .with_allowed_ciphers(&[chosen])
+                .unwrap();
+            for candidate in DtlsSctpCipher::ALL {
+                assert_eq!(policy.allows_cipher(candidate), candidate == chosen);
+            }
+            let config = policy.engine_config().unwrap();
+            let suites: Vec<_> = config.dtls12_cipher_suites().map(|s| s.suite()).collect();
+            assert_eq!(suites, [chosen.dtls12_suite()]);
+        }
     }
 
     #[test]
@@ -4700,7 +4814,11 @@ mod tests {
         let policy = DtlsSctpPolicy::default();
         assert_eq!(
             policy.allowed_ciphers().collect::<Vec<_>>(),
-            DtlsSctpCipher::ALL
+            [
+                DtlsSctpCipher::Aes128GcmSha256,
+                DtlsSctpCipher::Aes256GcmSha384,
+                DtlsSctpCipher::Chacha20Poly1305Sha256
+            ]
         );
         assert_eq!(
             DtlsSctpPolicy::dtls13(policy.frame_limits()),
@@ -4719,10 +4837,7 @@ mod tests {
         let config = DtlsSctpPolicy::default()
             .engine_config()
             .expect("Diameter binds the audited RustCrypto provider explicitly");
-        assert_eq!(
-            config.dtls12_cipher_suites().count(),
-            DtlsSctpCipher::ALL.len()
-        );
+        assert_eq!(config.dtls12_cipher_suites().count(), 3);
         assert_eq!(config.dtls13_cipher_suites().count(), 0);
     }
 
@@ -4897,5 +5012,78 @@ mod tests {
         let received = b.receive_message().await.expect("receive").expect("open");
         assert_eq!(received.ppid(), 0);
         assert_eq!(log.records()[0].ppid, 0);
+    }
+}
+
+#[cfg(test)]
+mod review_policy_tests {
+    use super::*;
+    #[test]
+    fn review_default_dtls_groups_exclude_ffdhe() {
+        let config = DtlsSctpPolicy::default().engine_config().unwrap();
+        assert!(config.kx_groups().all(|group| !group.name().is_ffdhe()));
+
+        // Walk the actual ClientHello using its RFC 6347 length fields, without
+        // sharing the engine's extension parser or matching raw byte patterns.
+        fn take<'a>(bytes: &mut &'a [u8], length: usize) -> &'a [u8] {
+            let (value, rest) = bytes.split_at(length);
+            *bytes = rest;
+            value
+        }
+        fn vector<'a>(bytes: &mut &'a [u8], width: usize) -> &'a [u8] {
+            let length = take(bytes, width)
+                .iter()
+                .fold(0usize, |n, byte| (n << 8) | usize::from(*byte));
+            take(bytes, length)
+        }
+        let key = rcgen::KeyPair::generate().unwrap();
+        let certificate = dimpl::DtlsCertificate {
+            // Only local ClientHello serialization is exercised.
+            certificate: vec![1],
+            intermediates: vec![],
+            private_key: key.serialize_der(),
+        };
+        let now = std::time::Instant::now();
+        let mut engine = dimpl::Dtls::new_12(config, certificate, now);
+        engine.set_active(true);
+        engine.handle_timeout(now).unwrap();
+        let mut buffer = vec![0; 2048];
+        let dimpl::Output::Packet(packet) = engine.poll_output(&mut buffer) else {
+            panic!("expected ClientHello");
+        };
+        assert_eq!(packet[0], 22); // handshake record
+        assert_eq!(packet[13], 1); // ClientHello
+        let mut hello = &packet[25..];
+        take(&mut hello, 2 + 32); // version and random
+        vector(&mut hello, 1); // session ID
+        vector(&mut hello, 1); // cookie
+        let suites = vector(&mut hello, 2);
+        assert_eq!(suites.len(), 6);
+        assert!(!suites.as_chunks::<2>().0.contains(&[0, 0x9e]));
+        vector(&mut hello, 1); // compression methods
+        let mut extensions = vector(&mut hello, 2);
+        assert!(hello.is_empty());
+        let mut offered_groups = None;
+        while !extensions.is_empty() {
+            let kind = take(&mut extensions, 2);
+            let mut value = vector(&mut extensions, 2);
+            if kind == [0, 10] {
+                assert!(offered_groups.is_none());
+                let groups = vector(&mut value, 2);
+                assert!(value.is_empty());
+                assert_eq!(groups.len() % 2, 0);
+                offered_groups = Some(
+                    groups
+                        .as_chunks::<2>()
+                        .0
+                        .iter()
+                        .map(|group| u16::from_be_bytes(*group))
+                        .collect::<Vec<_>>(),
+                );
+            }
+        }
+        let groups = offered_groups.expect("supported_groups extension");
+        assert!(!groups.is_empty());
+        assert!(groups.iter().all(|group| !(256..512).contains(group)));
     }
 }

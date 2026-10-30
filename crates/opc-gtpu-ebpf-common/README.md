@@ -17,6 +17,11 @@ GTP-U encapsulation/classification helpers.
   endpoint identity plus explicit `Any`, exact, or inclusive-range UDP source
   authorization. `validate_ipv4_downlink_binding_wire` and the owner wire
   helpers provide allocation-free verifier-facing checks over map-owned bytes.
+- `GtpuPeerSourcePolicy` preserves the exact peer check by default and adds an
+  explicit TEID/local multi-homing policy. Opt-in bindings use version 2;
+  ordinary/N3/MTU session entries use versions 4/5/6. Older versions retain exact
+  bytes and unsupported version/policy combinations are rejected. Policy bytes
+  participate in owner/commit equality and typed/borrowed checks agree.
 - `DownlinkBindingMismatch` defines the fixed invalid/family/peer/local/
   ingress/source-port counter cardinality; map names and indexes are shared by
   userspace and the tc object.
@@ -70,8 +75,10 @@ GTP-U encapsulation/classification helpers.
   field at bytes 73..74 for ordinary inner IPv6 over outer IPv4, using the
   legacy UDP/2152 source port and an in-tunnel Packet Too Big MTU of at least
   1,280. The constructor returns `None` for unsupported profiles, and both
-  readers reject them, including version 4 (N3 with MTU). Version 0, byte 3
-  and bytes 75..79 stay reserved. Every profile occupies 80 bytes inside the same
+  readers reject unsupported N3/MTU combinations. Versions 4, 5 and 6 carry
+  the ordinary, N3 and MTU profiles with explicit `TeidAndLocal` policy in byte 3.
+  Default-policy versions 1–3 still require byte 3 zero. Version 0 and bytes
+  75..79 stay reserved. Every profile occupies 80 bytes inside the same
   208-byte group authority, and typed/zero-copy readers enforce the same
   canonical contract. The grouped schema marker advances to
   `OPC-GROUP-IP-v7`; crossing from version 6 requires a fresh installation.

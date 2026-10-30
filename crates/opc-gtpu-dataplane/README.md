@@ -10,6 +10,11 @@ eBPF, mock, and unsupported backends, and keeps raw syscalls in
 The crate does not implement GTP-C, PFCP, namespace management, route steering,
 XFRM policy, deployment defaults, or traffic-readiness policy.
 
+`GtpPdpContext.peer_teid` and `ReceivedN3UplinkTnl` use `PeerTeid`, which
+accepts the peer-assigned zero value required by TS 29.281 section 5.1.
+Locally allocated TEIDs still use nonzero `Teid`. Convert an existing peer
+value with `PeerTeid::from(teid)` or construct it with `PeerTeid::new(raw)`.
+
 ## Experimental N3 packet and intent boundary
 
 The `n3` module keeps received uplink UPF TNL information separate from
@@ -377,6 +382,25 @@ Before downgrading to an SDK without zero-peer support, remove zero-peer context
   log is inspected only to establish that the verifier ran, and is never
   retained.
 
+## Multi-homing peer sources
+
+`GtpPdpContext::downlink_peer_source_policy` defaults explicitly to
+`GtpuPeerSourcePolicy::BackendDefault`: eBPF checks the configured peer address,
+while Linux GTP retains its native TEID lookup. For TS 29.281 sections 4.3.0 and
+4.4.3.3 multi-homing, select `TeidAndLocal` on the eBPF context (or
+`GtpuSessionEntry::with_peer_source_policy` for grouped/N3 entries). Other source
+addresses of the same family can then send to the context's TEID and local
+endpoint. The incoming interface, UDP source-port policy, inner PAA, ownership,
+generation and N3 QFI checks still apply. Outgoing traffic uses the configured
+peer address. Restrict access to the GTP-U transport network: this option is
+not peer authentication or an alternate-address allowlist.
+
+The policy is retained in map ownership, commit records and durable selector
+admissions, and exact readback detects a policy conflict. Default-policy bytes
+retain their existing versions. Opt-in bindings/entries/descriptors use new
+versions that older implementations reject. Linux GTP rejects the explicit
+opt-in because its netlink readback cannot retain that policy.
+
 ## Usage
 
 ```rust,no_run
@@ -384,7 +408,7 @@ use std::net::{IpAddr, Ipv4Addr};
 
 use opc_gtpu_dataplane::{
     CreateGtpDeviceRequest, GtpPdpContext, GtpVersion, GtpuDataplaneBackend,
-    GtpuSourcePortPolicy, GtpuUplinkSourcePortPolicy, MockGtpuDataplaneBackend,
+    GtpuPeerSourcePolicy, GtpuSourcePortPolicy, GtpuUplinkSourcePortPolicy, MockGtpuDataplaneBackend,
     PeerTeid, RemovePdpContextRequest, Teid,
 };
 
@@ -401,11 +425,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         ms_address: IpAddr::V4(Ipv4Addr::new(10, 23, 0, 2)),
         peer_address: IpAddr::V4(Ipv4Addr::new(192, 0, 2, 10)),
         link_ifindex: device.ifindex,
+        downlink_peer_source_policy: GtpuPeerSourcePolicy::BackendDefault,
         downlink_source_port_policy: GtpuSourcePortPolicy::Any,
         gtp_version: GtpVersion::V1,
         bearer_mark: None,
         egress_dscp: None,
         uplink_source_port_policy: GtpuUplinkSourcePortPolicy::LegacyServicePort,
+        downlink_inner_mtu: None,
     };
 
     backend.install_pdp_context(context.clone()).await?;
@@ -3237,7 +3263,7 @@ sudo unshare -n -- bash -lc 'ip link set lo up && OPC_GTPU_RUN_PRIVILEGED=1 carg
 ```
 
 The backend trait exposes `open_gtpu_control_port` for eBPF attachments with
-an IPv4 endpoint and for Linux kernel-GTP userspace-socket attachments. The
+IPv4 and/or IPv6 endpoints and for Linux kernel-GTP userspace-socket attachments. The
 former lose access on removal, replacement, backend loss or observed hook
 loss; the latter are retired on removal, replacement, adoption or socket
 generation change, and a kernel-owned recoverable attachment returns an exact

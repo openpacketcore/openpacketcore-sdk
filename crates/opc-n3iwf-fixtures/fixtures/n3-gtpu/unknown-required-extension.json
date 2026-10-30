@@ -23,7 +23,7 @@
     "synthetic": true,
     "independent_capture": false,
     "referenced_public_vector": "crates/opc-proto-gtpu/tests/gtpu_tests.rs",
-    "notes": "Comprehension-required unknown extension 0x84"
+    "notes": "Comprehension-required unknown extension 0x87"
   },
   "sanitized_fields": [
     {
@@ -34,10 +34,10 @@
   ],
   "wire": {
     "path": "wire/unknown-required-extension.hex",
-    "digest_sha256": "15f7e18ba252afa8c176770340ba0881d475356d1c8b9845cdd6f616becb2d11"
+    "digest_sha256": "d760ad70b9e600f4c72617c3be737ce34bfdef6c315b93cdad5171a02e980a5f"
   },
   "semantic_assertions": [
-    "ext_type=0x84",
+    "ext_type=0x87",
     "code=UnknownCriticalIe"
   ],
   "expected_outcome": "reject",

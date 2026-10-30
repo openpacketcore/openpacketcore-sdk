@@ -282,81 +282,6 @@ jobs:
           if floor is None or floor < (0, 7, 6):
               fail(ike, "crypto-bigint must require a patched stable release (>= 0.7.6)")
 
-          # All incoming edges must remain within this exact reviewed stack.
-          allowed = {
-              ("crypto-bigint", "0.5.5"): {("elliptic-curve", "0.13.8")},
-              ("elliptic-curve", "0.13.8"): {("ecdsa", "0.16.9"), ("primeorder", "0.13.6"),
-                                             ("p256", "0.13.2"), ("p384", "0.13.1")},
-              ("ecdsa", "0.16.9"): {("p256", "0.13.2"), ("p384", "0.13.1"), ("dimpl", "0.7.2")},
-              ("primeorder", "0.13.6"): {("p256", "0.13.2"), ("p384", "0.13.1")},
-              ("p256", "0.13.2"): {("dimpl", "0.7.2")},
-              ("p384", "0.13.1"): {("dimpl", "0.7.2")},
-              ("dimpl", "0.7.2"): {("opc-diameter-transport", "0.2.0")},
-          }
-          local = {
-              ("dimpl", "0.7.2"): root / "vendor/dimpl/Cargo.toml",
-              ("opc-diameter-transport", "0.2.0"): root / "crates/opc-diameter-transport/Cargo.toml",
-          }
-
-          def check_paths(packages, parents, lockfile, resolved=False):
-              pending = [identifier for identifier, package in packages.items()
-                         if (package["name"], package["version"]) == ("crypto-bigint", "0.5.5")]
-              if len(pending) != 1:
-                  fail(lockfile, "cannot verify the locked crypto-bigint 0.5.5 dependency path")
-              seen = set()
-              while pending:
-                  identifier = pending.pop()
-                  if identifier in seen:
-                      continue
-                  seen.add(identifier)
-                  package = packages[identifier]
-                  key = package["name"], package["version"]
-                  if key in local:
-                      if package.get("source") is not None or (resolved and
-                              Path(package["manifest_path"]).resolve() != local[key]):
-                          fail(lockfile, f"legacy crypto path must use the checked-in {key[0]}")
-                  elif package.get("source") != registry:
-                      fail(lockfile, f"legacy crypto path has an unexpected source for {key[0]}")
-                  incoming = parents[identifier]
-                  if key == ("opc-diameter-transport", "0.2.0"):
-                      continue
-                  # The same checked-in fork also has its own test workspace.
-                  if (key == ("dimpl", "0.7.2") and not incoming
-                          and lockfile == Path("vendor/dimpl/Cargo.lock")):
-                      continue
-                  if not incoming:
-                      fail(lockfile, f"legacy crypto path ends before the vendored DTLS consumer: {key}")
-                  for parent in incoming:
-                      other = packages[parent]
-                      if (other["name"], other["version"]) not in allowed.get(key, set()):
-                          fail(lockfile, f"unaccepted legacy crypto dependency: {other['name']} -> {key[0]}")
-                      pending.append(parent)
-
-          def check_locked_paths(lock, lockfile):
-              # Cargo.lock includes optional edges absent from enabled metadata.
-              packages = {(p["name"], p["version"], p.get("source")): p for p in lock["package"]}
-              if len(packages) != len(lock["package"]):
-                  fail(lockfile, "duplicate locked package identity")
-              parents = {identifier: set() for identifier in packages}
-              for identifier, package in packages.items():
-                  for dependency in package.get("dependencies", []):
-                      parts = dependency.split(" ", 2)
-                      matches = [key for key in packages if key[0] == parts[0]
-                                 and (len(parts) < 2 or key[1] == parts[1])
-                                 and (len(parts) < 3 or f"({key[2]})" == parts[2])]
-                      if len(matches) != 1:
-                          fail(lockfile, f"cannot resolve locked dependency {dependency!r}")
-                      parents[matches[0]].add(identifier)
-              check_paths(packages, parents, lockfile)
-
-          def check_resolved_paths(metadata, lockfile):
-              packages = {package["id"]: package for package in metadata["packages"]}
-              parents = {identifier: set() for identifier in packages}
-              for node in metadata["resolve"]["nodes"]:
-                  for dependency in node["deps"]:
-                      parents[dependency["pkg"]].add(node["id"])
-              check_paths(packages, parents, lockfile, resolved=True)
-
           tracked = subprocess.check_output(["git", "ls-files", "-z", "--", "Cargo.lock", "**/Cargo.lock",
                                              ":(exclude)ci/fixtures/**"])
           lockfiles = [Path(os.fsdecode(name)) for name in tracked.split(b"\0") if name]
@@ -365,32 +290,25 @@ jobs:
           database = str(Path(os.environ["RUNNER_TEMP"]) / "cargo-advisory-db")
           for index, lockfile in enumerate(lockfiles):
               lock = tomllib.loads(lockfile.read_text())
-              legacy = False
               for package in lock["package"]:
                   if package["name"] != "crypto-bigint":
                       continue
                   version = stable_version(package["version"])
                   if package.get("source") != registry:
                       fail(lockfile, "crypto-bigint must use the reviewed registry source")
-                  if package["version"] == "0.5.5":
-                      legacy = True
-                  elif version is None or version < (0, 7, 6):
+                  if version is None or version < (0, 7, 6):
                       fail(lockfile, f"RUSTSEC-2026-0387 is not accepted for crypto-bigint {package['version']}")
-              if legacy:
-                  check_locked_paths(lock, lockfile)
               manifest = str(lockfile.with_name("Cargo.toml"))
               subprocess.run(["cargo", "fetch", "--locked", "--manifest-path", manifest], check=True)
-              metadata = json.loads(subprocess.check_output([
+              json.loads(subprocess.check_output([
                   "cargo", "metadata", "--locked", "--offline", "--all-features", "--format-version", "1",
                   "--manifest-path", manifest,
               ]))
-              if legacy:
-                  check_resolved_paths(metadata, lockfile)
               command = ["cargo", "audit", "--db", database, "--deny", "warnings", "--file", str(lockfile)]
               if index:
                   command.append("--no-fetch")
               subprocess.run(command, check=True)
-          print(f"Audited {len(lockfiles)} tracked Cargo lockfiles; legacy crypto exception checked.")
+          print(f"Audited {len(lockfiles)} tracked Cargo lockfiles; all crypto-bigint versions require the patched floor.")
           PY
 
   cargo-deny:

@@ -603,17 +603,7 @@ pub fn consensus_snapshot_build_phase_for_test(store: &ConsensusSessionStore) ->
     store.inner.backend.snapshot_observation().phase_for_test()
 }
 
-/// Fixed bounded attempt limit for one local snapshot build command.
-pub const CONSENSUS_SNAPSHOT_BUILD_MAX_ATTEMPTS: usize =
-    crate::consensus::storage::SNAPSHOT_BUILD_MAX_ATTEMPTS;
-
-/// Fixed backoff interval between failed local snapshot build attempts.
-pub const CONSENSUS_SNAPSHOT_BUILD_RETRY_BACKOFF: std::time::Duration =
-    crate::consensus::storage::SNAPSHOT_BUILD_RETRY_BACKOFF;
-
-/// Arm deterministic transient local snapshot build failures for this store's
-/// core. Each armed failure fails exactly one attempt before any capture work
-/// starts; the production bounded-retry/degradation policy consumes them.
+/// Fail after creating both cleanup-owned staging children in the real builder.
 pub fn fail_next_consensus_snapshot_builds_for_test(
     store: &ConsensusSessionStore,
     failures: usize,
@@ -625,71 +615,28 @@ pub fn fail_next_consensus_snapshot_builds_for_test(
         .inject_build_failures_for_test(failures);
 }
 
-/// Arm deterministic transient local snapshot build failures that also latch
-/// the mid-publication indeterminate state, as a real publication failure
-/// would, for this store's core. The production retry wrapper must re-check the
-/// latch after the failed attempt and stop the engine fatally.
+/// Fail at the sealed-candidate publication boundary and latch indeterminacy.
+/// The candidate remains retained for audit by a fresh storage owner.
 pub fn fail_next_consensus_snapshot_builds_with_indeterminate_publication_for_test(
     store: &ConsensusSessionStore,
     failures: usize,
 ) {
-    let observation = store.inner.backend.snapshot_observation();
-    observation.inject_build_failures_for_test(failures);
-    observation.inject_indeterminate_publications_for_test(failures);
-}
-
-/// Observe the production bounded snapshot-build counters:
-/// `(started attempts, failed attempts, retry attempts, degraded commands, consecutive failures)`.
-pub fn consensus_snapshot_build_failure_counters_for_test(
-    store: &ConsensusSessionStore,
-) -> (u64, u64, u64, u64, u64) {
-    let (started, failed, retried, degraded, consecutive, _reason) = store
+    store
         .inner
         .backend
         .snapshot_observation()
-        .build_failure_diagnostics();
-    (started, failed, retried, degraded, consecutive)
+        .inject_indeterminate_publications_for_test(failures);
 }
 
-/// Wait until this core records at least `failed` failed local snapshot build
-/// attempts. The fixture supplies the deadline.
-pub async fn wait_for_consensus_snapshot_build_failures_for_test(
+/// Remaining staging and indeterminate-publication faults, respectively.
+pub fn consensus_snapshot_build_failures_remaining_for_test(
     store: &ConsensusSessionStore,
-    failed: u64,
-    timeout: std::time::Duration,
-) {
-    let deadline = tokio::time::Instant::now() + timeout;
-    loop {
-        if consensus_snapshot_build_failure_counters_for_test(store).1 >= failed {
-            return;
-        }
-        assert!(
-            tokio::time::Instant::now() < deadline,
-            "bounded snapshot build failures were not observed before the fixture deadline"
-        );
-        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-    }
-}
-
-/// Wait until this core records at least `degraded` build commands that kept
-/// the engine on the unchanged current snapshot. The fixture supplies the
-/// deadline.
-pub async fn wait_for_consensus_snapshot_build_degraded_for_test(
-    store: &ConsensusSessionStore,
-    degraded: u64,
-    timeout: std::time::Duration,
-) {
-    let deadline = tokio::time::Instant::now() + timeout;
-    loop {
-        if consensus_snapshot_build_failure_counters_for_test(store).3 >= degraded {
-            return;
-        }
-        assert!(
-            tokio::time::Instant::now() < deadline,
-            "bounded snapshot build degradation was not observed before the fixture deadline"
-        );
-        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-    }
+) -> (usize, usize) {
+    store
+        .inner
+        .backend
+        .snapshot_observation()
+        .remaining_build_failures_for_test()
 }
 
 /// Return constant-space local WAL timing totals without issuing a read

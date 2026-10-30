@@ -6,7 +6,6 @@ use crate::control_port::{
     GtpuControlDatagram, GtpuControlPort, GtpuControlPortError, GtpuControlResponseBudget,
 };
 use std::net::UdpSocket;
-use std::os::fd::AsFd;
 use std::time::Duration;
 
 const ECHO: [u8; 12] = [0x32, 1, 0, 4, 0, 0, 0, 0, 0x91, 0x73, 0, 0];
@@ -228,7 +227,7 @@ async fn control_port_readiness_wakes_async_consumer_for_every_queue() {
         assert!(!readiness_is_readable(&source));
         assert!(!readiness_is_readable(&sibling));
         assert_eq!(format!("{source:?}"), "GtpuControlReadiness(<redacted>)");
-        let reactor = tokio::io::unix::AsyncFd::new(source.as_fd()).unwrap();
+        let reactor = source.register_tokio().unwrap();
 
         for queue in [2152, 2153, 2154, 2152] {
             // Arm the consumer before the datagram exists. No timer or
@@ -325,7 +324,7 @@ async fn control_port_readiness_backend_loss_wakes_and_releases_all_bindings() {
     let fixture = Fixture::new(false).await;
     let port = fixture.open().await;
     let source = port.downlink_readiness().unwrap();
-    let reactor = tokio::io::unix::AsyncFd::new(source.as_fd()).unwrap();
+    let reactor = source.register_tokio().unwrap();
     let notified = reactor.readable();
     tokio::pin!(notified);
     assert!(futures_util::poll!(notified.as_mut()).is_pending());

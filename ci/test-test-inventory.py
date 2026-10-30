@@ -9,6 +9,7 @@ import os
 import shutil
 import subprocess
 import tempfile
+import tomllib
 import unittest
 from unittest.mock import patch
 import urllib.error
@@ -710,7 +711,7 @@ elif operation == 'audit':
     lock = args[args.index('--file') + 1] if '--file' in args else 'Cargo.lock'
     if lock == os.environ.get('FAIL_AUDIT_LOCK'):
         raise SystemExit(17)
-    # Model the ID-wide ignore: a vulnerable bigint alone does not fail audit.
+    # The independent locked-version guard must also reject vulnerable bigint.
     print('audit accepted configured exceptions')
 elif operation == 'fetch':
     if os.environ.get('FAIL_FETCH'):
@@ -721,7 +722,7 @@ else:
         cargo.chmod(0o755)
         self.write('crates/opc-proto-ikev2/Cargo.toml',
                    '[dependencies]\ncrypto-bigint = { version = "0.7.10" }\n')
-        self.write('.cargo/audit.toml', '[advisories]\nignore = ["RUSTSEC-2026-0387"]\n')
+        self.write('.cargo/audit.toml', '[advisories]\nignore = []\n')
         self.lock('Cargo.lock')
 
     def write(self, name, content):
@@ -826,11 +827,26 @@ else:
         self.assertIn('must require a patched stable release', result.stderr)
         self.assertEqual(calls, [])
 
-    def test_reviewed_vendored_legacy_stack_is_accepted(self):
+    def test_migrated_crypto_stack_no_longer_accepts_the_legacy_exception(self):
+        self.lock('Cargo.lock', '0.5.5')
+        result, _ = self.scan(self.legacy_graph())
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn('is not accepted for crypto-bigint 0.5.5', result.stderr)
+        root = Path(__file__).resolve().parents[1]
+        for name in ('.cargo/audit.toml', 'deny.toml'):
+            with self.subTest(config=name):
+                config = tomllib.loads((root / name).read_text())
+                ignores = config['advisories']['ignore']
+                ids = {entry if isinstance(entry, str) else entry['id'] for entry in ignores}
+                self.assertNotIn('RUSTSEC-2026-0386', ids)
+                self.assertNotIn('RUSTSEC-2026-0387', ids)
+
+    def test_reviewed_vendored_legacy_stack_is_rejected(self):
         self.lock('Cargo.lock', '0.5.5')
         result, calls = self.scan(self.legacy_graph())
-        self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertEqual(sum(args[0] == 'audit' for args in calls), 1)
+        self.assertNotEqual(result.returncode, 0, result.stderr)
+        self.assertIn('is not accepted for crypto-bigint 0.5.5', result.stderr)
+        self.assertEqual(sum(args[0] == 'audit' for args in calls), 0)
 
     def test_additional_legacy_consumer_is_rejected_at_every_boundary(self):
         for target in ('crypto-bigint', 'elliptic-curve', 'ecdsa', 'primeorder', 'p256', 'p384', 'dimpl'):
@@ -842,7 +858,7 @@ else:
                 metadata['resolve']['nodes'].append({'id': 'extra', 'deps': [{'pkg': target}]})
                 result, _ = self.scan(metadata)
                 self.assertNotEqual(result.returncode, 0)
-                self.assertIn(f'unaccepted legacy crypto dependency: extra -> {target}', result.stderr)
+                self.assertIn('is not accepted for crypto-bigint 0.5.5', result.stderr)
 
     def test_optional_locked_consumer_cannot_hide_outside_enabled_metadata(self):
         # Cargo.lock retains optional packages outside the enabled feature graph.
@@ -854,9 +870,9 @@ else:
         self.graph_lock('Cargo.lock', locked)
         result, _ = self.scan(resolved)
         self.assertNotEqual(result.returncode, 0)
-        self.assertIn('unaccepted legacy crypto dependency: optional -> crypto-bigint', result.stderr)
+        self.assertIn('is not accepted for crypto-bigint 0.5.5', result.stderr)
 
-    def test_standalone_checked_in_fork_is_the_only_allowed_terminal_dimpl(self):
+    def test_standalone_checked_in_fork_also_rejects_legacy_crypto(self):
         metadata = self.legacy_graph()
         metadata['packages'] = [package for package in metadata['packages']
                                 if package['name'] != 'opc-diameter-transport']
@@ -864,12 +880,13 @@ else:
                                         if node['id'] != 'opc-diameter-transport']
         self.graph_lock('vendor/dimpl/Cargo.lock', metadata)
         result, calls = self.scan(metadata)
-        self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertEqual(sum(args[0] == 'audit' for args in calls), 2)
+        self.assertNotEqual(result.returncode, 0, result.stderr)
+        self.assertIn('is not accepted for crypto-bigint 0.5.5', result.stderr)
+        self.assertEqual(sum(args[0] == 'audit' for args in calls), 1)
         self.graph_lock('Cargo.lock', metadata)
         result, _ = self.scan(metadata)
         self.assertNotEqual(result.returncode, 0)
-        self.assertIn('legacy crypto path ends before the vendored DTLS consumer', result.stderr)
+        self.assertIn('is not accepted for crypto-bigint 0.5.5', result.stderr)
 
     def test_similarly_named_registry_or_unvendored_fork_is_rejected(self):
         self.lock('Cargo.lock', '0.5.5')
@@ -882,19 +899,19 @@ else:
                     package[field] = value
                     result, _ = self.scan(metadata)
                     self.assertNotEqual(result.returncode, 0)
-                    self.assertIn(f'must use the checked-in {name}', result.stderr)
+                    self.assertIn('is not accepted for crypto-bigint 0.5.5', result.stderr)
 
     def test_unresolved_or_disconnected_legacy_copy_is_rejected(self):
         self.lock('Cargo.lock', '0.5.5')
         result, _ = self.scan()
         self.assertNotEqual(result.returncode, 0)
-        self.assertIn('cannot verify the locked crypto-bigint 0.5.5 dependency path', result.stderr)
+        self.assertIn('is not accepted for crypto-bigint 0.5.5', result.stderr)
         metadata = self.legacy_graph()
         for node in metadata['resolve']['nodes']:
             node['deps'] = []
         result, _ = self.scan(metadata)
         self.assertNotEqual(result.returncode, 0)
-        self.assertIn('legacy crypto path ends before the vendored DTLS consumer', result.stderr)
+        self.assertIn('is not accepted for crypto-bigint 0.5.5', result.stderr)
 
     def test_registry_source_is_part_of_the_exception(self):
         self.lock('Cargo.lock', '0.5.5', 'registry+https://registry.example.invalid/index')
@@ -1667,6 +1684,44 @@ echo "${RUNNER_TEMP}" >> "${GITHUB_PATH}"
 
 
 class DeclarationTests(unittest.TestCase):
+    def test_semantic_change_is_visible_without_an_assertion_count_change(self):
+        head = declare(rust('assert_eq!(value(), 2);'), kind='fixture-setup-changed')
+        for base in (rust(), {'Cargo.toml': MANIFEST, 'src/lib.rs': ''}):
+            with self.subTest(base=base):
+                result = report(base, head)
+                self.assertTrue(result.success)
+                self.assertEqual([(f.subject, f.kind, f.allowed) for f in result.findings],
+                                 [(TEST, 'fixture-setup-changed', True)])
+
+    def test_semantic_change_does_not_waive_coverage_reductions(self):
+        old = rust('assert!(ready()); assert_eq!(value(), 1);')
+        head = declare(rust('assert_eq!(value(), 2);', attributes='#[test] #[ignore]'),
+                       kind='fixture-setup-changed')
+        result = report(old, head)
+        self.assertFalse(result.success)
+        self.assertEqual({(f.kind, f.allowed) for f in result.findings},
+                         {('fixture-setup-changed', True), ('assertions-decreased', False), ('disabled', False)})
+
+    def test_semantic_change_requires_changed_source_existing_test_and_issue(self):
+        self.assertFalse(report(rust(), declare(rust(), kind='fixture-setup-changed')).success)
+        missing = declare({'Cargo.toml': MANIFEST, 'src/lib.rs': ''}, kind='fixture-setup-changed')
+        result = report(rust(), missing)
+        self.assertFalse(result.success)
+        self.assertTrue(any(f.kind == 'removed' and not f.allowed for f in result.findings))
+        invalid_issue = declare(rust('assert_eq!(value(), 2);'), kind='fixture-setup-changed', issue=99)
+        self.assertFalse(report(rust(), invalid_issue).success)
+
+    def test_semantic_change_cannot_declare_job_or_reduction_fields(self):
+        for extra in ({'renamed_to': TEST}, {'replacements': [TEST]}, {'behavior_deleted': True, 'deleting_change': 'change'}):
+            with self.subTest(extra=extra), self.assertRaises(GuardError):
+                report(rust(), declare(rust(), kind='fixture-setup-changed', **extra))
+        head = declare(rust(), kind='fixture-setup-changed')
+        record = json.loads(head['ci/test-changes.json'])
+        record['changes'][0]['job'] = record['changes'][0].pop('test')
+        head['ci/test-changes.json'] = json.dumps(record)
+        with self.assertRaises(GuardError):
+            report(rust(), head)
+
     def test_clock_conversion_is_printed_without_waiving_assertion_loss(self):
         old = rust('assert!(ready()); assert_eq!(value(), 1);')
         new = declare(rust('controlled_clock(); assert!(ready());'), kind='clock-source-changed')

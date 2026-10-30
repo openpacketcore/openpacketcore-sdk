@@ -913,35 +913,19 @@ namespace ownership. Neither operation alone grants quorum authority. See
 [ADR 0022](../../docs/adr/0022-native-session-persistence-modes.md) for the
 storage and cold-admission contract.
 
-### Local snapshot build failure recovery
+### Local snapshot build failures
 
 A local snapshot build runs capture, sealing, verification and durable
-publication under the existing fixed stage budgets. A failed attempt is retried
-under a fixed bounded budget (three attempts, 100 ms fixed backoff) and records
-a fixed, value-free failure reason, a paired warning, and the
-`opc_persist_snapshot_build_failures_total` / `opc_persist_snapshot_build_retries_total`
-counters. If every attempt fails, the builder reports the unchanged current
-published snapshot to Openraft. Openraft treats an older-or-equal snapshot as a
-duplicate build result: it clears its pending build state without advancing the
-snapshot frontier or purging logs. The engine keeps running with unchanged
-committed-log semantics, and the next snapshot policy trigger after further
-applied entries, or an explicit `Raft::trigger().snapshot()`, retries the build. No snapshot is claimed as
-published before its durable metadata commit.
+publication under the existing fixed stage budgets. Any build error is returned
+to Openraft and stops the local engine. The builder does not retry or report a
+previous snapshot as a successful build. Pre-publication staging retains its
+cleanup ownership; an indeterminate publication requires a fresh storage owner
+to audit the retained candidate. A failed callback never certifies a new
+snapshot frontier or permits log reclamation from its candidate.
 
-`ConsensusSessionStore::snapshot_build_failure()` reports the fixed
-classification (`build_failed`, `indeterminate_publication`,
-`no_published_snapshot`, `current_snapshot_unreadable`) with the bounded
-attempt, retry, degradation and consecutive-failure counters. A later
-successful publication keeps the historical reason but resets the
-consecutive-failure streak. Three classes remain fatal and stop the engine: an
-indeterminate snapshot-publication state (only a fresh core may resume
-publication), a current snapshot that cannot be read back, and a store with no
-published snapshot at all (there is no unchanged snapshot to keep serving at).
-The indeterminate latch is re-checked after every failed attempt and on the
-exhaustion path, because a publication attempt can latch it mid-build. While
-builds keep failing, the retained-log gates of #1249 bound accumulation, so
-sustained failure produces proposal backpressure rather than silent loss or an
-unbounded retry loop.
+Build and install recovery (#1254/#1243) remains deferred until the retained-log
+admission foundation (#1249) exists and is qualified. No retained-log
+backpressure or in-process build/install recovery is claimed here.
 
 ### Memory measurements and deployment sizing
 
@@ -1506,7 +1490,7 @@ tracked shutdown owner through its transaction. Caller cancellation cannot
 release those resources early or replay the write. A successful commit signals
 the checkpoint lane even when its caller has stopped waiting; a rejected commit
 rolls back without signaling. Failures emit a diagnostic containing only the
-error kind, even if the caller has stopped waiting. The pinned Tokio 1.53.1 pool
+error kind, even if the caller has stopped waiting. The pinned Tokio 1.53.3 pool
 drains jobs already queued behind a busy blocking worker even after
 `shutdown_timeout` returns; those jobs retain their resources and admission until
 completion. A closed runtime rejects new dispatch without executing SQL and
@@ -1545,7 +1529,7 @@ instance. There is no destructor refund or blocking cleanup. Retiring all 64
 slots disables the handoff optimization and keeps writes inline. Independent
 progress therefore still depends on available runtime capacity.
 
-This retirement proof uses Tokio 1.53.1's FIFO blocking-pool dequeue order.
+This retirement proof uses Tokio 1.53.3's FIFO blocking-pool dequeue order.
 The SDK manifest requires that exact crates.io version for consuming applications,
 independently of this repository's lockfile, with the original runtime features.
 An upgrade or dependency source override requires revalidating the actual
@@ -1676,8 +1660,11 @@ captured and verified offline. It excludes publication and predecessor
 retirement until descriptor admission finishes, so Openraft's shared
 snapshot-retrieval/application worker does not wait for the entire build.
 Builds, installation and recovery still retain one exclusive mutation owner;
-cancelled admission workers retain publication exclusion through their last
-read. Snapshot integrity checks and operation deadlines are unchanged.
+cancelled Dynamic and Fixed admission workers retain publication exclusion,
+the namespace lease and shutdown ownership through descriptor open,
+verification, rewind and transfer-handle construction. Shutdown waits for this
+work to retire even when its caller is cancelled. Snapshot integrity checks
+and operation deadlines are unchanged.
 
 The pinned Openraft implementation also retains the donor's required log
 suffix while a snapshot transfer owns it. Successful snapshot or log
@@ -1881,6 +1868,23 @@ receives the exact validated envelope key ID, while one current provider
 configuration atomically selects the active key only for future seals. The
 KMS/HKMS remains authoritative for historical retention/revocation; the SDK has
 no local history cache, retirement API, or enforcement gate.
+
+### Restore scan deadlines
+
+Consensus restore scans share one absolute caller deadline across the
+logical-time fence, worker and connection admission, page scan, and final
+authority check. Expiry of that deadline returns retryable
+`StoreError::BackendUnavailable`, including an empty page completed too late.
+It does not grant a new budget to a later phase. The same rule applies to
+consumer-scoped scans.
+
+The independent SQLite query limits (1,000 ms and 2,000,000 VM instructions)
+and native scan work bounds still return terminal
+`StoreError::RestoreScanWorkBudgetExceeded`. A delayed result retains the
+work-exhaustion classification observed by the query. Standalone SQLite keeps
+its existing work-budget deadline contract. Failure tracing reports the exact
+error variant, phase, and elapsed milliseconds without error text, record keys,
+or payloads.
 
 ### Replication-log range cursor contract
 

@@ -3,7 +3,7 @@
 //! The control port keeps ownership of every receive socket. A readiness
 //! source registers those sockets in a private epoll instance owned by the
 //! SDK and exposes only that epoll descriptor, so a consumer can wait with
-//! `epoll(7)`, `tokio::io::unix::AsyncFd` or [`GtpuControlReadiness::wait`]
+//! `epoll(7)`, an owned Tokio registration or [`GtpuControlReadiness::wait`]
 //! without polling, and cannot read, close or duplicate a socket descriptor,
 //! or bypass attachment invalidation.
 //!
@@ -122,7 +122,8 @@ impl fmt::Debug for GtpuDownlinkReadiness {
 ///
 /// The handle owns only a private epoll instance; the port keeps ownership of
 /// every socket. Use [`AsFd`] to register the SDK's epoll descriptor with the
-/// consumer's own epoll instance or `tokio::io::unix::AsyncFd`. Every wake
+/// consumer's own epoll instance. For Tokio, duplicate this private epoll
+/// descriptor into an owned registration; never register only a borrow. Every wake
 /// must be consumed through [`Self::try_readiness`] (or [`Self::wait`]), which
 /// also reports the queue classes that were ready; then drain with
 /// `try_receive_downlink`, which preserves the existing queue priority.
@@ -134,9 +135,10 @@ impl fmt::Debug for GtpuDownlinkReadiness {
 /// `epoll`/`AsyncFd` consumer wakes without a polling timer. Stop waiting on
 /// that source after `Unavailable`; a replacement port has a separate source.
 ///
-/// The handle must outlive every `epoll`/`AsyncFd` registration that borrows
+/// The handle must outlive every `epoll` registration that borrows
 /// its [`AsFd`] descriptor: the descriptor is borrowed from this handle and
-/// does not keep it alive.
+/// does not keep it alive. An owned duplicate keeps the epoll descriptor valid
+/// independently, including if its Tokio registration is forgotten.
 pub struct GtpuControlReadiness {
     inner: Arc<ReadinessInner>,
 }
@@ -150,8 +152,9 @@ impl fmt::Debug for GtpuControlReadiness {
 /// Borrow the SDK's private epoll descriptor.
 ///
 /// The descriptor is owned by this handle. Keep the handle alive for as long
-/// as an `epoll`/`AsyncFd` registration borrows it; the borrow does not extend
-/// the handle's lifetime.
+/// as an `epoll` registration borrows it; the borrow does not extend the handle's
+/// lifetime. Tokio registration must instead own a duplicate of this private
+/// epoll descriptor.
 impl AsFd for GtpuControlReadiness {
     fn as_fd(&self) -> BorrowedFd<'_> {
         self.inner.epoll.0.as_fd()
@@ -159,7 +162,18 @@ impl AsFd for GtpuControlReadiness {
 }
 
 impl GtpuControlReadiness {
-    /// Create a source over `queues`, keeping a weak liveness token for an
+    #[cfg(test)]
+    pub(crate) fn register_tokio(&self) -> std::io::Result<opc_tokio_fd_sys::AsyncOwnedFd> {
+        // Only the private epoll instance is duplicated, never a receive socket
+        // or retained SQLite file. Tokio owns the duplicate until deregistration,
+        // so dropping this source cannot invalidate its registered descriptor.
+        #[allow(clippy::disallowed_methods)]
+        let descriptor = self.as_fd().try_clone_to_owned()?;
+        opc_tokio_fd_sys::AsyncOwnedFd::with_interest(descriptor, tokio::io::Interest::READABLE)
+    }
+
+    /// Create a source over `queues`; both address families may share a queue
+    /// class. Keep a weak liveness token for an
     /// owner without an explicit revocation path.
     pub(crate) fn new<'a>(
         queues: impl IntoIterator<Item = (GtpuControlQueue, BorrowedFd<'a>)>,
@@ -175,20 +189,17 @@ impl GtpuControlReadiness {
         epoll
             .add(&retired, EpollEvent::new(EpollFlags::EPOLLIN, u64::MAX))
             .map_err(std::io::Error::from)?;
-        let mut watched = Vec::new();
+        let mut watched = false;
         for (queue, descriptor) in queues {
-            if watched.contains(&queue) {
-                return Err(GtpuControlPortError::InvalidLimits);
-            }
             let event = EpollEvent::new(EpollFlags::EPOLLIN, queue.index() as u64);
             epoll
                 .add(descriptor, event)
                 .map_err(|error| GtpuControlPortError::Io {
                     kind: std::io::Error::from(error).kind(),
                 })?;
-            watched.push(queue);
+            watched = true;
         }
-        if watched.is_empty() {
+        if !watched {
             return Err(GtpuControlPortError::InvalidLimits);
         }
         Ok(Self {
@@ -241,7 +252,7 @@ impl GtpuControlReadiness {
         if self.inner.is_revoked() {
             return Err(GtpuControlPortError::Unavailable);
         }
-        let mut events = [EpollEvent::empty(); GtpuControlQueue::ALL.len() + 1];
+        let mut events = [EpollEvent::empty(); GtpuControlQueue::ALL.len() + 2];
         let count = self
             .inner
             .epoll
@@ -316,6 +327,39 @@ mod tests {
             assert!(std::time::Instant::now() < deadline, "readiness deadline");
             std::thread::sleep(Duration::from_millis(1));
         }
+    }
+
+    #[test]
+    fn review_readiness_watches_both_shared_family_sockets() {
+        let ipv4 = bound();
+        let ipv6 = std::net::UdpSocket::bind("[::1]:0").unwrap();
+        let readiness = GtpuControlReadiness::new(
+            [
+                (GtpuControlQueue::Shared, ipv4.as_fd()),
+                (GtpuControlQueue::Shared, ipv6.as_fd()),
+            ],
+            None,
+        )
+        .unwrap();
+        for socket in [&ipv4, &ipv6] {
+            socket
+                .send_to(b"shared", socket.local_addr().unwrap())
+                .unwrap();
+            let mask = wait_ready(&readiness);
+            assert_eq!(
+                mask.queues().collect::<Vec<_>>(),
+                vec![GtpuControlQueue::Shared]
+            );
+            let mut bytes = [0; 16];
+            let (length, _) = socket.recv_from(&mut bytes).unwrap();
+            assert_eq!(&bytes[..length], b"shared");
+            assert!(readiness.try_readiness().unwrap().is_empty());
+        }
+        readiness.inner.revoke();
+        assert_eq!(
+            readiness.try_readiness().unwrap_err(),
+            GtpuControlPortError::Unavailable
+        );
     }
 
     #[test]
@@ -407,9 +451,11 @@ mod tests {
         let shared = bound();
         let readiness =
             GtpuControlReadiness::new([(GtpuControlQueue::Shared, shared.as_fd())], None).unwrap();
-        // The consumer wraps the borrowed readiness descriptor; the handle
-        // keeps the socket and the SDK epoll instance alive.
-        let async_fd = tokio::io::unix::AsyncFd::new(readiness.as_fd()).unwrap();
+        let async_fd = readiness.register_tokio().unwrap();
+        assert_ne!(
+            async_fd.get_ref().as_raw_fd(),
+            readiness.as_fd().as_raw_fd()
+        );
         let peer = bound();
         send_to(&peer, &shared, b"async-wake");
         let mask = tokio::time::timeout(Duration::from_secs(2), async {
@@ -425,6 +471,16 @@ mod tests {
         .await
         .expect("async readiness deadline");
         assert!(mask.is_ready(GtpuControlQueue::Shared));
+        drop(readiness);
+        // The registration still owns a valid epoll descriptor after the source
+        // is dropped, and has never gained ownership of a receive socket.
+        assert_eq!(
+            nix::sys::socket::getsockname::<nix::sys::socket::SockaddrStorage>(
+                async_fd.get_ref().as_raw_fd()
+            )
+            .unwrap_err(),
+            nix::errno::Errno::ENOTSOCK
+        );
     }
 
     #[test]

@@ -43,11 +43,8 @@ fields. Unknown discriminators or fields are refused before writes.
 Prefix reclamation releases resident log rows and their checkpoint inventory;
 it does not shrink the append-only generation file. Generation-file rollover
 is tracked separately in SDK #1253. Until then, the Durable 32 GiB and Async
-8 GiB file ceilings remain lifetime limits. A failed local snapshot build is
-retried under a fixed bounded attempt/backoff budget and keeps the engine on the
-unchanged published snapshot (ADR 0022, SDK #1254); only an indeterminate
-publication state or a store with no published snapshot at all stops the
-engine.
+8 GiB file ceilings remain lifetime limits. A failed local snapshot build still
+stops the engine; changing that behavior is separate work (SDK #1254).
 
 ## Decision
 

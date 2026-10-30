@@ -750,6 +750,21 @@ impl GtpuEndpointAddress {
     }
 }
 
+/// Inbound peer-address policy; TEID, local endpoint and other checks still apply.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Hash)]
+#[repr(u8)]
+pub enum GtpuPeerSourcePolicy {
+    /// Preserve the backend's existing policy: eBPF requires the configured
+    /// peer address; the Linux GTP module uses its native TEID lookup.
+    #[default]
+    BackendDefault = 0,
+    /// Explicitly allow other peer source addresses for multi-homing.
+    ///
+    /// Supported by the eBPF adapter. The caller must restrict access to the
+    /// GTP-U transport network; this policy does not authenticate the sender.
+    TeidAndLocal = 1,
+}
+
 /// Inclusive, canonical UDP source-port range.
 ///
 /// A range always contains at least two ports. Use
@@ -964,10 +979,10 @@ pub enum DownlinkBindingMismatch {
 ///
 /// | offset | field |
 /// |---|---|
-/// | 0 | format version (`1`) |
+/// | 0 | format version (`1` exact peer, `2` TEID/local policy) |
 /// | 1 | address family (`4` or `6`) |
 /// | 2 | source-port policy (`0` any, `1` exact, `2` range) |
-/// | 3 | reserved zero |
+/// | 3 | peer-source policy (`0` for version 1, `1` for version 2) |
 /// | 4..20 | peer address (IPv4 followed by twelve zero bytes, or IPv6) |
 /// | 20..36 | local address (same family/canonical form) |
 /// | 36..40 | ingress ifindex, big endian |
@@ -981,6 +996,7 @@ pub struct DownlinkEndpointBinding {
     local_address: GtpuEndpointAddress,
     ingress_ifindex: u32,
     source_port_policy: GtpuSourcePortPolicy,
+    peer_source_policy: GtpuPeerSourcePolicy,
     format_valid: bool,
 }
 
@@ -1020,12 +1036,26 @@ impl DownlinkEndpointBinding {
                 local_address,
                 ingress_ifindex,
                 source_port_policy,
+                peer_source_policy: GtpuPeerSourcePolicy::BackendDefault,
                 format_valid: true,
             })
         }
     }
 
-    /// Return the peer endpoint address.
+    /// Select the explicit inbound peer-address policy.
+    #[must_use]
+    pub const fn with_peer_source_policy(mut self, policy: GtpuPeerSourcePolicy) -> Self {
+        self.peer_source_policy = policy;
+        self
+    }
+
+    /// Return the retained inbound peer-address policy.
+    #[must_use]
+    pub const fn peer_source_policy(self) -> GtpuPeerSourcePolicy {
+        self.peer_source_policy
+    }
+
+    /// Return the configured peer endpoint address.
     #[must_use]
     pub const fn peer_address(self) -> GtpuEndpointAddress {
         self.peer_address
@@ -1074,7 +1104,10 @@ impl DownlinkEndpointBinding {
             (GtpuEndpointAddress::Ipv4(peer), GtpuEndpointAddress::Ipv4(local)) => (peer, local),
             _ => return Err(DownlinkBindingMismatch::AddressFamily),
         };
-        if peer_address != expected_peer {
+        if peer_address == [0; 4]
+            || (self.peer_source_policy == GtpuPeerSourcePolicy::BackendDefault
+                && peer_address != expected_peer)
+        {
             return Err(DownlinkBindingMismatch::PeerAddress);
         }
         if local_address != expected_local {
@@ -1099,10 +1132,13 @@ impl DownlinkEndpointBinding {
         let first = first.to_be_bytes();
         let last = last.to_be_bytes();
         [
-            1,
+            match self.peer_source_policy {
+                GtpuPeerSourcePolicy::BackendDefault => 1,
+                GtpuPeerSourcePolicy::TeidAndLocal => 2,
+            },
             self.peer_address.family_wire(),
             policy,
-            0,
+            self.peer_source_policy as u8,
             peer[0],
             peer[1],
             peer[2],
@@ -1214,7 +1250,14 @@ impl DownlinkEndpointBinding {
             local_address,
             ingress_ifindex: u32::from_be_bytes([value[36], value[37], value[38], value[39]]),
             source_port_policy,
-            format_valid: value[0] == 1 && value[3] == 0 && family_valid && policy_valid,
+            peer_source_policy: if value[3] == 1 {
+                GtpuPeerSourcePolicy::TeidAndLocal
+            } else {
+                GtpuPeerSourcePolicy::BackendDefault
+            },
+            format_valid: binding_profile_is_canonical(value[0], value[3])
+                && family_valid
+                && policy_valid,
         }
     }
 }
@@ -1270,8 +1313,13 @@ fn binding_policy_wire_is_valid<const N: usize>(value: &[u8; N], base: usize) ->
 }
 
 #[inline(always)]
+const fn binding_profile_is_canonical(version: u8, policy: u8) -> bool {
+    matches!((version, policy), (1, 0) | (2, 1))
+}
+
+#[inline(always)]
 fn binding_ipv4_wire_is_valid<const N: usize>(value: &[u8; N], base: usize) -> bool {
-    if value[base] != 1 || value[base + 1] != 4 || value[base + 3] != 0 {
+    if !binding_profile_is_canonical(value[base], value[base + 3]) || value[base + 1] != 4 {
         return false;
     }
     if wire_u32(value, base + 4) == 0 || wire_u32(value, base + 20) == 0 {
@@ -1288,7 +1336,9 @@ fn binding_ipv4_wire_is_valid<const N: usize>(value: &[u8; N], base: usize) -> b
 
 #[inline(always)]
 fn binding_wire_is_valid<const N: usize>(value: &[u8; N], base: usize) -> bool {
-    if value[base] != 1 || value[base + 3] != 0 || wire_u32(value, base + 36) == 0 {
+    if !binding_profile_is_canonical(value[base], value[base + 3])
+        || wire_u32(value, base + 36) == 0
+    {
         return false;
     }
     let family_valid = match value[base + 1] {
@@ -1364,7 +1414,9 @@ pub fn validate_ipv4_downlink_binding_wire(
     if value[1] != 4 {
         return Err(DownlinkBindingMismatch::AddressFamily);
     }
-    if wire_u32(&peer_address, 0) != wire_u32(value, 4) {
+    if wire_u32(&peer_address, 0) == 0
+        || (value[3] == 0 && wire_u32(&peer_address, 0) != wire_u32(value, 4))
+    {
         return Err(DownlinkBindingMismatch::PeerAddress);
     }
     if wire_u32(&local_address, 0) != wire_u32(value, 20) {
@@ -3026,6 +3078,78 @@ mod tests {
     }
 
     #[test]
+    fn endpoint_binding_multihoming_is_explicit_and_preserves_other_checks() {
+        let strict = ipv4_binding(GtpuSourcePortPolicy::Exact(2152));
+        let mut wire = strict.encode();
+        // New policy has its own version so older programs reject it.
+        wire[0] = 2;
+        wire[3] = 1;
+        let binding = DownlinkEndpointBinding::decode(&wire);
+        assert!(binding.is_valid());
+        assert_eq!(binding.encode(), wire);
+        assert_eq!(
+            strict.validate_ipv4_packet([192, 0, 2, 11], [192, 0, 2, 1], 7, 2152),
+            Err(DownlinkBindingMismatch::PeerAddress),
+        );
+        for (peer, local, ifindex, port, expected) in [
+            ([192, 0, 2, 11], [192, 0, 2, 1], 7, 2152, Ok(())),
+            (
+                [0; 4],
+                [192, 0, 2, 1],
+                7,
+                2152,
+                Err(DownlinkBindingMismatch::PeerAddress),
+            ),
+            (
+                [192, 0, 2, 11],
+                [192, 0, 2, 2],
+                7,
+                2152,
+                Err(DownlinkBindingMismatch::LocalAddress),
+            ),
+            (
+                [192, 0, 2, 11],
+                [192, 0, 2, 1],
+                8,
+                2152,
+                Err(DownlinkBindingMismatch::IngressAttachment),
+            ),
+            (
+                [192, 0, 2, 11],
+                [192, 0, 2, 1],
+                7,
+                2153,
+                Err(DownlinkBindingMismatch::SourcePort),
+            ),
+        ] {
+            assert_eq!(
+                binding.validate_ipv4_packet(peer, local, ifindex, port),
+                expected
+            );
+            assert_eq!(
+                validate_ipv4_downlink_binding_wire(&wire, peer, local, ifindex, port),
+                expected
+            );
+        }
+        for (version, policy) in [(1, 1), (2, 0), (2, 2), (3, 1)] {
+            let mut malformed = wire;
+            malformed[0] = version;
+            malformed[3] = policy;
+            assert!(!DownlinkEndpointBinding::decode(&malformed).is_valid());
+            assert_eq!(
+                validate_ipv4_downlink_binding_wire(
+                    &malformed,
+                    [192, 0, 2, 11],
+                    [192, 0, 2, 1],
+                    7,
+                    2152
+                ),
+                Err(DownlinkBindingMismatch::Invalid),
+            );
+        }
+    }
+
+    #[test]
     fn endpoint_binding_classifies_every_bounded_mismatch() {
         let exact = ipv4_binding(GtpuSourcePortPolicy::Exact(2152));
         let exact_wire = exact.encode();
@@ -3093,6 +3217,101 @@ mod tests {
         for forbidden in ["192", "2152", "7"] {
             assert!(!debug.contains(forbidden));
         }
+    }
+
+    #[test]
+    fn zero_peer_teid_preserves_default_and_marked_authority() {
+        let mut outgoing = far();
+        outgoing.o_teid = [0; 4];
+        let binding = ipv4_binding(GtpuSourcePortPolicy::Any);
+        let local = 0x1000_0001_u32.to_be_bytes();
+        assert!(default_bearer_graph_is_valid(
+            local,
+            DownlinkPdr {
+                ue_ip: [10, 23, 0, 2]
+            },
+            outgoing,
+            binding,
+            outgoing.local_ip,
+            binding.ingress_ifindex()
+        ));
+        assert!(!default_bearer_graph_is_valid(
+            [0; 4],
+            DownlinkPdr {
+                ue_ip: [10, 23, 0, 2]
+            },
+            outgoing,
+            binding,
+            outgoing.local_ip,
+            binding.ingress_ifindex()
+        ));
+        let owner = MarkedBearerOwner::new(
+            local,
+            outgoing,
+            None,
+            binding,
+            MarkedBearerOwnerPhase::Active,
+        );
+        assert!(owner.is_valid());
+        assert!(owner.authorizes_uplink(&outgoing, 0xff));
+        let mut substituted = outgoing;
+        substituted.o_teid = [0, 0, 0, 1];
+        assert!(!owner.authorizes_uplink(&substituted, 0xff));
+    }
+
+    #[test]
+    fn zero_peer_teid_preserves_borrowed_authority() {
+        let mut owner = canonical_owner(MarkedBearerOwnerPhase::Active);
+        owner.uplink_far.o_teid = [0; 4];
+        let wire = owner.encode();
+        assert!(marked_owner_wire_is_valid(&wire));
+        assert!(marked_owner_wire_authorizes_uplink(
+            &wire,
+            &owner.uplink_far,
+            owner.egress_dscp_wire()
+        ));
+        assert!(marked_owner_wire_authorizes_downlink(
+            &wire,
+            owner.local_teid,
+            &owner.downlink_binding.encode()
+        ));
+        let commit = PdpContextCommit::new(
+            owner.local_teid,
+            owner.uplink_far,
+            owner.egress_dscp(),
+            owner.downlink_binding,
+            GtpuUplinkSourcePortPolicy::LegacyServicePort,
+            MarkedBearerOwnerPhase::Active,
+        )
+        .expect("zero-peer typed commit")
+        .encode();
+        assert_eq!(
+            pdp_commit_wire_authorized_source_port(
+                &commit,
+                &owner.uplink_far,
+                owner.egress_dscp_wire()
+            ),
+            Some(2152)
+        );
+        assert!(pdp_commit_wire_authorizes_downlink(
+            &commit,
+            owner.local_teid,
+            &owner.downlink_binding.encode()
+        ));
+        let mut substituted = owner.uplink_far;
+        substituted.o_teid = [0, 0, 0, 1];
+        assert!(!marked_owner_wire_authorizes_uplink(
+            &wire,
+            &substituted,
+            owner.egress_dscp_wire()
+        ));
+        assert_eq!(
+            pdp_commit_wire_authorized_source_port(&commit, &substituted, owner.egress_dscp_wire()),
+            None
+        );
+        let mut zero_local = wire;
+        zero_local[..4].fill(0);
+        assert!(!marked_owner_wire_is_valid(&zero_local));
     }
 
     #[test]
@@ -3257,6 +3476,19 @@ mod tests {
             &owner.uplink_far,
             46,
             &binding,
+        ));
+
+        let multihoming_binding = owner
+            .downlink_binding
+            .with_peer_source_policy(GtpuPeerSourcePolicy::TeidAndLocal);
+        assert!(multihoming_binding.is_valid());
+        assert!(!owner.authorizes_downlink(owner.local_teid, &multihoming_binding));
+        assert!(!pdp_commit_wire_authorizes_graph(
+            &encoded,
+            owner.local_teid,
+            &owner.uplink_far,
+            46,
+            &multihoming_binding.encode(),
         ));
 
         let mut wrong_far = owner.uplink_far;

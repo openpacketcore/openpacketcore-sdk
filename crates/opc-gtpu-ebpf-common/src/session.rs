@@ -6,8 +6,8 @@
 //! point for all of a logical session's family entries.
 
 use crate::{
-    DownlinkInnerMtu, GtpuEndpointAddress, GtpuSourcePortPolicy, GtpuSourcePortRange,
-    GtpuUplinkSourcePortPolicy,
+    DownlinkInnerMtu, GtpuEndpointAddress, GtpuPeerSourcePolicy, GtpuSourcePortPolicy,
+    GtpuSourcePortRange, GtpuUplinkSourcePortPolicy,
 };
 
 /// Fixed byte width of a caller-owned grouped-session identifier.
@@ -46,6 +46,9 @@ const N3_ENTRY_FORMAT_VERSION: u8 = 2;
 /// Version carrying the opt-in downlink inner MTU in bytes 73..74 (byte 75
 /// stays reserved).
 const ENTRY_MTU_FORMAT_VERSION: u8 = 3;
+const MULTIHOMING_ENTRY_FORMAT_VERSION: u8 = 4;
+const MULTIHOMING_N3_ENTRY_FORMAT_VERSION: u8 = 5;
+const MULTIHOMING_MTU_ENTRY_FORMAT_VERSION: u8 = 6;
 const GROUP_FORMAT_VERSION: u8 = 1;
 const TRANSACTION_FORMAT_VERSION: u8 = 1;
 const CONFIG_FORMAT_VERSION: u8 = 1;
@@ -629,6 +632,7 @@ pub struct GtpuSessionEntry {
     peer_teid: [u8; 4],
     bearer_mark: [u8; 4],
     egress_dscp_wire: u8,
+    downlink_peer_source_policy: GtpuPeerSourcePolicy,
     downlink_source_port_policy: GtpuSourcePortPolicy,
     uplink_source_port_policy: GtpuUplinkSourcePortPolicy,
     n3_qfi: Option<u8>,
@@ -685,11 +689,25 @@ impl GtpuSessionEntry {
             peer_teid,
             bearer_mark,
             egress_dscp_wire: egress_dscp.unwrap_or(0xff),
+            downlink_peer_source_policy: GtpuPeerSourcePolicy::BackendDefault,
             downlink_source_port_policy,
             uplink_source_port_policy,
             n3_qfi: None,
             downlink_inner_mtu: None,
         })
+    }
+
+    /// Select the explicit inbound peer-address policy.
+    #[must_use]
+    pub const fn with_peer_source_policy(mut self, policy: GtpuPeerSourcePolicy) -> Self {
+        self.downlink_peer_source_policy = policy;
+        self
+    }
+
+    /// Return the retained inbound peer-address policy.
+    #[must_use]
+    pub const fn peer_source_policy(self) -> GtpuPeerSourcePolicy {
+        self.downlink_peer_source_policy
     }
 
     /// Select the fixed-flow N3IWF profile, with one six-bit QFI in both directions.
@@ -759,7 +777,7 @@ impl GtpuSessionEntry {
         self.inner_paa
     }
 
-    /// Authorized peer outer address.
+    /// Configured outgoing peer outer address.
     #[must_use]
     pub const fn peer_outer_address(self) -> GtpuEndpointAddress {
         self.peer_outer_address
@@ -842,7 +860,16 @@ impl GtpuSessionEntry {
         };
         out[1] = self.inner_family() as u8;
         out[2] = self.outer_family() as u8;
-        out[3] = 0;
+        if self.downlink_peer_source_policy == GtpuPeerSourcePolicy::TeidAndLocal {
+            out[0] = if self.n3_qfi.is_some() {
+                MULTIHOMING_N3_ENTRY_FORMAT_VERSION
+            } else if self.downlink_inner_mtu.is_some() {
+                MULTIHOMING_MTU_ENTRY_FORMAT_VERSION
+            } else {
+                MULTIHOMING_ENTRY_FORMAT_VERSION
+            };
+        }
+        out[3] = self.downlink_peer_source_policy as u8;
         out[4..20].copy_from_slice(&self.inner_paa.encode_bytes());
         out[20..36].copy_from_slice(&address_bytes(self.peer_outer_address));
         out[36..52].copy_from_slice(&address_bytes(self.local_outer_address));
@@ -863,7 +890,7 @@ impl GtpuSessionEntry {
     /// Decode one canonical fixed-width entry.
     #[must_use]
     pub fn decode(value: &[u8; GTPU_SESSION_ENTRY_LEN]) -> Option<Self> {
-        if !entry_profile_is_canonical(value) || value[3] != 0 {
+        if !entry_profile_is_canonical(value) {
             return None;
         }
         let inner = GtpuSessionPaa::decode(value[1], copy_16(value, 4)?)?;
@@ -893,13 +920,19 @@ impl GtpuSessionEntry {
             dscp,
             downlink_policy,
             uplink_policy,
-        )?;
-        let entry = match value[0] {
-            N3_ENTRY_FORMAT_VERSION => entry.with_n3_qfi(value[72])?,
-            _ => entry,
+        )?
+        .with_peer_source_policy(if value[3] == 1 {
+            GtpuPeerSourcePolicy::TeidAndLocal
+        } else {
+            GtpuPeerSourcePolicy::BackendDefault
+        });
+        let entry = if entry_is_n3(value[0]) {
+            entry.with_n3_qfi(value[72])?
+        } else {
+            entry
         };
         match value[0] {
-            ENTRY_MTU_FORMAT_VERSION => {
+            ENTRY_MTU_FORMAT_VERSION | MULTIHOMING_MTU_ENTRY_FORMAT_VERSION => {
                 let field = u16::from_be_bytes([value[73], value[74]]);
                 entry.with_downlink_inner_mtu(DownlinkInnerMtu::from_field(field)?)
             }
@@ -909,21 +942,33 @@ impl GtpuSessionEntry {
 }
 
 #[inline(always)]
+const fn entry_is_n3(version: u8) -> bool {
+    matches!(
+        version,
+        N3_ENTRY_FORMAT_VERSION | MULTIHOMING_N3_ENTRY_FORMAT_VERSION
+    )
+}
+
+#[inline(always)]
 fn entry_profile_is_canonical(value: &[u8; GTPU_SESSION_ENTRY_LEN]) -> bool {
     let mtu_field = u16::from_be_bytes([value[73], value[74]]);
     let mtu_is_absent = mtu_field == 0;
-    match value[0] {
-        ENTRY_FORMAT_VERSION if value[72] == 0 => {
+    match (value[0], value[3]) {
+        (ENTRY_FORMAT_VERSION, 0) | (MULTIHOMING_ENTRY_FORMAT_VERSION, 1) if value[72] == 0 => {
             if !mtu_is_absent {
                 return false;
             }
         }
-        N3_ENTRY_FORMAT_VERSION if value[72] <= 63 => {
+        (N3_ENTRY_FORMAT_VERSION, 0) | (MULTIHOMING_N3_ENTRY_FORMAT_VERSION, 1)
+            if value[72] <= 63 =>
+        {
             if !mtu_is_absent {
                 return false;
             }
         }
-        ENTRY_MTU_FORMAT_VERSION if value[72] == 0 => {
+        (ENTRY_MTU_FORMAT_VERSION, 0) | (MULTIHOMING_MTU_ENTRY_FORMAT_VERSION, 1)
+            if value[72] == 0 =>
+        {
             let Some(mtu) = DownlinkInnerMtu::from_field(mtu_field) else {
                 return false;
             };
@@ -1035,11 +1080,10 @@ fn entry_wire_is_canonical(
     };
     if !entry_profile_is_canonical(value)
         || value[1] != expected_family as u8
-        || value[3] != 0
         || !wire_paa_is_canonical(value[1], inner_paa)
         || !wire_address_is_canonical(value[2], peer_outer)
         || !wire_address_is_canonical(value[2], local_outer)
-        || (value[0] == N3_ENTRY_FORMAT_VERSION
+        || (entry_is_n3(value[0])
             && (!n3_outer_is_unicast(value[2], peer_outer)
                 || !n3_outer_is_unicast(value[2], local_outer)))
         || u32::from_ne_bytes([value[52], value[53], value[54], value[55]]) == 0
@@ -1147,7 +1191,7 @@ impl<'a> GtpuSessionEntryWireView<'a> {
     /// Fixed-flow N3 QFI from the already validated atomic entry.
     #[must_use]
     pub const fn n3_qfi(self) -> Option<u8> {
-        if self.wire[0] == N3_ENTRY_FORMAT_VERSION {
+        if entry_is_n3(self.wire[0]) {
             Some(self.wire[72])
         } else {
             None
@@ -1160,7 +1204,10 @@ impl<'a> GtpuSessionEntryWireView<'a> {
     #[must_use]
     #[inline(always)]
     pub const fn downlink_inner_mtu(self) -> Option<DownlinkInnerMtu> {
-        if self.wire[0] == ENTRY_MTU_FORMAT_VERSION {
+        if matches!(
+            self.wire[0],
+            ENTRY_MTU_FORMAT_VERSION | MULTIHOMING_MTU_ENTRY_FORMAT_VERSION
+        ) {
             DownlinkInnerMtu::from_field(u16::from_be_bytes([self.wire[73], self.wire[74]]))
         } else {
             None
@@ -1274,7 +1321,13 @@ impl<'a> GtpuSessionEntryWireView<'a> {
         source_port: u16,
         inner_destination: &[u8; 16],
     ) -> bool {
-        if peer_outer[..] != self.wire[20..36]
+        let peer_permitted = if self.wire[3] == 0 {
+            peer_outer[..] == self.wire[20..36]
+        } else {
+            wire_address_is_canonical(self.wire[2], peer_outer)
+                && (!entry_is_n3(self.wire[0]) || n3_outer_is_unicast(self.wire[2], peer_outer))
+        };
+        if !peer_permitted
             || local_outer[..] != self.wire[36..52]
             || !match self.wire[1] {
                 4 => inner_destination[..] == self.wire[4..20],
@@ -2504,7 +2557,7 @@ pub fn gtpu_session_group_authorizes_uplink(
 /// Return whether an Active group authorizes one exact downlink packet.
 ///
 /// The bounded inner parser supplies `inner_destination` before lookup. The
-/// selected slot, downlink key, peer/local outer addresses, source-port policy,
+/// selected slot, downlink key, peer-source policy, local address, source-port policy,
 /// device identity, and inner destination must all match the same canonical
 /// entry. A selector owned only by the other family can never authorize it.
 #[allow(clippy::too_many_arguments)]
@@ -2540,7 +2593,18 @@ pub fn gtpu_session_group_authorizes_downlink(
     let entry = decode_selected_authority_entry(record, candidate.slot)?;
     if GtpuSessionDownlinkKey::from_entry(entry) == key
         && entry.inner_paa.contains(inner_destination)
-        && entry.peer_outer_address == packet_peer_outer
+        && match entry.downlink_peer_source_policy {
+            GtpuPeerSourcePolicy::BackendDefault => entry.peer_outer_address == packet_peer_outer,
+            GtpuPeerSourcePolicy::TeidAndLocal => {
+                address_family(packet_peer_outer) == entry.outer_family()
+                    && !packet_peer_outer.is_unspecified()
+                    && (entry.n3_qfi.is_none()
+                        || n3_outer_is_unicast(
+                            packet_peer_outer.family_wire(),
+                            &address_bytes(packet_peer_outer),
+                        ))
+            }
+        }
         && entry.local_outer_address == packet_local_outer
         && entry
             .downlink_source_port_policy
@@ -3238,6 +3302,110 @@ mod tests {
     }
 
     #[test]
+    fn multihoming_policy_round_trips_and_authorizes_only_the_selected_session() {
+        for strict in [v4_entry(), v6_entry()] {
+            for n3 in [false, true] {
+                let strict = if n3 {
+                    strict.with_n3_qfi(9).unwrap()
+                } else {
+                    strict
+                };
+                let mut wire = strict.encode();
+                wire[0] = if n3 { 5 } else { 4 };
+                wire[3] = 1;
+                let entry = GtpuSessionEntry::decode(&wire).expect("explicit multi-homing entry");
+                assert_eq!(entry.encode(), wire);
+                assert_eq!(entry.n3_qfi(), strict.n3_qfi());
+                let reference = GtpuSessionGroupRef::single(group_id(), candidate(9, entry));
+                let reference_wire = reference.encode();
+                let config = device_config();
+                let config_wire = config.encode();
+                let mut alternate = address_bytes(entry.peer_outer_address());
+                alternate[if entry.outer_family() == GtpuSessionIpFamily::Ipv4 {
+                    3
+                } else {
+                    15
+                }] += 1;
+                let alternate_address =
+                    decode_address(entry.outer_family() as u8, alternate).unwrap();
+                for (selected, permitted) in [(strict, false), (entry, true)] {
+                    let authority = match entry.inner_family() {
+                        GtpuSessionIpFamily::Ipv4 => active(9, Some(selected), None),
+                        GtpuSessionIpFamily::Ipv6 => active(9, None, Some(selected)),
+                    }
+                    .encode();
+                    let view = select_gtpu_session_entry_wire(
+                        &authority,
+                        &reference_wire,
+                        &config_wire,
+                        42,
+                        entry.inner_family().slot(),
+                    )
+                    .unwrap();
+                    assert_eq!(view.n3_qfi(), entry.n3_qfi());
+                    let local = address_bytes(entry.local_outer_address());
+                    let inner = address_bytes(inner_packet(entry, 7));
+                    assert_eq!(
+                        view.authorizes_downlink_packet(&alternate, &local, 21_152, &inner),
+                        permitted
+                    );
+                    assert_eq!(
+                        gtpu_session_group_authorizes_downlink(
+                            &authority,
+                            reference,
+                            GtpuSessionDownlinkKey::from_entry(entry),
+                            config,
+                            42,
+                            alternate_address,
+                            entry.local_outer_address(),
+                            21_152,
+                            inner_packet(entry, 7)
+                        )
+                        .is_some(),
+                        permitted
+                    );
+                    assert!(!view.authorizes_downlink_packet(&alternate, &[0; 16], 21_152, &inner));
+                    assert!(!view.authorizes_downlink_packet(&alternate, &local, 21_152, &[0; 16]));
+                    assert!(!view.authorizes_downlink_packet(&[0; 16], &local, 21_152, &inner));
+                    if entry.downlink_source_port_policy() != GtpuSourcePortPolicy::Any {
+                        assert!(
+                            !view.authorizes_downlink_packet(&alternate, &local, 21_153, &inner)
+                        );
+                    }
+                    let mut wrong_teid = GtpuSessionDownlinkKey::from_entry(entry).encode();
+                    wrong_teid[7] ^= 1;
+                    assert!(!view.authorizes_downlink_key(&wrong_teid));
+                    assert!(select_gtpu_session_entry_wire(
+                        &authority,
+                        &reference_wire,
+                        &config_wire,
+                        43,
+                        entry.inner_family().slot()
+                    )
+                    .is_none());
+                    let wrong_generation =
+                        GtpuSessionGroupRef::single(group_id(), candidate(10, entry)).encode();
+                    assert!(select_gtpu_session_entry_wire(
+                        &authority,
+                        &wrong_generation,
+                        &config_wire,
+                        42,
+                        entry.inner_family().slot()
+                    )
+                    .is_none());
+                }
+                for (version, policy) in [(1, 1), (2, 1), (3, 1), (4, 0), (5, 0), (4, 2), (7, 1)] {
+                    let mut malformed = wire;
+                    malformed[0] = version;
+                    malformed[3] = policy;
+                    assert!(GtpuSessionEntry::decode(&malformed).is_none());
+                    assert!(!entry_wire_is_canonical(&malformed, entry.inner_family()));
+                }
+            }
+        }
+    }
+
+    #[test]
     fn zero_copy_wire_view_matches_typed_authorizers_for_both_families() {
         let entries = [v4_entry(), v6_entry()];
         let authority = active(9, Some(entries[0]), Some(entries[1])).encode();
@@ -3464,6 +3632,52 @@ mod tests {
         )
         .unwrap();
         assert_eq!(view.downlink_inner_mtu(), Some(mtu));
+    }
+
+    #[test]
+    fn multihoming_and_inner_mtu_keep_distinct_versions_and_borrowed_authority() {
+        let mtu = DownlinkInnerMtu::in_tunnel_packet_too_big(1_300).unwrap();
+        let original = v6_entry().with_downlink_inner_mtu(mtu).unwrap();
+        assert_eq!(
+            original.encode()[0],
+            3,
+            "backlog MTU ABI stays byte-compatible"
+        );
+        let entry = original.with_peer_source_policy(GtpuPeerSourcePolicy::TeidAndLocal);
+        let wire = entry.encode();
+        assert_eq!(
+            wire[0], 6,
+            "combined profile cannot alias ordinary/N3 multi-homing"
+        );
+        assert_eq!(wire[3], 1);
+        assert_eq!(&wire[73..75], &mtu.field().to_be_bytes());
+        assert_eq!(GtpuSessionEntry::decode(&wire), Some(entry));
+        let authority = active(9, None, Some(entry)).encode();
+        let reference = GtpuSessionGroupRef::single(group_id(), candidate(9, entry)).encode();
+        let config = device_config().encode();
+        let view = select_gtpu_session_entry_wire(
+            &authority,
+            &reference,
+            &config,
+            42,
+            GTPU_SESSION_IPV6_SLOT,
+        )
+        .unwrap();
+        assert_eq!(view.downlink_inner_mtu(), Some(mtu));
+        let mut alternate = address_bytes(entry.peer_outer_address());
+        alternate[3] ^= 1;
+        assert!(view.authorizes_downlink_packet(
+            &alternate,
+            &address_bytes(entry.local_outer_address()),
+            21_152,
+            &address_bytes(inner_packet(entry, 7))
+        ));
+        for version in [1, 2, 3, 4, 5, 7] {
+            let mut wrong = wire;
+            wrong[0] = version;
+            assert!(GtpuSessionEntry::decode(&wrong).is_none());
+            assert!(!entry_wire_is_canonical(&wrong, entry.inner_family()));
+        }
     }
 
     mod legacy_v6 {
@@ -3741,6 +3955,32 @@ mod tests {
             None,
         )
         .is_none());
+    }
+
+    #[test]
+    fn zero_peer_teid_is_valid_in_typed_and_borrowed_group_authority() {
+        for mut bytes in [independent_v4_entry_bytes(), independent_v6_entry_bytes()] {
+            bytes[56..60].fill(0);
+            let entry = GtpuSessionEntry::decode(&bytes).expect("peer TEID zero is valid");
+            assert_eq!(entry.peer_teid(), [0; 4]);
+            assert_eq!(entry.encode(), bytes);
+            bytes[52..56].fill(0);
+            assert!(GtpuSessionEntry::decode(&bytes).is_none());
+        }
+        let mut entry = v4_entry();
+        entry.peer_teid = [0; 4];
+        let authority = active(3, Some(entry), None).encode();
+        let reference = GtpuSessionGroupRef::single(group_id(), candidate(3, entry)).encode();
+        let config = device_config().encode();
+        let selected = select_gtpu_session_entry_wire(
+            &authority,
+            &reference,
+            &config,
+            42,
+            GTPU_SESSION_IPV4_SLOT,
+        )
+        .expect("borrowed zero-peer entry");
+        assert_eq!(selected.peer_teid(), [0; 4]);
     }
 
     fn independent_v4_entry_bytes() -> [u8; GTPU_SESSION_ENTRY_LEN] {

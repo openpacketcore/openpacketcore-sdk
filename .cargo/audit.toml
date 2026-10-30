@@ -17,24 +17,4 @@
 # artifact. No patched 0.7.x release exists. Remove once rust_decimal's rkyv
 # integration moves to a patched rkyv or the pinned openraft drops it.
 # Mirror of deny.toml — keep in sync.
-#
-# Tokio 1.53.1 AsyncFd constructors violate I/O safety (RUSTSEC-2026-0386).
-# The five production constructor sites in opc-sctp, opc-session-store and
-# opc-egress-fence own their descriptors exclusively and never replace/close
-# them while registered. The GTP-U readiness test borrows its descriptor and
-# retains the owning readiness handle for the entire AsyncFd registration;
-# migrating to AsyncFd::register needs `unsafe` outside the ADR 0017 sys-crate
-# allow-list, tracked as follow-up. Mirror of deny.toml — keep in sync.
-#
-# Timing variability in crypto-bigint operations intended to be constant-time.
-# The 0.7.x line uses non-yanked 0.7.10, retaining the fix introduced in 0.7.6.
-# A crypto-bigint 0.5.5 copy remains only in the audited vendored DTLS fork
-# (dimpl 0.7.2 -> p256/p384 0.13 -> elliptic-curve 0.13.8) consumed by
-# opc-diameter-transport; no 0.5.x fix exists and the fork's rust-crypto backend
-# has not migrated. It serves DTLS key agreement and certificate signing.
-# Observable timing leakage depends on the algorithm, compiler and target;
-# remote exploitability has not been ruled out. Upgrading the fork's RustCrypto
-# stack is tracked as follow-up. The security workflow checks every tracked
-# lockfile and confines this ID-wide ignore to that exact version and path.
-# Mirror of deny.toml — keep the two in sync.
-ignore = ["RUSTSEC-2023-0071", "RUSTSEC-2026-0235", "RUSTSEC-2026-0386", "RUSTSEC-2026-0387"]
+ignore = ["RUSTSEC-2023-0071", "RUSTSEC-2026-0235"]
