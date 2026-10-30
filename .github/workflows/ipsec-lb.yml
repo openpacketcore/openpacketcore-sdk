@@ -8,6 +8,8 @@ on:
       - "crates/opc-ipsec-lb-ebpf-common/**"
       - "crates/opc-session-net/**"
       - ".github/workflows/ipsec-lb.yml"
+      - "ci/disk-scratch.sh"
+      - "ci/disk-scratch.py"
       - "ci/setup-fsverity-tmp.sh"
       - "ci/fsverity-runtime.py"
       - "ci/test-fsverity-runtime.py"
@@ -24,6 +26,8 @@ on:
       - "crates/opc-ipsec-lb-ebpf-common/**"
       - "crates/opc-session-net/**"
       - ".github/workflows/ipsec-lb.yml"
+      - "ci/disk-scratch.sh"
+      - "ci/disk-scratch.py"
       - "ci/setup-fsverity-tmp.sh"
       - "ci/fsverity-runtime.py"
       - "ci/test-fsverity-runtime.py"
@@ -49,6 +53,9 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v7
+
+      - name: Prepare disk-backed scratch
+        run: bash ci/disk-scratch.sh prepare
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
@@ -124,6 +131,10 @@ jobs:
               --exact \
               "stateless_quorum_consumer::$timing_contract"
           done
+
+      - name: Remove disk-backed scratch
+        if: always() && env.OPC_CI_DISK_TMPDIR != ''
+        run: bash ci/disk-scratch.sh cleanup
 
   docs:
     name: Rust docs

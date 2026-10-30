@@ -166,8 +166,9 @@ pub(crate) struct Span(Option<(Trace, usize)>);
 
 impl Span {
     pub(crate) fn start(phase: Phase) -> Self {
-        let Ok(trace) = ACTIVE.try_with(Clone::clone) else {
-            return Self(None);
+        let trace = match ACTIVE.try_with(Clone::clone) {
+            Ok(trace) => trace,
+            Err(_) => return Self(None),
         };
         let mut state = trace.0.lock().expect("scoped-read trace");
         if state.snapshot.spans.len() == MAX_SPANS {

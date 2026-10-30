@@ -99,6 +99,8 @@ class DecisionTests(unittest.TestCase):
             "crates/opc-egress-fence-common/src/lib.rs",
             "crates/opc-egress-fence-ebpf/oracle/src/main.rs",
             ".github/workflows/egress-fence.yml",
+            "ci/disk-scratch.sh",
+            "ci/disk-scratch.py",
             "ci/setup-fsverity-tmp.sh",
             "ci/fsverity-runtime.py",
             "ci/test-fsverity-runtime.py",

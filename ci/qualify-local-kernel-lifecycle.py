@@ -148,6 +148,7 @@ def run_cases(record: dict, evidence: Path, binaries: dict, runner_root: Path, u
             run = [] if os.geteuid() == 0 else ["sudo", "-n"]
             run += [
                 "timeout", "--kill-after=5s", "120s", "env", "OPC_GTPU_RUN_PRIVILEGED=1",
+                *([f"TMPDIR={os.environ['TMPDIR']}"] if "TMPDIR" in os.environ else []),
                 "unshare", "-n", "-m", "--propagation", "private", "--", "sh", "-eu", "-c",
                 'mount -t bpf -o mode=0700 bpf /sys/fs/bpf\nexec "$@"',
                 "local-lifecycle-test", sys.executable,

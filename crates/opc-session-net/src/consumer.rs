@@ -10242,6 +10242,7 @@ struct PersistentV2LaneCall {
     deadline: tokio::time::Instant,
     completion: oneshot::Sender<Result<SessionConsumerV2Response, SessionConsumerClientError>>,
     write_progress: Arc<FrameWriteProgress>,
+    execution_progress: Option<Arc<prepared_fenced_v2::PreparedV2AttemptProgress>>,
     // The actor and caller both retain this reservation. Cancelling a caller
     // cannot release extended-read capacity while its wire read still runs.
     read_capacity: Option<Arc<PersistentReadReservation>>,
@@ -10720,8 +10721,12 @@ async fn run_persistent_v2_lane(actor: PersistentV2LaneActor) {
             deadline,
             mut completion,
             write_progress,
+            execution_progress,
             read_capacity,
         } = command;
+        if let Some(progress) = &execution_progress {
+            progress.observe(SessionConsumerFencedTransitionV2FailureStage::Send);
+        }
         #[cfg(test)]
         if let Some(hook) = &pre_call_test_hook {
             hook.entered.notify_one();
@@ -10953,6 +10958,9 @@ async fn run_persistent_v2_lane(actor: PersistentV2LaneActor) {
             return;
         }
 
+        if let Some(progress) = &execution_progress {
+            progress.observe(SessionConsumerFencedTransitionV2FailureStage::AwaitingReply);
+        }
         let response = if let Some(response) = early_response {
             Ok(response)
         } else {
@@ -11184,6 +11192,7 @@ struct PersistentV2CallAttempt<'a> {
     /// before acquiring any admission or setup capacity.
     read_response_deadline: Option<tokio::time::Instant>,
     status_write_accepted: Option<&'a AtomicBool>,
+    execution_progress: Option<&'a Arc<prepared_fenced_v2::PreparedV2AttemptProgress>>,
 }
 
 /// Cancellation-safe accounting for one complete revision-5 physical setup.
@@ -11967,10 +11976,7 @@ impl PersistentSessionConsumerV2Pool {
             pre_request_deadline,
             pre_request_budget_active,
             deadline,
-            matches!(
-                request.operation(),
-                SessionConsumerV2Operation::FencedTransitionV2Status { .. }
-            ),
+            None,
         )
         .await
         .and_then(|response| classify_v2_completed_response(request, response))
@@ -11987,6 +11993,7 @@ impl PersistentSessionConsumerV2Pool {
         self: &Arc<Self>,
         request: &SessionConsumerV2Request,
         caller_deadline: tokio::time::Instant,
+        execution_progress: Option<&Arc<prepared_fenced_v2::PreparedV2AttemptProgress>>,
     ) -> Result<SessionConsumerV2Response, PersistentSessionConsumerV2ExecuteError> {
         self.ensure_idle_reaper();
         if request.scope() != self.client.scope() || request.validate().is_err() {
@@ -12016,10 +12023,7 @@ impl PersistentSessionConsumerV2Pool {
             pre_request_deadline,
             pre_request_budget_active,
             deadline,
-            matches!(
-                request.operation(),
-                SessionConsumerV2Operation::FencedTransitionV2Status { .. }
-            ),
+            execution_progress,
         )
         .await
         .and_then(|response| classify_v2_completed_response(request, response))
@@ -12050,7 +12054,11 @@ impl PersistentSessionConsumerV2Pool {
             deadline,
             read_response_deadline,
             status_write_accepted,
+            execution_progress,
         } = attempt;
+        if let Some(progress) = execution_progress {
+            progress.start_attempt();
+        }
         if read_response_deadline.is_some()
             && !matches!(
                 request.operation(),
@@ -12210,6 +12218,7 @@ impl PersistentSessionConsumerV2Pool {
                 deadline,
                 completion,
                 write_progress: Arc::clone(&write_progress),
+                execution_progress: execution_progress.cloned(),
                 read_capacity: admission.read_capacity.clone(),
             })
             .map_err(
@@ -12218,6 +12227,12 @@ impl PersistentSessionConsumerV2Pool {
                 },
             )?;
         let completed = completed.await;
+        if let Some(progress) = execution_progress {
+            match &completed {
+                Ok(Ok(_)) | Ok(Err(SessionConsumerClientError::Deadline)) => {}
+                _ => progress.reply_lost(),
+            }
+        }
         if let Some(status_write_accepted) = status_write_accepted {
             if write_progress.accepted_any() {
                 status_write_accepted.store(true, Ordering::Release);
@@ -12303,8 +12318,12 @@ impl PersistentSessionConsumerV2Pool {
         pre_request_deadline: tokio::time::Instant,
         pre_request_budget_active: bool,
         deadline: tokio::time::Instant,
-        status_retry: bool,
+        execution_progress: Option<&Arc<prepared_fenced_v2::PreparedV2AttemptProgress>>,
     ) -> Result<SessionConsumerV2Response, PersistentSessionConsumerV2ExecuteError> {
+        let status_retry = matches!(
+            request.operation(),
+            SessionConsumerV2Operation::FencedTransitionV2Status { .. }
+        );
         let mut attempts = 0_usize;
         // A status recovery which has either accepted one of its own Call
         // bytes or received a valid retryable status response is absorbing:
@@ -12330,6 +12349,7 @@ impl PersistentSessionConsumerV2Pool {
                         deadline,
                         read_response_deadline: None,
                         status_write_accepted: status_retry.then_some(&status_write_accepted),
+                        execution_progress,
                     },
                 )
                 .await;
@@ -15630,12 +15650,24 @@ impl PersistentSessionConsumerClient {
         request: &SessionConsumerV2Request,
         deadline: tokio::time::Instant,
     ) -> Result<SessionConsumerV2Response, PersistentSessionConsumerV2ExecuteError> {
+        self.execute_v2_before_observed(request, deadline, None)
+            .await
+    }
+
+    async fn execute_v2_before_observed(
+        &self,
+        request: &SessionConsumerV2Request,
+        deadline: tokio::time::Instant,
+        execution_progress: Option<&Arc<prepared_fenced_v2::PreparedV2AttemptProgress>>,
+    ) -> Result<SessionConsumerV2Response, PersistentSessionConsumerV2ExecuteError> {
         if self.fenced_mutation_roster_transport_enabled() {
             return Err(PersistentSessionConsumerV2ExecuteError::NotTransmitted {
                 cause: SessionConsumerClientError::Protocol,
             });
         }
-        self.v2_pool.execute_before(request, deadline).await
+        self.v2_pool
+            .execute_before(request, deadline, execution_progress)
+            .await
     }
 
     /// Return the ALPN-specific V2 idle-pool diagnostics within the shared
@@ -22351,13 +22383,12 @@ mod prepared_fenced_v2;
 
 pub use prepared_fenced_v2::{
     ActivatedSessionConsumerFencedTransitionV2Voters,
-    SessionConsumerFencedTransitionV2AbandonError, SessionConsumerFencedTransitionV2ReclaimReport,
+    SessionConsumerFencedTransitionV2AbandonError,
+    SessionConsumerFencedTransitionV2FailureDiagnostics,
+    SessionConsumerFencedTransitionV2FailureStage, SessionConsumerFencedTransitionV2ReclaimReport,
     SessionConsumerFencedTransitionV2ReleaseError, SessionConsumerPreparedFencedTransitionV2,
     SessionConsumerPreparedFencedTransitionV2Backend,
     SessionConsumerPreparedFencedTransitionV2BackendError,
-    SessionConsumerPreparedFencedTransitionV2Failure,
-    SessionConsumerPreparedFencedTransitionV2FailureDiagnostic,
-    SessionConsumerPreparedFencedTransitionV2FailureStage,
     SessionConsumerRecoveredFencedTransition, SessionConsumerRecoveredFencedTransitionV2Status,
 };
 
@@ -29308,6 +29339,7 @@ mod tests {
                 deadline,
                 completion,
                 write_progress: Arc::clone(&progress),
+                execution_progress: None,
                 read_capacity: None,
             })
             .expect("one V2 Call reaches the reused actor");

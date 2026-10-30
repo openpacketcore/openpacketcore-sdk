@@ -1009,17 +1009,6 @@ accepted material rotation, idle/lifecycle retirement, and the public bounded
 shutdown apply to both ALPN-isolated pools; shutdown begins both drains together
 so V2 cannot add a second drain window.
 
-The prepared V2 handle's `execute_once_with_failure_diagnostic` performs the
-same dispatch as `execute_once` and returns the same effect-boundary error
-(recoverable through `into_error`), additionally attaching a value-free
-`SessionConsumerPreparedFencedTransitionV2FailureDiagnostic` to a
-`NotTransmitted` or `OutcomeUnknown` result. It reports only a closed stage
-(`setup`, `send`, `awaiting_reply`, `reply_lost`) and the remaining original
-budget in milliseconds, so a cold-setup expiry, a held refusal and a lost reply
-are distinguishable in logs and metrics. Dispatch authority, ownership, request
-identity, wire format and every classification rule are unchanged; resolved
-rejections and lease deferrals carry no diagnostic.
-
 An original prepared V2 handle settles its exact journal row when preflight
 fails or every voter proves that dispatch never occurred. Failed or cancelled
 deletion leaves that handle resolved so `release_resolved` can retry. The
@@ -1028,6 +1017,25 @@ window leaves an ordinary unknown row and status-only recovery. Applications
 using owned journals and the void profile can reclaim it after a terminal
 no-effect receipt; other journals follow the existing epoch lifecycle. A resumed
 deferred request retains its earlier binding when a later preflight fails.
+
+After a failed `execute_once`, `execution_failure_diagnostics()` reports a
+stage (`setup`, `send`, `awaiting_reply`, or `reply_lost`) and the remaining
+original caller budget in milliseconds. The stage enum is non-exhaustive so
+future diagnostics can add stages. The snapshot describes local progress:
+`send` includes preparing the Call on an authenticated lane;
+`reply_lost` means a written Call lost its connection or received an unusable
+reply. Neither stage proves a remote commit. The snapshot contains no request,
+peer, journal or store-error values and grants no retry or release authority.
+Transport completion fixes the budget snapshot before local journal cleanup;
+it never creates a fresh deadline. A new execution clears the old snapshot,
+while status and release calls preserve it.
+
+A local journal failure during V2 receipt lookup returns `Unavailable`
+immediately without resolving the handle. A later `status_once` or
+`status_until_terminal` call authenticates the complete original binding again
+and can recover its committed receipt. Missing, corrupt, or substituted rows
+remain unavailable without network dispatch; a matching caller ID alone never
+authorizes adoption of another request or restores mutation authority.
 
 The revision-2 persistent-consumer transport qualification contract remains
 recorded in the v7 profile and the published v6 profile remains the unchanged
