@@ -205,6 +205,11 @@ pub(super) async fn qualify() -> Result<(), Box<dyn std::error::Error>> {
         "ip",
         &["-n", &net.ue_ns, "link", "set", "ue1", "mtu", "1300"],
     );
+    // The fitting-packet control below forwards through ue0. Its first
+    // Neighbor Solicitation needs a ready link-local source even though the
+    // global test addresses were installed with nodad. Keep DAD out of the
+    // unchanged per-packet receive timeout.
+    resolve_ipv6_gateway_neighbour("ue0", "2001:db8:45::2");
     assert_host_packet_too_big_control(&net);
     let backend = EbpfGtpuDataplaneBackend::with_config(EbpfGtpuDataplaneBackendConfig {
         bpffs_pin_root: net.pin_root.clone(),
