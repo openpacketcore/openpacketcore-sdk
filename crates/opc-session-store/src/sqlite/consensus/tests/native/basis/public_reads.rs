@@ -242,7 +242,11 @@ async fn native_consensus_restore_late_delivery_preserves_terminal_cursor_error(
         }
     }
 
-    let (_directory, backend, core, wal) = backend(Arc::new(|_| Ok(()))).await;
+    // The first scan below validates the terminal result. Hold the second
+    // native read until its caller has registered the completion waker.
+    let gate = Gate::new(Point::BeforeNativePublicRead, 2);
+    let hook = Arc::clone(&gate);
+    let (_directory, backend, core, wal) = backend(Arc::new(move |point| hook.hook(point))).await;
     let writer = Arc::clone(&wal);
     tokio::task::spawn_blocking(move || {
         let entries = [formation()];
@@ -285,6 +289,8 @@ async fn native_consensus_restore_late_delivery_preserves_terminal_cursor_error(
     let waker = futures_util::task::waker(Arc::new(CompletionWake(ready_tx)));
     let mut context = std::task::Context::from_waker(&waker);
     assert!(std::future::Future::poll(operation.as_mut(), &mut context).is_pending());
+    gate.entered();
+    gate.release();
     ready_rx
         .recv_timeout(Duration::from_secs(5))
         .expect("the completed native read wakes its caller");
