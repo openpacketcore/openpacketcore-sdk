@@ -340,6 +340,15 @@ def staging_root(parent, uid, deadline, *, skip=(), create=True):
                         observed = marker
                     if observed != marker:
                         raise RuntimeError("fs-verity staging root belongs to another owner")
+                    # chmod does not remove inherited default ACLs. They would
+                    # override umask when a transaction creates its runtime.
+                    try:
+                        os.removexattr(descriptor, "system.posix_acl_default")
+                    except OSError as error:
+                        if error.errno not in (errno.ENODATA, errno.ENOTSUP):
+                            raise
+                    else:
+                        os.fsync(descriptor)
                     authenticated = True
                     yield descriptor
                     return
