@@ -237,6 +237,38 @@ mod material_tests {
     use super::*;
 
     #[test]
+    fn poisoned_material_is_a_redacted_permanent_failure() {
+        let key_id = KeyId::new("poison-sensitive-key").expect("key ID");
+        let controller = RemoteSealMaterialController::new(key_id.clone());
+        let poisoner = controller.clone();
+        assert!(std::thread::spawn(move || {
+            let _state = poisoner.inner.lock().unwrap();
+            panic!("poison material state");
+        })
+        .join()
+        .is_err());
+
+        let errors = [
+            controller.publish_active_key(key_id.clone()).unwrap_err(),
+            controller.epoch().unwrap_err(),
+            controller.active_selection().unwrap_err(),
+        ];
+        assert_eq!(
+            errors,
+            [
+                KeyError::OperationFailed,
+                KeyError::OperationFailed,
+                KeyError::OperationFailed
+            ]
+        );
+        for error in errors {
+            assert_eq!(error.to_string(), "key provider operation failed");
+            assert_eq!(format!("{error:?}"), "OperationFailed");
+        }
+        assert!(!format!("{controller:?}").contains(key_id.as_str()));
+    }
+
+    #[test]
     fn publication_is_shared_idempotent_and_redacted() {
         let old_key = KeyId::new("remote-sensitive-old").expect("old key ID");
         let new_key = KeyId::new("remote-sensitive-new").expect("new key ID");
