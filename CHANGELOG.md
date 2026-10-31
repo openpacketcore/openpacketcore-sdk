@@ -9,6 +9,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `opc-proto-ikev2`: typed RFC 5685 REDIRECT_SUPPORTED, REDIRECT and
+  REDIRECTED_FROM Notify codecs, with IPv4/IPv6/FQDN identities, explicit
+  exchange direction, echoed peer nonce bounds, named malformed-input errors,
+  redacted diagnostics and bounded atomic support extraction. Authentication,
+  nonce correlation, first/final IKE_AUTH placement and redirect policy remain
+  caller responsibilities.
+
 - `opc-proto-ikev2`: PKCS#1 v1.5 and PSS signing blind the RSA private operation
   with OS randomness; this hardening does not resolve RUSTSEC-2023-0071.
 

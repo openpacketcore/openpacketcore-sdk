@@ -472,3 +472,60 @@ fn debug_and_errors_do_not_reveal_gateways_or_nonces() {
         assert!(!format!("{error:?}: {error}").contains("vpn.example"));
     }
 }
+
+#[test]
+fn every_ip_identity_length_has_only_its_exact_width_accepted() {
+    for (kind, width, invalid) in [
+        (1, 4, Error::Ipv4LengthInvalid),
+        (2, 16, Error::Ipv6LengthInvalid),
+    ] {
+        for length in 0..=255_u8 {
+            let mut body = vec![0, 0, 0x40, 0x17, kind, length];
+            body.extend(vec![0x55; usize::from(length)]);
+            let result = decode_ikev2_redirect_notify(generic(&body), Context::IkeAuthResponse);
+            if length == width {
+                assert!(matches!(
+                    result,
+                    Ok(Some(Redirect::Redirect { nonce: None, .. }))
+                ));
+            } else {
+                assert_eq!(
+                    result,
+                    Err(if length == 0 {
+                        Error::GatewayIdentityEmpty
+                    } else {
+                        invalid
+                    })
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn fqdn_wire_decoder_rejects_invalid_utf8_and_dns_length_overflows() {
+    let long_labels = vec!["a".repeat(63); 4].join(".");
+    for (identity, expected) in [
+        (vec![0xff], Error::FqdnNonAscii),
+        (vec![b'a'; 64], Error::FqdnLabelTooLong),
+        (long_labels.into_bytes(), Error::FqdnNameTooLong),
+    ] {
+        let mut body = vec![0, 0, 0x40, 0x17, 3, u8::try_from(identity.len()).unwrap()];
+        body.extend_from_slice(&identity);
+        assert_eq!(
+            decode_ikev2_redirect_notify(generic(&body), Context::IkeAuthResponse),
+            Err(expected)
+        );
+    }
+}
+
+#[test]
+fn malformed_or_misplaced_recognized_notify_never_becomes_support() {
+    for malformed in [IPV4, &[0, 0, 0x40, 0x16, 0]] {
+        assert!(decode_ikev2_redirect_support(&[generic(SUPPORTED), generic(malformed)]).is_err());
+        assert!(decode_ikev2_redirect_support(&[generic(malformed), generic(SUPPORTED)]).is_err());
+    }
+    let mut full = vec![generic(&[0, 0, 0x40, 0x00]); IKEV2_REDIRECT_MAX_NOTIFIES];
+    full[IKEV2_REDIRECT_MAX_NOTIFIES - 1] = generic(FROM);
+    assert_eq!(decode_ikev2_redirect_support(&full), Ok(true));
+}

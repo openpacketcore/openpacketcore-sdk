@@ -22,6 +22,40 @@ state, retransmission policy, cookie policy, Child SA lifecycle, XFRM/IPsec
 programming, bearer admission or allocation policy, carrier acceptance
 evidence, or a production ePDG control-plane stack.
 
+## Redirect Notify values
+
+[`redirect`](src/redirect.rs) implements the transport-neutral Notify formats
+in [RFC 5685 sections 3, 5, 6 and 9](https://www.rfc-editor.org/rfc/rfc5685.html):
+`REDIRECT_SUPPORTED` (16406), `REDIRECT` (16407), and `REDIRECTED_FROM` (16408).
+The gateway identity uses the redirect registry's types 1/2/3 for IPv4, IPv6
+and FQDN; these are distinct from Identification payload type numbers.
+The one-octet length covers only the identity. An SA_INIT response requires
+the original peer Ni, 16..=256 octets; protected IKE_AUTH responses and
+gateway INFORMATIONAL requests prohibit nonce data. `REDIRECTED_FROM`
+accepts IP identities only. FQDN text is ASCII without terminators, with
+nonempty labels of at most 63 octets and at most 255 octets in DNS wire form.
+An optional final root dot and text case are preserved. Whitespace and
+control characters are rejected; this codec does not impose an LDH-only
+hostname policy or interpret DNS presentation escapes.
+
+Builders validate drafts and reuse the generic Notify encoder. Decoders
+distinguish unrelated types (`Ok(None)`) from malformed recognized types
+(named, value-free errors), validate SPI size and contents, and ignore
+Protocol ID for an empty SPI under the network receiver profile. The
+sender-canonical profile diagnoses a nonzero Protocol ID. A bounded support
+collector accepts either support advertisement, rejects repeated recognized
+support types as SDK ambiguity policy, and returns no partial success for
+malformed input. These policies add no packet or session state.
+
+Callers must bind the context to the actual exchange and original responder
+role, correlate echoed Ni, verify AUTH, accept REDIRECT only in the first or
+final IKE_AUTH response, and enforce trust, target selection, redirect-loop
+and SA deletion policy. A typed decoded value establishes none of those facts.
+In particular, constructing `Ikev2RedirectContext::IkeAuthResponse` is not an
+authentication or response-placement check. See `tests/redirect.rs` for
+independent literal body encodings, malformed-input checks and generic
+IKE_AUTH payload framing.
+
 ## N1-mode Notify values
 
 `n1_mode` implements TS 24.302 V18.7.0 sections 8.2.9.15–8.2.9.17:
