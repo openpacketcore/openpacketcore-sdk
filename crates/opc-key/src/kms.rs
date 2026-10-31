@@ -547,6 +547,266 @@ mod tests {
 
     static NEXT_SOCKET_ID: AtomicU64 = AtomicU64::new(0);
 
+    #[tokio::test]
+    async fn kms_invalid_unix_paths_are_permanent_for_all_operations() {
+        let mut results = Vec::new();
+        for endpoint in [
+            "unix://".to_string(),
+            "unix://relative.sock".to_string(),
+            "unix://unix:///tmp/kms.sock".to_string(),
+            "/tmp/kms\0.sock".to_string(),
+            "unix:///tmp/kms\0.sock".to_string(),
+            format!("unix:///{}", "x".repeat(256)),
+        ] {
+            results.push(kms_request_errors(endpoint, None, "kms.example").await);
+        }
+        assert!(
+            results
+                .iter()
+                .flatten()
+                .all(|error| *error == KeyError::OperationFailed),
+            "invalid paths must fail permanently: {results:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn kms_repeated_tcp_scheme_is_permanent_before_connect() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let errors = kms_request_errors(
+            format!("tcp://tcp://{}", listener.local_addr().unwrap()),
+            Some(kms_test_tls_connector()),
+            "kms.example",
+        )
+        .await;
+        assert!(
+            errors
+                .iter()
+                .all(|error| *error == KeyError::OperationFailed),
+            "repeated scheme must fail permanently: {errors:?}"
+        );
+        // A rejected configuration must not send even a TLS ClientHello.
+        assert!(
+            tokio::time::timeout(Duration::from_millis(20), listener.accept())
+                .await
+                .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn kms_absent_and_refused_unix_services_remain_unavailable() {
+        let path = next_mock_socket_path();
+        for prefix in ["", "unix://"] {
+            let errors =
+                kms_request_errors(format!("{prefix}{}", path.display()), None, "kms.example")
+                    .await;
+            assert!(errors.iter().all(|error| *error == KeyError::Unavailable));
+        }
+        // Dropping the listener leaves a valid socket pathname with no service.
+        let listener = std::os::unix::net::UnixListener::bind(&path).unwrap();
+        drop(listener);
+        let errors = kms_request_errors(path.display().to_string(), None, "kms.example").await;
+        std::fs::remove_file(path).unwrap();
+        assert!(errors.iter().all(|error| *error == KeyError::Unavailable));
+    }
+
+    #[tokio::test]
+    async fn kms_non_socket_unix_path_is_permanent_for_all_operations() {
+        let directory = next_mock_socket_path();
+        std::fs::create_dir(&directory).unwrap();
+        let file = directory.join("regular-file");
+        std::fs::write(&file, b"not a socket").unwrap();
+        // ENOTDIR is a configuration defect, unlike an absent service socket.
+        let errors = kms_request_errors(
+            file.join("socket").display().to_string(),
+            None,
+            "kms.example",
+        )
+        .await;
+        std::fs::remove_file(file).unwrap();
+        std::fs::remove_dir(directory).unwrap();
+        assert!(
+            errors
+                .iter()
+                .all(|error| *error == KeyError::OperationFailed),
+            "non-directory path component must fail permanently: {errors:?}"
+        );
+    }
+
+    async fn kms_certificate_failure_errors(trust_certificate: bool) -> [KeyError; 5] {
+        use tokio_rustls::rustls;
+        let generated = rcgen::generate_simple_self_signed(vec!["kms.example".into()]).unwrap();
+        let certificate = generated.cert.der().clone();
+        let key = rustls_pki_types::PrivatePkcs8KeyDer::from(generated.signing_key.serialize_der());
+        let crypto = std::sync::Arc::new(rustls::crypto::ring::default_provider());
+        let server = rustls::ServerConfig::builder_with_provider(crypto.clone())
+            .with_safe_default_protocol_versions()
+            .unwrap()
+            .with_no_client_auth()
+            .with_single_cert(vec![certificate.clone()], key.into())
+            .unwrap();
+        let mut roots = rustls::RootCertStore::empty();
+        if trust_certificate {
+            roots.add(certificate).unwrap();
+        }
+        let client = rustls::ClientConfig::builder_with_provider(crypto)
+            .with_safe_default_protocol_versions()
+            .unwrap()
+            .with_root_certificates(roots)
+            .with_no_client_auth();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = format!("tcp://{}", listener.local_addr().unwrap());
+        let acceptor = tokio_rustls::TlsAcceptor::from(std::sync::Arc::new(server));
+        let task = tokio::spawn(async move {
+            for _ in 0..5 {
+                let (stream, _) = listener.accept().await.unwrap();
+                assert!(
+                    acceptor.accept(stream).await.is_err(),
+                    "client must reject the certificate"
+                );
+            }
+        });
+        let name = if trust_certificate {
+            "wrong.example"
+        } else {
+            "kms.example"
+        };
+        let errors = kms_request_errors(
+            endpoint,
+            Some(tokio_rustls::TlsConnector::from(std::sync::Arc::new(
+                client,
+            ))),
+            name,
+        )
+        .await;
+        task.await.unwrap();
+        errors
+    }
+
+    #[tokio::test]
+    async fn kms_untrusted_certificate_is_permanent_for_all_operations() {
+        let errors = kms_certificate_failure_errors(false).await;
+        assert!(
+            errors
+                .iter()
+                .all(|error| *error == KeyError::OperationFailed),
+            "untrusted certificate must fail permanently: {errors:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn kms_certificate_name_mismatch_is_permanent_for_all_operations() {
+        let errors = kms_certificate_failure_errors(true).await;
+        assert!(
+            errors
+                .iter()
+                .all(|error| *error == KeyError::OperationFailed),
+            "certificate name mismatch must fail permanently: {errors:?}"
+        );
+    }
+
+    async fn kms_peer_alert_errors(alert: Option<u8>) -> [KeyError; 5] {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = format!("tcp://{}", listener.local_addr().unwrap());
+        let task = tokio::spawn(async move {
+            for _ in 0..5 {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let mut header = [0u8; 5];
+                stream.read_exact(&mut header).await.unwrap();
+                assert_eq!(header[0], 22, "client must send a handshake record");
+                let mut body = vec![0; usize::from(u16::from_be_bytes([header[3], header[4]]))];
+                stream.read_exact(&mut body).await.unwrap();
+                if let Some(alert) = alert {
+                    // TLS fatal alert record: bad_certificate, unknown_ca or access_denied.
+                    stream.write_all(&[21, 3, 3, 0, 2, 2, alert]).await.unwrap();
+                }
+            }
+        });
+        let errors =
+            kms_request_errors(endpoint, Some(kms_test_tls_connector()), "kms.example").await;
+        task.await.unwrap();
+        errors
+    }
+
+    #[tokio::test]
+    async fn kms_peer_authentication_alerts_are_permanent_for_all_operations() {
+        let mut results = Vec::new();
+        for alert in [42, 48, 49] {
+            results.push(kms_peer_alert_errors(Some(alert)).await);
+        }
+        assert!(
+            results
+                .iter()
+                .flatten()
+                .all(|error| *error == KeyError::OperationFailed),
+            "peer authentication rejection must fail permanently: {results:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn kms_handshake_transport_loss_remains_unavailable() {
+        let errors = kms_peer_alert_errors(None).await;
+        assert!(errors.iter().all(|error| *error == KeyError::Unavailable));
+    }
+
+    #[tokio::test]
+    async fn kms_explicit_unavailable_status_is_retryable_for_all_operations() {
+        let mut results = Vec::new();
+        for operation in [
+            "get_active_key",
+            "get_key_by_id",
+            "rotate_key",
+            "seal",
+            "unseal",
+        ] {
+            for message in [
+                "busy",
+                "throttled",
+                "key not found in temporarily unavailable replica",
+            ] {
+                let response =
+                    serde_json::json!({"status": "unavailable", "error_message": message});
+                results.push(
+                    malformed_response_error(
+                        operation,
+                        MockResponse::Bytes(response.to_string().into_bytes()),
+                    )
+                    .await,
+                );
+            }
+        }
+        assert!(
+            results.iter().all(|error| *error == KeyError::Unavailable),
+            "explicit availability status must remain retryable: {results:?}"
+        );
+        for error in results {
+            assert_eq!(format!("{error:?}"), "Unavailable");
+        }
+    }
+
+    #[tokio::test]
+    async fn kms_error_text_cannot_make_a_rejection_retryable() {
+        for operation in [
+            "get_active_key",
+            "get_key_by_id",
+            "rotate_key",
+            "seal",
+            "unseal",
+        ] {
+            for status in ["error", "busy", "throttled", "UNAVAILABLE"] {
+                let response = serde_json::json!({"status": status,
+                    "error_message": "busy throttled service unavailable sensitive-canary", "retryable": true});
+                let error = malformed_response_error(
+                    operation,
+                    MockResponse::Bytes(response.to_string().into_bytes()),
+                )
+                .await;
+                assert_eq!(error, KeyError::OperationFailed);
+                assert_eq!(format!("{error:?}"), "OperationFailed");
+                assert_eq!(error.to_string(), "key provider operation failed");
+            }
+        }
+    }
+
     fn next_mock_socket_path() -> PathBuf {
         let unique = NEXT_SOCKET_ID.fetch_add(1, Ordering::Relaxed);
         // `sockaddr_un::sun_path` is short on supported Unix targets. A

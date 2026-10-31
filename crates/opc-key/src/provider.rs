@@ -227,3 +227,20 @@ fn append_digest_field(out: &mut Vec<u8>, field: &[u8]) {
     out.extend_from_slice(&len.to_be_bytes());
     out.extend_from_slice(field);
 }
+
+#[cfg(test)]
+mod payload_debug_tests {
+    use super::EncryptedPayload;
+
+    #[test]
+    fn encrypted_payload_debug_redacts_aad_and_ciphertext() {
+        let payload = EncryptedPayload {
+            aad: b"aad-canary".to_vec(),
+            ciphertext_and_tag: b"ciphertext-canary".to_vec(),
+        };
+        assert_eq!(
+            format!("{payload:?}"),
+            "EncryptedPayload { aad: \"<redacted>\", ciphertext_and_tag: \"<redacted>\" }"
+        );
+    }
+}

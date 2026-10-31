@@ -4777,6 +4777,27 @@ mod tests {
         ));
     }
 
+    #[test]
+    fn cas_idempotency_cache_tombstones_key_provider_outages() {
+        let cache = Arc::new(StdMutex::new(CasIdempotencyCache::default()));
+        let peer = ReplicaId::new("replica-a").expect("peer");
+        let request_id = uuid::Uuid::from_u128(74);
+        let epoch = cache.lock().expect("cache").epoch();
+        let digest = [3; 32];
+        let CasIdempotencyAdmission::Execute(permit) =
+            CasIdempotencyCache::begin(&cache, &peer, request_id, epoch, digest, Instant::now())
+        else {
+            panic!("first request must execute");
+        };
+        let unavailable = Err(StoreError::KeyProviderUnavailable("provider outage".into()));
+        assert!(!cas_outcome_is_definitive(&unavailable));
+        drop(permit);
+        assert!(matches!(
+            CasIdempotencyCache::begin(&cache, &peer, request_id, epoch, digest, Instant::now()),
+            CasIdempotencyAdmission::Reject(StoreError::CasIdempotencyOutcomeUnavailable)
+        ));
+    }
+
     #[tokio::test]
     async fn backend_reported_ambiguity_is_counted_for_store_and_lease_families() {
         let before = METRICS
