@@ -743,6 +743,64 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn kms_tls13_client_authentication_rejection_is_permanent_for_all_operations() {
+        use tokio_rustls::rustls;
+        let generated = rcgen::generate_simple_self_signed(vec!["kms.example".into()]).unwrap();
+        let certificate = generated.cert.der().clone();
+        let key = rustls_pki_types::PrivatePkcs8KeyDer::from(generated.signing_key.serialize_der());
+        let crypto = std::sync::Arc::new(rustls::crypto::ring::default_provider());
+        let mut roots = rustls::RootCertStore::empty();
+        roots.add(certificate.clone()).unwrap();
+        let verifier = rustls::server::WebPkiClientVerifier::builder_with_provider(
+            std::sync::Arc::new(roots.clone()),
+            crypto.clone(),
+        )
+        .build()
+        .unwrap();
+        let server = rustls::ServerConfig::builder_with_provider(crypto.clone())
+            .with_protocol_versions(&[&rustls::version::TLS13])
+            .unwrap()
+            .with_client_cert_verifier(verifier)
+            .with_single_cert(vec![certificate], key.into())
+            .unwrap();
+        let client = rustls::ClientConfig::builder_with_provider(crypto)
+            .with_protocol_versions(&[&rustls::version::TLS13])
+            .unwrap()
+            .with_root_certificates(roots)
+            .with_no_client_auth();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = format!("tcp://{}", listener.local_addr().unwrap());
+        let acceptor = tokio_rustls::TlsAcceptor::from(std::sync::Arc::new(server));
+        let task = tokio::spawn(async move {
+            for _ in 0..5 {
+                let (stream, _) = listener.accept().await.unwrap();
+                let error = acceptor.accept(stream).await.unwrap_err();
+                assert!(matches!(
+                    error
+                        .get_ref()
+                        .and_then(|cause| cause.downcast_ref::<rustls::Error>()),
+                    Some(rustls::Error::NoCertificatesPresented)
+                ));
+            }
+        });
+        let errors = kms_request_errors(
+            endpoint,
+            Some(tokio_rustls::TlsConnector::from(std::sync::Arc::new(
+                client,
+            ))),
+            "kms.example",
+        )
+        .await;
+        task.await.unwrap();
+        assert!(
+            errors
+                .iter()
+                .all(|error| *error == KeyError::OperationFailed),
+            "TLS 1.3 client authentication rejection must fail permanently: {errors:?}"
+        );
+    }
+
+    #[tokio::test]
     async fn kms_handshake_transport_loss_remains_unavailable() {
         let errors = kms_peer_alert_errors(None).await;
         assert!(errors.iter().all(|error| *error == KeyError::Unavailable));
