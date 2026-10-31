@@ -6,8 +6,12 @@
 //! the responder: IKE_AUTH must authenticate the admitted transcript before
 //! the caller trusts the peer. COOKIE and INVALID_KE_PAYLOAD are unauthenticated
 //! hints; a caller must bound retries and keep its original proposal policy.
+//! A REDIRECT outcome correlates the echoed Ni and initial support indication,
+//! but is unauthenticated and establishes no SA. The caller owns target trust,
+//! loop limits and REDIRECTED_FROM in the next initial request (RFC 5685 §3).
 //!
 //! @spec IETF RFC7296 1.2, 2.6, 2.7, 2.10, 2.14, 2.15, 2.16, 3.1, 3.3, 3.4, 3.9, 3.10.1
+//! @spec IETF RFC5685 3, 9.2
 //! @req REQ-IETF-RFC7296-SA-INIT-INITIATOR-001
 
 use std::{error::Error, fmt};
@@ -16,16 +20,19 @@ use bytes::Bytes;
 use opc_protocol::DecodeContext;
 
 use crate::{
+    decode_ike_sa_init_request_payloads, decode_ikev2_redirect_notify,
+    decode_ikev2_redirect_support,
     sa_init::{encode_ke_payload_build, encode_notify_payload_build, encode_sa_payload_build},
     sa_init_crypto::validate_dh_public_value,
     Header, HeaderFlags, Ikev2CookieNotify, Ikev2DhGroup, Ikev2EncryptionAlgorithm,
     Ikev2EphemeralDhKey, Ikev2IntegrityAlgorithm, Ikev2KeyExchangePayload,
     Ikev2KeyExchangePayloadBuild, Ikev2NoncePayload, Ikev2NotifyPayload, Ikev2NotifyPayloadBuild,
-    Ikev2PrfAlgorithm, Ikev2SaInitCryptoProfile, Ikev2SaPayload, Ikev2SaPayloadBuild,
-    Ikev2SaProposal, Ikev2SaProposalBuild, Ikev2SaTransform, Ikev2SaTransformBuild,
+    Ikev2PrfAlgorithm, Ikev2RedirectContext, Ikev2RedirectGatewayIdentity, Ikev2RedirectNotify,
+    Ikev2SaInitCryptoProfile, Ikev2SaPayload, Ikev2SaPayloadBuild, Ikev2SaProposal,
+    Ikev2SaProposalBuild, Ikev2SaTransform, Ikev2SaTransformBuild,
     Ikev2TransformAttributeBuildValue, Ikev2TransformAttributeValue, Message, OwnedMessage,
     PayloadType, EXCHANGE_TYPE_IKE_SA_INIT, HEADER_LEN, IKEV2_NOTIFY_COOKIE,
-    IKEV2_NOTIFY_INVALID_KE_PAYLOAD, IKEV2_NOTIFY_NO_PROPOSAL_CHOSEN,
+    IKEV2_NOTIFY_INVALID_KE_PAYLOAD, IKEV2_NOTIFY_NO_PROPOSAL_CHOSEN, IKEV2_NOTIFY_REDIRECT,
 };
 
 /// Value-free failures from initiator construction or response admission.
@@ -68,6 +75,8 @@ pub enum Ikev2SaInitInitiatorError {
     InvalidResponderNonce,
     /// A retry Notify is malformed, repeated or mixed with success payloads.
     InvalidRetry,
+    /// REDIRECT is malformed, lacks original support, mismatches Ni or has SPIr.
+    InvalidRedirect,
     /// The peer sent an error notification outside the supported retry types.
     UnsupportedNotification,
 }
@@ -93,6 +102,7 @@ impl Ikev2SaInitInitiatorError {
             Self::InvalidKeyExchange => "ike_initiator_invalid_ke",
             Self::InvalidResponderNonce => "ike_initiator_invalid_peer_nonce",
             Self::InvalidRetry => "ike_initiator_invalid_retry",
+            Self::InvalidRedirect => "ike_initiator_invalid_redirect",
             Self::UnsupportedNotification => "ike_initiator_unsupported_notification",
         }
     }
@@ -223,7 +233,7 @@ impl fmt::Debug for Ikev2SaInitAccepted<'_> {
     }
 }
 
-/// Success or one of the three RFC-defined unauthenticated retry outcomes.
+/// Success, an unauthenticated retry, or an RFC 5685 §3 redirect.
 ///
 /// Retry diagnostics expose no cookie or peer-selected values. Error replies
 /// accept either zero or non-zero SPIr, as required by RFC 7296 §2.6. A retry
@@ -241,6 +251,13 @@ pub enum Ikev2SaInitResponse<'a> {
     },
     /// The responder rejected every proposal; no suite was negotiated.
     NoProposalChosen,
+    /// An unauthenticated target correlated to the supported initial request.
+    /// No SA was established. Apply caller trust/loop policy and send
+    /// REDIRECTED_FROM in the next initial request.
+    Redirect {
+        /// Target identity; possession does not authorize resolving or using it.
+        gateway: Ikev2RedirectGatewayIdentity<'a>,
+    },
 }
 
 impl fmt::Debug for Ikev2SaInitResponse<'_> {
@@ -250,6 +267,7 @@ impl fmt::Debug for Ikev2SaInitResponse<'_> {
             Self::Cookie(_) => f.write_str("Cookie"),
             Self::InvalidKePayload { .. } => f.write_str("InvalidKePayload"),
             Self::NoProposalChosen => f.write_str("NoProposalChosen"),
+            Self::Redirect { .. } => f.write_str("Redirect(<redacted>)"),
         }
     }
 }
@@ -363,12 +381,17 @@ pub fn build_ike_sa_init_request(
 /// status notifications do not change suite selection. Retry payloads are
 /// parsed before requiring success payloads; malformed or ambiguous replies
 /// cannot be mistaken for successful negotiation.
+/// A REDIRECT additionally requires zero SPIr, the exact echoed original Ni,
+/// and a valid support indication in the immutable sent request. It grants no
+/// authentication, target authority or SA; callers own trust and loop policy.
 ///
 /// # Errors
 /// Returns a value-free [`Ikev2SaInitInitiatorError`] on invalid or unsupported
-/// input. COOKIE, INVALID_KE_PAYLOAD and NO_PROPOSAL_CHOSEN are successful typed
+/// input. COOKIE, INVALID_KE_PAYLOAD, NO_PROPOSAL_CHOSEN and REDIRECT are typed
 /// outcomes, never generic decoder failures. Apply caller retry policy and
 /// authenticate the resulting IKE_AUTH exchange before trusting the peer.
+/// Discard an invalid REDIRECT and keep waiting for a valid response, including
+/// when its nonce does not match (RFC 5685 §3); do not change PAD/SPD policy.
 pub fn admit_ike_sa_init_response<'a>(
     request: &Ikev2SaInitRequest,
     response: &Message<'a>,
@@ -425,7 +448,7 @@ pub fn admit_ike_sa_init_response<'a>(
             PayloadType::Notify => {
                 let notify = Ikev2NotifyPayload::decode(raw)
                     .map_err(|_| Ikev2SaInitInitiatorError::InvalidResponsePayload)?;
-                if let Some(outcome) = retry_outcome(notify, raw.offset)? {
+                if let Some(outcome) = retry_outcome(request, notify, raw.offset)? {
                     if retry.replace(outcome).is_some() {
                         return Err(Ikev2SaInitInitiatorError::InvalidRetry);
                     }
@@ -438,6 +461,9 @@ pub fn admit_ike_sa_init_response<'a>(
         }
     }
     if let Some(retry) = retry {
+        if matches!(retry, Ikev2SaInitResponse::Redirect { .. }) && header.responder_spi != 0 {
+            return Err(Ikev2SaInitInitiatorError::InvalidRedirect);
+        }
         if sa.is_some() || ke.is_some() || nonce.is_some() {
             return Err(Ikev2SaInitInitiatorError::InvalidRetry);
         }
@@ -475,10 +501,30 @@ pub fn admit_ike_sa_init_response<'a>(
     }))
 }
 
-fn retry_outcome(
-    notify: Ikev2NotifyPayload<'_>,
+fn retry_outcome<'a>(
+    request: &Ikev2SaInitRequest,
+    notify: Ikev2NotifyPayload<'a>,
     offset: usize,
-) -> Result<Option<Ikev2SaInitResponse<'_>>, Ikev2SaInitInitiatorError> {
+) -> Result<Option<Ikev2SaInitResponse<'a>>, Ikev2SaInitInitiatorError> {
+    if notify.notify_message_type == IKEV2_NOTIFY_REDIRECT {
+        let Some(Ikev2RedirectNotify::Redirect { gateway, nonce }) =
+            decode_ikev2_redirect_notify(notify, Ikev2RedirectContext::SaInitResponse)
+                .map_err(|_| Ikev2SaInitInitiatorError::InvalidRedirect)?
+        else {
+            return Err(Ikev2SaInitInitiatorError::InvalidRedirect);
+        };
+        let sent = decode_ike_sa_init_request_payloads(
+            &request.message.as_borrowed(),
+            DecodeContext::default(),
+        )
+        .map_err(|_| Ikev2SaInitInitiatorError::InvalidRedirect)?;
+        let support = decode_ikev2_redirect_support(&sent.notifies)
+            .map_err(|_| Ikev2SaInitInitiatorError::InvalidRedirect)?;
+        if !support.is_supported() || nonce != Some(sent.nonce.nonce) {
+            return Err(Ikev2SaInitInitiatorError::InvalidRedirect);
+        }
+        return Ok(Some(Ikev2SaInitResponse::Redirect { gateway }));
+    }
     if !matches!(
         notify.notify_message_type,
         IKEV2_NOTIFY_COOKIE | IKEV2_NOTIFY_INVALID_KE_PAYLOAD | IKEV2_NOTIFY_NO_PROPOSAL_CHOSEN

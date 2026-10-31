@@ -33,3 +33,69 @@ fn checked_original_gateway_draft_rejects_every_fqdn_before_text_validation() {
         );
     }
 }
+
+#[test]
+fn collection_distinguishes_explicit_support_and_original_ip_in_both_orders() {
+    let supported = build_ikev2_redirect_notify(
+        Ikev2RedirectNotify::Supported,
+        Ikev2RedirectContext::SaInitRequest,
+    )
+    .unwrap();
+    let original: IpAddr = "2001:db8::9".parse().unwrap();
+    let from = build_ikev2_redirect_notify(
+        Ikev2RedirectNotify::RedirectedFrom(original),
+        Ikev2RedirectContext::SaInitRequest,
+    )
+    .unwrap();
+    let supported = Ikev2NotifyPayload::decode_body(&supported).unwrap();
+    let from = Ikev2NotifyPayload::decode_body(&from).unwrap();
+    let explicit = decode_ikev2_redirect_support(&[supported]).unwrap();
+    assert!(explicit.is_supported());
+    assert!(explicit.supported_notify_present());
+    assert_eq!(explicit.redirected_from(), None);
+    for notifies in [[supported, from], [from, supported]] {
+        let summary = decode_ikev2_redirect_support(&notifies).unwrap();
+        assert!(summary.is_supported());
+        assert!(summary.supported_notify_present());
+        assert_eq!(summary.redirected_from(), Some(original));
+        assert!(!format!("{summary:?}").contains("2001:db8"));
+    }
+    for notifies in [[from, supported, from], [supported, from, supported]] {
+        assert!(matches!(
+            decode_ikev2_redirect_support(&notifies),
+            Err(Ikev2RedirectNotifyError::DuplicateSupported
+                | Ikev2RedirectNotifyError::DuplicateRedirectedFrom)
+        ));
+    }
+}
+
+#[test]
+fn unassigned_and_private_gateway_types_and_del_text_are_rejected() {
+    for kind in [0, 4, 240, 241, 254, 255] {
+        let data = [kind, 1, b'a'];
+        let notify = Ikev2NotifyPayload {
+            protocol_id: 0,
+            spi_size: 0,
+            spi: &[],
+            notify_message_type: 16407,
+            notification_data: &data,
+        };
+        assert_eq!(
+            opc_proto_ikev2::decode_ikev2_redirect_notify(
+                notify,
+                Ikev2RedirectContext::IkeAuthResponse
+            ),
+            Err(Ikev2RedirectNotifyError::GatewayIdentityTypeUnsupported)
+        );
+    }
+    assert_eq!(
+        build_ikev2_redirect_notify(
+            Ikev2RedirectNotify::Redirect {
+                gateway: Ikev2RedirectGatewayIdentity::Fqdn("a\u{7f}.example"),
+                nonce: None
+            },
+            Ikev2RedirectContext::IkeAuthResponse
+        ),
+        Err(Ikev2RedirectNotifyError::FqdnInvalidCharacter)
+    );
+}

@@ -4,13 +4,17 @@
 //! authenticate a sender, correlate an echoed nonce, authorize a target, or
 //! establish an IKE SA. RFC 5685 section 6 first/final IKE_AUTH placement,
 //! AUTH verification, redirect-loop limits and trust remain caller duties.
+//! A gateway MUST NOT send REDIRECT unless the peer indicated support in its
+//! initial request (RFC 5685 §3). Retain that fact across exchanges; the support
+//! collector exposes it without retaining session state. A redirected client
+//! sends REDIRECTED_FROM in its next initial request.
 //!
-//! @spec IETF RFC5685 3, 5, 6, 9; IETF RFC7296 3.5, 3.10
+//! @spec IETF RFC5685 3, 5, 6, 9, 12; IETF RFC7296 3.5, 3.9, 3.10; IETF RFC1035 2.3.3, 2.3.4, 3.1
 //! @conformance boundary-only
 
 use std::{
     fmt,
-    net::{Ipv4Addr, Ipv6Addr},
+    net::{IpAddr, Ipv4Addr, Ipv6Addr},
 };
 
 use crate::{
@@ -47,13 +51,29 @@ pub enum Ikev2RedirectContext {
 ///
 /// The enum can represent an unchecked FQDN draft; encoders validate it.
 /// Decoders borrow ASCII text without changing case or a final root dot.
+/// Equality compares bytes, not DNS names, target authorization or redirect
+/// loops. Callers own DNS case/root-dot normalization (RFC 1035 §2.3.3).
+///
+/// Registry extensions require callers to handle unknown variants:
+/// ```compile_fail
+/// use opc_proto_ikev2::Ikev2RedirectGatewayIdentity;
+/// fn kind(value: Ikev2RedirectGatewayIdentity<'_>) -> u8 {
+///     match value {
+///         Ikev2RedirectGatewayIdentity::Ipv4(_) => 1,
+///         Ikev2RedirectGatewayIdentity::Ipv6(_) => 2,
+///         Ikev2RedirectGatewayIdentity::Fqdn(_) => 3,
+///     }
+/// }
+/// ```
 #[derive(Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum Ikev2RedirectGatewayIdentity<'a> {
     /// Four address octets, gateway identity type 1.
     Ipv4(Ipv4Addr),
     /// Sixteen address octets, gateway identity type 2.
     Ipv6(Ipv6Addr),
-    /// ASCII DNS presentation text, gateway identity type 3.
+    /// Dotted ASCII FQDN text, gateway identity type 3. Backslash escapes,
+    /// whitespace and controls are rejected as SDK text policy.
     Fqdn(&'a str),
 }
 
@@ -83,7 +103,13 @@ pub enum Ikev2RedirectNotify<'a> {
         nonce: Option<&'a [u8]>,
     },
     /// Original gateway IP in a redirected initial request (RFC 5685 §9.3).
-    RedirectedFrom(Ikev2RedirectGatewayIdentity<'a>),
+    /// A DNS name cannot be represented here:
+    /// ```compile_fail
+    /// use opc_proto_ikev2::{Ikev2RedirectGatewayIdentity, Ikev2RedirectNotify};
+    /// let value = Ikev2RedirectNotify::RedirectedFrom(
+    ///     Ikev2RedirectGatewayIdentity::Fqdn("vpn.example"));
+    /// ```
+    RedirectedFrom(IpAddr),
 }
 
 impl fmt::Debug for Ikev2RedirectNotify<'_> {
@@ -98,6 +124,7 @@ impl fmt::Debug for Ikev2RedirectNotify<'_> {
 
 /// A named, value-free redirect codec or support collection failure.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+#[non_exhaustive]
 pub enum Ikev2RedirectNotifyError {
     /// Recognized type is not valid in the supplied direction.
     #[error("redirect Notify in wrong exchange direction")]
@@ -132,7 +159,7 @@ pub enum Ikev2RedirectNotifyError {
     /// FQDN contains non-ASCII octets.
     #[error("redirect FQDN must be ASCII")]
     FqdnNonAscii,
-    /// FQDN contains whitespace, control characters or a terminator.
+    /// FQDN contains backslash, whitespace, controls or a terminator.
     #[error("redirect FQDN contains invalid character")]
     FqdnInvalidCharacter,
     /// FQDN contains an empty label other than an optional final root dot.
@@ -217,7 +244,33 @@ impl Ikev2RedirectNotifyError {
 }
 
 impl Ikev2RedirectNotify<'_> {
+    /// Convert a gateway draft to the IP-only original-gateway value.
+    ///
+    /// # Errors
+    /// Returns [`Ikev2RedirectNotifyError::RedirectedFromRequiresIp`] for every
+    /// FQDN draft, before validating its text, just as the wire decoder rejects
+    /// identity type 3 before inspecting its length or text.
+    pub fn redirected_from(
+        gateway: Ikev2RedirectGatewayIdentity<'_>,
+    ) -> Result<Self, Ikev2RedirectNotifyError> {
+        match gateway {
+            Ikev2RedirectGatewayIdentity::Ipv4(address) => {
+                Ok(Self::RedirectedFrom(IpAddr::V4(address)))
+            }
+            Ikev2RedirectGatewayIdentity::Ipv6(address) => {
+                Ok(Self::RedirectedFrom(IpAddr::V6(address)))
+            }
+            Ikev2RedirectGatewayIdentity::Fqdn(_) => {
+                Err(Ikev2RedirectNotifyError::RedirectedFromRequiresIp)
+            }
+        }
+    }
+
     /// Validate and build canonical generic Notify fields without a payload header.
+    ///
+    /// Before sending REDIRECT, the caller MUST have retained the peer's
+    /// initial support indication. Redirected clients send REDIRECTED_FROM in
+    /// the next initial request. This stateless builder verifies neither duty.
     ///
     /// # Errors
     ///
@@ -226,7 +279,6 @@ impl Ikev2RedirectNotify<'_> {
         self,
         context: Ikev2RedirectContext,
     ) -> Result<Ikev2NotifyPayloadBuild, Ikev2RedirectNotifyError> {
-        use Ikev2RedirectNotifyError as Error;
         let mut notification_data = Vec::new();
         let notify_message_type = match self {
             Self::Supported => {
@@ -243,9 +295,10 @@ impl Ikev2RedirectNotify<'_> {
             }
             Self::RedirectedFrom(gateway) => {
                 require_initial_request(context)?;
-                if matches!(gateway, Ikev2RedirectGatewayIdentity::Fqdn(_)) {
-                    return Err(Error::RedirectedFromRequiresIp);
-                }
+                let gateway = match gateway {
+                    IpAddr::V4(address) => Ikev2RedirectGatewayIdentity::Ipv4(address),
+                    IpAddr::V6(address) => Ikev2RedirectGatewayIdentity::Ipv6(address),
+                };
                 append_gateway(&mut notification_data, gateway)?;
                 IKEV2_NOTIFY_REDIRECTED_FROM
             }
@@ -260,6 +313,9 @@ impl Ikev2RedirectNotify<'_> {
 }
 
 /// Build a generic Notify body, excluding its four-octet generic payload header.
+///
+/// REDIRECT transmission requires the peer's retained initial support
+/// indication (RFC 5685 §3); the codec cannot establish that precondition.
 ///
 /// # Errors
 ///
@@ -318,7 +374,9 @@ pub fn decode_ikev2_redirect_notify_with_profile(
     if !notify.spi.is_empty() {
         return Err(Error::SpiNonempty);
     }
-    if profile.requires_sender_canonical_fields() && notify.protocol_id != 0 {
+    if profile.requires_sender_canonical_fields()
+        && notify.protocol_id != IKEV2_NOTIFY_PROTOCOL_ID_NONE
+    {
         return Err(Error::ProtocolIdNonzero);
     }
     let typed = match notify.notify_message_type {
@@ -340,57 +398,101 @@ pub fn decode_ikev2_redirect_notify_with_profile(
         }
         _ => {
             require_initial_request(context)?;
-            let (gateway, tail) = decode_gateway(notify.notification_data)?;
-            if matches!(gateway, Ikev2RedirectGatewayIdentity::Fqdn(_)) {
+            if notify.notification_data.first() == Some(&3) {
                 return Err(Error::RedirectedFromRequiresIp);
             }
+            let (gateway, tail) = decode_gateway(notify.notification_data)?;
+            let original = Ikev2RedirectNotify::redirected_from(gateway)?;
             if !tail.is_empty() {
                 return Err(Error::UnexpectedTrailingData);
             }
-            Ikev2RedirectNotify::RedirectedFrom(gateway)
+            original
         }
     };
     Ok(Some(typed))
 }
 
-/// Extract structural support from a caller-selected initial-request collection.
+/// Support facts from one complete initial-request collection.
+///
+/// These facts authenticate no peer and grant no target or routing authority.
+/// Retain support across exchanges before sending any REDIRECT (RFC 5685 §3).
+#[derive(Clone, Copy, Default, PartialEq, Eq)]
+pub struct Ikev2RedirectSupport {
+    supported_notify_present: bool,
+    redirected_from: Option<IpAddr>,
+}
+
+impl Ikev2RedirectSupport {
+    /// Either explicit SUPPORTED or a valid original-gateway IP implies support.
+    #[must_use]
+    pub const fn is_supported(self) -> bool {
+        self.supported_notify_present || self.redirected_from.is_some()
+    }
+
+    /// Whether the collection contained an explicit REDIRECT_SUPPORTED.
+    #[must_use]
+    pub const fn supported_notify_present(self) -> bool {
+        self.supported_notify_present
+    }
+
+    /// Original gateway IP, if REDIRECTED_FROM was supplied. Do not log it.
+    #[must_use]
+    pub const fn redirected_from(self) -> Option<IpAddr> {
+        self.redirected_from
+    }
+}
+
+impl fmt::Debug for Ikev2RedirectSupport {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Ikev2RedirectSupport")
+            .field("supported_notify_present", &self.supported_notify_present)
+            .field("redirected_from_present", &self.redirected_from.is_some())
+            .finish()
+    }
+}
+
+/// Extract support and original-gateway facts from a complete initial request.
 ///
 /// Either SUPPORTED or a valid REDIRECTED_FROM implies support (RFC 5685 §3).
-/// Both may coexist. Repeats of either type, even identical, fail under an SDK
-/// ambiguity policy. Unrelated types count toward the local work bound. Any
+/// Both may coexist. Repeats of either type, even identical, fail under the SDK
+/// strict duplicate policy. Unrelated types count toward the local work bound. Any
 /// malformed recognized input fails atomically, without a partial result.
 /// This function does not authenticate the collection or authorize a redirect.
 ///
 /// # Errors
 ///
-/// Returns a named malformed-input, duplicate or input-count error.
+/// Returns a named error for malformed or misplaced recognized input, repeated
+/// SUPPORTED/FROM, or more than [`IKEV2_REDIRECT_MAX_NOTIFIES`] total inputs.
+/// For every error, this collection establishes no support and supplies no
+/// partial original-gateway identity: callers MUST NOT send REDIRECT based on
+/// it. Handle malformed/context errors using caller-owned exchange error
+/// policy; duplicate and count errors reject the collection under SDK policy.
 pub fn decode_ikev2_redirect_support(
     notifies: &[Ikev2NotifyPayload<'_>],
-) -> Result<bool, Ikev2RedirectNotifyError> {
+) -> Result<Ikev2RedirectSupport, Ikev2RedirectNotifyError> {
     use Ikev2RedirectNotifyError as Error;
     if notifies.len() > IKEV2_REDIRECT_MAX_NOTIFIES {
         return Err(Error::TooManyNotifies);
     }
-    let mut supported = false;
-    let mut redirected_from = false;
+    let mut support = Ikev2RedirectSupport::default();
     for &notify in notifies {
         match decode_ikev2_redirect_notify(notify, Ikev2RedirectContext::SaInitRequest)? {
             Some(Ikev2RedirectNotify::Supported) => {
-                if supported {
+                if support.supported_notify_present {
                     return Err(Error::DuplicateSupported);
                 }
-                supported = true;
+                support.supported_notify_present = true;
             }
-            Some(Ikev2RedirectNotify::RedirectedFrom(_)) => {
-                if redirected_from {
+            Some(Ikev2RedirectNotify::RedirectedFrom(address)) => {
+                if support.redirected_from.is_some() {
                     return Err(Error::DuplicateRedirectedFrom);
                 }
-                redirected_from = true;
+                support.redirected_from = Some(address);
             }
             _ => {}
         }
     }
-    Ok(supported || redirected_from)
+    Ok(support)
 }
 
 fn require_initial_request(context: Ikev2RedirectContext) -> Result<(), Ikev2RedirectNotifyError> {
@@ -434,7 +536,10 @@ fn validate_fqdn(bytes: &[u8]) -> Result<&str, Ikev2RedirectNotifyError> {
     if !bytes.is_ascii() {
         return Err(Error::FqdnNonAscii);
     }
-    if bytes.iter().any(|byte| !byte.is_ascii_graphic()) {
+    if bytes
+        .iter()
+        .any(|byte| !byte.is_ascii_graphic() || *byte == b'\\')
+    {
         return Err(Error::FqdnInvalidCharacter);
     }
     let name = std::str::from_utf8(bytes).map_err(|_| Error::FqdnNonAscii)?;

@@ -64,7 +64,7 @@ fn constants_and_three_identity_types_match_literal_notify_bodies() {
 
 #[test]
 fn support_and_redirected_from_match_literal_bodies_and_imply_support() {
-    let from = Redirect::RedirectedFrom(Gateway::Ipv4(Ipv4Addr::new(192, 0, 2, 9)));
+    let from = Redirect::RedirectedFrom(Ipv4Addr::new(192, 0, 2, 9).into());
     for (typed, wire) in [(Redirect::Supported, SUPPORTED), (from, FROM)] {
         assert_eq!(
             build_ikev2_redirect_notify(typed, Context::SaInitRequest).unwrap(),
@@ -74,16 +74,23 @@ fn support_and_redirected_from_match_literal_bodies_and_imply_support() {
             decode_ikev2_redirect_notify(generic(wire), Context::SaInitRequest),
             Ok(Some(typed))
         );
-        assert_eq!(decode_ikev2_redirect_support(&[generic(wire)]), Ok(true));
+        assert_eq!(
+            decode_ikev2_redirect_support(&[generic(wire)]).map(|support| support.is_supported()),
+            Ok(true)
+        );
     }
     assert_eq!(
-        decode_ikev2_redirect_support(&[generic(SUPPORTED), generic(FROM)]),
+        decode_ikev2_redirect_support(&[generic(SUPPORTED), generic(FROM)])
+            .map(|support| support.is_supported()),
         Ok(true)
     );
-    assert_eq!(decode_ikev2_redirect_support(&[]), Ok(false));
+    assert_eq!(
+        decode_ikev2_redirect_support(&[]).map(|support| support.is_supported()),
+        Ok(false)
+    );
     let mut from_v6 = IPV6.to_vec();
     from_v6[3] = 0x18;
-    let typed = Redirect::RedirectedFrom(Gateway::Ipv6("2001:db8::1".parse().unwrap()));
+    let typed = Redirect::RedirectedFrom("2001:db8::1".parse().unwrap());
     assert_eq!(
         build_ikev2_redirect_notify(typed, Context::SaInitRequest).unwrap(),
         from_v6
@@ -310,10 +317,8 @@ fn redirected_from_prohibits_fqdn_and_trailing_data() {
         Err(Error::RedirectedFromRequiresIp)
     );
     assert_eq!(
-        build_ikev2_redirect_notify(
-            Redirect::RedirectedFrom(Gateway::Fqdn("vpn.example")),
-            Context::SaInitRequest
-        ),
+        Redirect::redirected_from(Gateway::Fqdn("vpn.example"))
+            .and_then(|value| build_ikev2_redirect_notify(value, Context::SaInitRequest)),
         Err(Error::RedirectedFromRequiresIp)
     );
     let mut trailing = FROM.to_vec();
@@ -405,7 +410,8 @@ fn support_collection_is_bounded_atomic_and_rejects_duplicate_recognized_types()
         Ok(None)
     );
     assert_eq!(
-        decode_ikev2_redirect_support(&vec![unrelated; IKEV2_REDIRECT_MAX_NOTIFIES]),
+        decode_ikev2_redirect_support(&vec![unrelated; IKEV2_REDIRECT_MAX_NOTIFIES])
+            .map(|support| support.is_supported()),
         Ok(false)
     );
     assert_eq!(
@@ -527,5 +533,8 @@ fn malformed_or_misplaced_recognized_notify_never_becomes_support() {
     }
     let mut full = vec![generic(&[0, 0, 0x40, 0x00]); IKEV2_REDIRECT_MAX_NOTIFIES];
     full[IKEV2_REDIRECT_MAX_NOTIFIES - 1] = generic(FROM);
-    assert_eq!(decode_ikev2_redirect_support(&full), Ok(true));
+    assert_eq!(
+        decode_ikev2_redirect_support(&full).map(|support| support.is_supported()),
+        Ok(true)
+    );
 }

@@ -32,29 +32,52 @@ and FQDN; these are distinct from Identification payload type numbers.
 The one-octet length covers only the identity. An SA_INIT response requires
 the original peer Ni, 16..=256 octets; protected IKE_AUTH responses and
 gateway INFORMATIONAL requests prohibit nonce data. `REDIRECTED_FROM`
-accepts IP identities only. FQDN text is ASCII without terminators, with
-nonempty labels of at most 63 octets and at most 255 octets in DNS wire form.
-An optional final root dot and text case are preserved. Whitespace and
-control characters are rejected; this codec does not impose an LDH-only
-hostname policy or interpret DNS presentation escapes.
+uses `IpAddr`, so a DNS name cannot be represented. The checked
+`redirected_from` draft conversion rejects every FQDN before text validation;
+the decoder rejects type 3 at the first identity octet. Gateway-identity and
+error enums are non-exhaustive to allow registry extensions (RFC 5685 §12).
+FQDN text is dotted ASCII without terminators, with nonempty labels of at most
+63 octets and at most 255 octets in DNS wire form (RFC 1035 §§2.3.4, 3.1).
+An optional final root dot and text case are preserved. Backslash, whitespace
+and controls are rejected as SDK text policy; this is not an escape-aware DNS
+presentation parser and imposes no LDH-only hostname policy. Derived equality
+compares bytes, not DNS names or target trust; callers own case/root-dot
+normalization for matching and redirect loops (RFC 1035 §2.3.3).
 
 Builders validate drafts and reuse the generic Notify encoder. Decoders
 distinguish unrelated types (`Ok(None)`) from malformed recognized types
 (named, value-free errors), validate SPI size and contents, and ignore
 Protocol ID for an empty SPI under the network receiver profile. The
-sender-canonical profile diagnoses a nonzero Protocol ID. A bounded support
-collector accepts either support advertisement, rejects repeated recognized
-support types as SDK ambiguity policy, and returns no partial success for
-malformed input. These policies add no packet or session state.
+sender-canonical profile diagnoses a nonzero Protocol ID. The bounded support
+collector returns `Ikev2RedirectSupport`: `is_supported()`, whether SUPPORTED
+was explicit, and the optional original gateway IP from REDIRECTED_FROM.
+Either form implies support and both may coexist. Its strict duplicate policy
+rejects repeated SUPPORTED or FROM, even identical. Malformed or misplaced
+recognized input, duplicates and more than 64 total Notifies all fail atomically:
+no support or partial original IP is established, and callers MUST NOT send
+REDIRECT based on that collection. Apply caller-owned exchange error handling
+to malformed/context errors; duplicate/count errors reject the collection
+under SDK policy. Unrelated types count toward the bound. Debug hides identities.
 
-Callers must bind the context to the actual exchange and original responder
-role, correlate echoed Ni, verify AUTH, accept REDIRECT only in the first or
-final IKE_AUTH response, and enforce trust, target selection, redirect-loop
-and SA deletion policy. A typed decoded value establishes none of those facts.
-In particular, constructing `Ikev2RedirectContext::IkeAuthResponse` is not an
-authentication or response-placement check. See `tests/redirect.rs` for
-independent literal body encodings, malformed-input checks and generic
-IKE_AUTH payload framing.
+A gateway MUST NOT send REDIRECT unless the peer indicated support in its
+initial request; retain that fact across all exchanges (RFC 5685 §3). A
+redirected client sends REDIRECTED_FROM in its next initial request. These
+stateless codecs cannot enforce retained session policy. Callers must bind the
+context to the actual exchange and original responder role, correlate echoed
+Ni, verify AUTH, accept IKE_AUTH REDIRECT only in the first or final response,
+and enforce trust, target selection, redirect-loop and SA deletion policy.
+A typed decoded value establishes none of those facts. Constructing
+`Ikev2RedirectContext::IkeAuthResponse` is not an authentication or placement check.
+
+For SA_INIT, `build_ike_sa_init_notify_response` emits a zero-responder-SPI,
+Notify-only REDIRECT without SA/KE/Nr (RFC 5685 §3). Its header-only interface
+requires the caller to verify support and supply the exact original Ni.
+`admit_ike_sa_init_response` checks the immutable sent request's support, the
+nonce echo, zero responder SPI and absence of success or competing retry
+outcomes, then returns `Ikev2SaInitResponse::Redirect`. That outcome authenticates
+no gateway, establishes no SA, and authorizes no target. See `tests/redirect.rs`,
+`tests/redirect_revision.rs` and `tests/redirect_api.rs` for independent literal
+encodings, initial-exchange admission, malformed inputs and public API contracts.
 
 ## N1-mode Notify values
 

@@ -356,8 +356,8 @@ pub use redirect::{
     build_ikev2_redirect_notify, decode_ikev2_redirect_notify,
     decode_ikev2_redirect_notify_with_profile, decode_ikev2_redirect_support, Ikev2RedirectContext,
     Ikev2RedirectGatewayIdentity, Ikev2RedirectNotify, Ikev2RedirectNotifyError,
-    IKEV2_NOTIFY_REDIRECT, IKEV2_NOTIFY_REDIRECTED_FROM, IKEV2_NOTIFY_REDIRECT_SUPPORTED,
-    IKEV2_REDIRECT_MAX_NOTIFIES,
+    Ikev2RedirectSupport, IKEV2_NOTIFY_REDIRECT, IKEV2_NOTIFY_REDIRECTED_FROM,
+    IKEV2_NOTIFY_REDIRECT_SUPPORTED, IKEV2_REDIRECT_MAX_NOTIFIES,
 };
 pub use sa_init::{
     build_ike_sa_init_invalid_ke_response, build_ike_sa_init_notify_response,
