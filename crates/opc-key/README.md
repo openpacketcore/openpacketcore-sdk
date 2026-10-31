@@ -130,6 +130,12 @@ non-canonical, or context-mismatched output fails with a fieldless stable code.
   custody.
 - `KmsKeyProvider` redacts errors and requires TLS for TCP endpoints. Unix
   sockets are accepted for local KMS deployments.
+- `KeyError::Unavailable` identifies provider availability failures. The
+  in-memory remote adapter reports AEAD rejection as fieldless `OperationFailed`.
+  Both JSON KMS adapters preserve `NotFound` for missing keys and report other
+  completed failure responses as `OperationFailed`; transport loss and timeout
+  remain `Unavailable`. Rejected ciphertext or revoked keys must not be
+  mistaken for a provider outage, and provider-native details remain redacted.
 - Existing `KeyProvider`, `KeyHandle`, `KmsRemoteSealProvider`,
   `MemoryRemoteSealProvider`, and custom `RemoteSealProvider` implementations
   remain source- and wire-compatible. They are explicitly unadmitted unless

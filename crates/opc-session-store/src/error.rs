@@ -55,10 +55,10 @@ pub enum StoreError {
     /// succeed; choose a backend that satisfies the required profile.
     #[error("capability not supported: {0}")]
     CapabilityNotSupported(String),
-    /// The backend could not be reached or a replica quorum could not be
-    /// formed. Transient: callers may retry, but until the retry succeeds they
-    /// must treat any in-flight lease state as unknown — i.e. lost — and stop
-    /// authoritative writes (RFC 004 §9.3).
+    /// The backend or key provider could not be reached, or a replica quorum
+    /// could not be formed. Transient: callers may retry, but until the retry
+    /// succeeds they must treat any in-flight lease state as unknown — i.e.
+    /// lost — and stop authoritative writes (RFC 004 §9.3).
     #[error("backend unavailable: {0}")]
     BackendUnavailable(String),
     /// The operation's keys are inconsistent (for example a compare-and-set
@@ -253,13 +253,11 @@ pub enum StoreError {
     /// Append-only to preserve every existing serialized discriminant.
     #[error("backend unavailable: protected fenced-transition V2 recovery journal unavailable")]
     FencedTransitionRecoveryJournalUnavailable,
-    /// The key provider backing record encryption/decryption is temporarily
-    /// unavailable (for example a KMS restart, TLS failure, refused connection,
-    /// or timeout). The failure happens before any envelope content is
-    /// processed, so it reveals nothing about persisted data and is safe to
-    /// retry like [`StoreError::BackendUnavailable`]. Content-dependent key
-    /// failures (invalid envelope, unknown key id, authentication failure)
-    /// remain collapsed into [`StoreError::Crypto`].
+    /// Legacy retryable key-provider outage, retained for source and serialized
+    /// discriminant compatibility. Record encryption and decryption now return
+    /// [`StoreError::BackendUnavailable`] for provider outages so existing
+    /// backend retry classifiers apply. Content-dependent failures remain
+    /// collapsed into [`StoreError::Crypto`].
     ///
     /// Append-only to preserve every existing serialized discriminant.
     #[error("key provider unavailable: {0}")]

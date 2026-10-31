@@ -316,6 +316,7 @@ async fn memory_remote_authentication_failure_is_not_unavailability() {
             .await
             .expect_err("every modified byte must fail authentication");
         assert_ne!(error, KeyError::Unavailable);
+        assert_eq!(error, KeyError::OperationFailed);
         assert_eq!(error.to_string(), "key provider operation failed");
         assert_eq!(format!("{error:?}"), "OperationFailed");
     }

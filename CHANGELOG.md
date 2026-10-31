@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- `opc-key`, `opc-session-store`: distinguish authentication and completed KMS
+  rejections from retryable provider outages. Outages use the existing
+  `BackendUnavailable` contract with a constant redacted message; content
+  failures remain `Crypto`. Preserve the legacy provider error's serialized
+  position for compatibility. Refs #1197.
+
 ### Added
 
 - `opc-proto-ikev2`: PKCS#1 v1.5 and PSS signing blind the RSA private operation

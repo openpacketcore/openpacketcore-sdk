@@ -1808,6 +1808,13 @@ envelope key ID for historical-key lookup. A provider outage therefore blocks
 a new plaintext write before consensus submission but does not prevent already
 sealed Raft traffic, replay, or quorum formation.
 
+Local key lookup and remote seal/unseal report `KeyError::Unavailable` as
+`StoreError::BackendUnavailable("session key provider unavailable")`. Callers
+can retry within their existing request budget when the provider recovers.
+Unknown keys, authentication failures, malformed envelopes and other provider
+errors still return the same coarse `StoreError::Crypto` classification without
+exposing provider details or envelope contents.
+
 Both protection wrappers default to `EnvelopeReadPolicy::MigrationCompatible`,
 which retains intentional legacy/plaintext reads and unclassified-row probing.
 Configure `.with_read_policy(EnvelopeReadPolicy::RequireEnvelopeV1)` to require

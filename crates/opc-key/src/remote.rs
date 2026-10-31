@@ -17,6 +17,9 @@ use crate::{
 /// memory. Callers still build the same [`EnvelopeAad`] used by the local
 /// [`crate::KeyProvider`] path, and implementations must bind the exact bytes
 /// from [`serialize_bound_aad`] into the remote encrypt/decrypt request.
+/// Reserve [`KeyError::Unavailable`] for availability failures. Authentication
+/// or other content-dependent rejection must remain a separate coarse error,
+/// such as [`KeyError::OperationFailed`], so callers can retry only outages.
 #[async_trait]
 pub trait RemoteSealProvider: Send + Sync {
     /// Seal inside the KMS/HSM; the key never enters app memory.
@@ -203,7 +206,7 @@ impl RemoteSealProvider for MemoryRemoteSealProvider {
             .await?;
         handle
             .encrypt_payload(aad, plaintext, self.nonce)
-            .map_err(|_| KeyError::Unavailable)
+            .map_err(|_| KeyError::OperationFailed)
     }
 
     async fn unseal(
@@ -225,7 +228,7 @@ impl RemoteSealProvider for MemoryRemoteSealProvider {
                 self.nonce,
             )
             .map(Zeroizing::new)
-            .map_err(|_| KeyError::Unavailable)
+            .map_err(|_| KeyError::OperationFailed)
     }
 }
 

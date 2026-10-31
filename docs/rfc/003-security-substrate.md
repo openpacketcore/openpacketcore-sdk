@@ -528,6 +528,14 @@ does not cache historical key material or authorization decisions, persist its
 epoch, watch a source, coordinate pods, or produce a fleet-comparable epoch.
 Each unseal calls the remote provider for the exact envelope key ID.
 
+Provider availability and request rejection MUST remain distinguishable.
+`KeyError::Unavailable` permits a retry within the caller's original budget;
+it MUST NOT represent an unknown key or a content-dependent authentication
+failure. Such failures remain redacted as `NotFound` or a coarse operation
+error. The session-store envelope boundary preserves availability as
+`StoreError::BackendUnavailable` and collapses content-dependent failures into
+`StoreError::Crypto`.
+
 ### 9.4 Rotation
 
 Key rotation MUST support:

@@ -231,7 +231,7 @@ impl KmsKeyProvider {
             if msg.contains("not found") {
                 Err(KeyError::NotFound)
             } else {
-                Err(KeyError::Unavailable)
+                Err(KeyError::OperationFailed)
             }
         }
     }
@@ -435,7 +435,7 @@ impl KmsRemoteSealProvider {
             if msg.contains("not found") {
                 Err(KeyError::NotFound)
             } else {
-                Err(KeyError::Unavailable)
+                Err(KeyError::OperationFailed)
             }
         }
     }
@@ -866,6 +866,7 @@ mod tests {
                     _ => unreachable!("fixed operation fixture"),
                 };
                 assert_ne!(error, KeyError::Unavailable, "{operation}: {reason}");
+                assert_eq!(error, KeyError::OperationFailed);
                 assert_eq!(error.to_string(), "key provider operation failed");
                 assert_eq!(format!("{error:?}"), "OperationFailed");
             }
@@ -1049,6 +1050,7 @@ mod tests {
             .unseal(&key_id, &session_aad(), b"ciphertext-canary")
             .await
             .expect_err("revoked historical key must fail closed");
+        assert_eq!(error, KeyError::OperationFailed);
         assert_eq!(error.to_string(), "key provider operation failed");
         let rendered = format!("{error} {error:?}");
         assert!(!rendered.contains(key_id.as_str()));
