@@ -617,15 +617,22 @@ fn parse_link_address(value: &str) -> [u8; 6] {
 /// bounded, for DAD to finish and then resolve the neighbour, so every later
 /// send is a single-packet assertion on the tc datapath itself.
 fn resolve_s2bu_ipv6_gateway_neighbour() {
+    resolve_ipv6_gateway_neighbour("s2bu", "2001:db8:2::10");
+}
+
+/// Finish link-local DAD and resolve the peer before starting a packet's
+/// receive deadline. Forwarded traffic cannot use its remote source address
+/// for Neighbor Discovery while the interface's link-local address is tentative.
+fn resolve_ipv6_gateway_neighbour(interface: &str, peer: &str) {
     let deadline = Instant::now() + Duration::from_secs(10);
     loop {
         let output = Command::new("ip")
-            .args(["-6", "addr", "show", "dev", "s2bu", "tentative"])
+            .args(["-6", "addr", "show", "dev", interface, "tentative"])
             .output()
-            .expect("read s2bu tentative IPv6 addresses");
+            .expect("read tentative IPv6 addresses");
         assert!(
             output.status.success(),
-            "ip -6 addr show dev s2bu tentative failed: status={} stdout={} stderr={}",
+            "ip -6 addr show dev {interface} tentative failed: status={} stdout={} stderr={}",
             output.status,
             String::from_utf8_lossy(&output.stdout),
             String::from_utf8_lossy(&output.stderr)
@@ -635,14 +642,14 @@ fn resolve_s2bu_ipv6_gateway_neighbour() {
         }
         assert!(
             Instant::now() < deadline,
-            "s2bu IPv6 DAD did not complete: status={} stdout={} stderr={}",
+            "{interface} IPv6 DAD did not complete: status={} stdout={} stderr={}",
             output.status,
             String::from_utf8_lossy(&output.stdout),
             String::from_utf8_lossy(&output.stderr)
         );
         std::thread::sleep(Duration::from_millis(50));
     }
-    run("ping", &["-6", "-c", "1", "-W", "1", "2001:db8:2::10"]);
+    run("ping", &["-6", "-c", "1", "-W", "1", peer]);
 }
 
 fn main_link_address(interface: &str) -> [u8; 6] {
