@@ -1090,7 +1090,7 @@ impl Error for Ikev2SaInitBuildError {}
 /// Error returned while building an unauthenticated IKE_SA_INIT Notify
 /// response.
 ///
-/// @spec IETF RFC7296 2.5, 2.6, 2.7, 2.21.1, 3.10.1
+/// @spec IETF RFC7296 2.5, 2.6, 2.7, 2.21.1, 3.10.1; IETF RFC5685 3
 /// @req REQ-IETF-RFC7296-SA-INIT-ERROR-NOTIFY-BUILD-ERROR-001
 /// @conformance boundary-only
 ///
@@ -1120,6 +1120,7 @@ impl Error for Ikev2SaInitBuildError {}
 /// }
 /// ```
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum Ikev2SaInitNotifyBuildError {
     /// Input header was not IKE_SA_INIT.
     NotIkeSaInit,

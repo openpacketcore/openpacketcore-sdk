@@ -68,6 +68,7 @@ use crate::{
 /// }
 /// ```
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum Ikev2SaInitInitiatorError {
     /// The caller supplied the reserved zero initiator SPI.
     InvalidInitiatorSpi,
@@ -103,7 +104,7 @@ pub enum Ikev2SaInitInitiatorError {
     InvalidResponderNonce,
     /// A retry Notify is malformed, repeated or mixed with success payloads.
     InvalidRetry,
-    /// REDIRECT is malformed, lacks original support, mismatches Ni or has SPIr.
+    /// REDIRECT is malformed, lacks original support or mismatches Ni.
     InvalidRedirect,
     /// The peer sent an error notification outside the supported retry types.
     UnsupportedNotification,
@@ -281,6 +282,7 @@ impl fmt::Debug for Ikev2SaInitAccepted<'_> {
 /// }
 /// ```
 #[derive(Clone)]
+#[non_exhaustive]
 pub enum Ikev2SaInitResponse<'a> {
     /// One complete offered suite, KEr and Nr ready for key derivation.
     Accepted(Ikev2SaInitAccepted<'a>),
@@ -423,8 +425,9 @@ pub fn build_ike_sa_init_request(
 /// status notifications do not change suite selection. Retry payloads are
 /// parsed before requiring success payloads; malformed or ambiguous replies
 /// cannot be mistaken for successful negotiation.
-/// A REDIRECT additionally requires zero SPIr, the exact echoed original Ni,
-/// and a valid support indication in the immutable sent request. It grants no
+/// A REDIRECT requires the exact echoed original Ni and a valid support
+/// indication in the immutable sent request. Like other no-SA outcomes, it
+/// tolerates either zero or nonzero SPIr (RFC 7296 §2.6). It grants no
 /// authentication, target authority or SA; callers own trust and loop policy.
 ///
 /// # Errors
@@ -503,9 +506,6 @@ pub fn admit_ike_sa_init_response<'a>(
         }
     }
     if let Some(retry) = retry {
-        if matches!(retry, Ikev2SaInitResponse::Redirect { .. }) && header.responder_spi != 0 {
-            return Err(Ikev2SaInitInitiatorError::InvalidRedirect);
-        }
         if sa.is_some() || ke.is_some() || nonce.is_some() {
             return Err(Ikev2SaInitInitiatorError::InvalidRetry);
         }

@@ -635,6 +635,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Breaking
 
+- `opc-proto-ikev2`: added `Ikev2SaInitResponse::Redirect`,
+  `Ikev2SaInitInitiatorError::InvalidRedirect` and
+  `Ikev2SaInitNotifyBuildError::InvalidRedirect` to previously exhaustive public
+  enums. Those three enums are now `#[non_exhaustive]`; downstream matches
+  require a wildcard arm. `admit_ike_sa_init_response` now rejects REDIRECT
+  mixed into a success response, which previously remained in the accepted
+  notification collection. A standalone, nonce-correlated REDIRECT tolerates
+  either responder SPI value under RFC 7296 §2.6; builders still emit zero.
+
 - `opc-ipsec-xfrm`: remove the unused `esp_dummy_payload` plaintext builder,
   which never shipped in a release.
   Use `EspTfcDummySender` to transmit through an existing kernel ESP SA;

@@ -73,8 +73,9 @@ For SA_INIT, `build_ike_sa_init_notify_response` emits a zero-responder-SPI,
 Notify-only REDIRECT without SA/KE/Nr (RFC 5685 §3). Its header-only interface
 requires the caller to verify support and supply the exact original Ni.
 `admit_ike_sa_init_response` checks the immutable sent request's support, the
-nonce echo, zero responder SPI and absence of success or competing retry
-outcomes, then returns `Ikev2SaInitResponse::Redirect`. That outcome authenticates
+nonce echo and absence of success or competing retry outcomes, accepting either
+zero or nonzero responder SPI as for other no-SA outcomes (RFC 7296 §2.6). It
+then returns `Ikev2SaInitResponse::Redirect`. That outcome authenticates
 no gateway, establishes no SA, and authorizes no target. See `tests/redirect.rs`,
 `tests/redirect_revision.rs` and `tests/redirect_api.rs` for independent literal
 encodings, initial-exchange admission, malformed inputs and public API contracts.

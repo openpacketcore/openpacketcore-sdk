@@ -205,33 +205,32 @@ fn initiator_admits_supported_matching_redirect_without_establishing_an_sa() {
 }
 
 #[test]
-fn initial_redirect_rejects_nonce_mismatch_nonzero_spi_and_absent_support() {
+fn initial_redirect_checks_nonce_and_support_across_both_spi_forms() {
     let request = request(true);
-    let mut mismatch = raw_response(&request);
-    let mut raw = mismatch.raw_payloads.to_vec();
-    *raw.last_mut().unwrap() ^= 1;
-    mismatch.raw_payloads = Bytes::from(raw);
-    assert!(admit_ike_sa_init_response(
-        &request,
-        &mismatch.as_borrowed(),
-        DecodeContext::default()
-    )
-    .is_err());
-    let mut wrong_spi = raw_response(&request);
-    wrong_spi.header.responder_spi = 1;
-    assert!(admit_ike_sa_init_response(
-        &request,
-        &wrong_spi.as_borrowed(),
-        DecodeContext::default()
-    )
-    .is_err());
-    let unsupported = self::request(false);
-    assert!(admit_ike_sa_init_response(
-        &unsupported,
-        &raw_response(&unsupported).as_borrowed(),
-        DecodeContext::default()
-    )
-    .is_err());
+    for responder_spi in [0, 1] {
+        let mut valid = raw_response(&request);
+        valid.header.responder_spi = responder_spi;
+        let outcome =
+            admit_ike_sa_init_response(&request, &valid.as_borrowed(), DecodeContext::default())
+                .unwrap();
+        assert!(matches!(outcome, Ikev2SaInitResponse::Redirect {
+            gateway: Gateway::Ipv4(address)
+        } if address == Ipv4Addr::new(192, 0, 2, 1)));
+        assert!(!matches!(outcome, Ikev2SaInitResponse::Accepted(_)));
+        let mut mismatch = valid;
+        let mut raw = mismatch.raw_payloads.to_vec();
+        *raw.last_mut().unwrap() ^= 1;
+        mismatch.raw_payloads = Bytes::from(raw);
+        assert_admission_error(&request, &mismatch, AdmissionError::InvalidRedirect);
+        let unsupported = self::request(false);
+        let mut unsupported_response = raw_response(&unsupported);
+        unsupported_response.header.responder_spi = responder_spi;
+        assert_admission_error(
+            &unsupported,
+            &unsupported_response,
+            AdmissionError::InvalidRedirect,
+        );
+    }
 }
 
 fn assert_admission_error(
@@ -366,7 +365,13 @@ fn initial_redirect_reports_exact_failures_for_nonce_spi_and_malformed_identity(
     let request = request(true);
     let mut response = raw_response(&request);
     response.header.responder_spi = 1;
-    assert_admission_error(&request, &response, AdmissionError::InvalidRedirect);
+    let outcome =
+        admit_ike_sa_init_response(&request, &response.as_borrowed(), DecodeContext::default())
+            .unwrap();
+    assert!(matches!(outcome, Ikev2SaInitResponse::Redirect {
+        gateway: Gateway::Ipv4(address)
+    } if address == Ipv4Addr::new(192, 0, 2, 1)));
+    assert!(!matches!(outcome, Ikev2SaInitResponse::Accepted(_)));
     let unsupported = self::request(false);
     assert_admission_error(
         &unsupported,
