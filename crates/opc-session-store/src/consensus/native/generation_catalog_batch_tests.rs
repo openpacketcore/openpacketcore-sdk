@@ -111,6 +111,9 @@ impl Fixture {
                     .collect()
             }
             Table::Notification => {
+                // The encoded rows are a complete sequence starting at one;
+                // the section's committed frontier must describe that sequence.
+                after.business.frontiers.watch_sequence = count as u64;
                 let entry = storage.business.notifications[0].resident().unwrap();
                 (0..count)
                     .map(|index| {
@@ -357,6 +360,9 @@ fn native_catalog_batch_preserves_delta_predecessors_and_watch_offsets() {
                     row.bytes = postcard::to_allocvec(&entry).unwrap();
                 }
             }
+        }
+        if matches!(table, Table::Notification) {
+            fixture.after.business.frontiers.watch_sequence += 65;
         }
         fixture.run(&mut expected, false, None, &|| Ok(())).unwrap();
         resources(8, 128 * 1024 * 1024, |resources, _| {
