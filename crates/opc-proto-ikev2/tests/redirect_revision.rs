@@ -410,3 +410,42 @@ fn initial_redirect_reports_exact_failures_for_nonce_spi_and_malformed_identity(
     response.raw_payloads = raw.into();
     assert_admission_error(&request, &response, AdmissionError::InvalidRedirect);
 }
+
+#[test]
+fn initial_redirect_outcome_ignores_the_responder_spi() {
+    let request = request(true);
+    for responder_spi in [0, 1, 0x0102_0304_0506_0708, u64::MAX] {
+        let mut response = raw_response(&request);
+        response.header.responder_spi = responder_spi;
+        let result =
+            admit_ike_sa_init_response(&request, &response.as_borrowed(), DecodeContext::default());
+        assert!(
+            result.is_ok(),
+            "a correlated no-SA redirect tolerates either SPI form: {result:?}"
+        );
+        let result = result.unwrap();
+        assert!(matches!(result, Ikev2SaInitResponse::Redirect {
+            gateway: Gateway::Ipv4(address)
+        } if address == Ipv4Addr::new(192, 0, 2, 1)));
+        assert!(!matches!(result, Ikev2SaInitResponse::Accepted(_)));
+        assert_eq!(format!("{result:?}"), "Redirect(<redacted>)");
+    }
+}
+
+#[test]
+fn zero_spi_redirect_preserves_canonical_wire_and_non_sa_outcome() {
+    let request = request(true);
+    let expected = raw_response(&request);
+    let built =
+        build_ike_sa_init_notify_response(&request.message().header, &[redirect_notify()]).unwrap();
+    assert_eq!(built.header.responder_spi, 0);
+    assert_eq!(built.header, expected.header);
+    assert_eq!(built.raw_payloads, expected.raw_payloads);
+    let result =
+        admit_ike_sa_init_response(&request, &built.as_borrowed(), DecodeContext::default())
+            .unwrap();
+    assert!(matches!(result, Ikev2SaInitResponse::Redirect {
+        gateway: Gateway::Ipv4(address)
+    } if address == Ipv4Addr::new(192, 0, 2, 1)));
+    assert!(!matches!(result, Ikev2SaInitResponse::Accepted(_)));
+}

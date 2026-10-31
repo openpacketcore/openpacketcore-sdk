@@ -39,6 +39,34 @@ use crate::{
 ///
 /// No variant retains a nested decoder error, peer bytes, cryptographic input,
 /// SPI or algorithm identifier. `Display` is a stable machine-readable code.
+///
+/// External matches must retain a wildcard for future outcomes:
+/// ```compile_fail
+/// use opc_proto_ikev2::Ikev2SaInitInitiatorError as Error;
+/// fn exhaustive(value: Error) {
+///     match value {
+///         Error::InvalidInitiatorSpi => {},
+///         Error::InvalidOffer => {},
+///         Error::KeyExchangeNotOffered => {},
+///         Error::InvalidInitiatorNonce => {},
+///         Error::InvalidNotify => {},
+///         Error::Encoding => {},
+///         Error::InvalidResponseHeader => {},
+///         Error::InvalidResponderSpi => {},
+///         Error::InvalidResponsePayload => {},
+///         Error::UnexpectedPayload => {},
+///         Error::MissingPayload => {},
+///         Error::DuplicatePayload => {},
+///         Error::InvalidSelection => {},
+///         Error::KeyExchangeMismatch => {},
+///         Error::InvalidKeyExchange => {},
+///         Error::InvalidResponderNonce => {},
+///         Error::InvalidRetry => {},
+///         Error::InvalidRedirect => {},
+///         Error::UnsupportedNotification => {},
+///     }
+/// }
+/// ```
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Ikev2SaInitInitiatorError {
     /// The caller supplied the reserved zero initiator SPI.
@@ -238,6 +266,20 @@ impl fmt::Debug for Ikev2SaInitAccepted<'_> {
 /// Retry diagnostics expose no cookie or peer-selected values. Error replies
 /// accept either zero or non-zero SPIr, as required by RFC 7296 §2.6. A retry
 /// does not establish an SA, authenticate the peer or authorize a downgrade.
+///
+/// External matches must retain a wildcard for future outcomes:
+/// ```compile_fail
+/// use opc_proto_ikev2::Ikev2SaInitResponse as Response;
+/// fn exhaustive(value: Response<'_>) {
+///     match value {
+///         Response::Accepted(_) => {},
+///         Response::Cookie(_) => {},
+///         Response::InvalidKePayload { .. } => {},
+///         Response::NoProposalChosen => {},
+///         Response::Redirect { .. } => {},
+///     }
+/// }
+/// ```
 #[derive(Clone)]
 pub enum Ikev2SaInitResponse<'a> {
     /// One complete offered suite, KEr and Nr ready for key derivation.

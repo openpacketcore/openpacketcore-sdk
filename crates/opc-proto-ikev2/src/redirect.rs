@@ -123,6 +123,41 @@ impl fmt::Debug for Ikev2RedirectNotify<'_> {
 }
 
 /// A named, value-free redirect codec or support collection failure.
+///
+/// External matches must retain a wildcard for future outcomes:
+/// ```compile_fail
+/// use opc_proto_ikev2::Ikev2RedirectNotifyError as Error;
+/// fn exhaustive(value: Error) {
+///     match value {
+///         Error::WrongContext => {},
+///         Error::NonceRequired => {},
+///         Error::NonceLengthInvalid => {},
+///         Error::NonceProhibited => {},
+///         Error::GatewayHeaderTruncated => {},
+///         Error::GatewayIdentityTypeUnsupported => {},
+///         Error::GatewayIdentityEmpty => {},
+///         Error::GatewayIdentityTruncated => {},
+///         Error::Ipv4LengthInvalid => {},
+///         Error::Ipv6LengthInvalid => {},
+///         Error::FqdnNonAscii => {},
+///         Error::FqdnInvalidCharacter => {},
+///         Error::FqdnEmptyLabel => {},
+///         Error::FqdnLabelTooLong => {},
+///         Error::GatewayIdentityTooLong => {},
+///         Error::FqdnNameTooLong => {},
+///         Error::RedirectedFromRequiresIp => {},
+///         Error::UnexpectedTrailingData => {},
+///         Error::SupportedDataNonempty => {},
+///         Error::ProtocolIdNonzero => {},
+///         Error::SpiSizeNonzero => {},
+///         Error::SpiNonempty => {},
+///         Error::DuplicateSupported => {},
+///         Error::DuplicateRedirectedFrom => {},
+///         Error::TooManyNotifies => {},
+///         Error::Encoding => {},
+///     }
+/// }
+/// ```
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
 #[non_exhaustive]
 pub enum Ikev2RedirectNotifyError {

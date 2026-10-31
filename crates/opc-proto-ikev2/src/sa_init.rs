@@ -1093,6 +1093,32 @@ impl Error for Ikev2SaInitBuildError {}
 /// @spec IETF RFC7296 2.5, 2.6, 2.7, 2.21.1, 3.10.1
 /// @req REQ-IETF-RFC7296-SA-INIT-ERROR-NOTIFY-BUILD-ERROR-001
 /// @conformance boundary-only
+///
+/// External matches must retain a wildcard for future outcomes:
+/// ```compile_fail
+/// use opc_proto_ikev2::Ikev2SaInitNotifyBuildError as Error;
+/// fn exhaustive(value: Error) {
+///     match value {
+///         Error::NotIkeSaInit => {},
+///         Error::ResponseHeader => {},
+///         Error::InitiatorFlagNotSet => {},
+///         Error::InitiatorSpiZero => {},
+///         Error::MessageIdNonZero => {},
+///         Error::ResponderSpiNonZero => {},
+///         Error::MissingNotify => {},
+///         Error::MultipleNotifies => {},
+///         Error::UnsupportedNotifyType => {},
+///         Error::ProtocolIdNotZero => {},
+///         Error::SpiNotEmpty => {},
+///         Error::UnexpectedNotificationData => {},
+///         Error::UnsupportedCriticalPayloadDataLength => {},
+///         Error::InvalidKePayloadDataLength => {},
+///         Error::InvalidDhGroup => {},
+///         Error::InvalidRedirect => {},
+///         Error::LengthOverflow => {},
+///     }
+/// }
+/// ```
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Ikev2SaInitNotifyBuildError {
     /// Input header was not IKE_SA_INIT.
