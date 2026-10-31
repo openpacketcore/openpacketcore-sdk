@@ -681,6 +681,7 @@ fn cas_outcome_is_definitive(result: &Result<CompareAndSetResult, StoreError>) -
     !matches!(
         result,
         Err(StoreError::BackendUnavailable(_)
+            | StoreError::KeyProviderUnavailable(_)
             | StoreError::BackendOperationOutcomeUnavailable
             | StoreError::CasIdempotencyOutcomeUnavailable)
     )

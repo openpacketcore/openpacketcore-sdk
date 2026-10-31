@@ -21,10 +21,19 @@ pub const AES_256_GCM_SIV_NONCE_LEN: usize = 12;
 pub const AEAD_TAG_LEN: usize = 16;
 
 /// Serialized AEAD inputs returned to the envelope layer after encryption.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct EncryptedPayload {
     pub aad: Vec<u8>,
     pub ciphertext_and_tag: Vec<u8>,
+}
+
+impl fmt::Debug for EncryptedPayload {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("EncryptedPayload")
+            .field("aad", &"<redacted>")
+            .field("ciphertext_and_tag", &"<redacted>")
+            .finish()
+    }
 }
 
 /// Key-provider contract from RFC 003.

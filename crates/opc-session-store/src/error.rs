@@ -253,8 +253,9 @@ pub enum StoreError {
     /// Append-only to preserve every existing serialized discriminant.
     #[error("backend unavailable: protected fenced-transition V2 recovery journal unavailable")]
     FencedTransitionRecoveryJournalUnavailable,
-    /// Legacy retryable key-provider outage, retained for source and serialized
-    /// discriminant compatibility. Record encryption and decryption now return
+    /// Retryable key-provider outage with a fixed position in this error schema.
+    /// This variant was introduced in the current unreleased version.
+    /// Record encryption and decryption return
     /// [`StoreError::BackendUnavailable`] for provider outages so existing
     /// backend retry classifiers apply. Content-dependent failures remain
     /// collapsed into [`StoreError::Crypto`].

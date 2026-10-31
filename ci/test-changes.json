@@ -1599,6 +1599,13 @@
       "kind": "fixture-setup-changed",
       "reason": "Issue #1160 makes a wall-clock restore deadline retryable availability, while true fixed-work exhaustion remains terminal. Replace only the stale expected Err(RestoreScanWorkBudgetExceeded) in the wall-deadline branch with exact Err(BackendUnavailable(\"session restore scan deadline exceeded\")). Retain the original 100 ms absolute deadline, active-cancellation branch, detached-State assertion, worker-reservation retention and retirement checks, later authoritative read, barrier and shutdown. Fixed-work exhaustion expectations are unchanged.",
       "issue": 1160
+    },
+    {
+      "test": "rust:crates/opc-security-testkit::test=security_tests::test_kms_fault_responses_return_unavailable",
+      "kind": "removed",
+      "renamed_to": "rust:crates/opc-security-testkit::test=security_tests::test_kms_fault_responses_preserve_failure_class",
+      "reason": "Name the explicit classification contract: truncated transport remains Unavailable; oversized responses and malformed key hex are OperationFailed. All three original cases and exact equality assertions remain.",
+      "issue": 1197
     }
   ]
 }

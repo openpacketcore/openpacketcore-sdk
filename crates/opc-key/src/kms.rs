@@ -112,11 +112,58 @@ fn decode_hex_vec(hex: &str) -> Result<Vec<u8>, KeyError> {
     Ok(bytes)
 }
 
+fn unix_endpoint_path(endpoint: &str) -> Result<&str, KeyError> {
+    let path = endpoint.strip_prefix("unix://").unwrap_or(endpoint);
+    if !std::path::Path::new(path).is_absolute() {
+        return Err(KeyError::OperationFailed);
+    }
+    // Validate the platform's actual sun_path limit and reject interior NULs
+    // before attempting I/O. An endpoint has at most one scheme prefix.
+    std::os::unix::net::SocketAddr::from_pathname(path).map_err(|_| KeyError::OperationFailed)?;
+    Ok(path)
+}
+
+fn unix_connect_error(error: std::io::Error) -> KeyError {
+    match error.raw_os_error() {
+        // The service socket is absent or has no listener.
+        Some(libc::ENOENT | libc::ECONNREFUSED)
+        // A connection raced service shutdown or exceeded its transport wait.
+        | Some(libc::ECONNRESET | libc::ECONNABORTED | libc::ETIMEDOUT)
+        // Interrupted syscall or a full local socket backlog.
+        | Some(libc::EINTR | libc::EAGAIN)
+        // Temporary memory, buffer or process/system descriptor exhaustion.
+        | Some(libc::ENOMEM | libc::ENOBUFS | libc::EMFILE | libc::ENFILE) => {
+            KeyError::Unavailable
+        }
+        // Permissions, invalid path components, protocol mismatch and other
+        // local configuration failures must not consume a retry budget.
+        _ => KeyError::OperationFailed,
+    }
+}
+
+fn kms_transport_error(error: std::io::Error) -> KeyError {
+    // Rustls wraps certificate verification and fatal peer alerts in io::Error.
+    // TLS 1.3 can deliver a peer authentication refusal on application I/O after
+    // the client's connect future completes, so use this at every TLS I/O site.
+    if error
+        .get_ref()
+        .is_some_and(|cause| cause.is::<tokio_rustls::rustls::Error>())
+        || matches!(
+            error.kind(),
+            std::io::ErrorKind::InvalidData | std::io::ErrorKind::InvalidInput
+        )
+    {
+        KeyError::OperationFailed
+    } else {
+        KeyError::Unavailable
+    }
+}
+
 fn tcp_endpoint_addr(endpoint: &str) -> Result<&str, KeyError> {
     // Keep the address spelling accepted by the released adapters. In
     // particular, converting scoped IPv6 to an (Ipv6Addr, port) tuple would
     // discard its scope. Tokio parses a complete SocketAddr before resolving.
-    let addr = endpoint.trim_start_matches("tcp://");
+    let addr = endpoint.strip_prefix("tcp://").unwrap_or(endpoint);
     if addr.contains("://") {
         return Err(KeyError::OperationFailed);
     }
@@ -207,10 +254,10 @@ impl KmsKeyProvider {
     async fn call_kms_inner(&self, req: KmsRequest) -> Result<KmsResponse, KeyError> {
         let connect_fut = async {
             if self.endpoint.starts_with('/') || self.endpoint.starts_with("unix://") {
-                let path = self.endpoint.trim_start_matches("unix://");
+                let path = unix_endpoint_path(&self.endpoint)?;
                 let stream = tokio::net::UnixStream::connect(path)
                     .await
-                    .map_err(|_| KeyError::Unavailable)?;
+                    .map_err(unix_connect_error)?;
                 Ok::<KmsStream, KeyError>(KmsStream::Unix(stream))
             } else {
                 let addr = tcp_endpoint_addr(&self.endpoint)?;
@@ -223,31 +270,31 @@ impl KmsKeyProvider {
                 let tls_stream = connector
                     .connect(domain, stream)
                     .await
-                    .map_err(|_| KeyError::Unavailable)?;
+                    .map_err(kms_transport_error)?;
                 Ok(KmsStream::Tls(Box::new(tls_stream)))
             }
         };
 
         let mut stream = connect_fut.await?;
 
-        let req_bytes = serde_json::to_vec(&req).map_err(|_| KeyError::Unavailable)?;
+        let req_bytes = serde_json::to_vec(&req).map_err(|_| KeyError::OperationFailed)?;
         let req_len = req_bytes.len() as u32;
 
         stream
             .write_all(&req_len.to_be_bytes())
             .await
-            .map_err(|_| KeyError::Unavailable)?;
+            .map_err(kms_transport_error)?;
         stream
             .write_all(&req_bytes)
             .await
-            .map_err(|_| KeyError::Unavailable)?;
-        stream.flush().await.map_err(|_| KeyError::Unavailable)?;
+            .map_err(kms_transport_error)?;
+        stream.flush().await.map_err(kms_transport_error)?;
 
         let mut len_buf = [0u8; 4];
         stream
             .read_exact(&mut len_buf)
             .await
-            .map_err(|_| KeyError::Unavailable)?;
+            .map_err(kms_transport_error)?;
         let len = u32::from_be_bytes(len_buf) as usize;
         if len > Self::MAX_RESPONSE_BYTES {
             return Err(KeyError::OperationFailed);
@@ -257,12 +304,16 @@ impl KmsKeyProvider {
         stream
             .read_exact(&mut resp_buf)
             .await
-            .map_err(|_| KeyError::Unavailable)?;
+            .map_err(kms_transport_error)?;
         let resp: KmsResponse =
             serde_json::from_slice(&resp_buf).map_err(|_| KeyError::OperationFailed)?;
 
         if resp.status == "success" {
             Ok(resp)
+        } else if resp.status == "unavailable" {
+            // Only this protocol status signals temporary busy/throttling.
+            // Free-form provider messages never select a retryable class.
+            Err(KeyError::Unavailable)
         } else {
             let msg = resp
                 .error_message
@@ -410,10 +461,10 @@ impl KmsRemoteSealProvider {
     async fn call_kms_inner(&self, req: KmsRequest) -> Result<KmsResponse, KeyError> {
         let connect_fut = async {
             if self.endpoint.starts_with('/') || self.endpoint.starts_with("unix://") {
-                let path = self.endpoint.trim_start_matches("unix://");
+                let path = unix_endpoint_path(&self.endpoint)?;
                 let stream = tokio::net::UnixStream::connect(path)
                     .await
-                    .map_err(|_| KeyError::Unavailable)?;
+                    .map_err(unix_connect_error)?;
                 Ok::<KmsStream, KeyError>(KmsStream::Unix(stream))
             } else {
                 let addr = tcp_endpoint_addr(&self.endpoint)?;
@@ -426,31 +477,31 @@ impl KmsRemoteSealProvider {
                 let tls_stream = connector
                     .connect(domain, stream)
                     .await
-                    .map_err(|_| KeyError::Unavailable)?;
+                    .map_err(kms_transport_error)?;
                 Ok(KmsStream::Tls(Box::new(tls_stream)))
             }
         };
 
         let mut stream = connect_fut.await?;
 
-        let req_bytes = serde_json::to_vec(&req).map_err(|_| KeyError::Unavailable)?;
+        let req_bytes = serde_json::to_vec(&req).map_err(|_| KeyError::OperationFailed)?;
         let req_len = req_bytes.len() as u32;
 
         stream
             .write_all(&req_len.to_be_bytes())
             .await
-            .map_err(|_| KeyError::Unavailable)?;
+            .map_err(kms_transport_error)?;
         stream
             .write_all(&req_bytes)
             .await
-            .map_err(|_| KeyError::Unavailable)?;
-        stream.flush().await.map_err(|_| KeyError::Unavailable)?;
+            .map_err(kms_transport_error)?;
+        stream.flush().await.map_err(kms_transport_error)?;
 
         let mut len_buf = [0u8; 4];
         stream
             .read_exact(&mut len_buf)
             .await
-            .map_err(|_| KeyError::Unavailable)?;
+            .map_err(kms_transport_error)?;
         let len = u32::from_be_bytes(len_buf) as usize;
         if len > KmsKeyProvider::MAX_RESPONSE_BYTES {
             return Err(KeyError::OperationFailed);
@@ -460,12 +511,16 @@ impl KmsRemoteSealProvider {
         stream
             .read_exact(&mut resp_buf)
             .await
-            .map_err(|_| KeyError::Unavailable)?;
+            .map_err(kms_transport_error)?;
         let resp: KmsResponse =
             serde_json::from_slice(&resp_buf).map_err(|_| KeyError::OperationFailed)?;
 
         if resp.status == "success" {
             Ok(resp)
+        } else if resp.status == "unavailable" {
+            // Only this protocol status signals temporary busy/throttling.
+            // Free-form provider messages never select a retryable class.
+            Err(KeyError::Unavailable)
         } else {
             let msg = resp
                 .error_message
@@ -546,6 +601,45 @@ mod tests {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     static NEXT_SOCKET_ID: AtomicU64 = AtomicU64::new(0);
+
+    #[test]
+    fn kms_unix_connect_classification_preserves_outages_and_rejects_configuration() {
+        for errno in [
+            libc::ENOENT,
+            libc::ECONNREFUSED,
+            libc::ECONNRESET,
+            libc::ECONNABORTED,
+            libc::ETIMEDOUT,
+            libc::EINTR,
+            libc::EAGAIN,
+            libc::ENOMEM,
+            libc::ENOBUFS,
+            libc::EMFILE,
+            libc::ENFILE,
+        ] {
+            assert_eq!(
+                unix_connect_error(std::io::Error::from_raw_os_error(errno)),
+                KeyError::Unavailable,
+                "temporary service or resource failure: {errno}"
+            );
+        }
+        for errno in [
+            libc::EACCES,
+            libc::EPERM,
+            libc::EINVAL,
+            libc::ENOTDIR,
+            libc::ENAMETOOLONG,
+            libc::ELOOP,
+            libc::ENOTSOCK,
+            libc::EPROTOTYPE,
+        ] {
+            assert_eq!(
+                unix_connect_error(std::io::Error::from_raw_os_error(errno)),
+                KeyError::OperationFailed,
+                "invalid local configuration: {errno}"
+            );
+        }
+    }
 
     #[tokio::test]
     async fn kms_invalid_unix_paths_are_permanent_for_all_operations() {
@@ -1461,7 +1555,6 @@ mod tests {
         for (endpoint, expected) in [
             ("kms.example:443", "kms.example:443"),
             ("tcp://kms.example:443", "kms.example:443"),
-            ("tcp://tcp://kms.example:443", "kms.example:443"),
             ("tcp://kms.example:+443", "kms.example:+443"),
             ("tcp://127.0.0.1:0", "127.0.0.1:0"),
             ("tcp://127.0.0.1:65535", "127.0.0.1:65535"),
@@ -1473,6 +1566,8 @@ mod tests {
             assert_eq!(tcp_endpoint_addr(endpoint), Ok(expected), "{endpoint}");
         }
         for endpoint in [
+            // Only one scheme prefix is valid; repeated prefixes are configuration errors.
+            "tcp://tcp://kms.example:443",
             "tcp://kms.example:443/path",
             "tcp://kms.example/path:443",
             "tcp://user@kms.example:443",

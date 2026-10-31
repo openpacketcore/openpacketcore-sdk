@@ -536,17 +536,37 @@ error. The session-store envelope boundary preserves availability as
 `StoreError::BackendUnavailable` and collapses content-dependent failures into
 `StoreError::Crypto`.
 Malformed KMS responses, poisoned local provider state and local configuration
-errors (including invalid TCP endpoints, missing TLS connectors and invalid TLS
-server names) MUST remain permanent operation failures. Both JSON KMS adapters
-accept absolute Unix socket paths or `unix://<path>`, and bare `host:port` or
-`tcp://host:port` TCP endpoints, including IPv4 and bracketed IPv6 with numeric
-scopes such as `[fe80::1%2]:7443`. Released resolver forms, including
-unbracketed numeric IPv6 and `u16` ports with a leading `+`, remain accepted.
-Hosts containing NUL, control characters or whitespace are invalid. Resolution
-and connection failures MUST remain availability failures. Provider outages
-share the `backend_unavailable` metrics label with storage and quorum outages;
-the fixed session-key-provider message distinguishes their origin without
-disclosing provider details.
+errors (including invalid Unix/TCP endpoints, missing TLS connectors and invalid
+TLS server names) MUST remain permanent operation failures. TLS certificate and
+peer authentication rejection MUST also remain permanent, including alerts
+received after the client handshake completes. Both JSON KMS adapters accept
+absolute Unix socket paths with at most one optional `unix://` prefix. Empty or
+relative Unix paths, interior NULs, and paths exceeding the platform socket
+address limit MUST be rejected before connecting. TCP accepts bare `host:port`
+or one `tcp://` prefix, including IPv4 and bracketed IPv6 with numeric scopes
+such as `[fe80::1%2]:7443`. Released resolver forms, including unbracketed numeric
+IPv6 and `u16` ports with a leading `+`, remain accepted. Hosts containing NUL,
+control characters or whitespace are invalid. Unix permission, path-component
+and protocol errors are permanent; absent/refused services, connection loss,
+timeouts, interruption and temporary backlog/resource exhaustion remain
+availability failures. TCP resolution/connect failures and transport loss
+remain availability failures.
+
+The JSON KMS protocol reserves the exact case-sensitive response status
+`unavailable` for temporary service unavailability, including busy/throttled
+backpressure required by RFC 030. Both adapters MUST map
+`{"status":"unavailable"}` to `KeyError::Unavailable` for every operation.
+Optional `error_message` text MUST NOT select retryability or escape to callers.
+All other failure statuses remain permanent (`NotFound` for missing keys,
+otherwise `OperationFailed`); describing throttling in an `error` reply is not
+an availability signal. This classification adds no retry loop or budget and
+does not establish that a mutation was never performed.
+
+Provider outages share the `backend_unavailable` metrics label with storage
+and quorum outages. The fixed session-key-provider message distinguishes their
+origin only in local store errors. Session-net intentionally sends the generic
+`backend unavailable` message, preserving availability classification without
+exposing provider details.
 
 ### 9.4 Rotation
 

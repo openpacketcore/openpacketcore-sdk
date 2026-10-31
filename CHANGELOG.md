@@ -9,11 +9,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
-- `opc-key`, `opc-session-store`: distinguish authentication and completed KMS
-  rejections from retryable provider outages. Outages use the existing
-  `BackendUnavailable` contract with a constant redacted message; content
-  failures remain `Crypto`. Preserve the legacy provider error's serialized
-  position for compatibility. Refs #1197.
+- `opc-key`, `opc-session-store`: distinguish permanent authentication,
+  configuration and completed KMS rejections from retryable provider outages.
+  Validate Unix/TCP endpoints before connecting, reject TLS peer authentication
+  failures, and classify malformed/oversized responses, short seal output and
+  poisoned material state as permanent. The explicit KMS response status
+  `unavailable` preserves retryable busy/throttling backpressure. Store outages
+  use `BackendUnavailable`; permanent provider failures remain `Crypto`.
+  `EncryptedPayload` debug output redacts AAD and ciphertext. Refs #1197.
+- `opc-session-net`: treat `KeyProviderUnavailable` from a custom backend as a
+  non-definitive CAS outcome, preserving an ambiguity tombstone instead of
+  caching the outage as a completed result. Refs #1197.
 
 ### Added
 
@@ -762,12 +768,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   refresh. Downstream exhaustive matches must handle the new variants.
   Refs #1246.
 
-- `opc-session-store`: `StoreError::KeyProviderUnavailable` remains available
-  for source and serialized discriminant compatibility. Current record
-  sealing/unsealing reports provider outages as
-  `BackendUnavailable("session key provider unavailable")`; content-dependent
-  failures remain `Crypto`. Downstream exhaustive matches must still handle
-  the retained variant. Refs #1197.
+- `opc-key`: add fieldless `KeyError::OperationFailed` and
+  `KeyCustodyOperationError::ProviderOperationFailed` variants. Direct callers
+  must handle these in exhaustive matches. Completed KMS rejections,
+  malformed/oversized responses, invalid endpoint/TLS configuration and
+  authentication failures now return `OperationFailed` instead of `Unavailable`.
+  Missing keys remain `NotFound`; timeouts, transport loss and explicit
+  `status: "unavailable"` responses remain retryable. Refs #1197.
+- `opc-session-store`: the newly added, unreleased
+  `StoreError::KeyProviderUnavailable` variant keeps its assigned serialized
+  position. Record sealing/unsealing instead reports provider outages as
+  `BackendUnavailable("session key provider unavailable")`; permanent provider
+  failures remain `Crypto`. Downstream exhaustive matches must handle the
+  added variant; custom backends returning it receive non-definitive CAS
+  handling in `opc-session-net`. Refs #1197.
 - `opc-session-store` and `opc-session-net`: protected-roster activation now
   binds the admission capacity policy, and authenticated admissions distinguish
   ordinary and emergency work. Crossing this storage boundary requires a fresh

@@ -1815,7 +1815,9 @@ Unknown keys, authentication failures, malformed envelopes and other provider
 errors still return the same coarse `StoreError::Crypto` classification without
 exposing provider details or envelope contents.
 The shared `backend_unavailable` metrics label covers both provider and backend
-outages; the fixed error message distinguishes provider outages.
+outages. The fixed provider message distinguishes local store errors only;
+session-net sends the generic `backend unavailable` message while preserving
+availability classification.
 
 Both protection wrappers default to `EnvelopeReadPolicy::MigrationCompatible`,
 which retains intentional legacy/plaintext reads and unclassified-row probing.
