@@ -5,6 +5,8 @@
 
 use bytes::{BufMut, Bytes, BytesMut};
 
+/// Typed FQ-CSID values beside the generic IE framing layer.
+pub mod fq_csid;
 /// Typed S2b-oriented IE decoders and encoders.
 pub mod typed;
 use opc_protocol::{
@@ -12,6 +14,10 @@ use opc_protocol::{
 };
 
 use crate::decode_error::{Gtpv2cDecodeError, Gtpv2cOffendingIe};
+pub use fq_csid::{
+    FqCsid, FqCsidBuildError, FqCsidDecodeError, FqCsidMccMncNodeId, FqCsidNodeId, IE_TYPE_FQ_CSID,
+    MAX_FQ_CSID_COUNT,
+};
 pub use typed::{
     decode_typed_ie_sequence, encode_typed_ie_sequence, AccessPointName,
     AdditionalProtocolConfigurationOptions, AggregateMaximumBitRate, AllocationRetentionPriority,

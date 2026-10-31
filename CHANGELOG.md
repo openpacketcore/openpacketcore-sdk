@@ -9,6 +9,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `opc-proto-gtpv2c`: add typed FQ-CSID support with bounded validated value
+  construction, IPv4/IPv6 and binary MCC/MNC Node-ID forms, canonical encoding
+  through the raw IE layer, and value-free decode errors with request Cause
+  classification (TS 29.274 V19.6.0 clauses 8.62, 7.7.7 and 7.7.8).
+
 - `opc-proto-ikev2`: PKCS#1 v1.5 and PSS signing blind the RSA private operation
   with OS randomness; this hardening does not resolve RUSTSEC-2023-0071.
 

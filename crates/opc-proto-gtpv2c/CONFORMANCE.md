@@ -44,6 +44,45 @@ builders retain their stricter projection checks. `tests/s2b_receive_policy.rs`
 and `tests/dedicated_bearer.rs` cover wrong instances, discarded values,
 mandatory fields, framing, literal payloads and bearer correlation.
 
+## Typed FQ-CSID values
+
+`FqCsid` adds typed FQ-CSID (IE 132) support beside the generic IE layer, using
+TS 29.274 **V19.6.0**, clauses **8.62**, **7.7.7** and **7.7.8**. Decode an existing
+`RawIe` with `FqCsid::decode_from_raw`; unrelated IE types return `Ok(None)`.
+The generic decoder remains responsible for TLIV framing and instance selection.
+
+`FqCsid::new` bounds storage to 0–15 unsigned 16-bit CSIDs. Node-ID forms are
+IPv4, IPv6, or the four-octet binary MCC/MNC-plus-operator-ID form. Numeric MCC
+and MNC each fit three decimal digits, and the operator ID fits twelve bits;
+this is not PLMN TBCD encoding and carries no separate MNC digit-count flag.
+Use `to_raw_ie(instance)` with a four-bit instance, then the existing raw IE
+encoder. Canonical output has zero header spare bits and no unknown extensions.
+
+Receive ignores header spare bits and unknown trailing octets of this extendable
+IE, while requiring the complete Node-ID and every declared CSID. Reserved
+Node-ID Types 3–15 are invalid values, not spare bits. Errors contain no received
+values: missing/truncated known fields classify as Invalid Length (67), and a
+reserved type or invalid binary MCC/MNC classifies as Mandatory IE Incorrect (69)
+when the IE is mandatory or verifiably conditional in an applicable Request.
+`mandatory_request_cause` supplies that classification only; it does not plan or
+send a response. Optional-IE discard, erroneous Response notification and Echo
+special handling remain with the enclosing procedure.
+
+Clause 8.62 permits counts other than one only in Delete PDN Connection Set
+Requests. Procedure presence/count rules remain caller-owned, as do suitable
+global-unicast address selection, allocation and Node-ID/CSID uniqueness.
+Address fields are fixed-width wire representations, not a network allocation
+or reachability check. No new message procedure or transport is added.
+
+The specification is available from the
+[official TS 29.274 V19.6.0 publication](https://www.etsi.org/deliver/etsi_ts/129200_129299/129274/19.06.00_60/ts_129274v190600p.pdf).
+
+Evidence is specification-authored: `tests/fq_csid.rs` covers independent exact
+vectors for all three forms, both empty/reserved malformed examples, each known
+prefix truncation, count/numeric boundaries, every spare nibble, raw/generic IE
+boundaries, maximum-length extension input, and deterministic randomized value
+layouts and round trips. It makes no independent-peer interoperability claim.
+
 ## N1-mode APCO value boundary
 
 `src/n1_mode.rs` implements the ordinary APCO value format from TS 24.008
