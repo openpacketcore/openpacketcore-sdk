@@ -198,7 +198,7 @@ fn recognized_notifies_require_their_exchange_direction() {
 
 #[test]
 fn malformed_gateway_headers_lengths_and_types_are_named() {
-    for (data, expected) in [
+    let cases: Vec<(Vec<u8>, Error)> = vec![
         (vec![], Error::GatewayHeaderTruncated),
         (vec![1], Error::GatewayHeaderTruncated),
         (
@@ -217,7 +217,8 @@ fn malformed_gateway_headers_lengths_and_types_are_named() {
             vec![2, 15, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
             Error::Ipv6LengthInvalid,
         ),
-    ] {
+    ];
+    for (data, expected) in cases {
         let view = Ikev2NotifyPayload {
             notification_data: &data,
             ..generic(IPV4)
@@ -423,7 +424,10 @@ fn generic_ike_auth_chain_has_exact_rfc_notify_payload_framing() {
     }])
     .unwrap();
     assert_eq!(first, PayloadType::Notify);
-    assert_eq!(chain, [0, 0, 0, 14, 0, 0, 0x40, 0x17, 1, 4, 192, 0, 2, 1]);
+    assert_eq!(
+        chain.as_ref(),
+        [0, 0, 0, 14, 0, 0, 0x40, 0x17, 1, 4, 192, 0, 2, 1]
+    );
     let decoded = decode_ike_auth_cleartext_payloads(first, &chain).unwrap();
     assert_eq!(decoded.notifies.len(), 1);
     assert_eq!(
