@@ -125,6 +125,13 @@ non-canonical, or context-mismatched output fails with a fieldless stable code.
 
 ## Status Notes
 
+- Both JSON KMS adapters accept absolute Unix socket paths or `unix://<path>`.
+  TCP endpoints accept bare `host:port` or an optional `tcp://` prefix, including
+  IPv4 and bracketed IPv6 with numeric scopes such as `[fe80::1%2]:7443`.
+  Released resolver forms, including unbracketed numeric IPv6 and `+` ports
+  that parse as `u16`, remain supported. Invalid endpoints, including hosts
+  containing NUL, control characters or whitespace, fail permanently as
+  `OperationFailed`; resolution and connection failures remain `Unavailable`.
 - Key material is zeroized on drop.
 - `MemoryKeyProvider` is suitable for tests and fixtures, not production key
   custody.
@@ -134,7 +141,9 @@ non-canonical, or context-mismatched output fails with a fieldless stable code.
   in-memory remote adapter reports AEAD rejection as fieldless `OperationFailed`.
   Both JSON KMS adapters preserve `NotFound` for missing keys and report other
   completed failure responses as `OperationFailed`; transport loss and timeout
-  remain `Unavailable`. Rejected ciphertext or revoked keys must not be
+  remain `Unavailable`. Malformed KMS responses and poisoned remote-material
+  state also return the redacted, permanent `OperationFailed` classification.
+  Rejected ciphertext or revoked keys must not be
   mistaken for a provider outage, and provider-native details remain redacted.
 - Existing `KeyProvider`, `KeyHandle`, `KmsRemoteSealProvider`,
   `MemoryRemoteSealProvider`, and custom `RemoteSealProvider` implementations

@@ -535,6 +535,18 @@ failure. Such failures remain redacted as `NotFound` or a coarse operation
 error. The session-store envelope boundary preserves availability as
 `StoreError::BackendUnavailable` and collapses content-dependent failures into
 `StoreError::Crypto`.
+Malformed KMS responses, poisoned local provider state and local configuration
+errors (including invalid TCP endpoints, missing TLS connectors and invalid TLS
+server names) MUST remain permanent operation failures. Both JSON KMS adapters
+accept absolute Unix socket paths or `unix://<path>`, and bare `host:port` or
+`tcp://host:port` TCP endpoints, including IPv4 and bracketed IPv6 with numeric
+scopes such as `[fe80::1%2]:7443`. Released resolver forms, including
+unbracketed numeric IPv6 and `u16` ports with a leading `+`, remain accepted.
+Hosts containing NUL, control characters or whitespace are invalid. Resolution
+and connection failures MUST remain availability failures. Provider outages
+share the `backend_unavailable` metrics label with storage and quorum outages;
+the fixed session-key-provider message distinguishes their origin without
+disclosing provider details.
 
 ### 9.4 Rotation
 

@@ -91,7 +91,7 @@ impl RemoteSealMaterialController {
         &self,
         active_key_id: KeyId,
     ) -> Result<RemoteSealMaterialEpoch, KeyError> {
-        let mut state = self.inner.lock().map_err(|_| KeyError::Unavailable)?;
+        let mut state = self.inner.lock().map_err(|_| KeyError::OperationFailed)?;
         if state.active_key_id == active_key_id {
             return Ok(state.epoch);
         }
@@ -110,14 +110,14 @@ impl RemoteSealMaterialController {
         self.inner
             .lock()
             .map(|state| state.epoch)
-            .map_err(|_| KeyError::Unavailable)
+            .map_err(|_| KeyError::OperationFailed)
     }
 
     pub(crate) fn active_selection(&self) -> Result<(RemoteSealMaterialEpoch, KeyId), KeyError> {
         self.inner
             .lock()
             .map(|state| (state.epoch, state.active_key_id.clone()))
-            .map_err(|_| KeyError::Unavailable)
+            .map_err(|_| KeyError::OperationFailed)
     }
 }
 

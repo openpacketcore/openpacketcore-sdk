@@ -1814,6 +1814,8 @@ can retry within their existing request budget when the provider recovers.
 Unknown keys, authentication failures, malformed envelopes and other provider
 errors still return the same coarse `StoreError::Crypto` classification without
 exposing provider details or envelope contents.
+The shared `backend_unavailable` metrics label covers both provider and backend
+outages; the fixed error message distinguishes provider outages.
 
 Both protection wrappers default to `EnvelopeReadPolicy::MigrationCompatible`,
 which retains intentional legacy/plaintext reads and unclassified-row probing.
