@@ -26,8 +26,10 @@ this is not PLMN TBCD encoding and carries no separate MNC digit-count flag.
 Use `to_raw_ie(instance)` with a four-bit instance, then the existing raw IE
 encoder. Canonical output has zero header spare bits and no unknown extensions.
 
-Receive ignores header spare bits and unknown trailing octets of this extendable
-IE, while requiring the complete Node-ID and every declared CSID. Reserved
+The value decoder does not evaluate the header spare nibble; Strict and
+ProcedureAware framing rejects nonzero header spares before this decoder.
+It ignores unknown trailing octets of this extendable IE while requiring the
+complete Node-ID and every declared CSID. Reserved
 Node-ID Types 3–15 are invalid values, not spare bits. Errors contain no received
 values: missing/truncated known fields classify as Invalid Length (67), and a
 reserved type or invalid binary MCC/MNC classifies as Mandatory IE Incorrect (69)

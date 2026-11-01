@@ -36,7 +36,7 @@ fn encode(value: &FqCsid, instance: u8) -> Vec<u8> {
 }
 
 #[test]
-fn supplied_malformations_have_named_value_free_errors_and_request_causes() {
+fn empty_and_reserved_values_have_named_value_free_errors_and_request_causes() {
     for (wire, error, cause) in [
         (
             &[132, 0, 0, 2][..],

@@ -58,8 +58,10 @@ this is not PLMN TBCD encoding and carries no separate MNC digit-count flag.
 Use `to_raw_ie(instance)` with a four-bit instance, then the existing raw IE
 encoder. Canonical output has zero header spare bits and no unknown extensions.
 
-Receive ignores header spare bits and unknown trailing octets of this extendable
-IE, while requiring the complete Node-ID and every declared CSID. Reserved
+The value decoder does not evaluate the header spare nibble; Strict and
+ProcedureAware framing rejects nonzero header spares before this decoder.
+It ignores unknown trailing octets of this extendable IE while requiring the
+complete Node-ID and every declared CSID. Reserved
 Node-ID Types 3–15 are invalid values, not spare bits. Errors contain no received
 values: missing/truncated known fields classify as Invalid Length (67), and a
 reserved type or invalid binary MCC/MNC classifies as Mandatory IE Incorrect (69)
@@ -78,7 +80,7 @@ The specification is available from the
 [official TS 29.274 V19.6.0 publication](https://www.etsi.org/deliver/etsi_ts/129200_129299/129274/19.06.00_60/ts_129274v190600p.pdf).
 
 Evidence is specification-authored: `tests/fq_csid.rs` covers independent exact
-vectors for all three forms, both empty/reserved malformed examples, each known
+vectors for all three forms, empty values and reserved Node-ID types, each known
 prefix truncation, count/numeric boundaries, every spare nibble, raw/generic IE
 boundaries, maximum-length extension input, and deterministic randomized value
 layouts and round trips. It makes no independent-peer interoperability claim.

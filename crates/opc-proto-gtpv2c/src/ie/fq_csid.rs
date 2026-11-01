@@ -7,8 +7,13 @@
 //! suitability and Node-ID/CSID uniqueness are also the creating node's duties.
 //!
 //! Unknown trailing octets are ignored for this extendable IE (clause 7.7.7).
-//! Header spare bits are ignored on receive (clause 7.7.8); canonical output
-//! carries zero spares. Keep the original raw IE for byte-exact forwarding.
+//! This decoder does not evaluate the header spare nibble (clause 7.7.8).
+//! Generic Strict and ProcedureAware framing rejects nonzero header spares
+//! before this value decoder. Canonical output carries zero spares; retain the
+//! original raw IE for byte-exact forwarding.
+//!
+//! @spec 3GPP TS29274 V19.6.0 8.62, 7.7.7, 7.7.8
+//! @req REQ-3GPP-TS29274-R19-FQ-CSID-001
 //!
 //! ```
 //! use opc_proto_gtpv2c::{FqCsid, FqCsidNodeId};
@@ -257,7 +262,9 @@ impl FqCsid {
     /// Decode a value whose TLIV framing was handled by the generic IE layer.
     ///
     /// Unrelated IE types return `Ok(None)` without interpreting their values.
-    /// FQ-CSID header spare bits and unknown extension octets are ignored.
+    /// Unknown extension octets are ignored. This decoder does not evaluate
+    /// the header spare nibble; generic Strict and ProcedureAware framing
+    /// rejects nonzero header spares before this value decoder.
     ///
     /// # Errors
     /// Returns value-free errors for truncated known fields, a reserved Node-ID
