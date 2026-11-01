@@ -808,15 +808,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `PersistFailed`; startup rollback preserves the original store error. Missing
   or revoked active keys on new writes return `Unavailable`, without claiming
   stored data damage. Coarse state-machine, recovery and startup task failures
-  use `ConfigApplyFailed`. Alarm severity and recovery fencing remain intact.
+  use `ConfigApplyFailed`. Runtime append, reconciliation and recovery-marker
+  cleanup retain the source store code. Rejected stored JSON and metadata retain
+  `Crypto`; missing startup rollback parents retain Critical severity with
+  `ConfigApplyFailed`. Alarm severity and recovery fencing remain intact.
   Refs #1197.
 - `opc-persist`: checkpoint reopen/read-back provider failures change from
   `Rejected` to `Unavailable`, preserving the checkpoint. Sealing and provisioning
   also report repairable provider faults. Provisioning after storage preparation
-  retains its existing `Indeterminate` outcome. Refs #1197.
+  retains its existing `Indeterminate` outcome. Config-history reads distinguish
+  rejected bytes (including SQLite corruption) from read outages at the storage
+  boundary, preserving the first read failure across transaction completion.
+  Local invariants and write failures do not establish stored-data corruption.
+  Refs #1197.
 - `opc-key-vault`: configuration/authentication, malformed-response and TLS
   verification failures use `ProviderUnusable` and avoid transient retries.
-  Truncated response bodies retain outage retries; rotation preserves
+  Truncated response bodies retain outage retries except after successful
+  rotation responses: a truncated 2xx body is reported without replaying the
+  already-applied rotation POST. Rotation preserves
   `Unavailable` versus `ProviderUnusable` instead of returning `RotationFailed`.
   Outages, throttling and peer TLS internal errors remain `Unavailable`.
   HTTP error messages cannot establish key or ciphertext rejection. Refs #1197.

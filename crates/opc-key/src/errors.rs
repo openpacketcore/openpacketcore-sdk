@@ -104,6 +104,10 @@ impl KeyError {
     /// rejected ciphertext. Only this predicate authorizes a provider error to
     /// cross a terminal data-rejection boundary. All other errors retain data.
     ///
+    /// A successful key lookup is outside this error predicate: consumers must
+    /// still reject a returned handle that contradicts the stored binding, as
+    /// documented by `opc_crypto::CryptoError::is_definitive_rejection`.
+    ///
     /// Both matches are exhaustive inside the defining crate: adding a key or
     /// custody variant requires an explicit classification here. Custody health,
     /// admission, identity and output-contract failures are never data verdicts.

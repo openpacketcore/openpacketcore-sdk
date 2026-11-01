@@ -274,11 +274,14 @@ async fn rejected_stored_scalar_shapes_keep_corruption_alarm() {
         let persistence = backend(&path).await;
         seed(&persistence).await;
         let conn = rusqlite::Connection::open(&path).unwrap();
-        conn.execute_batch("PRAGMA ignore_check_constraints=ON").unwrap();
+        conn.execute_batch("PRAGMA ignore_check_constraints=ON")
+            .unwrap();
         conn.execute_batch(sql).unwrap();
         let adapter = PersistManagedDatastore::<TestConfig, _>::new(Arc::new(persistence));
         observed.push(adapter.load_latest().await.err().unwrap().code);
-        let count: i64 = conn.query_row("SELECT COUNT(*) FROM config_history", [], |row| row.get(0)).unwrap();
+        let count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM config_history", [], |row| row.get(0))
+            .unwrap();
         assert_eq!(count, 1);
     }
     assert_eq!(observed, vec![StoreErrorCode::Crypto; 3]);

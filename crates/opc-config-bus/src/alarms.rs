@@ -255,6 +255,49 @@ mod provider_failure_tests {
     use super::*;
 
     #[test]
+    fn all_store_codes_preserve_alarm_evidence_and_severity() {
+        for code in [
+            StoreErrorCode::Crypto,
+            StoreErrorCode::RestoreSchemaMismatch,
+            StoreErrorCode::InvalidHistorySequence,
+        ] {
+            assert_eq!(store_failure_cause(code), ProbableCause::StorageCorruption);
+            assert_eq!(
+                startup_error_alarm_spec(code),
+                (Severity::Critical, ProbableCause::StorageCorruption)
+            );
+        }
+        for code in [
+            StoreErrorCode::Unavailable,
+            StoreErrorCode::Internal,
+            StoreErrorCode::OutcomeUnknown,
+            StoreErrorCode::RestoreRecoveryRequired,
+            StoreErrorCode::RestoreConfirmedDeadline,
+            StoreErrorCode::StartupValidationTaskFailed,
+        ] {
+            assert_eq!(store_failure_cause(code), ProbableCause::ConfigApplyFailed);
+            assert_eq!(
+                startup_error_alarm_spec(code),
+                (Severity::Critical, ProbableCause::ConfigApplyFailed)
+            );
+        }
+        for code in [
+            StoreErrorCode::NotFound,
+            StoreErrorCode::StartupSyntaxValidationFailed,
+            StoreErrorCode::StartupSemanticValidationFailed,
+            StoreErrorCode::HistoryPageTooLarge,
+            StoreErrorCode::HistoryCompacted,
+            StoreErrorCode::HistoryCursorAhead,
+        ] {
+            assert_eq!(store_failure_cause(code), ProbableCause::ConfigApplyFailed);
+            assert_eq!(
+                startup_error_alarm_spec(code),
+                (Severity::Major, ProbableCause::ConfigApplyFailed)
+            );
+        }
+    }
+
+    #[test]
     fn provider_configuration_startup_backpressure_is_not_storage_corruption() {
         assert_eq!(
             startup_error_alarm_spec(StoreErrorCode::Unavailable),

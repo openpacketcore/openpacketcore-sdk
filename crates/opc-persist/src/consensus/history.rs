@@ -149,12 +149,18 @@ fn corrupt() -> io::Error {
     )
 }
 
-fn database_error(_: rusqlite::Error) -> io::Error {
-    io::Error::other("config history storage unavailable")
+fn database_error(error: rusqlite::Error) -> io::Error {
+    crate::error::sqlite_read_io_error(error)
 }
 
-fn persist_error(_: io::Error) -> PersistError {
-    PersistError::corrupt_blob()
+fn persist_error(error: io::Error) -> PersistError {
+    crate::error::history_read_error(error)
+}
+
+fn write_error(_: rusqlite::Error) -> io::Error {
+    io::Error::other(PersistError::inconsistent_state(
+        "config history write failed",
+    ))
 }
 
 fn history_mac(key: &AuditKey, bytes: &[u8]) -> io::Result<Hmac<Sha256>> {
@@ -328,15 +334,21 @@ pub(crate) fn validate_record_chain_sync(
 }
 
 fn save_state(conn: &Connection, key: &AuditKey, state: &HistoryState) -> io::Result<()> {
-    let encoded = serde_json::to_vec(state).map_err(|_| corrupt())?;
+    let encoded = serde_json::to_vec(state).map_err(|_| {
+        io::Error::other(PersistError::inconsistent_state(
+            "config history encoding failed",
+        ))
+    })?;
     if encoded.len() > STATE_MAX_BYTES {
-        return Err(corrupt());
+        return Err(io::Error::other(PersistError::inconsistent_state(
+            "config history encoding exceeds bound",
+        )));
     }
     let tag = history_mac(key, &encoded)?.finalize().into_bytes();
     conn.execute(
         "INSERT INTO config_raft_history_retention (singleton, state_json, state_hmac) VALUES (1, ?1, ?2) ON CONFLICT(singleton) DO UPDATE SET state_json = excluded.state_json, state_hmac = excluded.state_hmac",
         params![encoded, tag.as_slice()],
-    ).map_err(database_error)?;
+    ).map_err(write_error)?;
     Ok(())
 }
 
@@ -748,11 +760,11 @@ pub(crate) fn retain_sync(
             "UPDATE config_history SET parent_tx_id = NULL WHERE tx_id = ?1",
             [&first_tx],
         )
-        .map_err(database_error)?;
-        conn.execute("DELETE FROM audit_trail WHERE tx_id IN (SELECT tx_id FROM config_history WHERE version < ?1)", [from]).map_err(database_error)?;
-        conn.execute("DELETE FROM config_lifecycle_audit WHERE tx_id IN (SELECT tx_id FROM config_history WHERE version < ?1)", [from]).map_err(database_error)?;
+        .map_err(write_error)?;
+        conn.execute("DELETE FROM audit_trail WHERE tx_id IN (SELECT tx_id FROM config_history WHERE version < ?1)", [from]).map_err(write_error)?;
+        conn.execute("DELETE FROM config_lifecycle_audit WHERE tx_id IN (SELECT tx_id FROM config_history WHERE version < ?1)", [from]).map_err(write_error)?;
         conn.execute("DELETE FROM config_history WHERE version < ?1", [from])
-            .map_err(database_error)?;
+            .map_err(write_error)?;
         state.record_chain = record_chain_sync(conn, cancellation)?;
     }
     state.records = record_count(conn)?;

@@ -1503,7 +1503,7 @@ fn config_schema_manifest(
 ) -> io::Result<Vec<(String, String, String, String)>> {
     let mut statement = conn
         .prepare(&format!("{CONFIG_SCHEMA_OBJECTS} ORDER BY type, name"))
-        .map_err(db_error)?;
+        .map_err(crate::error::sqlite_read_io_error)?;
     let rows = statement
         .query_map([], |row| {
             Ok((
@@ -1513,11 +1513,11 @@ fn config_schema_manifest(
                 row.get::<_, String>(3)?,
             ))
         })
-        .map_err(db_error)?;
+        .map_err(crate::error::sqlite_read_io_error)?;
     let mut manifest = Vec::new();
     for row in rows {
         cancellation.check_io()?;
-        manifest.push(row.map_err(db_error)?);
+        manifest.push(row.map_err(crate::error::sqlite_read_io_error)?);
     }
     Ok(manifest)
 }
@@ -1527,10 +1527,10 @@ fn config_schema_manifest_digest(
     cancellation: &SqliteWorkCancellation,
 ) -> io::Result<[u8; 32]> {
     cancellation.check_io()?;
-    let expected = Connection::open_in_memory().map_err(db_error)?;
+    let expected = Connection::open_in_memory().map_err(crate::error::sqlite_reference_io_error)?;
     expected
         .execute_batch(CONFIG_RAFT_SCHEMA)
-        .map_err(db_error)?;
+        .map_err(crate::error::sqlite_reference_io_error)?;
     let expected_manifest = config_schema_manifest(&expected, cancellation)?;
     let live_count: i64 = conn
         .query_row(
@@ -1538,7 +1538,7 @@ fn config_schema_manifest_digest(
             [],
             |row| row.get(0),
         )
-        .map_err(db_error)?;
+        .map_err(crate::error::sqlite_read_io_error)?;
     if usize::try_from(live_count).ok() != Some(expected_manifest.len()) {
         return Err(invalid_data(
             "config consensus owned schema manifest does not match",
@@ -1554,7 +1554,7 @@ fn config_schema_manifest_digest(
             "SELECT EXISTS(SELECT 1 FROM main.sqlite_schema WHERE type = ?1 AND name = ?2 AND tbl_name = ?3 AND sql = ?4)",
             params![kind, name, table, sql],
             |row| row.get(0),
-        ).map_err(db_error)?;
+        ).map_err(crate::error::sqlite_read_io_error)?;
         if !matches {
             return Err(invalid_data(
                 "config consensus owned schema manifest does not match",
@@ -1582,12 +1582,16 @@ pub(super) fn validate_live_history_schema_sync(
     let unexpected: bool = conn.query_row(
         "SELECT EXISTS(SELECT 1 FROM main.sqlite_schema WHERE type = 'trigger') OR EXISTS(SELECT 1 FROM sqlite_temp_schema)",
         [], |row| row.get(0),
-    ).map_err(db_error)?;
+    ).map_err(crate::error::sqlite_read_io_error)?;
     if unexpected {
         return Err(invalid_data("config history schema is not admitted"));
     }
-    crate::schema::validate_retained_base_schema(conn)
-        .map_err(|_| invalid_data("config history base schema does not match"))?;
+    crate::schema::validate_retained_base_schema(conn).map_err(|error| match error {
+        // The schema validator uses InvalidQuery solely for a compared
+        // catalog mismatch. Allocation and I/O failures are not evidence.
+        rusqlite::Error::InvalidQuery => invalid_data("config history base schema does not match"),
+        error => crate::error::sqlite_read_io_error(error),
+    })?;
     config_schema_manifest_digest(conn, cancellation)?;
     cancellation.check_io()
 }

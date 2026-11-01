@@ -127,7 +127,7 @@ pub(crate) fn validate_uuid_bytes(name: &str, bytes: &[u8]) -> Result<(), Persis
 }
 
 /// Deserialize a CommitSource from a DB-stored lowercase string.
-/// Returns `PersistError::inconsistent_state()` if the value is unrecognized.
+/// Returns `PersistError::corrupt_blob()` if the stored value is unrecognized.
 pub(crate) fn deserialize_commit_source(source: &str) -> Result<CommitSource, PersistError> {
     match source {
         "gnmi" => Ok(CommitSource::Gnmi),
@@ -136,9 +136,7 @@ pub(crate) fn deserialize_commit_source(source: &str) -> Result<CommitSource, Pe
         "startup_restore" => Ok(CommitSource::StartupRestore),
         "rollback" => Ok(CommitSource::Rollback),
         "commit_confirmed_restore" => Ok(CommitSource::CommitConfirmedRestore),
-        _ => Err(PersistError::inconsistent_state(
-            "unrecognized CommitSource in config_history",
-        )),
+        _ => Err(PersistError::corrupt_blob()),
     }
 }
 

@@ -1170,12 +1170,12 @@ fn copy_for_validation(
 
 // Preserve provider failures before the checkpoint's data-rejection boundary.
 fn checkpoint_encrypt_error(error: opc_crypto::CryptoError) -> ConsumerCheckpointError {
-    match error {
-        opc_crypto::CryptoError::ProviderUnavailable => {}
-        opc_crypto::CryptoError::ProviderUnusable | opc_crypto::CryptoError::KeyRejected => {
+    match error.encryption_failure_kind() {
+        opc_crypto::EncryptionFailureKind::ProviderUnavailable => {}
+        opc_crypto::EncryptionFailureKind::ProviderUnusable => {
             tracing::warn!("checkpoint key provider configuration unavailable; retain checkpoint and back off until provider repair");
         }
-        _ => {
+        opc_crypto::EncryptionFailureKind::Local => {
             tracing::warn!("checkpoint local encryption failed; retain checkpoint and investigate before retrying");
         }
     }
@@ -1188,10 +1188,6 @@ fn checkpoint_decrypt_error(error: opc_crypto::CryptoError) -> ConsumerCheckpoin
     }
     match error {
         opc_crypto::CryptoError::ProviderUnavailable => ConsumerCheckpointError::Unavailable,
-        opc_crypto::CryptoError::EncryptionFailed => {
-            tracing::warn!("checkpoint local encryption failed; retain checkpoint and investigate before retrying");
-            ConsumerCheckpointError::Unavailable
-        }
         _ => {
             tracing::warn!("checkpoint key provider configuration unavailable; retain checkpoint and back off until provider repair");
             ConsumerCheckpointError::Unavailable

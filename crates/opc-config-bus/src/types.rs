@@ -726,9 +726,9 @@ impl<C: OpcConfig> SealedConfig<C> {
     ) -> Result<opc_crypto::AuthenticatedEnvelopeClaim, StoreError> {
         self.fresh_envelope
             .as_ref()
-            .ok_or_else(|| StoreError::crypto("config envelope lacks fresh encryption evidence"))?
+            .ok_or_else(|| StoreError::internal("config envelope lacks fresh encryption evidence"))?
             .claim()
-            .map_err(|_| StoreError::crypto("config envelope evidence was already consumed"))
+            .map_err(|_| StoreError::internal("config envelope evidence was already consumed"))
     }
 
     /// Wraps an unencrypted payload from a record written before envelope

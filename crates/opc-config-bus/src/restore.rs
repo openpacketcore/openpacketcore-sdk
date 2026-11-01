@@ -17,8 +17,8 @@ use crate::authorizer::{AllowAllAuthorizer, ConfigAuthorizer};
 use crate::commit::{ConfigBus, DEFAULT_COMMIT_QUEUE_CAPACITY};
 use crate::datastore::{CommittedRevisionSource, ManagedDatastore};
 use crate::types::{
-    AuthorityMode, CommitWrite, ConfirmedCommitResolution, StoreError, StoredConfig,
-    StoredRequestMode,
+    AuthorityMode, CommitWrite, ConfirmedCommitResolution, StoreError, StoreErrorCode,
+    StoredConfig, StoredRequestMode,
 };
 
 pub(crate) const RESTORE_SCHEMA_MISMATCH_MESSAGE: &str =
@@ -588,7 +588,15 @@ impl<C: OpcConfig> ConfigBus<C> {
                                     "failed to load previous confirmed config during startup rollback",
                                     &err,
                                 );
-                                preserve_startup_error(&alarm_manager, StoreError::new(err.code, "stored running config requires commit-confirmed recovery"))
+                                let code = if err.code == StoreErrorCode::NotFound {
+                                    StoreErrorCode::RestoreConfirmedDeadline
+                                } else {
+                                    err.code
+                                };
+                                preserve_startup_error(
+                                    &alarm_manager,
+                                    StoreError::new(code, RESTORE_CONFIRMED_DEADLINE_MESSAGE),
+                                )
                             })?;
                         validate_publishable_stored_config(&prev_stored)
                             .map_err(|err| preserve_startup_error(&alarm_manager, err))?;

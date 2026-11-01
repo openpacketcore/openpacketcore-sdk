@@ -428,6 +428,15 @@ impl VaultKeyProvider {
         path: &str,
         body: &B,
     ) -> Result<T, KeyError> {
+        self.post_with_body_retry(path, body, true).await
+    }
+
+    async fn post_with_body_retry<B: Serialize, T: for<'de> Deserialize<'de>>(
+        &self,
+        path: &str,
+        body: &B,
+        retry_body_loss: bool,
+    ) -> Result<T, KeyError> {
         self.refresh_token_if_due().await?;
 
         let mut retried_auth = false;
@@ -435,6 +444,11 @@ impl VaultKeyProvider {
         loop {
             let token = self.current_token().await;
             let result = match self.send_post_with_token(path, body, &token).await {
+                // A successful rotation status acknowledges an applied mutation.
+                // Failure to read its body must not replay that POST.
+                Ok(resp) if !retry_body_loss => {
+                    return decode_response(resp).await.map_err(Into::into)
+                }
                 Ok(resp) => decode_response(resp).await,
                 Err(error) => Err(error),
             };
@@ -645,9 +659,10 @@ impl KeyProvider for VaultKeyProvider {
         // Rotate the wrapping key in Transit, then mint a fresh data key under
         // the new version so callers receive a post-rotation active key id.
         let _: serde_json::Value = self
-            .post(
+            .post_with_body_retry(
                 &format!("v1/{}/keys/{}/rotate", self.mount_path, key_name),
                 &RotateRequest {},
+                false,
             )
             .await?;
 

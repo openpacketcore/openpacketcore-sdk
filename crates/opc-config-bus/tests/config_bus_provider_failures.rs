@@ -23,7 +23,15 @@ impl FaultStore {
 #[async_trait]
 impl ManagedDatastore<TestConfig> for FaultStore {
     async fn load_latest(&self) -> Result<Option<StoredConfig<TestConfig>>, StoreError> {
+        self.fail("latest")?;
+        if self.stage == "pending-latest" && self.inner.history().await.len() >= 2 {
+            return Err(StoreError::new(self.code, "storage operation failed"));
+        }
         self.inner.load_latest().await
+    }
+    async fn load_committed_latest(&self) -> Result<Option<StoredConfig<TestConfig>>, StoreError> {
+        self.fail("committed")?;
+        self.inner.load_committed_latest().await
     }
     async fn load_rollback(
         &self,
@@ -55,6 +63,9 @@ impl ManagedDatastore<TestConfig> for FaultStore {
             return Err(StoreError::internal("append rejected"));
         }
         self.fail("append")?;
+        if self.stage == "pending-append" && self.inner.history().await.len() == 2 {
+            return Err(StoreError::new(self.code, "storage operation failed"));
+        }
         self.inner.append_commit_write(write).await
     }
     async fn clear_recovery_required(&self, tx: TxId) -> Result<(), StoreError> {
@@ -374,5 +385,174 @@ async fn expiry_marker_clear_preserves_storage_failure_alarm() {
             .await
             .unwrap_err();
         assert_eq!(fenced.code, CommitErrorCode::RecoveryRequired);
+    }
+}
+
+impl opc_config_bus::CommittedRevisionSource<TestConfig> for FaultStore {}
+
+#[tokio::test]
+async fn startup_latest_and_shadow_reads_preserve_failure_alarm() {
+    for stage in ["latest", "committed"] {
+        for code in [StoreErrorCode::Unavailable, StoreErrorCode::Crypto] {
+            let store = Arc::new(FaultStore {
+                inner: MockManagedDatastore::new(),
+                stage,
+                code,
+            });
+            let result = if stage == "latest" {
+                ConfigBus::restore_or_new_dev_only(TestConfig::new("fallback"), store.clone()).await
+            } else {
+                ConfigBus::restore_shadow(store.clone()).await
+            };
+            let error = match result {
+                Ok(_) => panic!("failed reads must fence startup"),
+                Err(error) => error,
+            };
+            assert_eq!(error.code, code);
+            let alarms = error.alarm_manager().unwrap().active_alarms();
+            assert_eq!(alarms.len(), 1);
+            assert_eq!(alarms[0].severity, Severity::Critical);
+            assert_eq!(
+                alarms[0].probable_cause,
+                if code == StoreErrorCode::Crypto {
+                    ProbableCause::StorageCorruption
+                } else {
+                    ProbableCause::ConfigApplyFailed
+                }
+            );
+            assert!(store.inner.history().await.is_empty());
+        }
+    }
+}
+
+async fn pending_fault_bus(
+    stage: &'static str,
+    code: StoreErrorCode,
+    expiry: bool,
+) -> (ConfigBus<TestConfig>, Arc<FaultStore>) {
+    let store = Arc::new(FaultStore {
+        inner: MockManagedDatastore::new(),
+        stage,
+        code,
+    });
+    store
+        .inner
+        .seed(StoredConfig::new(
+            TxId::new(),
+            ConfigVersion::new(1),
+            principal(),
+            RequestSource::Northbound,
+            TestConfig::new("initial"),
+        ))
+        .await;
+    let bus = ConfigBus::restore_or_new_dev_only(TestConfig::new("fallback"), store.clone())
+        .await
+        .unwrap();
+    bus.submit(
+        CommitRequest::new(
+            RequestId::new(),
+            principal(),
+            TransportType::Internal,
+            RequestSource::Northbound,
+            ConfigOperation::Replace,
+            CommitMode::CommitConfirmed {
+                timeout: if expiry {
+                    Duration::from_millis(50)
+                } else {
+                    Duration::from_secs(60)
+                },
+            },
+            Instant::now() + Duration::from_secs(2),
+            Some(TestConfig::new("tentative")),
+            vec![changed_path()],
+        )
+        .with_base_version(bus.version()),
+    )
+    .await
+    .unwrap();
+    (bus, store)
+}
+
+#[tokio::test]
+async fn cancel_confirmed_reads_and_append_preserve_failure_alarm() {
+    for stage in ["pending-latest", "rollback", "pending-append"] {
+        for code in [StoreErrorCode::Unavailable, StoreErrorCode::Crypto] {
+            let (bus, store) = pending_fault_bus(stage, code, false).await;
+            let error = bus
+                .submit(
+                    CommitRequest::new(
+                        RequestId::new(),
+                        principal(),
+                        TransportType::Internal,
+                        RequestSource::Northbound,
+                        ConfigOperation::Replace,
+                        CommitMode::CancelConfirmed,
+                        Instant::now() + Duration::from_secs(2),
+                        None,
+                        vec![changed_path()],
+                    )
+                    .with_base_version(bus.version()),
+                )
+                .await
+                .unwrap_err();
+            assert!(matches!(
+                error.code,
+                CommitErrorCode::RollbackUnavailable
+                    | CommitErrorCode::PersistFailed
+                    | CommitErrorCode::StateMachineFault
+            ));
+            assert_eq!(bus.load().name, "tentative");
+            assert_eq!(store.inner.history().await.len(), 2);
+            let alarms = bus.alarm_manager().active_alarms();
+            assert_eq!(alarms.len(), 1);
+            assert_eq!(alarms[0].severity, Severity::Major);
+            assert_eq!(
+                alarms[0].probable_cause,
+                if code == StoreErrorCode::Crypto {
+                    ProbableCause::StorageCorruption
+                } else {
+                    ProbableCause::ConfigApplyFailed
+                }
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn expiry_latest_parent_and_append_preserve_failure_alarm() {
+    for stage in ["pending-latest", "rollback", "pending-append"] {
+        for code in [StoreErrorCode::Unavailable, StoreErrorCode::Crypto] {
+            let (bus, store) = pending_fault_bus(stage, code, true).await;
+            tokio::time::timeout(Duration::from_secs(2), async {
+                while bus.alarm_manager().active_alarms().is_empty() {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .unwrap();
+            assert_eq!(bus.load().name, "tentative");
+            assert_eq!(store.inner.history().await.len(), 2);
+            let alarms = bus.alarm_manager().active_alarms();
+            assert_eq!(alarms.len(), 1);
+            assert_eq!(alarms[0].severity, Severity::Major);
+            assert_eq!(
+                alarms[0].probable_cause,
+                if code == StoreErrorCode::Crypto {
+                    ProbableCause::StorageCorruption
+                } else {
+                    ProbableCause::ConfigApplyFailed
+                }
+            );
+            assert_eq!(
+                bus.submit(
+                    commit_request("later", Instant::now() + Duration::from_secs(2))
+                        .with_base_version(bus.version())
+                )
+                .await
+                .unwrap_err()
+                .code,
+                CommitErrorCode::RecoveryRequired
+            );
+        }
     }
 }

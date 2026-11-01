@@ -715,10 +715,12 @@ async fn worker_loop<C: OpcConfig>(
 
                 if result.is_ok() {
                     if let Some(reason) = recovery.reason() {
-                        raise_commit_error(
-                            &alarm_manager,
-                            &CommitError::recovery_required(reason),
-                        );
+                        let error = CommitError::recovery_required(reason);
+                        if let Some(store_code) = store_failure {
+                            raise_commit_store_error(&alarm_manager, &error, store_code);
+                        } else {
+                            raise_commit_error(&alarm_manager, &error);
+                        }
                     } else {
                         apply_commit_alarm_outcome(&alarm_manager, &result);
                     }
@@ -875,13 +877,14 @@ async fn worker_loop<C: OpcConfig>(
                     }
                     Ok(marker_clear_error) => {
                         crate::metrics::record_rollback_success();
-                        if marker_clear_error.is_some() {
+                        if let Some(error) = marker_clear_error {
                             recovery.fence(RECOVERY_RECONCILIATION_FAILED_MESSAGE);
-                            raise_commit_error(
+                            raise_commit_store_error(
                                 &alarm_manager,
                                 &CommitError::recovery_required(
                                     RECOVERY_RECONCILIATION_FAILED_MESSAGE,
                                 ),
+                                error.code,
                             );
                         }
                     }
@@ -1232,6 +1235,7 @@ async fn process_commit<C: OpcConfig>(
                 }
                 Ok(Err(err)) => {
                     log_store_error("append_commit failed", request.request_id, &err);
+                    *store_failure = Some(err.code);
                     if err.code == StoreErrorCode::OutcomeUnknown {
                         recovery.fence(OUTCOME_UNKNOWN_MESSAGE);
                         return Err(CommitError::outcome_unknown(OUTCOME_UNKNOWN_MESSAGE));
@@ -1257,6 +1261,7 @@ async fn process_commit<C: OpcConfig>(
                         }
                         Ok(None) => {}
                         Err(lookup_error) => {
+                            *store_failure = Some(lookup_error.code);
                             log_store_error(
                                 "post-append reconciliation lookup failed",
                                 request.request_id,
@@ -1290,6 +1295,7 @@ async fn process_commit<C: OpcConfig>(
                 Ok(Ok(())) => {}
                 Ok(Err(err)) => {
                     log_store_error("clear_recovery_required failed", request.request_id, &err);
+                    *store_failure = Some(err.code);
                     recovery.fence(RECOVERY_RECONCILIATION_FAILED_MESSAGE);
                 }
                 Err(panic_payload) => {

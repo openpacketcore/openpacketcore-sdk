@@ -520,7 +520,7 @@ where
             plaintext.as_slice().strip_prefix(CONFIG_PLAINTEXT_V2_MAGIC)
         {
             let plaintext: ConfigPlaintextV2<C> = serde_json::from_slice(encoded)
-                .map_err(|_| StoreError::internal(CONFIG_ENVELOPE_SERIALIZATION_FAILED_MESSAGE))?;
+                .map_err(|_| StoreError::crypto(CONFIG_ENVELOPE_SERIALIZATION_FAILED_MESSAGE))?;
             verify_replay_lookup_binding(
                 record.idempotency_key.as_ref(),
                 plaintext.idempotency_key.as_ref(),
@@ -541,7 +541,7 @@ where
             // the serialized config. The binary magic above cannot prefix a
             // valid JSON value, making this compatibility path unambiguous.
             let config: C = serde_json::from_slice(plaintext.as_slice())
-                .map_err(|_| StoreError::internal(CONFIG_ENVELOPE_SERIALIZATION_FAILED_MESSAGE))?;
+                .map_err(|_| StoreError::crypto(CONFIG_ENVELOPE_SERIALIZATION_FAILED_MESSAGE))?;
             (config, None)
         };
         if config.schema_digest() != record.schema_digest {
@@ -1231,19 +1231,19 @@ pub type MockManagedDatastore<C> = InMemoryManagedDatastore<C>;
 
 // Sealing a new write cannot establish damage to existing stored bytes.
 fn config_encrypt_error(error: opc_crypto::CryptoError) -> StoreError {
-    match error {
-        opc_crypto::CryptoError::ProviderUnavailable => {
+    match error.encryption_failure_kind() {
+        opc_crypto::EncryptionFailureKind::ProviderUnavailable => {
             StoreError::unavailable("config key provider unavailable")
         }
-        opc_crypto::CryptoError::ProviderUnusable | opc_crypto::CryptoError::KeyRejected => {
+        opc_crypto::EncryptionFailureKind::ProviderUnusable => {
             tracing::warn!("config key provider configuration unavailable; retain records and back off until provider repair");
             StoreError::unavailable("config key provider configuration unavailable")
         }
-        _ => {
+        opc_crypto::EncryptionFailureKind::Local => {
             tracing::warn!(
                 "config local encryption failed; retain records and investigate before retrying"
             );
-            StoreError::unavailable(CONFIG_ENVELOPE_ENCRYPT_FAILED_MESSAGE)
+            StoreError::internal(CONFIG_ENVELOPE_ENCRYPT_FAILED_MESSAGE)
         }
     }
 }
@@ -1256,12 +1256,6 @@ fn config_provider_error(error: opc_crypto::CryptoError, rejected: &'static str)
         opc_crypto::CryptoError::ProviderUnavailable => {
             StoreError::unavailable("config key provider unavailable")
         }
-        opc_crypto::CryptoError::EncryptionFailed => {
-            tracing::warn!(
-                "config local encryption failed; retain records and investigate before retrying"
-            );
-            StoreError::unavailable(CONFIG_ENVELOPE_ENCRYPT_FAILED_MESSAGE)
-        }
         _ => {
             tracing::warn!("config key provider configuration unavailable; retain records and back off until provider repair");
             StoreError::unavailable("config key provider configuration unavailable")
@@ -1271,12 +1265,6 @@ fn config_provider_error(error: opc_crypto::CryptoError, rejected: &'static str)
 
 #[cfg(test)]
 mod provider_failure_tests {
-    #[test]
-    fn local_encryption_failure_does_not_claim_corrupt_stored_data() {
-        let error =
-            super::config_provider_error(opc_crypto::CryptoError::EncryptionFailed, "rejected");
-        assert_eq!(error.code, crate::StoreErrorCode::Unavailable);
-    }
     use std::sync::{Arc, Mutex};
     #[derive(Clone, Default)]
     struct CapturedDiagnostics(Arc<Mutex<Vec<String>>>);
@@ -1310,24 +1298,23 @@ mod provider_failure_tests {
     }
 
     #[test]
-    fn local_config_crypto_failure_diagnostic_does_not_blame_provider() {
-        let capture = CapturedDiagnostics::default();
-        let error = tracing::subscriber::with_default(capture.clone(), || {
-            super::config_provider_error(opc_crypto::CryptoError::EncryptionFailed, "rejected")
-        });
-        assert_eq!(error.code, crate::StoreErrorCode::Unavailable);
-        let reports = capture.0.lock().unwrap().join("\n");
-        assert!(
-            reports.contains("config local encryption failed"),
-            "{reports}"
-        );
-        assert!(!reports.contains("provider repair"), "{reports}");
-    }
-    #[test]
     fn local_config_encryption_fault_is_internal() {
-        for failure in [opc_crypto::CryptoError::EncryptionFailed, opc_crypto::CryptoError::InvalidEnvelope, opc_crypto::CryptoError::DecryptionFailed] {
-            assert_eq!(super::config_encrypt_error(failure).code, crate::StoreErrorCode::Internal);
+        for failure in [
+            opc_crypto::CryptoError::EncryptionFailed,
+            opc_crypto::CryptoError::InvalidEnvelope,
+            opc_crypto::CryptoError::DecryptionFailed,
+        ] {
+            let capture = CapturedDiagnostics::default();
+            let error = tracing::subscriber::with_default(capture.clone(), || {
+                super::config_encrypt_error(failure)
+            });
+            assert_eq!(error.code, crate::StoreErrorCode::Internal);
+            let reports = capture.0.lock().unwrap().join("\n");
+            assert!(
+                reports.contains("config local encryption failed"),
+                "{reports}"
+            );
+            assert!(!reports.contains("provider repair"), "{reports}");
         }
     }
-
 }

@@ -348,7 +348,32 @@ pub enum CryptoError {
     ProviderUnusable,
 }
 
+/// Origin of a failed encryption of new data. None establishes corruption of
+/// stored data. This closed set keeps write-side consumers exhaustive even
+/// though [`CryptoError`] can acquire new variants.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EncryptionFailureKind {
+    /// A local encryption or envelope-construction invariant failed.
+    Local,
+    /// The key provider could not serve the request.
+    ProviderUnavailable,
+    /// Provider configuration or key selection needs repair.
+    ProviderUnusable,
+}
+
 impl CryptoError {
+    /// Classify an error from encrypting a new value, before any stored-data
+    /// rejection boundary. New error variants must choose their origin here.
+    pub const fn encryption_failure_kind(&self) -> EncryptionFailureKind {
+        match self {
+            Self::EncryptionFailed | Self::InvalidEnvelope | Self::DecryptionFailed => {
+                EncryptionFailureKind::Local
+            }
+            Self::ProviderUnavailable => EncryptionFailureKind::ProviderUnavailable,
+            Self::ProviderUnusable | Self::KeyRejected => EncryptionFailureKind::ProviderUnusable,
+        }
+    }
+
     /// Positive evidence against the envelope or its key. Other failures must
     /// retain stored data; an encryption failure alone is not such evidence.
     /// A successful provider handle whose tenant, purpose or key ID contradicts
@@ -502,8 +527,8 @@ pub async fn decrypt_envelope<P: KeyProvider + ?Sized>(
         CryptoEnvelopeV1::decode(envelope_bytes).map_err(|_| CryptoError::DecryptionFailed)?;
     // The header and its stored AAD must agree before an unavailable or
     // differently configured provider can obscure positive local damage.
-    let bound = opc_key::serialize_bound_aad(expected_aad, &envelope.key_id)
-        .map_err(|_| CryptoError::DecryptionFailed)?;
+    let bound =
+        opc_key::serialize_bound_aad(expected_aad, &envelope.key_id).map_err(provider_error)?;
     if bound != envelope.aad {
         return Err(CryptoError::DecryptionFailed);
     }
