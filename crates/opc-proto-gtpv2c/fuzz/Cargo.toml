@@ -39,3 +39,8 @@ test = false
 name = "error_response_plans"
 path = "fuzz_targets/error_response_plans.rs"
 test = false
+
+[[bin]]
+name = "fq_csid"
+path = "fuzz_targets/fq_csid.rs"
+test = false
