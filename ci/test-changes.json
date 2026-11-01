@@ -618,7 +618,7 @@
     {
       "test": "rust:crates/opc-gtpu-dataplane::test=ebpf_gtpu_privileged::ebpf_gtpu_downlink_oversized_dont_fragment_is_fragmented_inside_the_tunnel",
       "kind": "assertions-decreased",
-      "reason": "Restore main\u2019s successful live default-limit update instead of the erroneous InvalidLimits expectation. The static count loses unwrap_err(), while assert_eq!(setter_result, Ok(())) and all packet, rate-limit, ESP, silence and deadline assertions remain. The per-destination lifetime test independently enforces RFC 6864 section 4.3 across replacements, and the native scenario passes with the restored contract.",
+      "reason": "Restore main’s successful live default-limit update instead of the erroneous InvalidLimits expectation. The static count loses unwrap_err(), while assert_eq!(setter_result, Ok(())) and all packet, rate-limit, ESP, silence and deadline assertions remain. The per-destination lifetime test independently enforces RFC 6864 section 4.3 across replacements, and the native scenario passes with the restored contract.",
       "issue": 1018,
       "replacements": [
         "rust:crates/opc-gtpu-dataplane::lib=lib::reassembly::tests::rate_budget_retention_preserves_lifetime_bound_across_limit_replacement"
@@ -1622,24 +1622,6 @@
       "replacements": [
         "rust:crates/opc-crypto::lib=lib::tests::damaged_key_binding_is_rejected_before_provider_lookup",
         "rust:crates/opc-crypto::lib=lib::tests::decrypt_rejects_wrong_key_aad_corrupt_tag_and_unknown_key_id_with_redacted_errors"
-      ]
-    },
-    {
-      "test": "rust:crates/opc-config-bus::lib=lib::datastore::provider_failure_tests::local_encryption_failure_does_not_claim_corrupt_stored_data",
-      "kind": "removed",
-      "reason": "Exercise the live config_encrypt_error mapper instead of the unreachable decrypt-provider EncryptionFailed arm. The replacement checks all three local encryption failures, Internal classification and local diagnostic text without provider-repair wording in one capture test; no sibling shares that tracing callsite.",
-      "issue": 1197,
-      "replacements": [
-        "rust:crates/opc-config-bus::lib=lib::datastore::provider_failure_tests::local_config_encryption_fault_is_internal"
-      ]
-    },
-    {
-      "test": "rust:crates/opc-config-bus::lib=lib::datastore::provider_failure_tests::local_config_crypto_failure_diagnostic_does_not_blame_provider",
-      "kind": "removed",
-      "reason": "Exercise the live config_encrypt_error mapper instead of the unreachable decrypt-provider EncryptionFailed arm. The replacement checks all three local encryption failures, Internal classification and local diagnostic text without provider-repair wording in one capture test; no sibling shares that tracing callsite.",
-      "issue": 1197,
-      "replacements": [
-        "rust:crates/opc-config-bus::lib=lib::datastore::provider_failure_tests::local_config_encryption_fault_is_internal"
       ]
     }
   ]
