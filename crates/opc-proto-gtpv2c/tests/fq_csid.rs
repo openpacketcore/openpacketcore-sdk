@@ -325,3 +325,83 @@ fn maximum_tlv_extension_keeps_typed_storage_bounded() {
     assert_eq!(value.csids(), &[0x1234]);
     assert_eq!(raw(&wire).value.len(), usize::from(u16::MAX));
 }
+
+#[test]
+fn ipv6_and_decimal_node_debug_redact_every_identity_and_csid() {
+    let decimal = FqCsidMccMncNodeId::new(310, 260, 0xabc).unwrap();
+    assert_eq!(format!("{decimal:?}"), "FqCsidMccMncNodeId(<redacted>)");
+    for (wire, kind) in [(IPV6, 1), (MCC_MNC, 2)] {
+        let value = typed(wire);
+        assert_eq!(
+            format!("{:?}", value.node_id()),
+            format!("FqCsidNodeId {{ type: {kind}, .. }}")
+        );
+        assert_eq!(
+            format!("{value:?}"),
+            format!(
+                "FqCsid {{ node_id: FqCsidNodeId {{ type: {kind}, .. }}, csid_count: {}, .. }}",
+                value.csids().len()
+            )
+        );
+    }
+}
+
+#[test]
+fn decode_and_build_errors_keep_exact_distinct_value_free_labels() {
+    let decode = [
+        (
+            FqCsidDecodeError::MissingTypeAndCount,
+            "gtpv2c_fq_csid_missing_type_and_count",
+        ),
+        (
+            FqCsidDecodeError::TruncatedNodeId,
+            "gtpv2c_fq_csid_truncated_node_id",
+        ),
+        (
+            FqCsidDecodeError::TruncatedCsids,
+            "gtpv2c_fq_csid_truncated_csids",
+        ),
+        (
+            FqCsidDecodeError::ReservedNodeIdType,
+            "gtpv2c_fq_csid_reserved_node_id_type",
+        ),
+        (
+            FqCsidDecodeError::InvalidMccMnc,
+            "gtpv2c_fq_csid_invalid_mcc_mnc",
+        ),
+    ];
+    let build = [
+        (
+            FqCsidBuildError::TooManyCsids,
+            "gtpv2c_fq_csid_too_many_csids",
+        ),
+        (FqCsidBuildError::InvalidMcc, "gtpv2c_fq_csid_invalid_mcc"),
+        (FqCsidBuildError::InvalidMnc, "gtpv2c_fq_csid_invalid_mnc"),
+        (
+            FqCsidBuildError::InvalidOperatorId,
+            "gtpv2c_fq_csid_invalid_operator_id",
+        ),
+        (
+            FqCsidBuildError::InvalidInstance,
+            "gtpv2c_fq_csid_invalid_instance",
+        ),
+    ];
+    let mut labels = std::collections::BTreeSet::new();
+    for (error, label) in decode {
+        assert_eq!(error.as_str(), label);
+        assert_eq!(error.to_string(), label);
+        assert!(
+            labels.insert(label),
+            "each decode error has a distinct label"
+        );
+    }
+    for (error, label) in build {
+        assert_eq!(error.as_str(), label);
+        assert_eq!(error.to_string(), label);
+        assert!(
+            labels.insert(label),
+            "each build error has a distinct label"
+        );
+    }
+    assert_eq!(labels.len(), 10);
+}
