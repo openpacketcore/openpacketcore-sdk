@@ -575,6 +575,7 @@ async fn provider_errors_preserve_only_safe_public_classifications() {
         .await
         .expect_err("contextual provider errors must collapse");
     assert_eq!(error, KeyError::ProviderUnusable);
+    assert_eq!(error.to_string(), "key provider unusable as configured");
     assert!(!format!("{error:?} {error}").contains(KEY_MATERIAL_CANARY));
 
     module.set_mode(ProviderMode::Valid);
