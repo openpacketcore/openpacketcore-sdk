@@ -162,7 +162,7 @@ async fn kms_permission_configuration_during_recovery_deletes_and_releases_nothi
         NEXT.fetch_add(1, Ordering::Relaxed)
     ));
     let listener = std::os::unix::net::UnixListener::bind(&path).unwrap();
-    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0)).unwrap();
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o000)).unwrap();
     let denied = std::os::unix::net::UnixStream::connect(&path).unwrap_err();
     assert_eq!(denied.kind(), std::io::ErrorKind::PermissionDenied);
     let provider = KmsKeyProvider::new(path.display().to_string(), None, Duration::from_secs(2));
