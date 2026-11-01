@@ -775,7 +775,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `opc-key`: add fieldless `KeyError::OperationFailed` and `ProviderUnusable`,
   and the exhaustive positive-verdict predicate. Only `NotFound` and actual
   key revocation/ciphertext rejection are definitive; every custody state and
-  unknown failure retains data. Custody preserves positive verdicts distinctly.
+  unknown failure retains data. Custody now preserves positive `OperationFailed`
+  distinctly, and generic provider failures change from
+  `CustodyOperation(ProviderOperationFailed)` to `ProviderUnusable`. The SDK no
+  longer produces `ProviderOperationFailed` while converting provider errors.
   JSON KMS `status: "error"` now requires exact `reason: "key_not_found"`,
   `"key_revoked"`, or `"ciphertext_rejected"` (decrypt only) for a verdict.
   Neither an `error` without a recognized reason nor any free-form `not found`
@@ -801,13 +804,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `ConfigWatchError::Integrity`. Unavailable dependencies and coarse failed or
   unresolved commits use `ConfigApplyFailed` alarms; rollback retains a
   `StorageCorruption` cause only when the original store error supplies positive
-  data evidence. Alarm severity and recovery fencing remain intact. Refs #1197.
+  data evidence. Idempotency and retained-history unavailability return
+  `PersistFailed`; startup rollback preserves the original store error. Missing
+  or revoked active keys on new writes return `Unavailable`, without claiming
+  stored data damage. Coarse state-machine, recovery and startup task failures
+  use `ConfigApplyFailed`. Alarm severity and recovery fencing remain intact.
+  Refs #1197.
 - `opc-persist`: checkpoint reopen/read-back provider failures change from
   `Rejected` to `Unavailable`, preserving the checkpoint. Sealing and provisioning
   also report repairable provider faults. Provisioning after storage preparation
   retains its existing `Indeterminate` outcome. Refs #1197.
 - `opc-key-vault`: configuration/authentication, malformed-response and TLS
   verification failures use `ProviderUnusable` and avoid transient retries.
+  Truncated response bodies retain outage retries; rotation preserves
+  `Unavailable` versus `ProviderUnusable` instead of returning `RotationFailed`.
   Outages, throttling and peer TLS internal errors remain `Unavailable`.
   HTTP error messages cannot establish key or ciphertext rejection. Refs #1197.
 - `opc-session-store` and `opc-session-net`: protected-roster activation now

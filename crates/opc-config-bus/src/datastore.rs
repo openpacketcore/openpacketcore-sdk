@@ -486,9 +486,7 @@ where
         let envelope =
             encrypt_attested_envelope(self.provider.as_ref(), &aad, plaintext.as_slice())
                 .await
-                .map_err(|error| {
-                    config_provider_error(error, CONFIG_ENVELOPE_ENCRYPT_FAILED_MESSAGE)
-                })?;
+                .map_err(config_encrypt_error)?;
         record.encrypted_blob = envelope.encoded().to_vec();
         Ok(record.with_config(SealedConfig::newly_encrypted(schema_digest, envelope)))
     }
@@ -718,6 +716,10 @@ fn build_config_envelope_aad<C: OpcConfig>(
     store_kind: &str,
     persisted_principal: Option<&str>,
 ) -> Result<EnvelopeAad, StoreError> {
+    // Store kind is local configuration, not authenticated record evidence.
+    if store_kind.trim().is_empty() {
+        return Err(StoreError::unavailable(CONFIG_ENVELOPE_AAD_FAILED_MESSAGE));
+    }
     let principal = match persisted_principal {
         Some(principal) => principal.to_owned(),
         None => serde_json::to_string(&record.principal)
@@ -1227,6 +1229,25 @@ impl<C: OpcConfig> ManagedDatastore<C> for InMemoryManagedDatastore<C> {
 /// [`InMemoryManagedDatastore`] so runtime composition does not imply a mock.
 pub type MockManagedDatastore<C> = InMemoryManagedDatastore<C>;
 
+// Sealing a new write cannot establish damage to existing stored bytes.
+fn config_encrypt_error(error: opc_crypto::CryptoError) -> StoreError {
+    match error {
+        opc_crypto::CryptoError::ProviderUnavailable => {
+            StoreError::unavailable("config key provider unavailable")
+        }
+        opc_crypto::CryptoError::ProviderUnusable | opc_crypto::CryptoError::KeyRejected => {
+            tracing::warn!("config key provider configuration unavailable; retain records and back off until provider repair");
+            StoreError::unavailable("config key provider configuration unavailable")
+        }
+        _ => {
+            tracing::warn!(
+                "config local encryption failed; retain records and investigate before retrying"
+            );
+            StoreError::unavailable(CONFIG_ENVELOPE_ENCRYPT_FAILED_MESSAGE)
+        }
+    }
+}
+
 fn config_provider_error(error: opc_crypto::CryptoError, rejected: &'static str) -> StoreError {
     if error.is_definitive_rejection() {
         return StoreError::crypto(rejected);
@@ -1234,6 +1255,12 @@ fn config_provider_error(error: opc_crypto::CryptoError, rejected: &'static str)
     match error {
         opc_crypto::CryptoError::ProviderUnavailable => {
             StoreError::unavailable("config key provider unavailable")
+        }
+        opc_crypto::CryptoError::EncryptionFailed => {
+            tracing::warn!(
+                "config local encryption failed; retain records and investigate before retrying"
+            );
+            StoreError::unavailable(CONFIG_ENVELOPE_ENCRYPT_FAILED_MESSAGE)
         }
         _ => {
             tracing::warn!("config key provider configuration unavailable; retain records and back off until provider repair");

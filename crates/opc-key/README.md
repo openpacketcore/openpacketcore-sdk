@@ -154,6 +154,7 @@ non-canonical, or context-mismatched output fails with a fieldless stable code.
   classification, record deletion, SA teardown, plaintext/packet release or a
   final cached mutation result. No adapter adds retries or extends caller
   budgets; a channel failure does not prove a mutation was never performed.
+
 Only positive evidence about a key or ciphertext permits terminal rejection.
 Use `KeyError::is_definitive_rejection()`: it is true only for a positively
 missing key (`NotFound`) or actual key revocation/ciphertext rejection

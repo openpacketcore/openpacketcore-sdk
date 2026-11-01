@@ -69,8 +69,9 @@ pub enum StoreErrorCode {
     /// Store invariant violation or serialization failure (duplicate tx id or
     /// version, envelope encode failure); not retryable without intervention.
     Internal,
-    /// AEAD encryption/decryption or plaintext-digest verification failed;
-    /// the record is treated as tampered and the operation fails closed.
+    /// Stored envelope decryption, binding or plaintext-digest verification
+    /// failed; the record is rejected. Failure to encrypt a new write is
+    /// `Unavailable`, not evidence against existing stored data.
     Crypto,
     /// The stored schema digest does not match the digest recomputed from the
     /// decoded payload; the record is refused for publication.

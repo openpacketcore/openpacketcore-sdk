@@ -1606,6 +1606,13 @@
       "renamed_to": "rust:crates/opc-security-testkit::test=security_tests::test_kms_fault_responses_preserve_failure_class",
       "reason": "Name the explicit classification contract: truncated transport remains Unavailable; oversized responses and malformed key hex require provider repair (ProviderUnusable). All three original cases and exact equality assertions remain.",
       "issue": 1197
+    },
+    {
+      "test": "rust:crates/opc-key-vault::test=integration_tests::rotate_key_failure_maps_to_rotation_failed",
+      "kind": "removed",
+      "renamed_to": "rust:crates/opc-key-vault::test=integration_tests::rotate_key_failure_preserves_outage",
+      "reason": "Rotation preserves the provider outage class instead of collapsing it to RotationFailed. The HTTP 500 failure and exact error assertion remain, with separate authentication and retry-count controls.",
+      "issue": 1197
     }
   ]
 }

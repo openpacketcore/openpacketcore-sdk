@@ -137,7 +137,8 @@ fn request_error(error: &reqwest::Error) -> VaultRequestError {
     let mut invalid_io = false;
     while let Some(cause) = source {
         if let Some(tls) = cause.downcast_ref::<rustls::Error>() {
-            // RFC 8446 §6.2: internal_error is a transient peer-internal fault.
+            // RFC 8446 §6.2: internal_error is an internal fault unrelated
+            // to the receiving peer or protocol correctness. Use outage handling.
             return if matches!(
                 tls,
                 rustls::Error::AlertReceived(rustls::AlertDescription::InternalError)
@@ -163,11 +164,25 @@ fn request_error(error: &reqwest::Error) -> VaultRequestError {
         }
         source = cause.source();
     }
-    if invalid_io || error.is_builder() || error.is_decode() || error.is_redirect() {
+    // reqwest labels body transport failures as decode errors too. JSON
+    // parsing is classified separately in decode_response, after a full read.
+    if invalid_io || error.is_builder() || error.is_redirect() {
         VaultRequestError::ProviderUnusable
     } else {
         VaultRequestError::Unavailable
     }
+}
+
+async fn decode_response<T: for<'de> Deserialize<'de>>(
+    response: reqwest::Response,
+) -> Result<T, VaultRequestError> {
+    // Body transport loss is an outage; only complete malformed JSON needs
+    // provider repair. reqwest::Response::json conflates the two as decode.
+    let bytes = response
+        .bytes()
+        .await
+        .map_err(|error| request_error(&error))?;
+    serde_json::from_slice(&bytes).map_err(|_| VaultRequestError::ProviderUnusable)
 }
 
 fn status_error(status: StatusCode) -> VaultRequestError {
@@ -288,10 +303,9 @@ impl VaultKeyProvider {
             return Err((VaultError::AuthFailed, status_error(resp.status()).into()));
         }
 
-        let body: VaultAuthEnvelope = resp
-            .json()
+        let body: VaultAuthEnvelope = decode_response(resp)
             .await
-            .map_err(|error| (VaultError::RequestFailed, request_error(&error).into()))?;
+            .map_err(|error| (VaultError::RequestFailed, error.into()))?;
         let token = body
             .auth
             .client_token
@@ -345,10 +359,7 @@ impl VaultKeyProvider {
         let resp = self
             .send_post_with_token("v1/auth/token/renew-self", &RenewRequest {}, &current)
             .await?;
-        let body: VaultAuthEnvelope = resp.json().await.map_err(|error| {
-            error!("failed to parse vault token renewal response");
-            request_error(&error)
-        })?;
+        let body: VaultAuthEnvelope = decode_response(resp).await?;
         let token = body
             .auth
             .client_token
@@ -421,10 +432,14 @@ impl VaultKeyProvider {
 
         let mut retried_auth = false;
         let mut transient_retries = 0;
-        let resp = loop {
+        loop {
             let token = self.current_token().await;
-            match self.send_post_with_token(path, body, &token).await {
-                Ok(resp) => break resp,
+            let result = match self.send_post_with_token(path, body, &token).await {
+                Ok(resp) => decode_response(resp).await,
+                Err(error) => Err(error),
+            };
+            match result {
+                Ok(body) => return Ok(body),
                 Err(VaultRequestError::Forbidden) if !retried_auth => {
                     retried_auth = true;
                     self.reauthenticate().await?;
@@ -438,12 +453,7 @@ impl VaultKeyProvider {
                 }
                 Err(err) => return Err(err.into()),
             }
-        };
-
-        resp.json().await.map_err(|error| {
-            error!("failed to parse vault response");
-            request_error(&error).into()
-        })
+        }
     }
 
     #[instrument(level = "debug", skip(self), fields(tenant = %tenant, purpose = %purpose))]
@@ -639,8 +649,7 @@ impl KeyProvider for VaultKeyProvider {
                 &format!("v1/{}/keys/{}/rotate", self.mount_path, key_name),
                 &RotateRequest {},
             )
-            .await
-            .map_err(|_| KeyError::RotationFailed)?;
+            .await?;
 
         let (key_id, _material) = self.generate_data_key(purpose, tenant).await?;
         Ok(key_id)

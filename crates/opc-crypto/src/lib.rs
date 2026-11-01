@@ -351,6 +351,9 @@ pub enum CryptoError {
 impl CryptoError {
     /// Positive evidence against the envelope or its key. Other failures must
     /// retain stored data; an encryption failure alone is not such evidence.
+    /// A successful provider handle whose tenant, purpose or key ID contradicts
+    /// the row is a binding mismatch and remains definitive, as are failures
+    /// of the stored binding checked before provider lookup.
     pub const fn is_definitive_rejection(&self) -> bool {
         match self {
             Self::InvalidEnvelope | Self::DecryptionFailed | Self::KeyRejected => true,
@@ -497,6 +500,13 @@ pub async fn decrypt_envelope<P: KeyProvider + ?Sized>(
 ) -> Result<Zeroizing<Vec<u8>>, CryptoError> {
     let envelope =
         CryptoEnvelopeV1::decode(envelope_bytes).map_err(|_| CryptoError::DecryptionFailed)?;
+    // The header and its stored AAD must agree before an unavailable or
+    // differently configured provider can obscure positive local damage.
+    let bound = opc_key::serialize_bound_aad(expected_aad, &envelope.key_id)
+        .map_err(|_| CryptoError::DecryptionFailed)?;
+    if bound != envelope.aad {
+        return Err(CryptoError::DecryptionFailed);
+    }
     let handle = provider
         .get_key_by_id(&envelope.key_id)
         .await
@@ -910,14 +920,17 @@ mod tests {
             .await
             .expect_err("unknown key should fail");
 
-        for err in [wrong_aad_err, wrong_key_err, corrupt_err] {
+        let missing_key_err = decrypt_envelope(&MemoryKeyProvider::new(), &aad, &encoded)
+            .await
+            .expect_err("missing provider key must fail closed");
+        for err in [wrong_aad_err, wrong_key_err, corrupt_err, unknown_key_err] {
             assert_eq!(err, CryptoError::DecryptionFailed);
             assert_eq!(err.to_string(), "envelope decryption failed");
             assert!(err.is_definitive_rejection());
         }
-        assert_eq!(unknown_key_err, CryptoError::KeyRejected);
-        assert_eq!(unknown_key_err.to_string(), "key or ciphertext rejected");
-        assert!(unknown_key_err.is_definitive_rejection());
+        assert_eq!(missing_key_err, CryptoError::KeyRejected);
+        assert_eq!(missing_key_err.to_string(), "key or ciphertext rejected");
+        assert!(missing_key_err.is_definitive_rejection());
     }
 
     #[tokio::test]

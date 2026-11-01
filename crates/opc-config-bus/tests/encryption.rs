@@ -443,8 +443,8 @@ async fn encrypting_store_append_commit_reports_missing_key() {
         .await
         .expect_err("append must fail without a config key");
 
-    assert_eq!(err.code, StoreErrorCode::Crypto);
-    assert_eq!(err.message, "config envelope encryption failed");
+    assert_eq!(err.code, StoreErrorCode::Unavailable);
+    assert_eq!(err.message, "config key provider configuration unavailable");
 }
 
 #[tokio::test]
@@ -1055,4 +1055,50 @@ async fn missing_active_seed_key_does_not_claim_stored_data_damage() {
         opc_alarm::ProbableCause::ConfigApplyFailed
     );
     assert!(inner.history().await.is_empty());
+}
+
+#[tokio::test]
+async fn invalid_store_configuration_does_not_claim_seed_corruption() {
+    let inner = Arc::new(MockManagedDatastore::<SealedConfig<TestConfig>>::new());
+    let store = EncryptingManagedDatastore::with_store_kind(inner.clone(), test_provider(), " ");
+    let error = match ConfigBus::restore_or_new_dev_only(TestConfig::new("initial"), store).await {
+        Ok(_) => panic!("invalid configuration must prevent seeding"),
+        Err(error) => error,
+    };
+    assert_eq!(error.code, StoreErrorCode::Unavailable);
+    let alarms = error.alarm_manager().unwrap().active_alarms();
+    assert_eq!(alarms.len(), 1);
+    assert_eq!(
+        alarms[0].probable_cause,
+        opc_alarm::ProbableCause::ConfigApplyFailed
+    );
+    assert!(inner.history().await.is_empty());
+}
+
+#[tokio::test]
+async fn invalid_store_configuration_retains_intact_records() {
+    let inner = Arc::new(MockManagedDatastore::new());
+    let provider = test_provider();
+    let bus = ConfigBus::new_dev_only(
+        TestConfig::new("initial"),
+        EncryptingManagedDatastore::new(inner.clone(), provider.clone()),
+    )
+    .await
+    .unwrap();
+    submit_commit(&bus, "retained").await;
+    let before = inner.history().await;
+    let broken = EncryptingManagedDatastore::with_store_kind(inner.clone(), provider.clone(), " ");
+    let error = match broken.load_latest().await {
+        Ok(_) => panic!("invalid configuration must not release plaintext"),
+        Err(error) => error,
+    };
+    assert_eq!(error.code, StoreErrorCode::Unavailable);
+    let after = inner.history().await;
+    assert_eq!(before.len(), after.len());
+    assert_eq!(before[0].encrypted_blob, after[0].encrypted_blob);
+    let repaired = EncryptingManagedDatastore::new(inner, provider);
+    assert_eq!(
+        repaired.load_latest().await.unwrap().unwrap().config.name,
+        "retained"
+    );
 }

@@ -1013,7 +1013,15 @@ async fn process_commit<C: OpcConfig>(
                     .await
                     .map_err(|err| {
                         log_store_error("load_by_idempotency_key failed", request.request_id, &err);
-                        CommitError::state_machine_fault(IDEMPOTENCY_LOOKUP_FAILED_MESSAGE)
+                        *store_failure = Some(err.code);
+                        CommitError::new(
+                            if err.code == StoreErrorCode::Unavailable {
+                                CommitErrorCode::PersistFailed
+                            } else {
+                                CommitErrorCode::StateMachineFault
+                            },
+                            IDEMPOTENCY_LOOKUP_FAILED_MESSAGE,
+                        )
                     })?
                 {
                     if request_matches_stored_fingerprint(&request, &existing)? {
@@ -1052,8 +1060,16 @@ async fn process_commit<C: OpcConfig>(
             if store
                 .retained_history_floor()
                 .await
-                .map_err(|_| {
-                    CommitError::state_machine_fault("config history authority is unavailable")
+                .map_err(|err| {
+                    *store_failure = Some(err.code);
+                    CommitError::new(
+                        if err.code == StoreErrorCode::Unavailable {
+                            CommitErrorCode::PersistFailed
+                        } else {
+                            CommitErrorCode::StateMachineFault
+                        },
+                        "config history authority is unavailable",
+                    )
                 })?
                 .is_some()
                 && request.base_version != current.version

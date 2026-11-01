@@ -236,7 +236,7 @@ impl RemoteSealProvider for MemoryRemoteSealProvider {
 
 // Keep the local failure conversion independently testable.
 fn local_seal_error(_: crate::errors::CryptoOperationError) -> KeyError {
-    KeyError::OperationFailed
+    KeyError::ProviderUnusable
 }
 
 #[cfg(test)]

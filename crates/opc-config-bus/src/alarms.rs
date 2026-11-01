@@ -114,7 +114,7 @@ pub(crate) fn commit_error_alarm_spec(code: CommitErrorCode) -> (Severity, Proba
         | CommitErrorCode::RollbackUnavailable => {
             (Severity::Major, ProbableCause::ConfigApplyFailed)
         }
-        CommitErrorCode::StateMachineFault => (Severity::Major, ProbableCause::StorageCorruption),
+        CommitErrorCode::StateMachineFault => (Severity::Major, ProbableCause::ConfigApplyFailed),
         CommitErrorCode::VersionExhausted => (Severity::Major, ProbableCause::ConfigApplyFailed),
         CommitErrorCode::AdmissionRejected
         | CommitErrorCode::ApplyPlanRejected
@@ -134,17 +134,21 @@ pub(crate) fn startup_error_alarm_spec(code: StoreErrorCode) -> (Severity, Proba
     match code {
         // An unavailable dependency is not evidence of corrupt stored bytes.
         StoreErrorCode::Unavailable => (Severity::Critical, ProbableCause::ConfigApplyFailed),
-        StoreErrorCode::OutcomeUnknown
-        | StoreErrorCode::Internal
-        | StoreErrorCode::Crypto
+        StoreErrorCode::Crypto
         | StoreErrorCode::RestoreSchemaMismatch
-        | StoreErrorCode::RestoreRecoveryRequired
-        | StoreErrorCode::RestoreConfirmedDeadline
-        | StoreErrorCode::StartupValidationTaskFailed
         | StoreErrorCode::InvalidHistorySequence => {
             (Severity::Critical, ProbableCause::StorageCorruption)
         }
-        StoreErrorCode::NotFound => (Severity::Major, ProbableCause::StorageCorruption),
+        // Control-state fences, unknown outcomes and task failures do not
+        // establish that any stored bytes were read and rejected.
+        StoreErrorCode::OutcomeUnknown
+        | StoreErrorCode::Internal
+        | StoreErrorCode::RestoreRecoveryRequired
+        | StoreErrorCode::RestoreConfirmedDeadline
+        | StoreErrorCode::StartupValidationTaskFailed => {
+            (Severity::Critical, ProbableCause::ConfigApplyFailed)
+        }
+        StoreErrorCode::NotFound => (Severity::Major, ProbableCause::ConfigApplyFailed),
         StoreErrorCode::StartupSyntaxValidationFailed
         | StoreErrorCode::StartupSemanticValidationFailed
         | StoreErrorCode::HistoryPageTooLarge

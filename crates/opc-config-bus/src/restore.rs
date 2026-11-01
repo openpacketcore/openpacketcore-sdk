@@ -588,7 +588,7 @@ impl<C: OpcConfig> ConfigBus<C> {
                                     "failed to load previous confirmed config during startup rollback",
                                     &err,
                                 );
-                                preserve_startup_error(&alarm_manager, StoreError::restore_confirmed_deadline("stored running config requires commit-confirmed recovery"))
+                                preserve_startup_error(&alarm_manager, StoreError::new(err.code, "stored running config requires commit-confirmed recovery"))
                             })?;
                         validate_publishable_stored_config(&prev_stored)
                             .map_err(|err| preserve_startup_error(&alarm_manager, err))?;
@@ -636,9 +636,7 @@ impl<C: OpcConfig> ConfigBus<C> {
                                 );
                                 preserve_startup_error(
                                     &alarm_manager,
-                                    StoreError::restore_recovery_required(
-                                        RESTORE_RECOVERY_REQUIRED_MESSAGE,
-                                    ),
+                                    StoreError::new(err.code, RESTORE_RECOVERY_REQUIRED_MESSAGE),
                                 )
                             })?;
 
@@ -653,9 +651,7 @@ impl<C: OpcConfig> ConfigBus<C> {
                                 );
                                 preserve_startup_error(
                                     &alarm_manager,
-                                    StoreError::restore_recovery_required(
-                                        RESTORE_RECOVERY_REQUIRED_MESSAGE,
-                                    ),
+                                    StoreError::new(err.code, RESTORE_RECOVERY_REQUIRED_MESSAGE),
                                 )
                             })?;
 

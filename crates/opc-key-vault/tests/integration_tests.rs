@@ -580,7 +580,7 @@ async fn rotate_key_rotates_and_returns_fresh_id() {
 }
 
 #[tokio::test]
-async fn rotate_key_failure_maps_to_rotation_failed() {
+async fn rotate_key_failure_preserves_outage() {
     let responses = Arc::new(Mutex::new(vec![MockResponse {
         status: 500,
         body: r#"{"errors":["rotation denied"]}"#.into(),
@@ -593,7 +593,7 @@ async fn rotate_key_failure_maps_to_rotation_failed() {
         .rotate_key(KeyPurpose::Session, &tenant())
         .await
         .expect_err("should fail");
-    assert_eq!(err, KeyError::RotationFailed);
+    assert_eq!(err, KeyError::Unavailable);
 }
 
 /// Full envelope round trip through `opc-crypto`, exercising the realistic
@@ -681,7 +681,7 @@ async fn vault_truncated_reply_is_an_outage_with_bounded_retries() {
     let server = tokio::spawn(async move {
         let mut attempts = 0;
         while let Ok(Ok((mut stream, _))) =
-            tokio::time::timeout(std::time::Duration::from_millis(300), listener.accept()).await
+            tokio::time::timeout(std::time::Duration::from_secs(1), listener.accept()).await
         {
             attempts += 1;
             let mut request = [0; 4096];
@@ -692,6 +692,7 @@ async fn vault_truncated_reply_is_an_outage_with_bounded_retries() {
         attempts
     });
     let error = VaultKeyProvider::new(url, "token".into(), "transit".into())
+        .dangerous_allow_insecure_http()
         .get_active_key(KeyPurpose::Config, &tenant())
         .await
         .unwrap_err();

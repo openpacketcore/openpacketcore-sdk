@@ -503,8 +503,11 @@ synchronously verifies that the module identity and validation declaration
 still match admission and that the complete frozen grant remains both
 advertised and serviceable. A module whose subsequent self-test or health state
 becomes invalid MUST withdraw the affected readiness capability. Provider
-`NotFound`, `Unavailable` and `ProviderUnusable` classifications retain their public meaning;
-other provider context is collapsed to a fieldless redaction-safe error.
+`NotFound`, positive `OperationFailed`, `Unavailable` and `ProviderUnusable`
+classifications retain their public meaning. Other provider failures become
+fieldless `ProviderUnusable`; custody state failures retain their typed class.
+`ProviderOperationFailed` remains available for compatibility but the SDK no
+longer produces it when converting provider errors.
 
 Successful provider-returned bound AAD MUST be rejected before parsing when it
 exceeds 64 KiB. Within that bound it MUST decode as the exact canonical SDK AAD
@@ -555,8 +558,9 @@ key/data rejection MUST remain distinguishable:
 - `KeyError::OperationFailed` is reserved for positive key revocation or
   ciphertext rejection, including AEAD authentication failure. A generic request
   refusal is not a verdict. RFC 030 terminal recovery uses the shared predicate.
-- TLS `internal_error` (80) is an outage: RFC 8446 §6.2 defines it as an internal
-  peer fault unrelated to the peer's protocol/configuration correctness.
+- TLS `internal_error` (80) uses outage handling. RFC 8446 §6.2 describes an
+  internal fault unrelated to the receiving peer or protocol correctness; this
+  classification does not assert that every such fault is transient.
 
 Neither `Unavailable` nor `ProviderUnusable` authorizes record deletion, SA
 teardown, uncommitted plaintext/packet release, or a final cached mutation result.
