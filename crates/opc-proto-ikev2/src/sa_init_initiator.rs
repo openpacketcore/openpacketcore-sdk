@@ -264,9 +264,10 @@ impl fmt::Debug for Ikev2SaInitAccepted<'_> {
 
 /// Success, an unauthenticated retry, or an RFC 5685 §3 redirect.
 ///
-/// Retry diagnostics expose no cookie or peer-selected values. Error replies
-/// accept either zero or non-zero SPIr, as required by RFC 7296 §2.6. A retry
-/// does not establish an SA, authenticate the peer or authorize a downgrade.
+/// Retry diagnostics expose no cookie or peer-selected values. Error and
+/// redirect outcomes accept either zero or non-zero SPIr, as for other no-SA
+/// replies described in RFC 7296 §2.6. Neither establishes an SA, authenticates
+/// the peer or authorizes a downgrade.
 ///
 /// External matches must retain a wildcard for future outcomes:
 /// ```compile_fail

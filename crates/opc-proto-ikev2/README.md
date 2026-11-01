@@ -1020,12 +1020,13 @@ This does not close #786 or establish external interoperability. See
   (Transform IDs 15-18) are caller-selected alternatives with exact widths.
   Child-SA profiles additionally support ENCR_NULL (11) with a mandatory
   separate supported integrity transform and exactly zero
-  encryption/salt KEYMAT octets. The notify-only error builder is deliberately bounded to
-  one IKE-SA-shaped `UNSUPPORTED_CRITICAL_PAYLOAD`, `NO_PROPOSAL_CHOSEN`, or
-  `INVALID_KE_PAYLOAD`. Typed convenience builders write the offending payload
-  type as exactly one octet or the accepted non-zero group as exactly two
-  big-endian octets. These failures are mutually exclusive, so the builder
-  rejects a multi-Notify response rather than emitting ambiguity.
+  encryption/salt KEYMAT octets. The notify-only builder is deliberately bounded to
+  one IKE-SA-shaped `UNSUPPORTED_CRITICAL_PAYLOAD`, `NO_PROPOSAL_CHOSEN`,
+  `INVALID_KE_PAYLOAD`, or RFC 5685 `REDIRECT` with a valid gateway identity and
+  16..=256-octet echoed Ni. Typed convenience builders write the offending
+  payload type as exactly one octet or the accepted non-zero group as exactly
+  two big-endian octets. These outcomes are complete and mutually exclusive,
+  so the builder rejects a multi-Notify response rather than emitting ambiguity.
 - `protected_payload_crypto` provides caller-keyed AES-GCM-16, AES-CCM-8,
   ChaCha20-Poly1305 and AES-CBC/HMAC encrypt-then-MAC `SK`/`SKF` open/seal helpers for
   already-derived SA_INIT key material. Production CBC sealing obtains a fresh

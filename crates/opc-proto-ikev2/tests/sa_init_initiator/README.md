@@ -43,8 +43,9 @@ crate's integration-test graph enables `testkit` through a dev dependency.
 
 The public API is `build_ike_sa_init_request`, `Ikev2SaInitRequest::message`,
 `Ikev2SaInitRequest::with_cookie` and `admit_ike_sa_init_response`. Admission
-returns `Ikev2SaInitResponse::Accepted`, `Cookie`, `InvalidKePayload` or
-`NoProposalChosen`. An accepted response exposes the profile, SPIr, KEr, Nr
+returns `Ikev2SaInitResponse::Accepted`, `Cookie`, `InvalidKePayload`,
+`NoProposalChosen` or `Redirect`; the non-exhaustive enum also allows future
+outcomes. An accepted response exposes the profile, SPIr, KEr, Nr
 and status notifications. The caller retains its live DH key and the exact
 wire transcript, then composes `agree`, `derive_ike_sa_init_key_material`,
 protected-payload seal/open and `compute_ike_auth_shared_key_mic` as the test
