@@ -1102,3 +1102,59 @@ async fn invalid_store_configuration_retains_intact_records() {
         "retained"
     );
 }
+
+async fn rejected_stored_json_keeps_corruption_alarm(plaintext: &[u8]) {
+    let inner = Arc::new(MockManagedDatastore::new());
+    let provider = test_provider();
+    let mut record = StoredConfig::new(
+        TxId::new(),
+        ConfigVersion::new(1),
+        principal(),
+        RequestSource::Northbound,
+        TestConfig::new("stored"),
+    );
+    record.plaintext_digest = Some(Sha256::digest(plaintext).into());
+    let aad = EnvelopeAad::config(
+        record.principal.tenant.clone(),
+        record.version.get(),
+        ConfigAad::new(
+            record.tx_id,
+            record.parent_tx_id,
+            record.committed_at,
+            serde_json::to_string(&record.principal).unwrap(),
+            record.schema_digest,
+            "running",
+        )
+        .unwrap(),
+    );
+    let envelope = encrypt_attested_envelope(provider.as_ref(), &aad, plaintext)
+        .await
+        .unwrap();
+    record.encrypted_blob = envelope.encoded().to_vec();
+    let schema = record.schema_digest;
+    inner
+        .seed(record.with_config(SealedConfig::new(schema)))
+        .await;
+    let reader = Arc::new(EncryptingManagedDatastore::new(inner.clone(), provider));
+    let error = match ConfigBus::restore_or_new_dev_only(TestConfig::new("fallback"), reader).await
+    {
+        Ok(_) => panic!("rejected stored JSON must fence startup"),
+        Err(error) => error,
+    };
+    assert_eq!(error.code, StoreErrorCode::Crypto);
+    let alarms = error.alarm_manager().unwrap().active_alarms();
+    assert_eq!(alarms.len(), 1);
+    assert_eq!(
+        alarms[0].probable_cause,
+        opc_alarm::ProbableCause::StorageCorruption
+    );
+    assert_eq!(inner.history().await.len(), 1);
+}
+#[tokio::test]
+async fn rejected_legacy_stored_json_keeps_corruption_alarm() {
+    rejected_stored_json_keeps_corruption_alarm(b"{").await;
+}
+#[tokio::test]
+async fn rejected_v2_stored_json_keeps_corruption_alarm() {
+    rejected_stored_json_keeps_corruption_alarm(b"\x89OPCCFG\x02\r\n\x1a\n{").await;
+}

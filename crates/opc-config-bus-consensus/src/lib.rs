@@ -1070,7 +1070,7 @@ mod tests {
 
         for value in malformed {
             let encoded = serde_json::to_string(&value).expect("metadata JSON");
-            assert!(decode_persisted_bus_metadata(&encoded).is_err());
+            assert_eq!(decode_persisted_bus_metadata(&encoded).err().unwrap().code, opc_config_bus::StoreErrorCode::Crypto);
         }
     }
 
@@ -1091,7 +1091,7 @@ mod tests {
             serde_json::Value::Bool(true),
         );
         let encoded = serde_json::Value::Object(principal).to_string();
-        assert!(decode_persisted_bus_metadata(&encoded).is_err());
+        assert_eq!(decode_persisted_bus_metadata(&encoded).err().unwrap().code, opc_config_bus::StoreErrorCode::Crypto);
     }
 
     #[test]
@@ -1114,7 +1114,7 @@ mod tests {
             ),
         ];
         for encoded in duplicate {
-            assert!(decode_persisted_bus_metadata(&encoded).is_err());
+            assert_eq!(decode_persisted_bus_metadata(&encoded).err().unwrap().code, opc_config_bus::StoreErrorCode::Crypto);
         }
     }
 

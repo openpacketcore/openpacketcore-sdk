@@ -721,3 +721,28 @@ async fn vault_rotation_preserves_outage_and_repair_classes() {
         assert_eq!(mock.request_paths().await.len(), count);
     }
 }
+
+#[tokio::test]
+async fn vault_rotation_does_not_replay_applied_truncated_reply() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = url::Url::parse(&format!("http://{}/", listener.local_addr().unwrap())).unwrap();
+    let server = tokio::spawn(async move {
+        let mut attempts = 0;
+        while let Ok(Ok((mut stream, _))) =
+            tokio::time::timeout(std::time::Duration::from_secs(1), listener.accept()).await
+        {
+            attempts += 1;
+            let mut request = [0; 4096];
+            assert!(stream.read(&mut request).await.unwrap() > 0);
+            stream.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 1000\r\nConnection: close\r\n\r\n{\"data\":").await.unwrap();
+            stream.shutdown().await.unwrap();
+        }
+        attempts
+    });
+    let error = VaultKeyProvider::new(url, "token".into(), "transit".into())
+        .dangerous_allow_insecure_http()
+        .rotate_key(KeyPurpose::Config, &tenant())
+        .await
+        .unwrap_err();
+    assert_eq!((error, server.await.unwrap()), (KeyError::Unavailable, 1));
+}

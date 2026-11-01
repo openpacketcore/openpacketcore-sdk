@@ -1323,4 +1323,11 @@ mod provider_failure_tests {
         );
         assert!(!reports.contains("provider repair"), "{reports}");
     }
+    #[test]
+    fn local_config_encryption_fault_is_internal() {
+        for failure in [opc_crypto::CryptoError::EncryptionFailed, opc_crypto::CryptoError::InvalidEnvelope, opc_crypto::CryptoError::DecryptionFailed] {
+            assert_eq!(super::config_encrypt_error(failure).code, crate::StoreErrorCode::Internal);
+        }
+    }
+
 }

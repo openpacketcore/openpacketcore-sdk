@@ -8,6 +8,9 @@ use std::time::{Duration, Instant};
 #[path = "adapter/election.rs"]
 mod election;
 
+#[path = "adapter/storage_failures.rs"]
+mod storage_failures;
+
 use opc_config_bus::{
     CommitWrite, CommittedRevisionSource, ConfigBus, ConfigSnapshot, EncryptingManagedDatastore,
     ManagedDatastore, SealedConfig, StoreErrorCode, StoredConfig,
