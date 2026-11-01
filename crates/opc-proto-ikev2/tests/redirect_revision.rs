@@ -454,3 +454,96 @@ fn zero_spi_redirect_preserves_canonical_wire_and_non_sa_outcome() {
     } if address == Ipv4Addr::new(192, 0, 2, 1)));
     assert!(!matches!(result, Ikev2SaInitResponse::Accepted(_)));
 }
+
+#[test]
+fn redirect_rejects_real_sa_ke_nonce_mixtures_at_both_responder_spis() {
+    for supported in [true, false] {
+        let request = request(supported);
+        // The request supplies a valid offered SA and an actual ECP public key.
+        // Reuse their bodies as the responder's selected suite and KE, with a
+        // distinct Nr. The nonzero-SPI control proves real success admission.
+        let mut success: Vec<_> = request
+            .message()
+            .payloads()
+            .take(3)
+            .map(|raw| {
+                let raw = raw.unwrap();
+                (raw.payload_type, raw.body.to_vec())
+            })
+            .collect();
+        assert_eq!(
+            success.iter().map(|(kind, _)| *kind).collect::<Vec<_>>(),
+            [
+                PayloadType::SecurityAssociation,
+                PayloadType::KeyExchange,
+                PayloadType::Nonce
+            ]
+        );
+        success[2].1 = vec![0x72; 32];
+        let redirect = raw_response(&request)
+            .payloads()
+            .next()
+            .unwrap()
+            .unwrap()
+            .body
+            .to_vec();
+        let mut entries = success;
+        entries.push((PayloadType::Notify, redirect));
+        for spi in [0, 0x1112_1314_1516_1718] {
+            for shape in [
+                &[0, 1, 2, 3][..],
+                &[3, 0, 1, 2],
+                &[0, 1, 3],
+                &[0, 3],
+                &[1, 3],
+            ] {
+                let mut response = raw_response(&request);
+                response.header.responder_spi = spi;
+                let mut wire = Vec::new();
+                for (index, &entry) in shape.iter().enumerate() {
+                    let (_, body) = &entries[entry];
+                    wire.push(
+                        shape
+                            .get(index + 1)
+                            .map_or(0, |next| entries[*next].0.as_u8()),
+                    );
+                    wire.push(0);
+                    wire.extend_from_slice(&u16::try_from(body.len() + 4).unwrap().to_be_bytes());
+                    wire.extend_from_slice(body);
+                }
+                response.header.next_payload = entries[shape[0]].0.as_u8();
+                response.header.length = 28 + u32::try_from(wire.len()).unwrap();
+                response.raw_payloads = wire.into();
+                assert_admission_error(
+                    &request,
+                    &response,
+                    if supported {
+                        AdmissionError::InvalidRetry
+                    } else {
+                        AdmissionError::InvalidRedirect
+                    },
+                );
+            }
+        }
+        let mut control = raw_response(&request);
+        let mut wire = Vec::new();
+        for (index, (_, body)) in entries[..3].iter().enumerate() {
+            wire.push(
+                entries[..3]
+                    .get(index + 1)
+                    .map_or(0, |(kind, _)| kind.as_u8()),
+            );
+            wire.push(0);
+            wire.extend_from_slice(&u16::try_from(body.len() + 4).unwrap().to_be_bytes());
+            wire.extend_from_slice(body);
+        }
+        control.header.responder_spi = 0x1112_1314_1516_1718;
+        control.header.next_payload = PayloadType::SecurityAssociation.as_u8();
+        control.header.length = 28 + u32::try_from(wire.len()).unwrap();
+        control.raw_payloads = wire.into();
+        assert!(matches!(
+            admit_ike_sa_init_response(&request, &control.as_borrowed(), DecodeContext::default()),
+            Ok(Ikev2SaInitResponse::Accepted(_))
+        ));
+    }
+}
