@@ -84,8 +84,10 @@ pub(crate) fn commit_error_alarm_spec(code: CommitErrorCode) -> (Severity, Proba
         CommitErrorCode::PersistFailed
         | CommitErrorCode::OutcomeUnknown
         | CommitErrorCode::RecoveryRequired
-        | CommitErrorCode::RollbackUnavailable
-        | CommitErrorCode::StateMachineFault => (Severity::Major, ProbableCause::StorageCorruption),
+        | CommitErrorCode::RollbackUnavailable => {
+            (Severity::Major, ProbableCause::ConfigApplyFailed)
+        }
+        CommitErrorCode::StateMachineFault => (Severity::Major, ProbableCause::StorageCorruption),
         CommitErrorCode::VersionExhausted => (Severity::Major, ProbableCause::ConfigApplyFailed),
         CommitErrorCode::AdmissionRejected
         | CommitErrorCode::ApplyPlanRejected
@@ -103,8 +105,9 @@ pub(crate) fn commit_error_alarm_spec(code: CommitErrorCode) -> (Severity, Proba
 
 pub(crate) fn startup_error_alarm_spec(code: StoreErrorCode) -> (Severity, ProbableCause) {
     match code {
-        StoreErrorCode::Unavailable
-        | StoreErrorCode::OutcomeUnknown
+        // An unavailable dependency is not evidence of corrupt stored bytes.
+        StoreErrorCode::Unavailable => (Severity::Critical, ProbableCause::ConfigApplyFailed),
+        StoreErrorCode::OutcomeUnknown
         | StoreErrorCode::Internal
         | StoreErrorCode::Crypto
         | StoreErrorCode::RestoreSchemaMismatch

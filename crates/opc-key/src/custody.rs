@@ -328,6 +328,7 @@ fn map_provider_error(error: KeyError) -> KeyError {
     match error {
         KeyError::NotFound => KeyError::NotFound,
         KeyError::Unavailable => KeyError::Unavailable,
+        KeyError::ProviderUnusable => KeyError::ProviderUnusable,
         _ => KeyCustodyOperationError::ProviderOperationFailed.into(),
     }
 }

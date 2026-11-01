@@ -158,6 +158,10 @@ fn aad(key: RowKey, version: Version, stamp: u64) -> EnvelopeAad {
 pub fn classify_key_error(error: KeyError) -> Error {
     match error {
         KeyError::Unavailable => Error::Backpressure,
+        KeyError::ProviderUnusable => {
+            eprintln!("recovery key provider configuration unavailable; retain row and back off until provider repair");
+            Error::Backpressure
+        }
         KeyError::NotFound => Error::KeyLost,
         _ => Error::Integrity,
     }

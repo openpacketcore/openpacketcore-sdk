@@ -45,6 +45,10 @@ fn key_provider_error(error: KeyError, crypto_message: &'static str) -> StoreErr
         KeyError::Unavailable => {
             StoreError::BackendUnavailable(SESSION_KEY_PROVIDER_UNAVAILABLE_MESSAGE.into())
         }
+        KeyError::ProviderUnusable => {
+            tracing::warn!("session key provider configuration unavailable; retain data and back off until provider repair");
+            StoreError::BackendUnavailable("session key provider configuration unavailable".into())
+        }
         _ => StoreError::Crypto(crypto_message.into()),
     }
 }

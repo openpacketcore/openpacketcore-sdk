@@ -125,49 +125,46 @@ non-canonical, or context-mismatched output fails with a fieldless stable code.
 
 ## Status Notes
 
-- Both JSON KMS adapters accept absolute Unix socket paths, optionally prefixed
-  by one `unix://`. Empty or relative paths, interior NULs, paths exceeding the
-  platform socket-address limit, and repeated scheme prefixes fail permanently
-  before connecting. TCP endpoints accept bare `host:port` or one optional
-  `tcp://` prefix, including IPv4 and bracketed IPv6 with numeric scopes such as
-  `[fe80::1%2]:7443`. Released resolver forms, including unbracketed numeric IPv6
-  and `+` ports that parse as `u16`, remain supported. Hosts containing NUL,
-  control characters or whitespace fail permanently as `OperationFailed`.
-  Unix permission/path/protocol errors are permanent; an absent/refused service,
-  connection loss, timeout, interruption, backlog pressure or memory/descriptor
-  exhaustion remains `Unavailable`. TCP resolution and connection failures also
-  remain `Unavailable`.
-- Key material is zeroized on drop.
-- `MemoryKeyProvider` is suitable for tests and fixtures, not production key
-  custody.
-- `KmsKeyProvider` redacts errors and requires TLS for TCP endpoints. Missing TLS
-  configuration and peer/certificate authentication rejection are permanent,
-  including TLS alerts delivered after the client handshake completes. Unix
-  sockets are accepted for local KMS deployments.
-- `KeyError::Unavailable` identifies provider availability failures. The
-  in-memory remote adapter reports AEAD rejection as fieldless `OperationFailed`.
-  Both JSON KMS adapters recognize the exact, case-sensitive JSON response
-  `{"status":"unavailable"}` as temporary service unavailability, including
-  busy or throttled providers. It returns `Unavailable` for every operation;
-  optional `error_message` text does not affect that classification or escape
-  in the error. A provider must use this status to signal backpressure, rather
-  than describe throttling in an `error` response. All other failure statuses
-  are permanent: missing keys remain `NotFound`, and other completed
-  rejections return `OperationFailed`. Transport loss and timeout remain
-  `Unavailable`. No adapter adds retries or extends caller budgets, and an
-  availability failure does not prove a mutation was never performed.
-  Malformed KMS responses and poisoned remote-material state also return the
-  redacted, permanent `OperationFailed` classification.
-  Rejected ciphertext or revoked keys must not be
-  mistaken for a provider outage, and provider-native details remain redacted.
+- Both JSON KMS adapters accept absolute Unix socket paths with at most one
+  `unix://` prefix. Empty/relative paths, NULs, overlong socket addresses,
+  non-socket files and repeated schemes return `ProviderUnusable`. TCP accepts
+  bare `host:port` or one `tcp://` prefix, including IPv4, bracketed/scoped IPv6,
+  released unbracketed IPv6 forms and `+` ports that parse as `u16`. Invalid
+  authorities are rejected before connecting.
+- `KeyError::ProviderUnusable` means the provider needs operator repair: invalid
+  endpoints or TLS configuration, certificate/peer authentication failures,
+  fatal TLS alerts (including alerts after handshake), Unix permissions or
+  path/protocol errors, malformed/oversized replies, unknown response statuses,
+  short seal output, or poisoned provider state. It is **not** a key or data
+  verdict. Preserve rows and pending work, release nothing, report a redacted
+  configuration problem and back off until repair; do not retry it as an outage
+  in a tight loop. Certificate rotation or permission repair can make the same
+  stored ciphertext usable again.
+- `KeyError::Unavailable` covers outages, connection loss, timeouts, temporary
+  resource/backlog pressure and explicit busy/throttled replies. Both JSON KMS
+  adapters accept exactly `{"status":"unavailable"}` for this class. Absent or
+  refused Unix services remain outages, as do transient TCP resolution/connect
+  failures. Use bounded backoff within the original request budget.
+- `KeyError::OperationFailed` means a positive request/key/ciphertext rejection,
+  including local AEAD authentication failure and a completed KMS `error` reply.
+  A positively missing key remains `NotFound`. Free-form response text cannot
+  select availability; describing throttling in an `error` reply is not an
+  outage signal. Unknown statuses are `ProviderUnusable`, even if their text
+  says a key is missing. All these classes remain redacted and fieldless.
+- Neither unavailable nor unusable providers authorize corruption/integrity
+  classification, record deletion, SA teardown, plaintext/packet release or a
+  final cached mutation result. No adapter adds retries or extends caller
+  budgets; a channel failure does not prove a mutation was never performed.
+- Key material is zeroized on drop. `MemoryKeyProvider` is suitable for tests
+  and fixtures, not production key custody.
 - Existing `KeyProvider`, `KeyHandle`, `KmsRemoteSealProvider`,
   `MemoryRemoteSealProvider`, and custom `RemoteSealProvider` implementations
   remain source- and wire-compatible. They are explicitly unadmitted unless
   the consumer composes the same object as a `KeyCustodyModule`; direct values
   cannot construct or impersonate `AdmittedKeyCustody`.
 - An admitted provider must explicitly satisfy both `sealed_key_storage` and
-  `zeroization`. Provider `NotFound` and `Unavailable` outcomes keep their
-  existing public meaning; all other provider context is collapsed to a
+  `zeroization`. Provider `NotFound`, `Unavailable` and `ProviderUnusable`
+  outcomes keep their public meaning; other provider context is collapsed to a
   redaction-safe fieldless operation code.
 - Rotation keeps historical keys addressable by key ID.
 - `KmsRemoteSealProvider` keeps no local historical-key or authorization cache.

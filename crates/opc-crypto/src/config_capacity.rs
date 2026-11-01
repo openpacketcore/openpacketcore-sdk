@@ -69,9 +69,16 @@ pub enum ConfigCapacityError {
     /// Complete encoded envelope exceeds its inclusive bound.
     #[error("configuration envelope byte limit exceeded")]
     EnvelopeBytes,
-    /// Key selection, nonce generation or encryption failed.
+    /// Key selection was rejected, or nonce generation or encryption failed.
     #[error("configuration encryption failed")]
     EncryptionFailed,
+    /// Provider outage; preserve pending data and use bounded backoff.
+    #[error("key provider unavailable")]
+    ProviderUnavailable,
+    /// Provider configuration/channel failure; back off and report to operators.
+    /// This is not a verdict on the configuration data.
+    #[error("key provider unusable as configured")]
+    ProviderUnusable,
 }
 
 /// SDK-issued lengths for the exact plaintext of a successful encryption.
@@ -312,7 +319,11 @@ pub async fn encrypt_bounded_config_envelope<P: KeyProvider + ?Sized>(
     let handle = provider
         .get_active_key(aad.purpose(), aad.tenant())
         .await
-        .map_err(|_| ConfigCapacityError::EncryptionFailed)?;
+        .map_err(|error| match error {
+            opc_key::KeyError::Unavailable => ConfigCapacityError::ProviderUnavailable,
+            opc_key::KeyError::ProviderUnusable => ConfigCapacityError::ProviderUnusable,
+            _ => ConfigCapacityError::EncryptionFailed,
+        })?;
     let mut nonce = [0_u8; AES_256_GCM_SIV_NONCE_LEN];
     SysRng
         .try_fill_bytes(&mut nonce)

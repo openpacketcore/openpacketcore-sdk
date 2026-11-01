@@ -334,6 +334,21 @@ pub enum CryptoError {
     EncryptionFailed,
     #[error("envelope decryption failed")]
     DecryptionFailed,
+    /// Provider outage; preserve pending data and use bounded backoff.
+    #[error("key provider unavailable")]
+    ProviderUnavailable,
+    /// Provider configuration/channel failure; preserve data, back off and
+    /// report to operators. This does not indicate rejected ciphertext.
+    #[error("key provider unusable as configured")]
+    ProviderUnusable,
+}
+
+fn provider_error(error: opc_key::KeyError, rejected: CryptoError) -> CryptoError {
+    match error {
+        opc_key::KeyError::Unavailable => CryptoError::ProviderUnavailable,
+        opc_key::KeyError::ProviderUnusable => CryptoError::ProviderUnusable,
+        _ => rejected,
+    }
 }
 
 pub async fn encrypt_envelope<P: KeyProvider + ?Sized>(
@@ -372,7 +387,7 @@ pub async fn encrypt_envelope_with_nonce<P: KeyProvider + ?Sized>(
     let handle = provider
         .get_active_key(aad.purpose(), aad.tenant())
         .await
-        .map_err(|_| CryptoError::EncryptionFailed)?;
+        .map_err(|error| provider_error(error, CryptoError::EncryptionFailed))?;
     encrypt_envelope_with_handle_and_nonce(&handle, aad, plaintext, nonce)
 }
 
@@ -467,7 +482,7 @@ pub async fn decrypt_envelope<P: KeyProvider + ?Sized>(
     let handle = provider
         .get_key_by_id(&envelope.key_id)
         .await
-        .map_err(|_| CryptoError::DecryptionFailed)?;
+        .map_err(|error| provider_error(error, CryptoError::DecryptionFailed))?;
 
     decrypt_decoded_envelope_with_handle(&handle, expected_aad, &envelope)
 }

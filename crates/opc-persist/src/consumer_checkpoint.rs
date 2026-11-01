@@ -525,7 +525,7 @@ impl ConsumerCheckpointStore {
         )
         .await
         .map_err(|_| ConsumerCheckpointError::Limit)?
-        .map_err(|_| ConsumerCheckpointError::Rejected)?;
+        .map_err(checkpoint_decrypt_error)?;
         if payload.len() > self.options.max_payload_bytes {
             return Err(ConsumerCheckpointError::Limit);
         }
@@ -703,7 +703,7 @@ impl ConsumerCheckpointStore {
                 )
                 .await
                 .map_err(|_| ConsumerCheckpointError::Limit)?
-                .map_err(|_| ConsumerCheckpointError::Rejected)?;
+                .map_err(checkpoint_decrypt_error)?;
                 if payload.len() > options.max_payload_bytes {
                     return Err(ConsumerCheckpointError::Limit);
                 }
@@ -1166,6 +1166,18 @@ fn copy_for_validation(
         }
     }
     Ok(())
+}
+
+// Preserve provider failures before the checkpoint's data-rejection boundary.
+fn checkpoint_decrypt_error(error: opc_crypto::CryptoError) -> ConsumerCheckpointError {
+    match error {
+        opc_crypto::CryptoError::ProviderUnavailable => ConsumerCheckpointError::Unavailable,
+        opc_crypto::CryptoError::ProviderUnusable => {
+            tracing::warn!("checkpoint key provider configuration unavailable; retain checkpoint and back off until provider repair");
+            ConsumerCheckpointError::Unavailable
+        }
+        _ => ConsumerCheckpointError::Rejected,
+    }
 }
 
 #[cfg(all(test, unix))]

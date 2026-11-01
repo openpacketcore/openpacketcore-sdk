@@ -271,14 +271,27 @@ old encrypted WAL or snapshot bytes.
 
 Apply [#1197](https://github.com/openpacketcore/openpacketcore-sdk/issues/1197) to
 every row seal/unseal, including checkpoint creation, restore and fenced readback.
-Key-provider `Unavailable`, timeout and throttling are retryable backpressure;
-they release no uncommitted request and never select SA teardown. Until that
-classification reaches the full SDK envelope path, the consumer key-provider
-wrapper must preserve `KeyError::Unavailable` and equivalent transient outcomes
-before any generic crypto-error collapse. Do not treat retry-budget exhaustion
-as corruption. Authenticated-decryption failure, binding/public-value mismatch,
-unknown checkpoint format, provider `InvalidOutput`, or a positively missing (`NotFound`) or revoked key
-are terminal. Never infer any of those from an unavailable provider.
+Key-provider `Unavailable`, timeout and throttling are bounded retry backpressure.
+`ProviderUnusable` is also backpressure for the request and stored data, but
+requires a redacted operator configuration report and backoff until provider
+repair rather than immediate outage retries. It includes malformed endpoints,
+Unix permissions, TLS certificate/peer authentication, fatal alerts and invalid
+provider protocol responses. Short-lived SVID expiry and certificate rotation
+MUST NOT turn retained ciphertext into a terminal recovery outcome.
+
+Both classes release nothing, delete nothing and never select SA teardown or a
+final cached mutation result. Preserve the exact row, ciphertext, version and
+pending replay while access is blocked. Consumers MUST retain the classification
+through key custody, envelope, storage and network boundaries before any generic
+crypto-error collapse. Retry-budget exhaustion is not corruption.
+
+Authenticated-decryption failure, binding/public-value mismatch, unknown
+checkpoint format, provider `InvalidOutput`, or a positively missing (`NotFound`)
+or revoked key are terminal. `OperationFailed` is reserved for a completed
+request/key/ciphertext rejection; during unseal it must represent actual key/data
+rejection before terminal cleanup is authorized. Never infer a terminal outcome
+from `Unavailable` or `ProviderUnusable`. Repairing provider configuration alone
+must permit recovery of the unchanged retained row.
 
 Peer KE validation is a separate protocol boundary. `InvalidPeerPublicKey`,
 `MalformedKeyExchange` and `KeyAgreementFailed` terminate the exchange and are

@@ -1809,15 +1809,18 @@ a new plaintext write before consensus submission but does not prevent already
 sealed Raft traffic, replay, or quorum formation.
 
 Local key lookup and remote seal/unseal report `KeyError::Unavailable` as
-`StoreError::BackendUnavailable("session key provider unavailable")`. Callers
-can retry within their existing request budget when the provider recovers.
-Unknown keys, authentication failures, malformed envelopes and other provider
-errors still return the same coarse `StoreError::Crypto` classification without
-exposing provider details or envelope contents.
-The shared `backend_unavailable` metrics label covers both provider and backend
-outages. The fixed provider message distinguishes local store errors only;
-session-net sends the generic `backend unavailable` message while preserving
-availability classification.
+`StoreError::BackendUnavailable("session key provider unavailable")`.
+`KeyError::ProviderUnusable` becomes
+`BackendUnavailable("session key provider configuration unavailable")` with a
+fixed operator diagnostic. Neither is data rejection: retain records and pending
+operations, release nothing and back off. Configuration/channel failures require
+provider repair, while outages may recover within the existing request budget.
+Unknown/revoked keys, authenticated-decryption failures and malformed stored
+envelopes retain the coarse `StoreError::Crypto` classification.
+The shared `backend_unavailable` metrics label covers provider and backend
+failures. Fixed provider messages distinguish local store errors only;
+session-net sends generic `backend unavailable` and preserves non-definitive
+mutation handling rather than caching a provider failure as a final result.
 
 Both protection wrappers default to `EnvelopeReadPolicy::MigrationCompatible`,
 which retains intentional legacy/plaintext reads and unclassified-row probing.

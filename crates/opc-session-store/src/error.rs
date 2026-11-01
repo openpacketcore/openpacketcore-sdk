@@ -256,8 +256,9 @@ pub enum StoreError {
     /// Retryable key-provider outage with a fixed position in this error schema.
     /// This variant was introduced in the current unreleased version.
     /// Record encryption and decryption return
-    /// [`StoreError::BackendUnavailable`] for provider outages so existing
-    /// backend retry classifiers apply. Content-dependent failures remain
+    /// [`StoreError::BackendUnavailable`] for provider outages and unusable
+    /// provider configuration. Retain data and back off; configuration failures
+    /// also emit a fixed operator diagnostic. Content-dependent failures remain
     /// collapsed into [`StoreError::Crypto`].
     ///
     /// Append-only to preserve every existing serialized discriminant.

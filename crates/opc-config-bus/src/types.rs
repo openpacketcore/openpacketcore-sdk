@@ -58,8 +58,9 @@ pub enum StoreErrorCode {
     /// The requested record (rollback target, transaction, or idempotency
     /// key) does not exist; rollback commits map this to `RollbackNotFound`.
     NotFound,
-    /// The backend is temporarily unable to serve the request (for example a
-    /// rollback target that is still pending confirmation); retryable.
+    /// The backend or key provider cannot currently serve the request. Retain
+    /// data and back off within the existing budget; provider configuration
+    /// failures require operator repair. This is not a corruption verdict.
     Unavailable,
     /// The backend may have durably applied a write but lost the authoritative
     /// acknowledgement. The caller must resolve the result by reading with

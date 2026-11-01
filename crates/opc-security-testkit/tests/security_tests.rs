@@ -327,11 +327,11 @@ async fn test_kms_fault_responses_preserve_failure_class() {
         },
     ];
 
-    // Truncated transport remains retryable; oversized and malformed replies are permanent.
+    // Truncated transport is an outage; invalid replies need provider repair, not data rejection.
     let expected_errors = [
         opc_key::KeyError::Unavailable,
-        opc_key::KeyError::OperationFailed,
-        opc_key::KeyError::OperationFailed,
+        opc_key::KeyError::ProviderUnusable,
+        opc_key::KeyError::ProviderUnusable,
     ];
     assert_eq!(cases.len(), expected_errors.len());
     for (idx, (behavior, expected)) in cases.into_iter().zip(expected_errors).enumerate() {
@@ -372,6 +372,6 @@ async fn test_kms_tcp_without_tls_fails_closed() {
         .get_active_key(KeyPurpose::Config, &tenant())
         .await
         .unwrap_err();
-    // Missing TLS configuration is permanent and must fail before connecting.
-    assert_eq!(err, opc_key::KeyError::OperationFailed);
+    // Missing TLS configuration needs operator repair and must fail before connecting.
+    assert_eq!(err, opc_key::KeyError::ProviderUnusable);
 }

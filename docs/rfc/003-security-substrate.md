@@ -503,7 +503,7 @@ synchronously verifies that the module identity and validation declaration
 still match admission and that the complete frozen grant remains both
 advertised and serviceable. A module whose subsequent self-test or health state
 becomes invalid MUST withdraw the affected readiness capability. Provider
-`NotFound` and `Unavailable` classifications retain their public meaning;
+`NotFound`, `Unavailable` and `ProviderUnusable` classifications retain their public meaning;
 other provider context is collapsed to a fieldless redaction-safe error.
 
 Successful provider-returned bound AAD MUST be rejected before parsing when it
@@ -528,45 +528,59 @@ does not cache historical key material or authorization decisions, persist its
 epoch, watch a source, coordinate pods, or produce a fleet-comparable epoch.
 Each unseal calls the remote provider for the exact envelope key ID.
 
-Provider availability and request rejection MUST remain distinguishable.
-`KeyError::Unavailable` permits a retry within the caller's original budget;
-it MUST NOT represent an unknown key or a content-dependent authentication
-failure. Such failures remain redacted as `NotFound` or a coarse operation
-error. The session-store envelope boundary preserves availability as
-`StoreError::BackendUnavailable` and collapses content-dependent failures into
-`StoreError::Crypto`.
-Malformed KMS responses, poisoned local provider state and local configuration
-errors (including invalid Unix/TCP endpoints, missing TLS connectors and invalid
-TLS server names) MUST remain permanent operation failures. TLS certificate and
-peer authentication rejection MUST also remain permanent, including alerts
-received after the client handshake completes. Both JSON KMS adapters accept
-absolute Unix socket paths with at most one optional `unix://` prefix. Empty or
-relative Unix paths, interior NULs, and paths exceeding the platform socket
-address limit MUST be rejected before connecting. TCP accepts bare `host:port`
-or one `tcp://` prefix, including IPv4 and bracketed IPv6 with numeric scopes
-such as `[fe80::1%2]:7443`. Released resolver forms, including unbracketed numeric
-IPv6 and `u16` ports with a leading `+`, remain accepted. Hosts containing NUL,
-control characters or whitespace are invalid. Unix permission, path-component
-and protocol errors are permanent; absent/refused services, connection loss,
-timeouts, interruption and temporary backlog/resource exhaustion remain
-availability failures. TCP resolution/connect failures and transport loss
-remain availability failures.
+Provider availability, unusable configuration/channel state, and positive
+request/key/data rejection MUST remain distinguishable:
 
-The JSON KMS protocol reserves the exact case-sensitive response status
-`unavailable` for temporary service unavailability, including busy/throttled
-backpressure required by RFC 030. Both adapters MUST map
-`{"status":"unavailable"}` to `KeyError::Unavailable` for every operation.
-Optional `error_message` text MUST NOT select retryability or escape to callers.
-All other failure statuses remain permanent (`NotFound` for missing keys,
-otherwise `OperationFailed`); describing throttling in an `error` reply is not
-an availability signal. This classification adds no retry loop or budget and
-does not establish that a mutation was never performed.
+- `KeyError::Unavailable` covers outages, timeouts, transport loss, temporary
+  resource pressure and explicit busy/throttled replies. Retry only with backoff
+  within the caller's original budget.
+- `KeyError::ProviderUnusable` covers endpoint/TLS configuration, Unix permissions
+  and path/protocol errors, certificate/peer authentication failure, fatal TLS
+  alerts (including after handshake), malformed/oversized provider replies,
+  unknown response statuses and poisoned provider state. Preserve data and pending
+  work, report a redacted operator configuration problem and back off until
+  repair. It MUST NOT be treated as an outage for immediate retries or as a
+  verdict on any key, ciphertext or record. SVID expiry and trust rotation can
+  recover without changing the stored data.
+- `KeyError::OperationFailed` is reserved for a positive provider rejection of
+  the request, key or ciphertext, including AEAD authentication failure. A
+  positively missing key remains `NotFound`. RFC 030 terminal recovery requires
+  an actual key/data rejection; an unavailable or unusable provider proves none.
 
-Provider outages share the `backend_unavailable` metrics label with storage
-and quorum outages. The fixed session-key-provider message distinguishes their
-origin only in local store errors. Session-net intentionally sends the generic
-`backend unavailable` message, preserving availability classification without
-exposing provider details.
+Neither `Unavailable` nor `ProviderUnusable` authorizes record deletion, SA
+teardown, uncommitted plaintext/packet release, or a final cached mutation result.
+Budget exhaustion does not turn either class into corruption. Neither proves a
+mutation was never performed, and adapters add no retries or deadline extensions.
+
+Both JSON KMS adapters accept absolute Unix socket paths with at most one
+optional `unix://` prefix. Empty/relative paths, NULs, overlong socket addresses
+and repeated prefixes are rejected before connecting. A regular file or other
+non-socket endpoint is unusable configuration; an absent socket or a socket
+without a listener remains unavailable. TCP accepts bare `host:port` or one
+`tcp://` prefix, including IPv4, bracketed/scoped IPv6, released unbracketed IPv6
+forms and `u16` ports with a leading `+`. Invalid authorities fail before connect.
+
+The JSON KMS protocol reserves exactly `{"status":"unavailable"}` for temporary
+backpressure in every operation. Only an explicit `error` reply can positively
+reject a request/key/data; unknown statuses and malformed success replies are
+`ProviderUnusable`. Optional `error_message` text cannot select retryability and
+never escapes the adapter. Text describing throttling in an `error` reply does
+not make that rejection an outage.
+
+The session-store envelope boundary maps both provider availability classes to
+`StoreError::BackendUnavailable`; only key/data rejection remains `Crypto`.
+Configuration failures emit a fixed operator diagnostic before this coarse
+boundary. Session-net preserves non-definitive handling and transmits its generic
+`backend unavailable` message; the shared `backend_unavailable` metrics label
+also covers storage/quorum outages. Neither wire schema nor serialized error
+positions change.
+
+Generic envelope and bounded configuration encryption preserve these classes as
+`CryptoError::{ProviderUnavailable, ProviderUnusable}` and
+`ConfigCapacityError::{ProviderUnavailable, ProviderUnusable}`. Configuration
+storage and checkpoint readers keep them unavailable rather than data-rejected.
+Configuration-store startup unavailability and coarse failed/unresolved commits
+raise configuration-apply alarms, without claiming storage corruption.
 
 ### 9.4 Rotation
 

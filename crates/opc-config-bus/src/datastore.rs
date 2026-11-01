@@ -486,7 +486,9 @@ where
         let envelope =
             encrypt_attested_envelope(self.provider.as_ref(), &aad, plaintext.as_slice())
                 .await
-                .map_err(|_| StoreError::crypto(CONFIG_ENVELOPE_ENCRYPT_FAILED_MESSAGE))?;
+                .map_err(|error| {
+                    config_provider_error(error, CONFIG_ENVELOPE_ENCRYPT_FAILED_MESSAGE)
+                })?;
         record.encrypted_blob = envelope.encoded().to_vec();
         Ok(record.with_config(SealedConfig::newly_encrypted(schema_digest, envelope)))
     }
@@ -512,7 +514,9 @@ where
             build_config_envelope_aad(&record, self.store_kind(), record.config.aad_principal())?;
         let plaintext = decrypt_envelope(self.provider.as_ref(), &aad, &record.encrypted_blob)
             .await
-            .map_err(|_| StoreError::crypto(CONFIG_ENVELOPE_DECRYPT_FAILED_MESSAGE))?;
+            .map_err(|error| {
+                config_provider_error(error, CONFIG_ENVELOPE_DECRYPT_FAILED_MESSAGE)
+            })?;
         verify_plaintext_digest(&record, plaintext.as_slice())?;
         let (config, metadata) = if let Some(encoded) =
             plaintext.as_slice().strip_prefix(CONFIG_PLAINTEXT_V2_MAGIC)
@@ -1222,3 +1226,16 @@ impl<C: OpcConfig> ManagedDatastore<C> for InMemoryManagedDatastore<C> {
 /// New product code that needs a non-production backend should prefer
 /// [`InMemoryManagedDatastore`] so runtime composition does not imply a mock.
 pub type MockManagedDatastore<C> = InMemoryManagedDatastore<C>;
+
+fn config_provider_error(error: opc_crypto::CryptoError, rejected: &'static str) -> StoreError {
+    match error {
+        opc_crypto::CryptoError::ProviderUnavailable => {
+            StoreError::unavailable("config key provider unavailable")
+        }
+        opc_crypto::CryptoError::ProviderUnusable => {
+            tracing::warn!("config key provider configuration unavailable; retain records and back off until provider repair");
+            StoreError::unavailable("config key provider configuration unavailable")
+        }
+        _ => StoreError::crypto(rejected),
+    }
+}

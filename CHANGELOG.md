@@ -9,13 +9,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
-- `opc-key`, `opc-session-store`: distinguish permanent authentication,
-  configuration and completed KMS rejections from retryable provider outages.
-  Validate Unix/TCP endpoints before connecting, reject TLS peer authentication
-  failures, and classify malformed/oversized responses, short seal output and
-  poisoned material state as permanent. The explicit KMS response status
-  `unavailable` preserves retryable busy/throttling backpressure. Store outages
-  use `BackendUnavailable`; permanent provider failures remain `Crypto`.
+- `opc-key`, `opc-crypto`, `opc-session-store`, `opc-config-bus`, `opc-persist`:
+  preserve provider configuration/channel failures separately from positive
+  key/data rejection. Invalid endpoints, Unix permissions, TLS certificate/peer
+  failures, fatal alerts, malformed replies and poisoned provider state return
+  `ProviderUnusable`; outages and explicit busy/throttled replies remain
+  `Unavailable`. Envelope, custody, storage and RFC 030 recovery consumers retain
+  rows and pending work, release nothing and back off while configuration failures
+  are reported to operators. Configuration-store alarms no longer infer storage
+  corruption from unavailability or coarse failed/unresolved commits.
   `EncryptedPayload` debug output redacts AAD and ciphertext. Refs #1197.
 - `opc-session-net`: treat `KeyProviderUnavailable` from a custom backend as a
   non-definitive CAS outcome, preserving an ambiguity tombstone instead of
@@ -768,20 +770,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   refresh. Downstream exhaustive matches must handle the new variants.
   Refs #1246.
 
-- `opc-key`: add fieldless `KeyError::OperationFailed` and
-  `KeyCustodyOperationError::ProviderOperationFailed` variants. Direct callers
-  must handle these in exhaustive matches. Completed KMS rejections,
-  malformed/oversized responses, invalid endpoint/TLS configuration and
-  authentication failures now return `OperationFailed` instead of `Unavailable`.
-  Missing keys remain `NotFound`; timeouts, transport loss and explicit
-  `status: "unavailable"` responses remain retryable. Refs #1197.
+- `opc-key`: add fieldless `KeyError::OperationFailed` and `ProviderUnusable`.
+  Direct callers must distinguish positive request/key/data rejection from
+  provider configuration/channel failures and outages. `KeyError` is already
+  non-exhaustive; downstream wildcard handling must preserve nonterminal failures.
+  `OperationFailed` now means positive rejection only; malformed replies, invalid
+  endpoint/TLS configuration and peer authentication failures use `ProviderUnusable`.
+  Missing keys remain `NotFound`; outages, timeouts and exact `status: "unavailable"`
+  replies remain `Unavailable`. The custody boundary preserves `ProviderUnusable`.
+  Newly rejected endpoint forms accepted by released versions are relative
+  `unix://` paths, `unix://\0` abstract sockets, and repeated `tcp://` or `unix://`
+  prefixes. Existing filesystem paths must name sockets. Refs #1197.
+- `opc-crypto`: add `ProviderUnavailable` and `ProviderUnusable` to `CryptoError`
+  and `ConfigCapacityError`. Provider lookup failures no longer become generic
+  encryption/decryption rejection. Callers retain data, back off and report
+  unusable provider configuration. Both enums remain non-exhaustive. Refs #1197.
 - `opc-session-store`: the newly added, unreleased
   `StoreError::KeyProviderUnavailable` variant keeps its assigned serialized
-  position. Record sealing/unsealing instead reports provider outages as
-  `BackendUnavailable("session key provider unavailable")`; permanent provider
-  failures remain `Crypto`. Downstream exhaustive matches must handle the
-  added variant; custom backends returning it receive non-definitive CAS
-  handling in `opc-session-net`. Refs #1197.
+  position. Record sealing/unsealing reports provider outages and unusable
+  configuration as `BackendUnavailable`; positive key/data rejection remains
+  `Crypto`. Downstream exhaustive matches must handle the added variant; custom
+  backends returning it receive non-definitive CAS handling in `opc-session-net`.
+  Refs #1197.
 - `opc-session-store` and `opc-session-net`: protected-roster activation now
   binds the admission capacity policy, and authenticated admissions distinguish
   ordinary and emergency work. Crossing this storage boundary requires a fresh

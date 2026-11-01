@@ -489,7 +489,8 @@ async fn persistence_failure_raises_major_storage_commit_alarm() {
     assert_eq!(err.code, CommitErrorCode::PersistFailed);
     let alarm = single_active_alarm(&alarms, "config-bus.commit.failure");
     assert_eq!(alarm.severity, Severity::Major);
-    assert_eq!(alarm.probable_cause, ProbableCause::StorageCorruption);
+    // A failed or unresolved commit is not evidence of corrupt stored bytes.
+    assert_eq!(alarm.probable_cause, ProbableCause::ConfigApplyFailed);
     assert_eq!(
         alarm.text.as_str(),
         "Config bus commit failure: persist_failed"

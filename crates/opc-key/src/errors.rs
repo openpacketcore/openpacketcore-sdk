@@ -55,9 +55,9 @@ impl KeyCustodyOperationError {
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
 pub enum KeyError {
     /// The provider could not service the request because it is unavailable.
-    /// This is retryable within the caller's existing budget. Missing keys,
-    /// authentication failures and other content-dependent rejections must
-    /// use a different variant.
+    /// Outages, transport loss, timeouts and explicit busy/throttled replies
+    /// permit bounded backoff within the caller's original budget. This is
+    /// never a verdict on stored data or proof that a mutation did not run.
     #[error("key provider unavailable")]
     Unavailable,
     #[error("key id not found")]
@@ -78,11 +78,18 @@ pub enum KeyError {
     /// An admitted key-custody boundary rejected or failed an operation.
     #[error(transparent)]
     CustodyOperation(#[from] KeyCustodyOperationError),
-    /// A provider or cryptographic operation was rejected. This fieldless
-    /// error exposes no provider context and does not imply a temporary loss
-    /// of provider availability.
+    /// The provider positively rejected the request, key or ciphertext.
+    /// This fieldless error exposes no provider context. Endpoint, channel,
+    /// authentication and invalid-response failures use [`Self::ProviderUnusable`].
     #[error("key provider operation failed")]
     OperationFailed,
+    /// The provider cannot be used as configured: endpoint, permissions, TLS,
+    /// authentication, protocol or local provider state needs operator repair.
+    /// This is not a verdict on a key or data and never authorizes teardown,
+    /// deletion or release. Preserve pending work, report the configuration
+    /// problem, and back off; do not spend the outage budget on a tight retry.
+    #[error("key provider unusable as configured")]
+    ProviderUnusable,
 }
 
 impl KeyError {

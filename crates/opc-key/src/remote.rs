@@ -17,9 +17,11 @@ use crate::{
 /// memory. Callers still build the same [`EnvelopeAad`] used by the local
 /// [`crate::KeyProvider`] path, and implementations must bind the exact bytes
 /// from [`serialize_bound_aad`] into the remote encrypt/decrypt request.
-/// Reserve [`KeyError::Unavailable`] for availability failures. Authentication
-/// or other content-dependent rejection must remain a separate coarse error,
-/// such as [`KeyError::OperationFailed`], so callers can retry only outages.
+/// Reserve [`KeyError::Unavailable`] for outages and [`KeyError::ProviderUnusable`]
+/// for endpoint, TLS/peer authentication, protocol or configuration failures.
+/// Neither authorizes deleting data or releasing an uncommitted result. Callers
+/// back off and report unusable configuration to operators. Only positive
+/// request/key/ciphertext rejection uses [`KeyError::OperationFailed`].
 #[async_trait]
 pub trait RemoteSealProvider: Send + Sync {
     /// Seal inside the KMS/HSM; the key never enters app memory.
@@ -91,7 +93,7 @@ impl RemoteSealMaterialController {
         &self,
         active_key_id: KeyId,
     ) -> Result<RemoteSealMaterialEpoch, KeyError> {
-        let mut state = self.inner.lock().map_err(|_| KeyError::OperationFailed)?;
+        let mut state = self.inner.lock().map_err(|_| KeyError::ProviderUnusable)?;
         if state.active_key_id == active_key_id {
             return Ok(state.epoch);
         }
@@ -110,14 +112,14 @@ impl RemoteSealMaterialController {
         self.inner
             .lock()
             .map(|state| state.epoch)
-            .map_err(|_| KeyError::OperationFailed)
+            .map_err(|_| KeyError::ProviderUnusable)
     }
 
     pub(crate) fn active_selection(&self) -> Result<(RemoteSealMaterialEpoch, KeyId), KeyError> {
         self.inner
             .lock()
             .map(|state| (state.epoch, state.active_key_id.clone()))
-            .map_err(|_| KeyError::OperationFailed)
+            .map_err(|_| KeyError::ProviderUnusable)
     }
 }
 
@@ -254,6 +256,9 @@ mod material_tests {
             controller.active_selection().unwrap_err(),
         ];
         // Poisoned provider state says nothing about a request or ciphertext.
+        assert!(errors
+            .iter()
+            .all(|error| *error == KeyError::ProviderUnusable));
         for error in errors {
             assert_eq!(error.to_string(), "key provider unusable as configured");
             assert_eq!(format!("{error:?}"), "ProviderUnusable");

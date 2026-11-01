@@ -39,8 +39,11 @@ impl fmt::Debug for EncryptedPayload {
 /// Key-provider contract from RFC 003.
 ///
 /// Reserve [`KeyError::Unavailable`] for provider availability failures.
-/// Missing keys and completed request rejections must remain distinct from
-/// retryable outages; provider-specific context must not escape in errors.
+/// Use [`KeyError::ProviderUnusable`] for endpoint, channel, authentication or
+/// provider protocol/configuration failures. Neither class is a verdict on
+/// stored data. Callers retain pending work, back off and report configuration
+/// failures to operators. Missing keys and positive request/data rejections
+/// remain distinct; provider-specific context must not escape in errors.
 #[async_trait]
 pub trait KeyProvider: Send + Sync {
     async fn get_active_key(

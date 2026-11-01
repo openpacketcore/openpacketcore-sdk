@@ -69,7 +69,7 @@ struct KmsResponse {
 
 fn decode_hex_32(hex: &str) -> Result<Zeroizing<[u8; 32]>, KeyError> {
     if hex.len() != 64 || !hex.is_ascii() {
-        return Err(KeyError::OperationFailed);
+        return Err(KeyError::ProviderUnusable);
     }
     let mut bytes = Zeroizing::new([0u8; 32]);
     for (i, chunk) in hex.as_bytes().as_chunks::<2>().0.iter().enumerate() {
@@ -85,7 +85,7 @@ fn decode_hex_nibble(byte: u8) -> Result<u8, KeyError> {
         b'0'..=b'9' => Ok(byte - b'0'),
         b'a'..=b'f' => Ok(byte - b'a' + 10),
         b'A'..=b'F' => Ok(byte - b'A' + 10),
-        _ => Err(KeyError::OperationFailed),
+        _ => Err(KeyError::ProviderUnusable),
     }
 }
 
@@ -101,7 +101,7 @@ fn encode_hex(bytes: &[u8]) -> String {
 fn decode_hex_vec(hex: &str) -> Result<Vec<u8>, KeyError> {
     let (chunks, remainder) = hex.as_bytes().as_chunks::<2>();
     if !remainder.is_empty() || !hex.is_ascii() {
-        return Err(KeyError::OperationFailed);
+        return Err(KeyError::ProviderUnusable);
     }
     let mut bytes = Vec::with_capacity(hex.len() / 2);
     for chunk in chunks {
@@ -115,11 +115,11 @@ fn decode_hex_vec(hex: &str) -> Result<Vec<u8>, KeyError> {
 fn unix_endpoint_path(endpoint: &str) -> Result<&str, KeyError> {
     let path = endpoint.strip_prefix("unix://").unwrap_or(endpoint);
     if !std::path::Path::new(path).is_absolute() {
-        return Err(KeyError::OperationFailed);
+        return Err(KeyError::ProviderUnusable);
     }
     // Validate the platform's actual sun_path limit and reject interior NULs
     // before attempting I/O. An endpoint has at most one scheme prefix.
-    std::os::unix::net::SocketAddr::from_pathname(path).map_err(|_| KeyError::OperationFailed)?;
+    std::os::unix::net::SocketAddr::from_pathname(path).map_err(|_| KeyError::ProviderUnusable)?;
     Ok(path)
 }
 
@@ -137,7 +137,7 @@ fn unix_connect_error(error: std::io::Error) -> KeyError {
         }
         // Permissions, invalid path components, protocol mismatch and other
         // local configuration failures must not consume a retry budget.
-        _ => KeyError::OperationFailed,
+        _ => KeyError::ProviderUnusable,
     }
 }
 
@@ -150,10 +150,12 @@ fn kms_transport_error(error: std::io::Error) -> KeyError {
         .is_some_and(|cause| cause.is::<tokio_rustls::rustls::Error>())
         || matches!(
             error.kind(),
-            std::io::ErrorKind::InvalidData | std::io::ErrorKind::InvalidInput
+            std::io::ErrorKind::InvalidData
+                | std::io::ErrorKind::InvalidInput
+                | std::io::ErrorKind::PermissionDenied
         )
     {
-        KeyError::OperationFailed
+        KeyError::ProviderUnusable
     } else {
         KeyError::Unavailable
     }
@@ -165,12 +167,12 @@ fn tcp_endpoint_addr(endpoint: &str) -> Result<&str, KeyError> {
     // discard its scope. Tokio parses a complete SocketAddr before resolving.
     let addr = endpoint.strip_prefix("tcp://").unwrap_or(endpoint);
     if addr.contains("://") {
-        return Err(KeyError::OperationFailed);
+        return Err(KeyError::ProviderUnusable);
     }
     if addr.parse::<std::net::SocketAddr>().is_ok() {
         return Ok(addr);
     }
-    let (host, port) = addr.rsplit_once(':').ok_or(KeyError::OperationFailed)?;
+    let (host, port) = addr.rsplit_once(':').ok_or(KeyError::ProviderUnusable)?;
     if host.is_empty()
         || host
             .chars()
@@ -178,14 +180,14 @@ fn tcp_endpoint_addr(endpoint: &str) -> Result<&str, KeyError> {
         || port.parse::<u16>().is_err()
         || host.contains(['[', ']', '/', '?', '#', '@'])
     {
-        return Err(KeyError::OperationFailed);
+        return Err(KeyError::ProviderUnusable);
     }
     if host.contains(':') {
         // The resolver also accepts unbracketed numeric IPv6 host:port forms.
         // A zone is resolved with the address rather than treated as a name.
         let literal = if let Some((literal, zone)) = host.split_once('%') {
             if zone.is_empty() {
-                return Err(KeyError::OperationFailed);
+                return Err(KeyError::ProviderUnusable);
             }
             literal
         } else {
@@ -193,7 +195,7 @@ fn tcp_endpoint_addr(endpoint: &str) -> Result<&str, KeyError> {
         };
         literal
             .parse::<std::net::Ipv6Addr>()
-            .map_err(|_| KeyError::OperationFailed)?;
+            .map_err(|_| KeyError::ProviderUnusable)?;
     }
     Ok(addr)
 }
@@ -255,18 +257,28 @@ impl KmsKeyProvider {
         let connect_fut = async {
             if self.endpoint.starts_with('/') || self.endpoint.starts_with("unix://") {
                 let path = unix_endpoint_path(&self.endpoint)?;
+                // A regular file can produce ECONNREFUSED just like a stale
+                // socket. Distinguish configuration from an absent listener.
+                // Connect still classifies races after this observation.
+                use std::os::unix::fs::FileTypeExt;
+                let metadata = tokio::fs::metadata(path)
+                    .await
+                    .map_err(unix_connect_error)?;
+                if !metadata.file_type().is_socket() {
+                    return Err(KeyError::ProviderUnusable);
+                }
                 let stream = tokio::net::UnixStream::connect(path)
                     .await
                     .map_err(unix_connect_error)?;
                 Ok::<KmsStream, KeyError>(KmsStream::Unix(stream))
             } else {
                 let addr = tcp_endpoint_addr(&self.endpoint)?;
-                let connector = self.connector.as_ref().ok_or(KeyError::OperationFailed)?;
+                let connector = self.connector.as_ref().ok_or(KeyError::ProviderUnusable)?;
                 let domain = rustls_pki_types::ServerName::try_from(self.server_name.clone())
-                    .map_err(|_| KeyError::OperationFailed)?;
+                    .map_err(|_| KeyError::ProviderUnusable)?;
                 let stream = tokio::net::TcpStream::connect(addr)
                     .await
-                    .map_err(|_| KeyError::Unavailable)?;
+                    .map_err(kms_transport_error)?;
                 let tls_stream = connector
                     .connect(domain, stream)
                     .await
@@ -277,7 +289,7 @@ impl KmsKeyProvider {
 
         let mut stream = connect_fut.await?;
 
-        let req_bytes = serde_json::to_vec(&req).map_err(|_| KeyError::OperationFailed)?;
+        let req_bytes = serde_json::to_vec(&req).map_err(|_| KeyError::ProviderUnusable)?;
         let req_len = req_bytes.len() as u32;
 
         stream
@@ -297,7 +309,7 @@ impl KmsKeyProvider {
             .map_err(kms_transport_error)?;
         let len = u32::from_be_bytes(len_buf) as usize;
         if len > Self::MAX_RESPONSE_BYTES {
-            return Err(KeyError::OperationFailed);
+            return Err(KeyError::ProviderUnusable);
         }
 
         let mut resp_buf = Zeroizing::new(vec![0u8; len]);
@@ -306,7 +318,7 @@ impl KmsKeyProvider {
             .await
             .map_err(kms_transport_error)?;
         let resp: KmsResponse =
-            serde_json::from_slice(&resp_buf).map_err(|_| KeyError::OperationFailed)?;
+            serde_json::from_slice(&resp_buf).map_err(|_| KeyError::ProviderUnusable)?;
 
         if resp.status == "success" {
             Ok(resp)
@@ -314,15 +326,20 @@ impl KmsKeyProvider {
             // Only this protocol status signals temporary busy/throttling.
             // Free-form provider messages never select a retryable class.
             Err(KeyError::Unavailable)
-        } else {
-            let msg = resp
+        } else if resp.status == "error" {
+            // Only an explicit rejection may make a key/data verdict. An
+            // unknown status or malformed success is a provider protocol fault.
+            if resp
                 .error_message
-                .unwrap_or_else(|| "KMS failed".to_string());
-            if msg.contains("not found") {
+                .as_deref()
+                .is_some_and(|msg| msg.contains("not found"))
+            {
                 Err(KeyError::NotFound)
             } else {
                 Err(KeyError::OperationFailed)
             }
+        } else {
+            Err(KeyError::ProviderUnusable)
         }
     }
 }
@@ -344,10 +361,10 @@ impl KeyProvider for KmsKeyProvider {
             ciphertext_and_tag_hex: None,
         };
         let resp = self.call_kms(req).await?;
-        let key_id_str = resp.key_id.ok_or(KeyError::OperationFailed)?;
-        let key_bytes_hex = Zeroizing::new(resp.key_bytes_hex.ok_or(KeyError::OperationFailed)?);
+        let key_id_str = resp.key_id.ok_or(KeyError::ProviderUnusable)?;
+        let key_bytes_hex = Zeroizing::new(resp.key_bytes_hex.ok_or(KeyError::ProviderUnusable)?);
 
-        let key_id = KeyId::new(key_id_str).map_err(|_| KeyError::OperationFailed)?;
+        let key_id = KeyId::new(key_id_str).map_err(|_| KeyError::ProviderUnusable)?;
         let key_bytes = decode_hex_32(&key_bytes_hex)?;
 
         let handle = KeyHandle::new(key_id, purpose, tenant.clone(), key_bytes);
@@ -365,9 +382,9 @@ impl KeyProvider for KmsKeyProvider {
             ciphertext_and_tag_hex: None,
         };
         let resp = self.call_kms(req).await?;
-        let key_bytes_hex = Zeroizing::new(resp.key_bytes_hex.ok_or(KeyError::OperationFailed)?);
-        let purpose_str = resp.purpose.ok_or(KeyError::OperationFailed)?;
-        let tenant_str = resp.tenant.ok_or(KeyError::OperationFailed)?;
+        let key_bytes_hex = Zeroizing::new(resp.key_bytes_hex.ok_or(KeyError::ProviderUnusable)?);
+        let purpose_str = resp.purpose.ok_or(KeyError::ProviderUnusable)?;
+        let tenant_str = resp.tenant.ok_or(KeyError::ProviderUnusable)?;
 
         let purpose = match purpose_str.as_str() {
             "config" => KeyPurpose::Config,
@@ -377,9 +394,9 @@ impl KeyProvider for KmsKeyProvider {
             "ipsec-sa" => KeyPurpose::IpsecSa,
             "audit" => KeyPurpose::Audit,
             "backup" => KeyPurpose::Backup,
-            _ => return Err(KeyError::OperationFailed),
+            _ => return Err(KeyError::ProviderUnusable),
         };
-        let tenant = TenantId::new(tenant_str).map_err(|_| KeyError::OperationFailed)?;
+        let tenant = TenantId::new(tenant_str).map_err(|_| KeyError::ProviderUnusable)?;
         let key_bytes = decode_hex_32(&key_bytes_hex)?;
 
         let handle = KeyHandle::new(key_id.clone(), purpose, tenant, key_bytes);
@@ -397,8 +414,8 @@ impl KeyProvider for KmsKeyProvider {
             ciphertext_and_tag_hex: None,
         };
         let resp = self.call_kms(req).await?;
-        let key_id_str = resp.key_id.ok_or(KeyError::OperationFailed)?;
-        KeyId::new(key_id_str).map_err(|_| KeyError::OperationFailed)
+        let key_id_str = resp.key_id.ok_or(KeyError::ProviderUnusable)?;
+        KeyId::new(key_id_str).map_err(|_| KeyError::ProviderUnusable)
     }
 }
 
@@ -462,18 +479,28 @@ impl KmsRemoteSealProvider {
         let connect_fut = async {
             if self.endpoint.starts_with('/') || self.endpoint.starts_with("unix://") {
                 let path = unix_endpoint_path(&self.endpoint)?;
+                // A regular file can produce ECONNREFUSED just like a stale
+                // socket. Distinguish configuration from an absent listener.
+                // Connect still classifies races after this observation.
+                use std::os::unix::fs::FileTypeExt;
+                let metadata = tokio::fs::metadata(path)
+                    .await
+                    .map_err(unix_connect_error)?;
+                if !metadata.file_type().is_socket() {
+                    return Err(KeyError::ProviderUnusable);
+                }
                 let stream = tokio::net::UnixStream::connect(path)
                     .await
                     .map_err(unix_connect_error)?;
                 Ok::<KmsStream, KeyError>(KmsStream::Unix(stream))
             } else {
                 let addr = tcp_endpoint_addr(&self.endpoint)?;
-                let connector = self.connector.as_ref().ok_or(KeyError::OperationFailed)?;
+                let connector = self.connector.as_ref().ok_or(KeyError::ProviderUnusable)?;
                 let domain = rustls_pki_types::ServerName::try_from(self.server_name.clone())
-                    .map_err(|_| KeyError::OperationFailed)?;
+                    .map_err(|_| KeyError::ProviderUnusable)?;
                 let stream = tokio::net::TcpStream::connect(addr)
                     .await
-                    .map_err(|_| KeyError::Unavailable)?;
+                    .map_err(kms_transport_error)?;
                 let tls_stream = connector
                     .connect(domain, stream)
                     .await
@@ -484,7 +511,7 @@ impl KmsRemoteSealProvider {
 
         let mut stream = connect_fut.await?;
 
-        let req_bytes = serde_json::to_vec(&req).map_err(|_| KeyError::OperationFailed)?;
+        let req_bytes = serde_json::to_vec(&req).map_err(|_| KeyError::ProviderUnusable)?;
         let req_len = req_bytes.len() as u32;
 
         stream
@@ -504,7 +531,7 @@ impl KmsRemoteSealProvider {
             .map_err(kms_transport_error)?;
         let len = u32::from_be_bytes(len_buf) as usize;
         if len > KmsKeyProvider::MAX_RESPONSE_BYTES {
-            return Err(KeyError::OperationFailed);
+            return Err(KeyError::ProviderUnusable);
         }
 
         let mut resp_buf = Zeroizing::new(vec![0u8; len]);
@@ -513,7 +540,7 @@ impl KmsRemoteSealProvider {
             .await
             .map_err(kms_transport_error)?;
         let resp: KmsResponse =
-            serde_json::from_slice(&resp_buf).map_err(|_| KeyError::OperationFailed)?;
+            serde_json::from_slice(&resp_buf).map_err(|_| KeyError::ProviderUnusable)?;
 
         if resp.status == "success" {
             Ok(resp)
@@ -521,15 +548,20 @@ impl KmsRemoteSealProvider {
             // Only this protocol status signals temporary busy/throttling.
             // Free-form provider messages never select a retryable class.
             Err(KeyError::Unavailable)
-        } else {
-            let msg = resp
+        } else if resp.status == "error" {
+            // Only an explicit rejection may make a key/data verdict. An
+            // unknown status or malformed success is a provider protocol fault.
+            if resp
                 .error_message
-                .unwrap_or_else(|| "KMS failed".to_string());
-            if msg.contains("not found") {
+                .as_deref()
+                .is_some_and(|msg| msg.contains("not found"))
+            {
                 Err(KeyError::NotFound)
             } else {
                 Err(KeyError::OperationFailed)
             }
+        } else {
+            Err(KeyError::ProviderUnusable)
         }
     }
 }
@@ -555,12 +587,12 @@ impl RemoteSealProvider for KmsRemoteSealProvider {
         let resp = self.call_kms(req).await?;
         let ciphertext_hex = resp
             .ciphertext_and_tag_hex
-            .ok_or(KeyError::OperationFailed)?;
+            .ok_or(KeyError::ProviderUnusable)?;
         let ciphertext_and_tag = decode_hex_vec(&ciphertext_hex)?;
         // RemoteSeal output is opaque and may include provider framing, but
         // even an empty plaintext requires an authentication tag.
         if ciphertext_and_tag.len() < AEAD_TAG_LEN {
-            return Err(KeyError::OperationFailed);
+            return Err(KeyError::ProviderUnusable);
         }
 
         Ok(EncryptedPayload {
@@ -586,7 +618,7 @@ impl RemoteSealProvider for KmsRemoteSealProvider {
             ciphertext_and_tag_hex: Some(encode_hex(ciphertext_and_tag)),
         };
         let resp = self.call_kms(req).await?;
-        let plaintext_hex = Zeroizing::new(resp.plaintext_hex.ok_or(KeyError::OperationFailed)?);
+        let plaintext_hex = Zeroizing::new(resp.plaintext_hex.ok_or(KeyError::ProviderUnusable)?);
         Ok(Zeroizing::new(decode_hex_vec(&plaintext_hex)?))
     }
 }
@@ -681,7 +713,7 @@ mod tests {
         ] {
             assert_eq!(
                 unix_connect_error(std::io::Error::from_raw_os_error(errno)),
-                KeyError::OperationFailed,
+                KeyError::ProviderUnusable,
                 "invalid local configuration: {errno}"
             );
         }
@@ -704,7 +736,7 @@ mod tests {
             results
                 .iter()
                 .flatten()
-                .all(|error| *error == KeyError::OperationFailed),
+                .all(|error| *error == KeyError::ProviderUnusable),
             "invalid paths must fail permanently: {results:?}"
         );
     }
@@ -721,7 +753,7 @@ mod tests {
         assert!(
             errors
                 .iter()
-                .all(|error| *error == KeyError::OperationFailed),
+                .all(|error| *error == KeyError::ProviderUnusable),
             "repeated scheme must fail permanently: {errors:?}"
         );
         // A rejected configuration must not send even a TLS ClientHello.
@@ -755,21 +787,14 @@ mod tests {
         std::fs::create_dir(&directory).unwrap();
         let file = directory.join("regular-file");
         std::fs::write(&file, b"not a socket").unwrap();
-        // ENOTDIR is a configuration defect, unlike an absent service socket.
-        let errors = kms_request_errors(
-            file.join("socket").display().to_string(),
-            None,
-            "kms.example",
-        )
-        .await;
+        // Both the file itself and ENOTDIR require configuration repair;
+        // neither is an absent listener on an otherwise valid socket.
+        for path in [&file, &file.join("socket")] {
+            let errors = kms_request_errors(path.display().to_string(), None, "kms.example").await;
+            assert_provider_configuration(&errors);
+        }
         std::fs::remove_file(file).unwrap();
         std::fs::remove_dir(directory).unwrap();
-        assert!(
-            errors
-                .iter()
-                .all(|error| *error == KeyError::OperationFailed),
-            "non-directory path component must fail permanently: {errors:?}"
-        );
     }
 
     async fn kms_certificate_failure_errors(trust_certificate: bool) -> [KeyError; 5] {
@@ -828,7 +853,7 @@ mod tests {
         assert!(
             errors
                 .iter()
-                .all(|error| *error == KeyError::OperationFailed),
+                .all(|error| *error == KeyError::ProviderUnusable),
             "untrusted certificate must fail permanently: {errors:?}"
         );
     }
@@ -839,7 +864,7 @@ mod tests {
         assert!(
             errors
                 .iter()
-                .all(|error| *error == KeyError::OperationFailed),
+                .all(|error| *error == KeyError::ProviderUnusable),
             "certificate name mismatch must fail permanently: {errors:?}"
         );
     }
@@ -877,7 +902,7 @@ mod tests {
             results
                 .iter()
                 .flatten()
-                .all(|error| *error == KeyError::OperationFailed),
+                .all(|error| *error == KeyError::ProviderUnusable),
             "peer authentication rejection must fail permanently: {results:?}"
         );
     }
@@ -935,7 +960,7 @@ mod tests {
         assert!(
             errors
                 .iter()
-                .all(|error| *error == KeyError::OperationFailed),
+                .all(|error| *error == KeyError::ProviderUnusable),
             "TLS 1.3 client authentication rejection must fail permanently: {errors:?}"
         );
     }
@@ -998,9 +1023,14 @@ mod tests {
                     MockResponse::Bytes(response.to_string().into_bytes()),
                 )
                 .await;
-                assert_eq!(error, KeyError::OperationFailed);
-                assert_eq!(format!("{error:?}"), "OperationFailed");
-                assert_eq!(error.to_string(), "key provider operation failed");
+                assert_ne!(error, KeyError::Unavailable, "text cannot select an outage");
+                if status == "error" {
+                    assert_eq!(error, KeyError::OperationFailed);
+                    assert_eq!(format!("{error:?}"), "OperationFailed");
+                    assert_eq!(error.to_string(), "key provider operation failed");
+                } else {
+                    assert_provider_configuration(&[error]);
+                }
             }
         }
     }
@@ -1212,14 +1242,14 @@ mod tests {
     fn decode_hex_32_rejects_non_ascii_without_panic() {
         let malformed = "ä".repeat(32);
 
-        assert_eq!(decode_hex_32(&malformed), Err(KeyError::OperationFailed));
+        assert_eq!(decode_hex_32(&malformed), Err(KeyError::ProviderUnusable));
     }
 
     #[test]
     fn decode_hex_32_rejects_non_hex_ascii() {
         assert_eq!(
             decode_hex_32("zz0102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e"),
-            Err(KeyError::OperationFailed)
+            Err(KeyError::ProviderUnusable)
         );
     }
 
@@ -1255,7 +1285,7 @@ mod tests {
             .await
             .expect_err("oversized KMS response must fail");
 
-        assert_eq!(err, KeyError::OperationFailed);
+        assert_eq!(err, KeyError::ProviderUnusable);
     }
 
     #[tokio::test]
@@ -1268,7 +1298,7 @@ mod tests {
             .await
             .expect_err("malformed KMS JSON must fail");
 
-        assert_eq!(err, KeyError::OperationFailed);
+        assert_eq!(err, KeyError::ProviderUnusable);
     }
 
     #[tokio::test]
@@ -1292,7 +1322,7 @@ mod tests {
                 .await
                 .expect_err("malformed KMS key hex must fail");
 
-            assert_eq!(err, KeyError::OperationFailed);
+            assert_eq!(err, KeyError::ProviderUnusable);
         }
     }
 
@@ -1313,7 +1343,7 @@ mod tests {
             .await
             .expect_err("unknown KMS purpose must fail");
 
-        assert_eq!(err, KeyError::OperationFailed);
+        assert_eq!(err, KeyError::ProviderUnusable);
     }
 
     #[tokio::test]
@@ -1374,12 +1404,12 @@ mod tests {
         assert!(
             errors
                 .iter()
-                .all(|(_, _, error)| *error == KeyError::OperationFailed),
+                .all(|(_, _, error)| *error == KeyError::ProviderUnusable),
             "malformed success responses must be permanent: {errors:?}"
         );
         for (_, _, error) in errors {
-            assert_eq!(error.to_string(), "key provider operation failed");
-            assert_eq!(format!("{error:?}"), "OperationFailed");
+            assert_eq!(error.to_string(), "key provider unusable as configured");
+            assert_eq!(format!("{error:?}"), "ProviderUnusable");
         }
     }
 
@@ -1482,7 +1512,7 @@ mod tests {
         assert!(
             errors
                 .iter()
-                .all(|(_, error)| *error == KeyError::OperationFailed),
+                .all(|(_, error)| *error == KeyError::ProviderUnusable),
             "malformed complete response frames must be permanent: {errors:?}"
         );
     }
@@ -1514,7 +1544,7 @@ mod tests {
         assert!(
             results
                 .iter()
-                .all(|(_, _, error)| *error == Some(KeyError::OperationFailed)),
+                .all(|(_, _, error)| *error == Some(KeyError::ProviderUnusable)),
             "every short success output must fail permanently: {results:?}"
         );
     }
@@ -1613,7 +1643,7 @@ mod tests {
         assert!(
             errors
                 .iter()
-                .all(|error| *error == KeyError::OperationFailed),
+                .all(|error| *error == KeyError::ProviderUnusable),
             "invalid configuration must fail permanently: {errors:?}"
         );
         assert_eq!(
@@ -1668,7 +1698,7 @@ mod tests {
         ] {
             assert_eq!(
                 tcp_endpoint_addr(endpoint),
-                Err(KeyError::OperationFailed),
+                Err(KeyError::ProviderUnusable),
                 "{endpoint}"
             );
         }
@@ -1711,7 +1741,7 @@ mod tests {
             let endpoint = format!("tcp://kms{control}.example:7443");
             assert_eq!(
                 tcp_endpoint_addr(&endpoint),
-                Err(KeyError::OperationFailed),
+                Err(KeyError::ProviderUnusable),
                 "{endpoint:?}"
             );
         }
@@ -1747,7 +1777,7 @@ mod tests {
         assert!(
             errors
                 .iter()
-                .all(|error| *error == KeyError::OperationFailed),
+                .all(|error| *error == KeyError::ProviderUnusable),
             "a NUL host must fail permanently for every operation: {errors:?}"
         );
     }
@@ -1765,7 +1795,7 @@ mod tests {
         assert!(
             errors
                 .iter()
-                .all(|error| *error == KeyError::OperationFailed),
+                .all(|error| *error == KeyError::ProviderUnusable),
             "invalid configuration must fail permanently: {errors:?}"
         );
         assert_eq!(
@@ -1802,7 +1832,7 @@ mod tests {
         assert!(
             observed.iter().all(|(_, errors)| errors
                 .iter()
-                .all(|error| *error == KeyError::OperationFailed)),
+                .all(|error| *error == KeyError::ProviderUnusable)),
             "invalid endpoint configuration must fail permanently: {observed:?}"
         );
     }
@@ -1825,7 +1855,7 @@ mod tests {
         assert!(
             observed.iter().all(|(_, errors)| errors
                 .iter()
-                .all(|error| *error == KeyError::OperationFailed)),
+                .all(|error| *error == KeyError::ProviderUnusable)),
             "unsupported endpoint schemes must fail permanently: {observed:?}"
         );
         assert_eq!(
