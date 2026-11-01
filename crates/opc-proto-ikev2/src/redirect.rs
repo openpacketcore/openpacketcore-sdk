@@ -91,7 +91,20 @@ impl fmt::Debug for Ikev2RedirectGatewayIdentity<'_> {
 ///
 /// Builders validate every draft. Receiving a value grants no redirect or
 /// authentication authority. Echoed nonces must match the caller's original Ni.
+///
+/// External matches must allow future notification representations:
+/// ```compile_fail
+/// use opc_proto_ikev2::Ikev2RedirectNotify;
+/// fn exhaustive(value: Ikev2RedirectNotify<'_>) {
+///     match value {
+///         Ikev2RedirectNotify::Supported => {},
+///         Ikev2RedirectNotify::Redirect { .. } => {},
+///         Ikev2RedirectNotify::RedirectedFrom(_) => {},
+///     }
+/// }
+/// ```
 #[derive(Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum Ikev2RedirectNotify<'a> {
     /// Empty REDIRECT_SUPPORTED in an initial request.
     Supported,
