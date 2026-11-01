@@ -11,7 +11,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Instant;
 use tokio::sync::{mpsc, mpsc::error::TrySendError, oneshot};
 
-use opc_alarm::{ProbableCause, Severity, SharedAlarmManager};
+use opc_alarm::{Severity, SharedAlarmManager};
 use opc_config_model::{
     ApplyPlan, CommitError, CommitErrorCode, CommitMode, CommitRequest, CommitResult, CommitStatus,
     CommittedConfigRevision, ConfigError, ConfigImpactClassifier, ConfigOperation, OpcConfig,
@@ -21,8 +21,8 @@ use opc_config_model::{
 use opc_types::{redact, ConfigVersion, Timestamp, TxId};
 
 use crate::alarms::{
-    apply_commit_alarm_outcome, raise_commit_error, raise_config_error_alarm,
-    CONFIG_BUS_COMMIT_FAILURE_ALARM_TYPE,
+    apply_commit_alarm_outcome, raise_commit_error, raise_commit_store_error,
+    raise_config_error_alarm, store_failure_cause, CONFIG_BUS_COMMIT_FAILURE_ALARM_TYPE,
 };
 use crate::authorizer::{ConfigAuthorizer, DenyAllAuthorizer};
 use crate::datastore::{CommittedRevisionSource, ManagedDatastore};
@@ -672,6 +672,7 @@ async fn worker_loop<C: OpcConfig>(
 
                 let has_pending = pending_fire_at.is_some();
 
+                let mut store_failure = None;
                 let processed = AssertUnwindSafe(process_commit(
                     submission.request,
                     Arc::clone(&snapshot),
@@ -684,6 +685,7 @@ async fn worker_loop<C: OpcConfig>(
                     authority.as_ref(),
                     has_pending,
                     &mut submission.required_audit,
+                    &mut store_failure,
                 ))
                 .catch_unwind()
                 .await
@@ -720,6 +722,8 @@ async fn worker_loop<C: OpcConfig>(
                     } else {
                         apply_commit_alarm_outcome(&alarm_manager, &result);
                     }
+                } else if let (Err(error), Some(store_code)) = (&result, store_failure) {
+                    raise_commit_store_error(&alarm_manager, error, store_code);
                 } else {
                     apply_commit_alarm_outcome(&alarm_manager, &result);
                 }
@@ -866,7 +870,7 @@ async fn worker_loop<C: OpcConfig>(
                             "rollback_failed",
                             "rollback_failed",
                             Severity::Major,
-                            ProbableCause::StorageCorruption,
+                            store_failure_cause(err.code),
                         );
                     }
                     Ok(marker_clear_error) => {
@@ -899,6 +903,7 @@ async fn process_commit<C: OpcConfig>(
     authority: &Mutex<Option<Arc<dyn crate::ConfigAuthorityPort>>>,
     has_pending: bool,
     required_audit: &mut Option<crate::required_audit::RequiredAuditSubmission>,
+    store_failure: &mut Option<StoreErrorCode>,
 ) -> Result<ProcessedCommit, CommitError> {
     if let Some(reason) = recovery.reason() {
         let can_attempt_durable_replay = request.idempotency_key.is_some()
@@ -1082,6 +1087,7 @@ async fn process_commit<C: OpcConfig>(
                 store,
                 Arc::clone(&previous),
                 has_pending,
+                store_failure,
             )
             .await?;
             let (candidate, deltas, changed_paths) = compute_deltas_and_changed_paths(

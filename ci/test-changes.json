@@ -1606,6 +1606,111 @@
       "renamed_to": "rust:crates/opc-security-testkit::test=security_tests::test_kms_fault_responses_preserve_failure_class",
       "reason": "Name the explicit classification contract: truncated transport remains Unavailable; oversized responses and malformed key hex are OperationFailed. All three original cases and exact equality assertions remain.",
       "issue": 1197
+    },
+    {
+      "test": "rust:crates/opc-key::lib=lib::kms::tests::kms_invalid_unix_paths_are_permanent_for_all_operations",
+      "kind": "removed",
+      "renamed_to": "rust:crates/opc-key::lib=lib::kms::tests::kms_invalid_unix_paths_require_repair_for_all_operations",
+      "reason": "Rename provider configuration failures to describe repairable state. All classification, operation-count and redaction assertions remain; provider repair can restore access to unchanged ciphertext.",
+      "issue": 1197
+    },
+    {
+      "test": "rust:crates/opc-key::lib=lib::kms::tests::kms_repeated_tcp_scheme_is_permanent_before_connect",
+      "kind": "removed",
+      "renamed_to": "rust:crates/opc-key::lib=lib::kms::tests::kms_repeated_tcp_scheme_requires_repair_before_connect",
+      "reason": "Rename provider configuration failures to describe repairable state. All classification, operation-count and redaction assertions remain; provider repair can restore access to unchanged ciphertext.",
+      "issue": 1197
+    },
+    {
+      "test": "rust:crates/opc-key::lib=lib::kms::tests::kms_non_socket_unix_path_is_permanent_for_all_operations",
+      "kind": "removed",
+      "renamed_to": "rust:crates/opc-key::lib=lib::kms::tests::kms_non_socket_unix_path_requires_repair_for_all_operations",
+      "reason": "Rename provider configuration failures to describe repairable state. All classification, operation-count and redaction assertions remain; provider repair can restore access to unchanged ciphertext.",
+      "issue": 1197
+    },
+    {
+      "test": "rust:crates/opc-key::lib=lib::kms::tests::kms_untrusted_certificate_is_permanent_for_all_operations",
+      "kind": "removed",
+      "renamed_to": "rust:crates/opc-key::lib=lib::kms::tests::kms_untrusted_certificate_requires_repair_for_all_operations",
+      "reason": "Rename provider configuration failures to describe repairable state. All classification, operation-count and redaction assertions remain; provider repair can restore access to unchanged ciphertext.",
+      "issue": 1197
+    },
+    {
+      "test": "rust:crates/opc-key::lib=lib::kms::tests::kms_certificate_name_mismatch_is_permanent_for_all_operations",
+      "kind": "removed",
+      "renamed_to": "rust:crates/opc-key::lib=lib::kms::tests::kms_certificate_name_mismatch_requires_repair_for_all_operations",
+      "reason": "Rename provider configuration failures to describe repairable state. All classification, operation-count and redaction assertions remain; provider repair can restore access to unchanged ciphertext.",
+      "issue": 1197
+    },
+    {
+      "test": "rust:crates/opc-key::lib=lib::kms::tests::kms_peer_authentication_alerts_are_permanent_for_all_operations",
+      "kind": "removed",
+      "renamed_to": "rust:crates/opc-key::lib=lib::kms::tests::kms_peer_authentication_alerts_require_repair_for_all_operations",
+      "reason": "Rename provider configuration failures to describe repairable state. All classification, operation-count and redaction assertions remain; provider repair can restore access to unchanged ciphertext.",
+      "issue": 1197
+    },
+    {
+      "test": "rust:crates/opc-key::lib=lib::kms::tests::kms_tls13_client_authentication_rejection_is_permanent_for_all_operations",
+      "kind": "removed",
+      "renamed_to": "rust:crates/opc-key::lib=lib::kms::tests::kms_tls13_client_authentication_rejection_requires_repair_for_all_operations",
+      "reason": "Rename provider configuration failures to describe repairable state. All classification, operation-count and redaction assertions remain; provider repair can restore access to unchanged ciphertext.",
+      "issue": 1197
+    },
+    {
+      "test": "rust:crates/opc-key::lib=lib::kms::tests::kms_malformed_success_fields_are_permanent_and_redacted",
+      "kind": "removed",
+      "renamed_to": "rust:crates/opc-key::lib=lib::kms::tests::kms_malformed_success_fields_require_repair_and_redacted",
+      "reason": "Rename provider configuration failures to describe repairable state. All classification, operation-count and redaction assertions remain; provider repair can restore access to unchanged ciphertext.",
+      "issue": 1197
+    },
+    {
+      "test": "rust:crates/opc-key::lib=lib::kms::tests::kms_malformed_response_frames_are_permanent_for_all_operations",
+      "kind": "removed",
+      "renamed_to": "rust:crates/opc-key::lib=lib::kms::tests::kms_malformed_response_frames_require_repair_for_all_operations",
+      "reason": "Rename provider configuration failures to describe repairable state. All classification, operation-count and redaction assertions remain; provider repair can restore access to unchanged ciphertext.",
+      "issue": 1197
+    },
+    {
+      "test": "rust:crates/opc-key::lib=lib::kms::tests::kms_missing_tls_connector_is_permanent_before_connect",
+      "kind": "removed",
+      "renamed_to": "rust:crates/opc-key::lib=lib::kms::tests::kms_missing_tls_connector_requires_repair_before_connect",
+      "reason": "Rename provider configuration failures to describe repairable state. All classification, operation-count and redaction assertions remain; provider repair can restore access to unchanged ciphertext.",
+      "issue": 1197
+    },
+    {
+      "test": "rust:crates/opc-key::lib=lib::kms::tests::kms_nul_host_is_permanent_before_connect",
+      "kind": "removed",
+      "renamed_to": "rust:crates/opc-key::lib=lib::kms::tests::kms_nul_host_requires_repair_before_connect",
+      "reason": "Rename provider configuration failures to describe repairable state. All classification, operation-count and redaction assertions remain; provider repair can restore access to unchanged ciphertext.",
+      "issue": 1197
+    },
+    {
+      "test": "rust:crates/opc-key::lib=lib::kms::tests::kms_invalid_server_name_is_permanent_before_connect",
+      "kind": "removed",
+      "renamed_to": "rust:crates/opc-key::lib=lib::kms::tests::kms_invalid_server_name_requires_repair_before_connect",
+      "reason": "Rename provider configuration failures to describe repairable state. All classification, operation-count and redaction assertions remain; provider repair can restore access to unchanged ciphertext.",
+      "issue": 1197
+    },
+    {
+      "test": "rust:crates/opc-key::lib=lib::kms::tests::kms_invalid_tcp_endpoint_is_permanent_before_connect",
+      "kind": "removed",
+      "renamed_to": "rust:crates/opc-key::lib=lib::kms::tests::kms_invalid_tcp_endpoint_requires_repair_before_connect",
+      "reason": "Rename provider configuration failures to describe repairable state. All classification, operation-count and redaction assertions remain; provider repair can restore access to unchanged ciphertext.",
+      "issue": 1197
+    },
+    {
+      "test": "rust:crates/opc-key::lib=lib::kms::tests::kms_unsupported_endpoint_scheme_is_permanent_before_connect",
+      "kind": "removed",
+      "renamed_to": "rust:crates/opc-key::lib=lib::kms::tests::kms_unsupported_endpoint_scheme_requires_repair_before_connect",
+      "reason": "Rename provider configuration failures to describe repairable state. All classification, operation-count and redaction assertions remain; provider repair can restore access to unchanged ciphertext.",
+      "issue": 1197
+    },
+    {
+      "test": "rust:crates/opc-key::lib=lib::remote::tests::poisoned_material_is_a_redacted_permanent_failure",
+      "kind": "removed",
+      "renamed_to": "rust:crates/opc-key::lib=lib::remote::tests::poisoned_material_is_a_redacted_provider_configuration_failure",
+      "reason": "Rename provider configuration failures to describe repairable state. All classification, operation-count and redaction assertions remain; provider repair can restore access to unchanged ciphertext.",
+      "issue": 1197
     }
   ]
 }

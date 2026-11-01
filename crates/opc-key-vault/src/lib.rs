@@ -114,11 +114,75 @@ struct VaultAuth {
 enum VaultRequestError {
     Forbidden,
     Unavailable,
+    ProviderUnusable,
 }
 
 impl From<VaultRequestError> for KeyError {
-    fn from(_: VaultRequestError) -> Self {
-        KeyError::Unavailable
+    fn from(error: VaultRequestError) -> Self {
+        match error {
+            VaultRequestError::Unavailable => KeyError::Unavailable,
+            VaultRequestError::Forbidden | VaultRequestError::ProviderUnusable => {
+                KeyError::ProviderUnusable
+            }
+        }
+    }
+}
+
+fn request_error(error: &reqwest::Error) -> VaultRequestError {
+    use std::error::Error;
+    if error.is_timeout() {
+        return VaultRequestError::Unavailable;
+    }
+    let mut source = error.source();
+    let mut invalid_io = false;
+    while let Some(cause) = source {
+        if let Some(tls) = cause.downcast_ref::<rustls::Error>() {
+            // RFC 8446 §6.2: internal_error is a transient peer-internal fault.
+            return if matches!(
+                tls,
+                rustls::Error::AlertReceived(rustls::AlertDescription::InternalError)
+            ) {
+                VaultRequestError::Unavailable
+            } else {
+                VaultRequestError::ProviderUnusable
+            };
+        }
+        if let Some(io) = cause.downcast_ref::<std::io::Error>() {
+            invalid_io |= matches!(
+                io.kind(),
+                std::io::ErrorKind::PermissionDenied
+                    | std::io::ErrorKind::InvalidInput
+                    | std::io::ErrorKind::InvalidData
+            );
+            // I/O wrappers can hide the wrapped error itself from Error::source.
+            // Inspect it explicitly so typed TLS errors retain their class.
+            if let Some(inner) = io.get_ref() {
+                source = Some(inner);
+                continue;
+            }
+        }
+        source = cause.source();
+    }
+    if invalid_io || error.is_builder() || error.is_decode() || error.is_redirect() {
+        VaultRequestError::ProviderUnusable
+    } else {
+        VaultRequestError::Unavailable
+    }
+}
+
+fn status_error(status: StatusCode) -> VaultRequestError {
+    if status == StatusCode::FORBIDDEN {
+        VaultRequestError::Forbidden
+    } else if status.is_server_error()
+        || matches!(
+            status,
+            StatusCode::REQUEST_TIMEOUT | StatusCode::TOO_MANY_REQUESTS
+        )
+    {
+        VaultRequestError::Unavailable
+    } else {
+        // HTTP status and diagnostic text do not establish a key/data verdict.
+        VaultRequestError::ProviderUnusable
     }
 }
 
@@ -183,14 +247,20 @@ impl VaultKeyProvider {
             role: role.to_string(),
             jwt: Zeroizing::new(jwt.to_string()),
         });
-        let token = self.login_kubernetes(&auth).await?;
+        let token = self
+            .login_kubernetes(&auth)
+            .await
+            .map_err(|(public, _)| public)?;
         *self.token.write().await = token;
         self.kubernetes_auth = Some(auth);
         Ok(self)
     }
 
     #[cfg(feature = "k8s-auth")]
-    async fn login_kubernetes(&self, auth: &KubernetesAuth) -> Result<VaultToken, VaultError> {
+    async fn login_kubernetes(
+        &self,
+        auth: &KubernetesAuth,
+    ) -> Result<VaultToken, (VaultError, KeyError)> {
         #[derive(Serialize)]
         struct LoginRequest<'a> {
             role: &'a str,
@@ -200,7 +270,7 @@ impl VaultKeyProvider {
         let url = self
             .base_url
             .join("v1/auth/kubernetes/login")
-            .map_err(|_| VaultError::InvalidUrl)?;
+            .map_err(|_| (VaultError::InvalidUrl, KeyError::ProviderUnusable))?;
 
         let resp = self
             .client
@@ -212,17 +282,20 @@ impl VaultKeyProvider {
             .timeout(REQUEST_TIMEOUT)
             .send()
             .await
-            .map_err(VaultError::from)?;
+            .map_err(|error| (VaultError::RequestFailed, request_error(&error).into()))?;
 
         if !resp.status().is_success() {
-            return Err(VaultError::AuthFailed);
+            return Err((VaultError::AuthFailed, status_error(resp.status()).into()));
         }
 
-        let body: VaultAuthEnvelope = resp.json().await.map_err(VaultError::from)?;
+        let body: VaultAuthEnvelope = resp
+            .json()
+            .await
+            .map_err(|error| (VaultError::RequestFailed, request_error(&error).into()))?;
         let token = body
             .auth
             .client_token
-            .ok_or(VaultError::MalformedResponse)?;
+            .ok_or((VaultError::MalformedResponse, KeyError::ProviderUnusable))?;
         Ok(VaultToken::leased(
             token,
             body.auth.lease_duration,
@@ -231,7 +304,8 @@ impl VaultKeyProvider {
     }
 
     fn base_url_is_secure(&self) -> bool {
-        self.base_url.scheme() == "https" || self.allow_insecure_http
+        self.base_url.scheme() == "https"
+            || (self.allow_insecure_http && self.base_url.scheme() == "http")
     }
 
     fn ensure_secure_base_url(&self) -> Result<(), KeyError> {
@@ -240,7 +314,7 @@ impl VaultKeyProvider {
         }
 
         error!("vault base URL must use https unless insecure HTTP is explicitly enabled");
-        Err(KeyError::Unavailable)
+        Err(KeyError::ProviderUnusable)
     }
 
     fn key_name(purpose: KeyPurpose, tenant: &TenantId) -> String {
@@ -271,9 +345,9 @@ impl VaultKeyProvider {
         let resp = self
             .send_post_with_token("v1/auth/token/renew-self", &RenewRequest {}, &current)
             .await?;
-        let body: VaultAuthEnvelope = resp.json().await.map_err(|e| {
-            error!(error = %e, "failed to parse vault token renewal response");
-            VaultRequestError::Unavailable
+        let body: VaultAuthEnvelope = resp.json().await.map_err(|error| {
+            error!("failed to parse vault token renewal response");
+            request_error(&error)
         })?;
         let token = body
             .auth
@@ -290,16 +364,16 @@ impl VaultKeyProvider {
     async fn reauthenticate(&self) -> Result<(), KeyError> {
         #[cfg(feature = "k8s-auth")]
         if let Some(auth) = &self.kubernetes_auth {
-            let token = self.login_kubernetes(auth).await.map_err(|e| {
-                error!(error = %e, "vault kubernetes reauthentication failed");
-                KeyError::Unavailable
+            let token = self.login_kubernetes(auth).await.map_err(|(_, error)| {
+                error!("vault kubernetes reauthentication failed");
+                error
             })?;
             *self.token.write().await = token;
             return Ok(());
         }
 
         error!("vault returned 403 and no renewable auth method is configured");
-        Err(KeyError::Unavailable)
+        Err(KeyError::ProviderUnusable)
     }
 
     async fn send_post_with_token<B: Serialize>(
@@ -309,11 +383,11 @@ impl VaultKeyProvider {
         token: &str,
     ) -> Result<reqwest::Response, VaultRequestError> {
         self.ensure_secure_base_url()
-            .map_err(|_| VaultRequestError::Unavailable)?;
+            .map_err(|_| VaultRequestError::ProviderUnusable)?;
 
         let url = self.base_url.join(path).map_err(|_| {
             error!("invalid vault request path");
-            VaultRequestError::Unavailable
+            VaultRequestError::ProviderUnusable
         })?;
 
         let resp = self
@@ -324,19 +398,15 @@ impl VaultKeyProvider {
             .timeout(REQUEST_TIMEOUT)
             .send()
             .await
-            .map_err(|e| {
-                error!(error = %e, "vault request failed");
-                VaultRequestError::Unavailable
+            .map_err(|error| {
+                error!("vault request failed");
+                request_error(&error)
             })?;
 
         let status = resp.status();
-        if status == StatusCode::FORBIDDEN {
-            error!("vault returned 403");
-            return Err(VaultRequestError::Forbidden);
-        }
         if !status.is_success() {
             error!(status = %status, "vault returned error status");
-            return Err(VaultRequestError::Unavailable);
+            return Err(status_error(status));
         }
 
         Ok(resp)
@@ -370,9 +440,9 @@ impl VaultKeyProvider {
             }
         };
 
-        resp.json().await.map_err(|e| {
-            error!(error = %e, "failed to parse vault response");
-            KeyError::Unavailable
+        resp.json().await.map_err(|error| {
+            error!("failed to parse vault response");
+            request_error(&error).into()
         })
     }
 
@@ -398,7 +468,8 @@ impl VaultKeyProvider {
 
         let plaintext = Zeroizing::new(body.data.plaintext);
         let material = decode_material(&plaintext)?;
-        let key_id = wrapped_key_id(&key_name, &body.data.ciphertext)?;
+        let key_id = wrapped_key_id(&key_name, &body.data.ciphertext)
+            .map_err(|_| KeyError::ProviderUnusable)?;
         Ok((key_id, material))
     }
 
@@ -439,12 +510,12 @@ fn transient_retry_delay(retry_index: usize) -> Duration {
 fn decode_material(plaintext_b64: &str) -> Result<Zeroizing<[u8; 32]>, KeyError> {
     let decoded = Zeroizing::new(B64_STD.decode(plaintext_b64).map_err(|_| {
         error!("vault key material was not valid base64");
-        KeyError::Unavailable
+        KeyError::ProviderUnusable
     })?);
 
     if decoded.len() != 32 {
         error!("vault key material had unexpected length");
-        return Err(KeyError::Unavailable);
+        return Err(KeyError::ProviderUnusable);
     }
 
     let mut material = Zeroizing::new([0u8; 32]);

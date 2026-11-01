@@ -648,3 +648,28 @@ async fn golden_envelope_round_trip() {
     assert!(paths[0].contains("/datakey/plaintext/"));
     assert!(paths[1].contains("/decrypt/"));
 }
+
+#[tokio::test]
+async fn vault_tls_internal_error_uses_bounded_outage_retries() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = url::Url::parse(&format!("https://{}/", listener.local_addr().unwrap())).unwrap();
+    let server = tokio::spawn(async move {
+        let mut attempts = 0;
+        while let Ok(Ok((mut stream, _))) =
+            tokio::time::timeout(std::time::Duration::from_millis(300), listener.accept()).await
+        {
+            attempts += 1;
+            let mut hello = [0; 4096];
+            assert!(stream.read(&mut hello).await.unwrap() > 0);
+            // TLS fatal internal_error (80), unrelated to peer authentication.
+            stream.write_all(&[21, 3, 3, 0, 2, 2, 80]).await.unwrap();
+            stream.shutdown().await.unwrap();
+        }
+        attempts
+    });
+    let error = VaultKeyProvider::new(url, "token-canary".into(), "transit".into())
+        .get_active_key(KeyPurpose::Config, &tenant())
+        .await
+        .unwrap_err();
+    assert_eq!((error, server.await.unwrap()), (KeyError::Unavailable, 3));
+}

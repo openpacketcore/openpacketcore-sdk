@@ -677,14 +677,50 @@ fn backend_contract_error() -> StoreError {
     StoreError::BackendUnavailable(BACKEND_CONTRACT_MESSAGE.to_string())
 }
 
-fn cas_outcome_is_definitive(result: &Result<CompareAndSetResult, StoreError>) -> bool {
-    !matches!(
-        result,
-        Err(StoreError::BackendUnavailable(_)
-            | StoreError::KeyProviderUnavailable(_)
-            | StoreError::BackendOperationOutcomeUnavailable
-            | StoreError::CasIdempotencyOutcomeUnavailable)
+fn store_error_is_definitive(error: &StoreError) -> bool {
+    matches!(
+        error,
+        StoreError::NotFound
+            | StoreError::StaleFence
+            | StoreError::CasConflict
+            | StoreError::CasIdempotencyConflict
+            | StoreError::TopologyAuthorityRevoked
+            | StoreError::CapabilityNotSupported(_)
+            | StoreError::InvalidKey(_)
+            | StoreError::InvalidReplicationSequence
+            | StoreError::InvalidReplicationLogRange
+            | StoreError::ReplicationLogPageTooLarge { .. }
+            | StoreError::ReplicationLogCursorCompacted { .. }
+            | StoreError::ReplicationWatchCatchUpRequired
+            | StoreError::ReplicationOperationLimitExceeded
+            | StoreError::InvalidSessionTtl
+            | StoreError::InvalidRecordExpiry
+            | StoreError::RecordExpiryPreflightLimitExceeded
+            | StoreError::LeaseHeld
+            | StoreError::LeaseExpired
+            | StoreError::Crypto(_)
+            | StoreError::Serialization(_)
+            | StoreError::PayloadTooLarge { .. }
+            | StoreError::InvalidRestoreScanRequest(_)
+            | StoreError::InvalidRestoreScanResponse(_)
+            | StoreError::RestoreScanPageTooLarge { .. }
+            | StoreError::RestoreScanCursorStale
+            | StoreError::RestoreScanWorkBudgetExceeded
+            | StoreError::RestoreScanResponseTooLarge { .. }
+            | StoreError::FencedTransitionRequestConflict
+            | StoreError::FencedTransitionHistoryFull
+            | StoreError::FencedTransitionRetentionExhausted
+            | StoreError::FencedTransitionStorageExhausted
+            | StoreError::FencedTransitionHistoryEpochRetired
+            | StoreError::FencedTransitionHistoryEpochNotActive
+            | StoreError::SessionRecordReserved
+            | StoreError::FencedTransitionVoided
+            | StoreError::KeyCapacityExhausted
     )
+}
+
+fn cas_outcome_is_definitive(result: &Result<CompareAndSetResult, StoreError>) -> bool {
+    result.as_ref().err().is_none_or(store_error_is_definitive)
 }
 
 fn backend_lease_contract_error() -> LeaseError {
@@ -917,34 +953,16 @@ fn normalize_store_backend_outcome<T>(
     result: Result<T, StoreError>,
     outcome: BackendDeadlineOutcome,
 ) -> Result<T, StoreError> {
-    match (outcome, result) {
-        (
-            BackendDeadlineOutcome::Preflight,
-            Err(
-                StoreError::BackendUnavailable(_)
-                | StoreError::BackendOperationOutcomeUnavailable
-                | StoreError::CasIdempotencyOutcomeUnavailable,
-            ),
-        ) => Err(StoreError::BackendUnavailable(
-            "backend record-expiry preflight unavailable".into(),
-        )),
-        (
-            BackendDeadlineOutcome::CompareAndSet,
-            Err(
-                StoreError::BackendUnavailable(_)
-                | StoreError::BackendOperationOutcomeUnavailable
-                | StoreError::CasIdempotencyOutcomeUnavailable,
-            ),
-        ) => Err(StoreError::CasIdempotencyOutcomeUnavailable),
-        (
-            BackendDeadlineOutcome::Mutation,
-            Err(
-                StoreError::BackendUnavailable(_)
-                | StoreError::BackendOperationOutcomeUnavailable
-                | StoreError::CasIdempotencyOutcomeUnavailable,
-            ),
-        ) => Err(StoreError::BackendOperationOutcomeUnavailable),
-        (_, result) => result,
+    match result {
+        Err(error) if !store_error_is_definitive(&error) => Err(match outcome {
+            BackendDeadlineOutcome::Read | BackendDeadlineOutcome::RestoreScan => error,
+            BackendDeadlineOutcome::Preflight => {
+                StoreError::BackendUnavailable("backend record-expiry preflight unavailable".into())
+            }
+            BackendDeadlineOutcome::CompareAndSet => StoreError::CasIdempotencyOutcomeUnavailable,
+            BackendDeadlineOutcome::Mutation => StoreError::BackendOperationOutcomeUnavailable,
+        }),
+        result => result,
     }
 }
 

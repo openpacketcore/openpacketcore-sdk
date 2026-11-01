@@ -133,7 +133,7 @@ non-canonical, or context-mismatched output fails with a fieldless stable code.
   authorities are rejected before connecting.
 - `KeyError::ProviderUnusable` means the provider needs operator repair: invalid
   endpoints or TLS configuration, certificate/peer authentication failures,
-  fatal TLS alerts (including alerts after handshake), Unix permissions or
+  TLS protocol/authentication alerts (including after handshake), Unix permissions or
   path/protocol errors, malformed/oversized replies, unknown response statuses,
   short seal output, or poisoned provider state. It is **not** a key or data
   verdict. Preserve rows and pending work, release nothing, report a redacted
@@ -145,16 +145,45 @@ non-canonical, or context-mismatched output fails with a fieldless stable code.
   adapters accept exactly `{"status":"unavailable"}` for this class. Absent or
   refused Unix services remain outages, as do transient TCP resolution/connect
   failures. Use bounded backoff within the original request budget.
-- `KeyError::OperationFailed` means a positive request/key/ciphertext rejection,
-  including local AEAD authentication failure and a completed KMS `error` reply.
-  A positively missing key remains `NotFound`. Free-form response text cannot
-  select availability; describing throttling in an `error` reply is not an
-  outage signal. Unknown statuses are `ProviderUnusable`, even if their text
-  says a key is missing. All these classes remain redacted and fieldless.
+- `KeyError::OperationFailed` means positive key revocation or ciphertext
+  rejection, including local AEAD authentication failure. A positively missing
+  key remains `NotFound`. A generic request refusal is not a verdict.
+- TLS `internal_error` (80) remains `Unavailable`; protocol/authentication alerts
+  require provider repair. All these classes remain redacted and fieldless.
 - Neither unavailable nor unusable providers authorize corruption/integrity
   classification, record deletion, SA teardown, plaintext/packet release or a
   final cached mutation result. No adapter adds retries or extends caller
   budgets; a channel failure does not prove a mutation was never performed.
+Only positive evidence about a key or ciphertext permits terminal rejection.
+Use `KeyError::is_definitive_rejection()`: it is true only for a positively
+missing key (`NotFound`) or actual key revocation/ciphertext rejection
+(`OperationFailed`). Its exhaustive matches cover every key and custody variant;
+a new variant requires an explicit decision in the defining crate. All other
+errors retain data, including `RotationFailed`, invalid identifiers/metadata,
+and every `KeyCustodyOperationError`. Installation, identity, validation,
+capability, generic operation and provider-output failures prove no key/data
+verdict. Unknown downstream variants MUST default to nonterminal backpressure.
+
+Both JSON KMS adapters use an exact, case-sensitive structured contract.
+If present, `reason` must be a JSON string or null; invalid field types are a
+protocol failure (`ProviderUnusable`) before status classification:
+
+| `status` | `reason` | Result |
+| --- | --- | --- |
+| `success` | ignored | Validate the operation's required response fields. |
+| `unavailable` | ignored | `Unavailable`; bounded outage backoff. |
+| `error` | `key_not_found` | `NotFound`; the requested key is positively absent. |
+| `error` | `key_revoked` | `OperationFailed`; the requested key is positively revoked. |
+| `error` for a `decrypt` request | `ciphertext_rejected` | `OperationFailed`; the supplied ciphertext was rejected. |
+| `error` | missing, unknown, malformed, or inapplicable reason | `ProviderUnusable`; retain data and wait for repair. |
+| any other status | any reason | `ProviderUnusable`; retain data and wait for repair. |
+
+For example, `{"status":"error","reason":"key_not_found"}` carries a key
+verdict. Optional `error_message` is diagnostic text only: no substring, including
+`not found`, authentication failures or throttling text, selects a class. A KMS
+that has not added the structured reason loses terminal-cleanup precision, never
+retained data. Malformed success replies are also `ProviderUnusable`.
+
 - Key material is zeroized on drop. `MemoryKeyProvider` is suitable for tests
   and fixtures, not production key custody.
 - Existing `KeyProvider`, `KeyHandle`, `KmsRemoteSealProvider`,
@@ -163,9 +192,9 @@ non-canonical, or context-mismatched output fails with a fieldless stable code.
   the consumer composes the same object as a `KeyCustodyModule`; direct values
   cannot construct or impersonate `AdmittedKeyCustody`.
 - An admitted provider must explicitly satisfy both `sealed_key_storage` and
-  `zeroization`. Provider `NotFound`, `Unavailable` and `ProviderUnusable`
-  outcomes keep their public meaning; other provider context is collapsed to a
-  redaction-safe fieldless operation code.
+  `zeroization`. Positive `NotFound`/`OperationFailed` verdicts, outages and
+  typed custody state keep their public meaning. Other provider context is
+  redacted to nonterminal `ProviderUnusable`, never upgraded to a data verdict.
 - Rotation keeps historical keys addressable by key ID.
 - `KmsRemoteSealProvider` keeps no local historical-key or authorization cache.
   Every unseal calls KMS/HKMS with the exact validated envelope key ID. KMS/HKMS

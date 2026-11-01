@@ -63,8 +63,23 @@ struct KmsResponse {
     purpose: Option<String>,
     tenant: Option<String>,
     error_message: Option<String>,
+    reason: Option<String>,
     ciphertext_and_tag_hex: Option<String>,
     plaintext_hex: Option<String>,
+}
+
+fn classify_response(resp: KmsResponse, request_type: &str) -> Result<KmsResponse, KeyError> {
+    match resp.status.as_str() {
+        "success" => Ok(resp),
+        "unavailable" => Err(KeyError::Unavailable),
+        "error" => Err(match resp.reason.as_deref() {
+            Some("key_not_found") => KeyError::NotFound,
+            Some("key_revoked") => KeyError::OperationFailed,
+            Some("ciphertext_rejected") if request_type == "decrypt" => KeyError::OperationFailed,
+            _ => KeyError::ProviderUnusable,
+        }),
+        _ => Err(KeyError::ProviderUnusable),
+    }
 }
 
 fn decode_hex_32(hex: &str) -> Result<Zeroizing<[u8; 32]>, KeyError> {
@@ -153,6 +168,18 @@ fn kms_transport_error(error: std::io::Error) -> KeyError {
     // Rustls wraps certificate verification and fatal peer alerts in io::Error.
     // TLS 1.3 can deliver a peer authentication refusal on application I/O after
     // the client's connect future completes, so use this at every TLS I/O site.
+    // RFC 8446 §6.2: internal_error is a peer-internal failure, not evidence
+    // of incorrect client configuration, authentication or protocol use.
+    if matches!(
+        error
+            .get_ref()
+            .and_then(|cause| cause.downcast_ref::<tokio_rustls::rustls::Error>()),
+        Some(tokio_rustls::rustls::Error::AlertReceived(
+            tokio_rustls::rustls::AlertDescription::InternalError
+        ))
+    ) {
+        return KeyError::Unavailable;
+    }
     if error
         .get_ref()
         .is_some_and(|cause| cause.is::<tokio_rustls::rustls::Error>())
@@ -326,27 +353,7 @@ impl KmsKeyProvider {
         let resp: KmsResponse =
             serde_json::from_slice(&resp_buf).map_err(|_| KeyError::ProviderUnusable)?;
 
-        if resp.status == "success" {
-            Ok(resp)
-        } else if resp.status == "unavailable" {
-            // Only this protocol status signals temporary busy/throttling.
-            // Free-form provider messages never select a retryable class.
-            Err(KeyError::Unavailable)
-        } else if resp.status == "error" {
-            // Only an explicit rejection may make a key/data verdict. An
-            // unknown status or malformed success is a provider protocol fault.
-            if resp
-                .error_message
-                .as_deref()
-                .is_some_and(|msg| msg.contains("not found"))
-            {
-                Err(KeyError::NotFound)
-            } else {
-                Err(KeyError::OperationFailed)
-            }
-        } else {
-            Err(KeyError::ProviderUnusable)
-        }
+        classify_response(resp, &req.request_type)
     }
 }
 
@@ -546,27 +553,7 @@ impl KmsRemoteSealProvider {
         let resp: KmsResponse =
             serde_json::from_slice(&resp_buf).map_err(|_| KeyError::ProviderUnusable)?;
 
-        if resp.status == "success" {
-            Ok(resp)
-        } else if resp.status == "unavailable" {
-            // Only this protocol status signals temporary busy/throttling.
-            // Free-form provider messages never select a retryable class.
-            Err(KeyError::Unavailable)
-        } else if resp.status == "error" {
-            // Only an explicit rejection may make a key/data verdict. An
-            // unknown status or malformed success is a provider protocol fault.
-            if resp
-                .error_message
-                .as_deref()
-                .is_some_and(|msg| msg.contains("not found"))
-            {
-                Err(KeyError::NotFound)
-            } else {
-                Err(KeyError::OperationFailed)
-            }
-        } else {
-            Err(KeyError::ProviderUnusable)
-        }
+        classify_response(resp, &req.request_type)
     }
 }
 
@@ -837,7 +824,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn kms_invalid_unix_paths_are_permanent_for_all_operations() {
+    async fn kms_invalid_unix_paths_require_repair_for_all_operations() {
         let mut results = Vec::new();
         for endpoint in [
             "unix://".to_string(),
@@ -854,12 +841,12 @@ mod tests {
                 .iter()
                 .flatten()
                 .all(|error| *error == KeyError::ProviderUnusable),
-            "invalid paths must fail permanently: {results:?}"
+            "invalid paths must require provider repair: {results:?}"
         );
     }
 
     #[tokio::test]
-    async fn kms_repeated_tcp_scheme_is_permanent_before_connect() {
+    async fn kms_repeated_tcp_scheme_requires_repair_before_connect() {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let errors = kms_request_errors(
             format!("tcp://tcp://{}", listener.local_addr().unwrap()),
@@ -871,7 +858,7 @@ mod tests {
             errors
                 .iter()
                 .all(|error| *error == KeyError::ProviderUnusable),
-            "repeated scheme must fail permanently: {errors:?}"
+            "repeated scheme must require provider repair: {errors:?}"
         );
         // A rejected configuration must not send even a TLS ClientHello.
         assert!(
@@ -899,7 +886,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn kms_non_socket_unix_path_is_permanent_for_all_operations() {
+    async fn kms_non_socket_unix_path_requires_repair_for_all_operations() {
         let directory = next_mock_socket_path();
         std::fs::create_dir(&directory).unwrap();
         let file = directory.join("regular-file");
@@ -965,24 +952,24 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn kms_untrusted_certificate_is_permanent_for_all_operations() {
+    async fn kms_untrusted_certificate_requires_repair_for_all_operations() {
         let errors = kms_certificate_failure_errors(false).await;
         assert!(
             errors
                 .iter()
                 .all(|error| *error == KeyError::ProviderUnusable),
-            "untrusted certificate must fail permanently: {errors:?}"
+            "untrusted certificate must require provider repair: {errors:?}"
         );
     }
 
     #[tokio::test]
-    async fn kms_certificate_name_mismatch_is_permanent_for_all_operations() {
+    async fn kms_certificate_name_mismatch_requires_repair_for_all_operations() {
         let errors = kms_certificate_failure_errors(true).await;
         assert!(
             errors
                 .iter()
                 .all(|error| *error == KeyError::ProviderUnusable),
-            "certificate name mismatch must fail permanently: {errors:?}"
+            "certificate name mismatch must require provider repair: {errors:?}"
         );
     }
 
@@ -1010,7 +997,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn kms_peer_authentication_alerts_are_permanent_for_all_operations() {
+    async fn kms_peer_authentication_alerts_require_repair_for_all_operations() {
         let mut results = Vec::new();
         for alert in [42, 48, 49] {
             results.push(kms_peer_alert_errors(Some(alert)).await);
@@ -1020,12 +1007,12 @@ mod tests {
                 .iter()
                 .flatten()
                 .all(|error| *error == KeyError::ProviderUnusable),
-            "peer authentication rejection must fail permanently: {results:?}"
+            "peer authentication rejection must require provider repair: {results:?}"
         );
     }
 
     #[tokio::test]
-    async fn kms_tls13_client_authentication_rejection_is_permanent_for_all_operations() {
+    async fn kms_tls13_client_authentication_rejection_requires_repair_for_all_operations() {
         use tokio_rustls::rustls;
         let generated = rcgen::generate_simple_self_signed(vec!["kms.example".into()]).unwrap();
         let certificate = generated.cert.der().clone();
@@ -1078,7 +1065,7 @@ mod tests {
             errors
                 .iter()
                 .all(|error| *error == KeyError::ProviderUnusable),
-            "TLS 1.3 client authentication rejection must fail permanently: {errors:?}"
+            "TLS 1.3 client authentication rejection must require provider repair: {errors:?}"
         );
     }
 
@@ -1141,13 +1128,8 @@ mod tests {
                 )
                 .await;
                 assert_ne!(error, KeyError::Unavailable, "text cannot select an outage");
-                if status == "error" {
-                    assert_eq!(error, KeyError::OperationFailed);
-                    assert_eq!(format!("{error:?}"), "OperationFailed");
-                    assert_eq!(error.to_string(), "key provider operation failed");
-                } else {
-                    assert_provider_configuration(&[error]);
-                }
+                // Neither a generic error status nor diagnostic text is a verdict.
+                assert_provider_configuration(&[error]);
             }
         }
     }
@@ -1464,7 +1446,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn kms_malformed_success_fields_are_permanent_and_redacted() {
+    async fn kms_malformed_success_fields_require_repair_and_redacted() {
         let mut errors = Vec::new();
         for (operation, fields) in [
             ("get_active_key", &["key_id", "key_bytes_hex"][..]),
@@ -1522,7 +1504,7 @@ mod tests {
             errors
                 .iter()
                 .all(|(_, _, error)| *error == KeyError::ProviderUnusable),
-            "malformed success responses must be permanent: {errors:?}"
+            "malformed success responses must require provider repair: {errors:?}"
         );
         for (_, _, error) in errors {
             assert_eq!(error.to_string(), "key provider unusable as configured");
@@ -1607,7 +1589,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn kms_malformed_response_frames_are_permanent_for_all_operations() {
+    async fn kms_malformed_response_frames_require_repair_for_all_operations() {
         let mut errors = Vec::new();
         for operation in [
             "get_active_key",
@@ -1630,7 +1612,7 @@ mod tests {
             errors
                 .iter()
                 .all(|(_, error)| *error == KeyError::ProviderUnusable),
-            "malformed complete response frames must be permanent: {errors:?}"
+            "malformed complete response frames must require provider repair: {errors:?}"
         );
     }
 
@@ -1662,7 +1644,7 @@ mod tests {
             results
                 .iter()
                 .all(|(_, _, error)| *error == Some(KeyError::ProviderUnusable)),
-            "every short success output must fail permanently: {results:?}"
+            "every short success output must require provider repair: {results:?}"
         );
     }
 
@@ -1748,7 +1730,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn kms_missing_tls_connector_is_permanent_before_connect() {
+    async fn kms_missing_tls_connector_requires_repair_before_connect() {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind fixture");
         listener.set_nonblocking(true).expect("nonblocking fixture");
         let errors = kms_request_errors(
@@ -1761,7 +1743,7 @@ mod tests {
             errors
                 .iter()
                 .all(|error| *error == KeyError::ProviderUnusable),
-            "invalid configuration must fail permanently: {errors:?}"
+            "invalid configuration must require provider repair: {errors:?}"
         );
         assert_eq!(
             listener
@@ -1884,7 +1866,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn kms_nul_host_is_permanent_before_connect() {
+    async fn kms_nul_host_requires_repair_before_connect() {
         let errors = kms_request_errors(
             "tcp://kms\0.example:7443".into(),
             Some(kms_test_tls_connector()),
@@ -1895,12 +1877,12 @@ mod tests {
             errors
                 .iter()
                 .all(|error| *error == KeyError::ProviderUnusable),
-            "a NUL host must fail permanently for every operation: {errors:?}"
+            "a NUL host must require provider repair for every operation: {errors:?}"
         );
     }
 
     #[tokio::test]
-    async fn kms_invalid_server_name_is_permanent_before_connect() {
+    async fn kms_invalid_server_name_requires_repair_before_connect() {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind fixture");
         listener.set_nonblocking(true).expect("nonblocking fixture");
         let errors = kms_request_errors(
@@ -1913,7 +1895,7 @@ mod tests {
             errors
                 .iter()
                 .all(|error| *error == KeyError::ProviderUnusable),
-            "invalid configuration must fail permanently: {errors:?}"
+            "invalid configuration must require provider repair: {errors:?}"
         );
         assert_eq!(
             listener
@@ -1925,7 +1907,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn kms_invalid_tcp_endpoint_is_permanent_before_connect() {
+    async fn kms_invalid_tcp_endpoint_requires_repair_before_connect() {
         let endpoints = [
             "tcp://127.0.0.1",
             "tcp://127.0.0.1:",
@@ -1950,12 +1932,12 @@ mod tests {
             observed.iter().all(|(_, errors)| errors
                 .iter()
                 .all(|error| *error == KeyError::ProviderUnusable)),
-            "invalid endpoint configuration must fail permanently: {observed:?}"
+            "invalid endpoint configuration must require provider repair: {observed:?}"
         );
     }
 
     #[tokio::test]
-    async fn kms_unsupported_endpoint_scheme_is_permanent_before_connect() {
+    async fn kms_unsupported_endpoint_scheme_requires_repair_before_connect() {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind fixture");
         listener.set_nonblocking(true).expect("nonblocking fixture");
         let addr = listener.local_addr().expect("fixture address");
@@ -1973,7 +1955,7 @@ mod tests {
             observed.iter().all(|(_, errors)| errors
                 .iter()
                 .all(|error| *error == KeyError::ProviderUnusable)),
-            "unsupported endpoint schemes must fail permanently: {observed:?}"
+            "unsupported endpoint schemes must require provider repair: {observed:?}"
         );
         assert_eq!(
             listener
@@ -2021,6 +2003,7 @@ mod tests {
             for operation in ["get_active_key", "get_key_by_id", "seal", "unseal"] {
                 let response = serde_json::json!({
                     "status": "error",
+                    "reason": (reason == "key revoked").then_some("key_revoked"),
                     "error_message": format!("{reason}: key={} payload=secret-canary", key_id.as_str()),
                 })
                 .to_string()
@@ -2054,9 +2037,13 @@ mod tests {
                     _ => unreachable!("fixed operation fixture"),
                 };
                 assert_ne!(error, KeyError::Unavailable, "{operation}: {reason}");
-                assert_eq!(error, KeyError::OperationFailed);
-                assert_eq!(error.to_string(), "key provider operation failed");
-                assert_eq!(format!("{error:?}"), "OperationFailed");
+                if reason == "key revoked" {
+                    assert_eq!(error, KeyError::OperationFailed);
+                    assert_eq!(error.to_string(), "key provider operation failed");
+                    assert_eq!(format!("{error:?}"), "OperationFailed");
+                } else {
+                    assert_provider_configuration(&[error]);
+                }
             }
         }
     }
@@ -2185,6 +2172,7 @@ mod tests {
         let payload_canary = "subscriber-payload-canary";
         let response = serde_json::json!({
             "status": "error",
+            "reason": "key_not_found",
             "error_message": format!(
                 "not found: key={} tenant=tenant-a endpoint=provider.internal payload={payload_canary}",
                 key_id.as_str()
@@ -2222,6 +2210,7 @@ mod tests {
         let key_id = KeyId::new("session-remote-revoked-sensitive").expect("key id");
         let response = serde_json::json!({
             "status": "error",
+            "reason": "key_revoked",
             "error_message": format!("revoked key {} for tenant-a", key_id.as_str()),
         })
         .to_string()

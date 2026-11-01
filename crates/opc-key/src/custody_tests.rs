@@ -574,7 +574,8 @@ async fn provider_errors_preserve_only_safe_public_classifications() {
     let error = unseal_with_slot(&slot, &module.key_id, &aad, b"ciphertext")
         .await
         .expect_err("contextual provider errors must collapse");
-    assert_custody_error(error, KeyCustodyOperationError::ProviderOperationFailed);
+    assert_eq!(error, KeyError::ProviderUnusable);
+    assert!(!format!("{error:?} {error}").contains(KEY_MATERIAL_CANARY));
 
     module.set_mode(ProviderMode::Valid);
     assert_eq!(

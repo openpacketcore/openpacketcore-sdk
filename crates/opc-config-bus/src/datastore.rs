@@ -1228,15 +1228,17 @@ impl<C: OpcConfig> ManagedDatastore<C> for InMemoryManagedDatastore<C> {
 pub type MockManagedDatastore<C> = InMemoryManagedDatastore<C>;
 
 fn config_provider_error(error: opc_crypto::CryptoError, rejected: &'static str) -> StoreError {
+    if error.is_definitive_rejection() {
+        return StoreError::crypto(rejected);
+    }
     match error {
         opc_crypto::CryptoError::ProviderUnavailable => {
             StoreError::unavailable("config key provider unavailable")
         }
-        opc_crypto::CryptoError::ProviderUnusable => {
+        _ => {
             tracing::warn!("config key provider configuration unavailable; retain records and back off until provider repair");
             StoreError::unavailable("config key provider configuration unavailable")
         }
-        _ => StoreError::crypto(rejected),
     }
 }
 

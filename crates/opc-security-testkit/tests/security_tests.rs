@@ -279,8 +279,8 @@ async fn test_kms_key_provider_behavior() {
         .get_active_key(KeyPurpose::Config, &tenant())
         .await
         .unwrap_err();
-    // A completed KMS rejection is permanent, unlike a dropped transport.
-    assert_eq!(err3, opc_key::KeyError::OperationFailed);
+    // An unclassified request failure is not evidence against a key or data.
+    assert_eq!(err3, opc_key::KeyError::ProviderUnusable);
 
     // 7. Not found case
     fake_kms.set_behavior(KmsBehavior::default());

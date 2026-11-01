@@ -42,7 +42,7 @@ impl fmt::Debug for EncryptedPayload {
 /// Use [`KeyError::ProviderUnusable`] for endpoint, channel, authentication or
 /// provider protocol/configuration failures. Neither class is a verdict on
 /// stored data. Callers retain pending work, back off and report configuration
-/// failures to operators. Missing keys and positive request/data rejections
+/// failures to operators. Positively missing keys and actual key/ciphertext rejections
 /// remain distinct; provider-specific context must not escape in errors.
 #[async_trait]
 pub trait KeyProvider: Send + Sync {

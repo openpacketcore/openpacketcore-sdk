@@ -21,7 +21,7 @@ use crate::{
 /// for endpoint, TLS/peer authentication, protocol or configuration failures.
 /// Neither authorizes deleting data or releasing an uncommitted result. Callers
 /// back off and report unusable configuration to operators. Only positive
-/// request/key/ciphertext rejection uses [`KeyError::OperationFailed`].
+/// key revocation or ciphertext rejection uses [`KeyError::OperationFailed`].
 #[async_trait]
 pub trait RemoteSealProvider: Send + Sync {
     /// Seal inside the KMS/HSM; the key never enters app memory.
@@ -239,7 +239,7 @@ mod material_tests {
     use super::*;
 
     #[test]
-    fn poisoned_material_is_a_redacted_permanent_failure() {
+    fn poisoned_material_is_a_redacted_provider_configuration_failure() {
         let key_id = KeyId::new("poison-sensitive-key").expect("key ID");
         let controller = RemoteSealMaterialController::new(key_id.clone());
         let poisoner = controller.clone();

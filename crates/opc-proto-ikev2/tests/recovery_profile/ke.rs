@@ -51,7 +51,15 @@ fn crypto_error(error: opc_proto_ikev2::Ikev2SaInitCryptoError) -> Error {
         // Key revocation and positive NotFound are classified by the envelope.
         Ikev2SaInitCryptoError::CryptoModuleFailure { .. }
         | Ikev2SaInitCryptoError::KeyGenerationFailed { .. } => Error::Backpressure,
-        _ => Error::Format,
+        Ikev2SaInitCryptoError::InvalidNonceLength { .. }
+        | Ikev2SaInitCryptoError::InvalidKeyLength { .. }
+        | Ikev2SaInitCryptoError::KeyMaterialLimitOverflow { .. }
+        | Ikev2SaInitCryptoError::IncompleteTransformSet
+        | Ikev2SaInitCryptoError::InconsistentTransformSet
+        | Ikev2SaInitCryptoError::MissingIntegrityTransform
+        | Ikev2SaInitCryptoError::UnexpectedIntegrityTransform => Error::Format,
+        // Unknown/new module or algorithm failures are not checkpoint evidence.
+        _ => Error::Backpressure,
     }
 }
 

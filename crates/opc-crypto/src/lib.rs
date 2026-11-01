@@ -330,8 +330,13 @@ impl CryptoEnvelopeV1 {
 pub enum CryptoError {
     #[error("invalid envelope encoding")]
     InvalidEnvelope,
+    /// Local encryption failed; this is not evidence against stored data.
     #[error("envelope encryption failed")]
     EncryptionFailed,
+    /// A provider positively established a missing/revoked key or rejected
+    /// ciphertext through `KeyError::is_definitive_rejection`.
+    #[error("key or ciphertext rejected")]
+    KeyRejected,
     #[error("envelope decryption failed")]
     DecryptionFailed,
     /// Provider outage; preserve pending data and use bounded backoff.
@@ -343,11 +348,24 @@ pub enum CryptoError {
     ProviderUnusable,
 }
 
-fn provider_error(error: opc_key::KeyError, rejected: CryptoError) -> CryptoError {
+impl CryptoError {
+    /// Positive evidence against the envelope or its key. Other failures must
+    /// retain stored data; an encryption failure alone is not such evidence.
+    pub const fn is_definitive_rejection(&self) -> bool {
+        match self {
+            Self::InvalidEnvelope | Self::DecryptionFailed | Self::KeyRejected => true,
+            Self::EncryptionFailed | Self::ProviderUnavailable | Self::ProviderUnusable => false,
+        }
+    }
+}
+
+fn provider_error(error: opc_key::KeyError) -> CryptoError {
+    if error.is_definitive_rejection() {
+        return CryptoError::KeyRejected;
+    }
     match error {
         opc_key::KeyError::Unavailable => CryptoError::ProviderUnavailable,
-        opc_key::KeyError::ProviderUnusable => CryptoError::ProviderUnusable,
-        _ => rejected,
+        _ => CryptoError::ProviderUnusable,
     }
 }
 
@@ -387,7 +405,7 @@ pub async fn encrypt_envelope_with_nonce<P: KeyProvider + ?Sized>(
     let handle = provider
         .get_active_key(aad.purpose(), aad.tenant())
         .await
-        .map_err(|error| provider_error(error, CryptoError::EncryptionFailed))?;
+        .map_err(provider_error)?;
     encrypt_envelope_with_handle_and_nonce(&handle, aad, plaintext, nonce)
 }
 
@@ -482,7 +500,7 @@ pub async fn decrypt_envelope<P: KeyProvider + ?Sized>(
     let handle = provider
         .get_key_by_id(&envelope.key_id)
         .await
-        .map_err(|error| provider_error(error, CryptoError::DecryptionFailed))?;
+        .map_err(provider_error)?;
 
     decrypt_decoded_envelope_with_handle(&handle, expected_aad, &envelope)
 }
@@ -892,10 +910,14 @@ mod tests {
             .await
             .expect_err("unknown key should fail");
 
-        for err in [wrong_aad_err, wrong_key_err, corrupt_err, unknown_key_err] {
+        for err in [wrong_aad_err, wrong_key_err, corrupt_err] {
             assert_eq!(err, CryptoError::DecryptionFailed);
             assert_eq!(err.to_string(), "envelope decryption failed");
+            assert!(err.is_definitive_rejection());
         }
+        assert_eq!(unknown_key_err, CryptoError::KeyRejected);
+        assert_eq!(unknown_key_err.to_string(), "key or ciphertext rejected");
+        assert!(unknown_key_err.is_definitive_rejection());
     }
 
     #[tokio::test]

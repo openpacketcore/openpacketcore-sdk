@@ -9,19 +9,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
-- `opc-key`, `opc-crypto`, `opc-session-store`, `opc-config-bus`, `opc-persist`:
-  preserve provider configuration/channel failures separately from positive
-  key/data rejection. Invalid endpoints, Unix permissions, TLS certificate/peer
-  failures, fatal alerts, malformed replies and poisoned provider state return
-  `ProviderUnusable`; outages and explicit busy/throttled replies remain
-  `Unavailable`. Envelope, custody, storage and RFC 030 recovery consumers retain
-  rows and pending work, release nothing and back off while configuration failures
-  are reported to operators. Configuration-store alarms no longer infer storage
-  corruption from unavailability or coarse failed/unresolved commits.
+- `opc-key`, `opc-crypto`, `opc-key-vault`, `opc-session-store`,
+  `opc-config-bus`, `opc-persist`: only positive key/ciphertext evidence authorizes
+  protected-data rejection. The exhaustive `KeyError::is_definitive_rejection`
+  predicate keeps every custody state and unclassified failure nonterminal.
+  KMS verdicts require recognized structured reasons, never diagnostic text.
+  Malformed provider output, authentication/configuration faults and local
+  encryption failures retain rows and pending work. Vault configuration faults
+  avoid transient retries; TLS `internal_error` remains an outage. Checkpoint
+  sealing and reading emit repair diagnostics. Rollback alarms preserve actual
+  data evidence without inferring corruption from unavailable dependencies.
   `EncryptedPayload` debug output redacts AAD and ciphertext. Refs #1197.
-- `opc-session-net`: treat `KeyProviderUnavailable` from a custom backend as a
-  non-definitive CAS outcome, preserving an ambiguity tombstone instead of
-  caching the outage as a completed result. Refs #1197.
+- `opc-session-net`: custom `KeyProviderUnavailable` results remain non-definitive
+  across CAS, legacy mutations and expiry preflight. Positive deterministic store
+  results are explicit; unknown failures retain ambiguity rather than becoming
+  a cached final rejection. Refs #1197.
 
 ### Added
 
@@ -770,28 +772,44 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   refresh. Downstream exhaustive matches must handle the new variants.
   Refs #1246.
 
-- `opc-key`: add fieldless `KeyError::OperationFailed` and `ProviderUnusable`.
-  Direct callers must distinguish positive request/key/data rejection from
-  provider configuration/channel failures and outages. `KeyError` is already
-  non-exhaustive; downstream wildcard handling must preserve nonterminal failures.
-  `OperationFailed` now means positive rejection only; malformed replies, invalid
-  endpoint/TLS configuration and peer authentication failures use `ProviderUnusable`.
-  Missing keys remain `NotFound`; outages, timeouts and exact `status: "unavailable"`
-  replies remain `Unavailable`. The custody boundary preserves `ProviderUnusable`.
+- `opc-key`: add fieldless `KeyError::OperationFailed` and `ProviderUnusable`,
+  and the exhaustive positive-verdict predicate. Only `NotFound` and actual
+  key revocation/ciphertext rejection are definitive; every custody state and
+  unknown failure retains data. Custody preserves positive verdicts distinctly.
+  JSON KMS `status: "error"` now requires exact `reason: "key_not_found"`,
+  `"key_revoked"`, or `"ciphertext_rejected"` (decrypt only) for a verdict.
+  Neither an `error` without a recognized reason nor any free-form `not found`
+  substring authorizes cleanup. Older providers lose precision until upgraded,
+  never retained data. Exact `status: "unavailable"` remains outage backpressure.
   Newly rejected endpoint forms accepted by released versions are relative
-  `unix://` paths, `unix://\0` abstract sockets, and repeated `tcp://` or `unix://`
-  prefixes. Existing filesystem paths must name sockets. Refs #1197.
-- `opc-crypto`: add `ProviderUnavailable` and `ProviderUnusable` to `CryptoError`
-  and `ConfigCapacityError`. Provider lookup failures no longer become generic
-  encryption/decryption rejection. Callers retain data, back off and report
-  unusable provider configuration. Both enums remain non-exhaustive. Refs #1197.
-- `opc-session-store`: the newly added, unreleased
-  `StoreError::KeyProviderUnavailable` variant keeps its assigned serialized
-  position. Record sealing/unsealing reports provider outages and unusable
-  configuration as `BackendUnavailable`; positive key/data rejection remains
-  `Crypto`. Downstream exhaustive matches must handle the added variant; custom
-  backends returning it receive non-definitive CAS handling in `opc-session-net`.
-  Refs #1197.
+  `unix://` paths, `unix://\0` abstract sockets, repeated TCP/Unix prefixes and
+  existing non-socket paths. Refs #1197.
+- `opc-crypto`: add `ProviderUnavailable`, `ProviderUnusable` and `KeyRejected`
+  to `CryptoError` and `ConfigCapacityError`. Non-verdict provider failures no
+  longer become generic encryption/decryption rejection. Positive provider
+  verdicts use `KeyRejected`; local `EncryptionFailed` alone does not establish
+  rejected stored data. Callers use `CryptoError::is_definitive_rejection()`;
+  both enums remain non-exhaustive. Refs #1197.
+- `opc-session-store`: the new unreleased `KeyProviderUnavailable` variant keeps
+  its serialized position. Non-verdict key/custody failures and malformed remote
+  sealing responses return `BackendUnavailable`; positive key/data rejection
+  remains `Crypto`. Custom backend outages receive ambiguous mutation handling
+  in `opc-session-net`, including legacy preflight. No session wire positions
+  change. Refs #1197.
+- `opc-config-bus`: non-verdict provider failures change from `Crypto` to
+  `Unavailable`, so configuration watches retry instead of returning terminal
+  `ConfigWatchError::Integrity`. Unavailable dependencies and coarse failed or
+  unresolved commits use `ConfigApplyFailed` alarms; rollback retains a
+  `StorageCorruption` cause only when the original store error supplies positive
+  data evidence. Alarm severity and recovery fencing remain intact. Refs #1197.
+- `opc-persist`: checkpoint reopen/read-back provider failures change from
+  `Rejected` to `Unavailable`, preserving the checkpoint. Sealing and provisioning
+  also report repairable provider faults. Provisioning after storage preparation
+  retains its existing `Indeterminate` outcome. Refs #1197.
+- `opc-key-vault`: configuration/authentication, malformed-response and TLS
+  verification failures use `ProviderUnusable` and avoid transient retries.
+  Outages, throttling and peer TLS internal errors remain `Unavailable`.
+  HTTP error messages cannot establish key or ciphertext rejection. Refs #1197.
 - `opc-session-store` and `opc-session-net`: protected-roster activation now
   binds the admission capacity policy, and authenticated admissions distinguish
   ordinary and emergency work. Crossing this storage boundary requires a fresh

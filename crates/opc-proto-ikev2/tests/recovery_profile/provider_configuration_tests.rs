@@ -73,7 +73,7 @@ fn every_nonverdict_provider_error_retains_recovery_rows() {
     for (index, (error, definitive)) in provider_error_cases().into_iter().enumerate() {
         if !definitive
             && std::panic::catch_unwind(|| {
-                check_recovery(error.clone(), 2_800_000 + index as u64 * 10_000)
+                check_recovery(error.clone(), 40_000_000 + index as u64 * 10_000)
             })
             .is_err()
         {
@@ -92,7 +92,7 @@ fn positive_key_and_ciphertext_verdicts_authorize_terminal_cleanup() {
         .into_iter()
         .enumerate()
     {
-        matrix(3_000_000 + index as u64 * 10_000, |row| {
+        matrix(41_000_000 + index as u64 * 10_000, |row| {
             let provider = Provider::new();
             let mut store = CasStore::new(7);
             let owners = EpochOwners::new(7);
@@ -148,7 +148,7 @@ async fn kms_unclassified_error_replies_retain_recovery_rows() {
         server.await.unwrap();
         std::fs::remove_file(path).unwrap();
         if std::panic::catch_unwind(|| {
-            check_recovery(error.clone(), 3_100_000 + index as u64 * 10_000)
+            check_recovery(error.clone(), 42_000_000 + index as u64 * 10_000)
         })
         .is_err()
         {
@@ -207,10 +207,15 @@ fn check_recovery(error: KeyError, tag: u64) {
             &owners,
             store.fenced_read(&initial, row.key).unwrap(),
         );
-        let backpressured = matches!(
-            &result,
-            Err(driver::Error::Key(envelope::Error::Backpressure))
-        );
+        let policy = match &result {
+            Err(driver::Error::Key(error)) => error.retry_policy(),
+            _ => None,
+        };
+        let expected_policy = if error == KeyError::Unavailable {
+            envelope::RetryPolicy::BoundedBackoff
+        } else {
+            envelope::RetryPolicy::AwaitProviderRepair
+        };
         let mut transport = Transport::default();
         match result {
             Ok(Recovery::Terminal(mut cleanup)) => {
@@ -228,9 +233,23 @@ fn check_recovery(error: KeyError, tag: u64) {
             "an unusable provider must not authorize cleanup or a new crypto effect"
         );
         assert!(transport.submitted.is_empty(), "no packet may be released");
+        assert_eq!(
+            policy,
+            Some(expected_policy),
+            "retain the provider retry policy"
+        );
         assert!(
-            backpressured,
-            "provider configuration requires backpressure"
+            !expected_policy.may_retry(0, 3, false, true),
+            "repair does not bypass backoff"
+        );
+        assert!(
+            !expected_policy.may_retry(3, 3, true, true),
+            "repair does not extend the budget"
+        );
+        assert_eq!(
+            expected_policy.may_retry(0, 3, true, false),
+            error == KeyError::Unavailable,
+            "configuration retries wait for repair"
         );
         let current = store.inspect(row.key).expect("retain the recovery row");
         assert_eq!(current.version, stored.version);
@@ -239,6 +258,7 @@ fn check_recovery(error: KeyError, tag: u64) {
 
         // Repair the provider without altering the row; its exact replay survives.
         provider.inject_key_error(None);
+        assert!(expected_policy.may_retry(0, 3, true, true));
         let Recovery::Runtime(mut runtime) = remedy::recover(
             &provider,
             &owners,
@@ -321,5 +341,5 @@ async fn kms_endpoint_configuration_during_recovery_deletes_and_releases_nothing
         .get_key_by_id(&KeyId::new("recovery-fixture-envelope").unwrap())
         .await
         .expect_err("the endpoint has no path");
-    check_recovery(error, 2_700_000);
+    check_recovery(error, 2_730_000);
 }

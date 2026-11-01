@@ -21,6 +21,7 @@ use super::{
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Error {
     Backpressure,
+    RepairRequired,
     KeyLost,
     Integrity,
     Format,
@@ -99,7 +100,8 @@ impl Provider {
         match self.fault.load(Ordering::SeqCst) {
             0 => Ok(()),
             1..=3 => Err(KeyError::Unavailable),
-            4..=5 => Err(KeyError::NotFound),
+            4 => Err(KeyError::NotFound),
+            5 => Err(KeyError::OperationFailed),
             _ => unreachable!(),
         }
     }
@@ -117,7 +119,8 @@ impl KeyProvider for Provider {
             match self.scheduled_fault.load(Ordering::SeqCst) {
                 0 => {}
                 1..=3 => return Err(KeyError::Unavailable),
-                4..=5 => return Err(KeyError::NotFound),
+                4 => return Err(KeyError::NotFound),
+                5 => return Err(KeyError::OperationFailed),
                 _ => unreachable!(),
             }
         }
@@ -156,14 +159,58 @@ fn aad(key: RowKey, version: Version, stamp: u64) -> EnvelopeAad {
 }
 
 pub fn classify_key_error(error: KeyError) -> Error {
-    match error {
-        KeyError::Unavailable => Error::Backpressure,
-        KeyError::ProviderUnusable => {
-            eprintln!("recovery key provider configuration unavailable; retain row and back off until provider repair");
-            Error::Backpressure
+    if error.is_definitive_rejection() {
+        return if matches!(error, KeyError::NotFound) {
+            Error::KeyLost
+        } else {
+            Error::Integrity
+        };
+    }
+    if matches!(error, KeyError::Unavailable) {
+        Error::Backpressure
+    } else {
+        eprintln!("recovery key provider configuration unavailable; retain row and back off until provider repair");
+        Error::RepairRequired
+    }
+}
+
+/// A consumer schedules retries only after positive backoff. Configuration or
+/// custody repair is a separate condition; spending an outage budget cannot
+/// turn a retained row into a terminal result.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RetryPolicy {
+    BoundedBackoff,
+    AwaitProviderRepair,
+}
+impl RetryPolicy {
+    pub fn may_retry(
+        self,
+        attempts: usize,
+        budget: usize,
+        backoff_elapsed: bool,
+        provider_repaired: bool,
+    ) -> bool {
+        attempts < budget && backoff_elapsed && (self == Self::BoundedBackoff || provider_repaired)
+    }
+}
+impl Error {
+    pub fn retry_policy(self) -> Option<RetryPolicy> {
+        match self {
+            Self::Backpressure => Some(RetryPolicy::BoundedBackoff),
+            Self::RepairRequired => Some(RetryPolicy::AwaitProviderRepair),
+            _ => None,
         }
-        KeyError::NotFound => Error::KeyLost,
-        _ => Error::Integrity,
+    }
+}
+
+fn classify_crypto_error(error: opc_crypto::CryptoError) -> Error {
+    if error.is_definitive_rejection() {
+        Error::Integrity
+    } else if matches!(error, opc_crypto::CryptoError::ProviderUnavailable) {
+        Error::Backpressure
+    } else {
+        eprintln!("recovery envelope unavailable; retain row and wait for repair");
+        Error::RepairRequired
     }
 }
 
@@ -178,7 +225,7 @@ pub fn seal(
     let handle = ready(provider.get_active_key(KeyPurpose::Session, &tenant()))
         .map_err(classify_key_error)?;
     let envelope =
-        encrypt_envelope_with_handle(&handle, &aad, plaintext).map_err(|_| Error::Integrity)?;
+        encrypt_envelope_with_handle(&handle, &aad, plaintext).map_err(classify_crypto_error)?;
     Ok(StoredRow {
         version,
         sealed_stamp: stamp,
@@ -191,14 +238,14 @@ pub fn unseal(
     key: RowKey,
     row: &StoredRow,
 ) -> Result<Zeroizing<Vec<u8>>, Error> {
-    let envelope = CryptoEnvelopeV1::decode(&row.envelope).map_err(|_| Error::Integrity)?;
-    // Preserve Unavailable before the existing async envelope helper would
-    // collapse the key lookup into DecryptionFailed (tracked by issue #1197).
+    let envelope = CryptoEnvelopeV1::decode(&row.envelope).map_err(classify_crypto_error)?;
+    // Classify the original provider error with the shared positive-verdict
+    // predicate before the fixture decides whether cleanup is authorized.
     let handle = ready(provider.get_key_by_id(&envelope.key_id)).map_err(classify_key_error)?;
     decrypt_decoded_envelope_with_handle(
         &handle,
         &aad(key, row.version, row.sealed_stamp),
         &envelope,
     )
-    .map_err(|_| Error::Integrity)
+    .map_err(classify_crypto_error)
 }

@@ -39,6 +39,33 @@ pub(crate) fn raise_commit_error(alarm_manager: &SharedAlarmManager, error: &Com
     );
 }
 
+/// A coarse rollback failure must not discard positive data evidence. Absence
+/// of that evidence never creates a corruption alarm.
+pub(crate) fn raise_commit_store_error(
+    alarm_manager: &SharedAlarmManager,
+    error: &CommitError,
+    store_code: StoreErrorCode,
+) {
+    let (severity, _) = commit_error_alarm_spec(error.code);
+    raise_config_error_alarm(
+        alarm_manager,
+        CONFIG_BUS_COMMIT_FAILURE_ALARM_TYPE,
+        "commit",
+        error.code.as_str(),
+        severity,
+        store_failure_cause(store_code),
+    );
+}
+
+pub(crate) fn store_failure_cause(code: StoreErrorCode) -> ProbableCause {
+    match code {
+        StoreErrorCode::Crypto
+        | StoreErrorCode::RestoreSchemaMismatch
+        | StoreErrorCode::InvalidHistorySequence => ProbableCause::StorageCorruption,
+        _ => ProbableCause::ConfigApplyFailed,
+    }
+}
+
 pub(crate) fn raise_startup_error(alarm_manager: &SharedAlarmManager, error: &StoreError) {
     let (severity, probable_cause) = startup_error_alarm_spec(error.code);
     raise_config_error_alarm(

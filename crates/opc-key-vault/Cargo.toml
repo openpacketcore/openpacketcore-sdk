@@ -18,6 +18,7 @@ default = []
 k8s-auth = []
 
 [dependencies]
+rustls = { workspace = true }
 opc-key = { path = "../opc-key", version = "0.2.0" }
 opc-types = { path = "../opc-types", version = "0.2.0" }
 async-trait = { workspace = true }

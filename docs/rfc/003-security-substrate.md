@@ -528,24 +528,35 @@ does not cache historical key material or authorization decisions, persist its
 epoch, watch a source, coordinate pods, or produce a fleet-comparable epoch.
 Each unseal calls the remote provider for the exact envelope key ID.
 
+Only positive evidence about a key or ciphertext permits terminal rejection.
+Use `KeyError::is_definitive_rejection()`: it is true only for a positively
+missing key (`NotFound`) or actual key revocation/ciphertext rejection
+(`OperationFailed`). Its exhaustive matches cover every key and custody variant;
+a new variant requires an explicit decision in the defining crate. All other
+errors retain data, including `RotationFailed`, invalid identifiers/metadata,
+and every `KeyCustodyOperationError`. Installation, identity, validation,
+capability, generic operation and provider-output failures prove no key/data
+verdict. Unknown downstream variants MUST default to nonterminal backpressure.
+
 Provider availability, unusable configuration/channel state, and positive
-request/key/data rejection MUST remain distinguishable:
+key/data rejection MUST remain distinguishable:
 
 - `KeyError::Unavailable` covers outages, timeouts, transport loss, temporary
   resource pressure and explicit busy/throttled replies. Retry only with backoff
   within the caller's original budget.
 - `KeyError::ProviderUnusable` covers endpoint/TLS configuration, Unix permissions
   and path/protocol errors, certificate/peer authentication failure, fatal TLS
-  alerts (including after handshake), malformed/oversized provider replies,
+  protocol/authentication alerts (including after handshake), malformed/oversized provider replies,
   unknown response statuses and poisoned provider state. Preserve data and pending
   work, report a redacted operator configuration problem and back off until
   repair. It MUST NOT be treated as an outage for immediate retries or as a
   verdict on any key, ciphertext or record. SVID expiry and trust rotation can
   recover without changing the stored data.
-- `KeyError::OperationFailed` is reserved for a positive provider rejection of
-  the request, key or ciphertext, including AEAD authentication failure. A
-  positively missing key remains `NotFound`. RFC 030 terminal recovery requires
-  an actual key/data rejection; an unavailable or unusable provider proves none.
+- `KeyError::OperationFailed` is reserved for positive key revocation or
+  ciphertext rejection, including AEAD authentication failure. A generic request
+  refusal is not a verdict. RFC 030 terminal recovery uses the shared predicate.
+- TLS `internal_error` (80) is an outage: RFC 8446 §6.2 defines it as an internal
+  peer fault unrelated to the peer's protocol/configuration correctness.
 
 Neither `Unavailable` nor `ProviderUnusable` authorizes record deletion, SA
 teardown, uncommitted plaintext/packet release, or a final cached mutation result.
@@ -560,15 +571,33 @@ without a listener remains unavailable. TCP accepts bare `host:port` or one
 `tcp://` prefix, including IPv4, bracketed/scoped IPv6, released unbracketed IPv6
 forms and `u16` ports with a leading `+`. Invalid authorities fail before connect.
 
-The JSON KMS protocol reserves exactly `{"status":"unavailable"}` for temporary
-backpressure in every operation. Only an explicit `error` reply can positively
-reject a request/key/data; unknown statuses and malformed success replies are
-`ProviderUnusable`. Optional `error_message` text cannot select retryability and
-never escapes the adapter. Text describing throttling in an `error` reply does
-not make that rejection an outage.
+Both JSON KMS adapters use an exact, case-sensitive structured contract.
+If present, `reason` must be a JSON string or null; invalid field types are a
+protocol failure (`ProviderUnusable`) before status classification:
 
-The session-store envelope boundary maps both provider availability classes to
-`StoreError::BackendUnavailable`; only key/data rejection remains `Crypto`.
+| `status` | `reason` | Result |
+| --- | --- | --- |
+| `success` | ignored | Validate the operation's required response fields. |
+| `unavailable` | ignored | `Unavailable`; bounded outage backoff. |
+| `error` | `key_not_found` | `NotFound`; the requested key is positively absent. |
+| `error` | `key_revoked` | `OperationFailed`; the requested key is positively revoked. |
+| `error` for a `decrypt` request | `ciphertext_rejected` | `OperationFailed`; the supplied ciphertext was rejected. |
+| `error` | missing, unknown, malformed, or inapplicable reason | `ProviderUnusable`; retain data and wait for repair. |
+| any other status | any reason | `ProviderUnusable`; retain data and wait for repair. |
+
+For example, `{"status":"error","reason":"key_not_found"}` carries a key
+verdict. Optional `error_message` is diagnostic text only: no substring, including
+`not found`, authentication failures or throttling text, selects a class. A KMS
+that has not added the structured reason loses terminal-cleanup precision, never
+retained data. Malformed success replies are also `ProviderUnusable`.
+
+
+The session-store envelope boundary maps every non-verdict provider failure to
+`StoreError::BackendUnavailable`; positive key/data rejection remains `Crypto`.
+Malformed remote sealing output and local encryption failure do not establish
+stored-data rejection. Vault likewise separates configuration/authentication,
+TLS and malformed-response failures from retryable outages; configuration faults
+never enter its transient retry loop. HTTP error text is not a key verdict.
 Configuration failures emit a fixed operator diagnostic before this coarse
 boundary. Session-net preserves non-definitive handling and transmits its generic
 `backend unavailable` message; the shared `backend_unavailable` metrics label
@@ -577,7 +606,10 @@ positions change.
 
 Generic envelope and bounded configuration encryption preserve these classes as
 `CryptoError::{ProviderUnavailable, ProviderUnusable}` and
-`ConfigCapacityError::{ProviderUnavailable, ProviderUnusable}`. Configuration
+`ConfigCapacityError::{ProviderUnavailable, ProviderUnusable}`. Both also expose
+`KeyRejected` for positive provider verdicts; local `EncryptionFailed` alone is
+not evidence against stored data. `CryptoError::is_definitive_rejection()` keeps
+that distinction through downstream envelope consumers. Configuration
 storage and checkpoint readers keep them unavailable rather than data-rejected.
 Configuration-store startup unavailability and coarse failed/unresolved commits
 raise configuration-apply alarms, without claiming storage corruption.

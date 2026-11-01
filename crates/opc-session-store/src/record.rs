@@ -41,16 +41,36 @@ fn invalid_session_envelope() -> StoreError {
 }
 
 fn key_provider_error(error: KeyError, crypto_message: &'static str) -> StoreError {
+    if error.is_definitive_rejection() {
+        return StoreError::Crypto(crypto_message.into());
+    }
     match error {
         KeyError::Unavailable => {
             StoreError::BackendUnavailable(SESSION_KEY_PROVIDER_UNAVAILABLE_MESSAGE.into())
         }
-        KeyError::ProviderUnusable => {
+        _ => {
             tracing::warn!("session key provider configuration unavailable; retain data and back off until provider repair");
             StoreError::BackendUnavailable("session key provider configuration unavailable".into())
         }
-        _ => StoreError::Crypto(crypto_message.into()),
     }
+}
+
+fn envelope_encrypt_error(error: opc_crypto::CryptoError) -> StoreError {
+    if error.is_definitive_rejection() {
+        StoreError::Crypto(SESSION_ENVELOPE_ENCRYPT_FAILED_MESSAGE.into())
+    } else {
+        tracing::warn!(
+            "session envelope encryption unavailable; retain data and investigate before retrying"
+        );
+        StoreError::BackendUnavailable("session envelope encryption unavailable".into())
+    }
+}
+
+fn unusable_seal_response() -> StoreError {
+    key_provider_error(
+        KeyError::ProviderUnusable,
+        SESSION_ENVELOPE_ENCRYPT_FAILED_MESSAGE,
+    )
 }
 
 use serde::{Deserialize, Serialize};
@@ -602,9 +622,9 @@ impl EncryptedSessionPayload {
     /// The AAD binds tenant, NF kind, a keyed digest of the session key,
     /// state type, generation, fence, and `backend_namespace`, so the
     /// ciphertext only ever decrypts for exactly this record version in this
-    /// namespace. Provider unavailability returns retryable
-    /// [`StoreError::BackendUnavailable`]. Other failures return a deliberately
-    /// coarse [`StoreError::Crypto`] to avoid acting as an encryption oracle.
+    /// namespace. Non-verdict provider failures and local encryption failures
+    /// return [`StoreError::BackendUnavailable`]. Only positive key/data rejection
+    /// returns coarse [`StoreError::Crypto`], without exposing provider details.
     pub async fn encrypt<P: KeyProvider + ?Sized>(
         provider: &P,
         record: &StoredSessionRecord,
@@ -616,7 +636,7 @@ impl EncryptedSessionPayload {
             .map_err(|error| key_provider_error(error, SESSION_ENVELOPE_ENCRYPT_FAILED_MESSAGE))?;
         let aad = build_session_envelope_aad(record, backend_namespace, &handle)?;
         let ciphertext = encrypt_envelope_with_handle(&handle, &aad, record.payload.as_bytes())
-            .map_err(|_| StoreError::Crypto(SESSION_ENVELOPE_ENCRYPT_FAILED_MESSAGE.into()))?;
+            .map_err(envelope_encrypt_error)?;
         Self::try_envelope(ciphertext)
             .map_err(|_| StoreError::Crypto(SESSION_ENVELOPE_ENCRYPT_FAILED_MESSAGE.into()))
     }
@@ -629,8 +649,9 @@ impl EncryptedSessionPayload {
     /// [`Self::encrypt`], AEAD execution is delegated to `provider`; callers
     /// must keep a store on one seal mode because local and remote ciphertexts
     /// use different key custody and are not expected to decrypt across modes.
-    /// Provider unavailability returns retryable [`StoreError::BackendUnavailable`];
-    /// every other provider or envelope failure remains [`StoreError::Crypto`].
+    /// Non-verdict provider failures return [`StoreError::BackendUnavailable`];
+    /// only positive key/data or stored-envelope rejection is [`StoreError::Crypto`].
+    /// Malformed provider responses require repair and retain data.
     pub async fn remote_seal<S: RemoteSealProvider + ?Sized>(
         provider: &S,
         record: &StoredSessionRecord,
@@ -642,18 +663,13 @@ impl EncryptedSessionPayload {
             .await
             .map_err(|error| key_provider_error(error, SESSION_ENVELOPE_ENCRYPT_FAILED_MESSAGE))?;
         if sealed.ciphertext_and_tag.len() < AEAD_TAG_LEN {
-            return Err(StoreError::Crypto(
-                SESSION_ENVELOPE_ENCRYPT_FAILED_MESSAGE.into(),
-            ));
+            return Err(unusable_seal_response());
         }
-        let key_id = key_id_from_bound_aad(&sealed.aad)
-            .map_err(|_| StoreError::Crypto(SESSION_ENVELOPE_ENCRYPT_FAILED_MESSAGE.into()))?;
-        let expected_aad = serialize_bound_aad(&aad, &key_id)
-            .map_err(|_| StoreError::Crypto(SESSION_ENVELOPE_ENCRYPT_FAILED_MESSAGE.into()))?;
+        let key_id = key_id_from_bound_aad(&sealed.aad).map_err(|_| unusable_seal_response())?;
+        let expected_aad =
+            serialize_bound_aad(&aad, &key_id).map_err(|_| unusable_seal_response())?;
         if expected_aad != sealed.aad {
-            return Err(StoreError::Crypto(
-                SESSION_ENVELOPE_ENCRYPT_FAILED_MESSAGE.into(),
-            ));
+            return Err(unusable_seal_response());
         }
 
         let envelope = CryptoEnvelopeV1 {
@@ -664,10 +680,9 @@ impl EncryptedSessionPayload {
             ciphertext_and_tag: sealed.ciphertext_and_tag,
         }
         .encode()
-        .map_err(|_| StoreError::Crypto(SESSION_ENVELOPE_ENCRYPT_FAILED_MESSAGE.into()))?;
+        .map_err(|_| unusable_seal_response())?;
 
-        Self::try_envelope(envelope)
-            .map_err(|_| StoreError::Crypto(SESSION_ENVELOPE_ENCRYPT_FAILED_MESSAGE.into()))
+        Self::try_envelope(envelope).map_err(|_| unusable_seal_response())
     }
 
     /// Recover the plaintext payload according to the declared encoding.
@@ -734,8 +749,9 @@ impl EncryptedSessionPayload {
     /// Remote seal adds one KMS/HSM round-trip per seal operation (normally a
     /// checkpoint off the hot path) and one round-trip per unseal on failover
     /// restore, so restore latency and availability depend on the remote KMS.
-    /// Provider unavailability returns retryable [`StoreError::BackendUnavailable`];
-    /// every other provider or envelope failure remains [`StoreError::Crypto`].
+    /// Non-verdict provider failures return [`StoreError::BackendUnavailable`];
+    /// only positive key/data or stored-envelope rejection is [`StoreError::Crypto`].
+    /// Malformed provider responses require repair and retain data.
     pub async fn remote_unseal<S: RemoteSealProvider + ?Sized>(
         &self,
         provider: &S,
