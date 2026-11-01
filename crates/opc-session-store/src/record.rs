@@ -1037,6 +1037,202 @@ mod tests {
         );
     }
 
+    fn provider_error_cases() -> Vec<(KeyError, bool)> {
+        use opc_key::KeyCustodyOperationError as C;
+        let mut cases = vec![
+            (KeyError::Unavailable, false),
+            (KeyError::ProviderUnusable, false),
+            (KeyError::NotFound, true),
+            (KeyError::OperationFailed, true),
+            (
+                KeyError::DuplicateKeyId {
+                    key_id: KeyId::new("duplicate").unwrap(),
+                },
+                false,
+            ),
+            (
+                KeyError::InvalidMetadata {
+                    field: "scope",
+                    message: "invalid".into(),
+                },
+                false,
+            ),
+            (
+                KeyError::InvalidKeyId {
+                    message: "wrong provider".into(),
+                },
+                false,
+            ),
+            (KeyError::InvalidAlgorithm { id: 99 }, false),
+            (KeyError::RotationFailed, false),
+        ];
+        cases.extend(
+            [
+                C::NotInstalled,
+                C::IdentityChanged,
+                C::ValidationChanged,
+                C::CapabilityNotAdmitted,
+                C::CapabilityWithdrawn,
+                C::ProviderOperationFailed,
+                C::InvalidProviderOutput,
+            ]
+            .into_iter()
+            .map(|error| (KeyError::CustodyOperation(error), false)),
+        );
+        cases
+    }
+
+    struct ErrorProvider(KeyError);
+    #[async_trait::async_trait]
+    impl KeyProvider for ErrorProvider {
+        async fn get_active_key(&self, _: KeyPurpose, _: &TenantId) -> Result<KeyHandle, KeyError> {
+            Err(self.0.clone())
+        }
+        async fn get_key_by_id(&self, _: &KeyId) -> Result<KeyHandle, KeyError> {
+            Err(self.0.clone())
+        }
+        async fn rotate_key(&self, _: KeyPurpose, _: &TenantId) -> Result<KeyId, KeyError> {
+            Err(self.0.clone())
+        }
+    }
+    #[async_trait::async_trait]
+    impl RemoteSealProvider for ErrorProvider {
+        async fn seal(&self, _: &EnvelopeAad, _: &[u8]) -> Result<EncryptedPayload, KeyError> {
+            Err(self.0.clone())
+        }
+        async fn unseal(
+            &self,
+            _: &KeyId,
+            _: &EnvelopeAad,
+            _: &[u8],
+        ) -> Result<Zeroizing<Vec<u8>>, KeyError> {
+            Err(self.0.clone())
+        }
+    }
+
+    #[tokio::test]
+    async fn every_provider_error_preserves_its_verdict_at_store_boundaries() {
+        let record = provider_test_record();
+        let local = working_local_provider();
+        let remote = MemoryRemoteSealProvider::new(
+            KeyId::new(PROVIDER_TEST_KEY_ID).unwrap(),
+            KeyPurpose::Session,
+            provider_test_key().tenant,
+            Zeroizing::new([0x6b; 32]),
+        );
+        let sealed = EncryptedSessionPayload::encrypt(&local, &record, PROVIDER_TEST_NAMESPACE)
+            .await
+            .unwrap();
+        let remote_sealed =
+            EncryptedSessionPayload::remote_seal(&remote, &record, PROVIDER_TEST_NAMESPACE)
+                .await
+                .unwrap();
+        let mut failures = Vec::new();
+        for (error, definitive) in provider_error_cases() {
+            let provider = ErrorProvider(error.clone());
+            let errors = [
+                EncryptedSessionPayload::encrypt(&provider, &record, PROVIDER_TEST_NAMESPACE)
+                    .await
+                    .unwrap_err(),
+                EncryptedSessionPayload::remote_seal(&provider, &record, PROVIDER_TEST_NAMESPACE)
+                    .await
+                    .unwrap_err(),
+                sealed
+                    .decrypt(
+                        &provider,
+                        &record.key,
+                        &record.state_type,
+                        record.generation,
+                        record.fence,
+                        PROVIDER_TEST_NAMESPACE,
+                    )
+                    .await
+                    .unwrap_err(),
+                remote_sealed
+                    .remote_unseal(
+                        &provider,
+                        &record.key,
+                        &record.state_type,
+                        record.generation,
+                        record.fence,
+                        PROVIDER_TEST_NAMESPACE,
+                    )
+                    .await
+                    .unwrap_err(),
+            ];
+            for mapped in errors {
+                let expected = if definitive {
+                    crate::SessionConsumerStoreError::ProtectedDataRejected
+                } else {
+                    crate::SessionConsumerStoreError::Unavailable
+                };
+                if crate::SessionConsumerStoreError::from(mapped.clone()) != expected {
+                    failures.push((error.clone(), mapped));
+                }
+            }
+        }
+        assert!(
+            failures.is_empty(),
+            "provider classifications changed at store boundaries: {failures:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn malformed_remote_success_is_provider_failure_not_a_data_verdict() {
+        struct Malformed(MemoryRemoteSealProvider, usize);
+        #[async_trait]
+        impl RemoteSealProvider for Malformed {
+            async fn seal(
+                &self,
+                aad: &EnvelopeAad,
+                plaintext: &[u8],
+            ) -> Result<EncryptedPayload, KeyError> {
+                let mut sealed = self.0.seal(aad, plaintext).await?;
+                match self.1 {
+                    0 => sealed.ciphertext_and_tag.truncate(1),
+                    1 => sealed.aad = b"not-json".to_vec(),
+                    2 => sealed.aad.push(b' '),
+                    _ => unreachable!(),
+                }
+                Ok(sealed)
+            }
+            async fn unseal(
+                &self,
+                id: &KeyId,
+                aad: &EnvelopeAad,
+                ciphertext: &[u8],
+            ) -> Result<Zeroizing<Vec<u8>>, KeyError> {
+                self.0.unseal(id, aad, ciphertext).await
+            }
+        }
+        let mut failures = Vec::new();
+        for mode in 0..3 {
+            let provider = Malformed(
+                MemoryRemoteSealProvider::new(
+                    KeyId::new(PROVIDER_TEST_KEY_ID).unwrap(),
+                    KeyPurpose::Session,
+                    provider_test_key().tenant,
+                    Zeroizing::new([0x6b; 32]),
+                ),
+                mode,
+            );
+            let error = EncryptedSessionPayload::remote_seal(
+                &provider,
+                &provider_test_record(),
+                PROVIDER_TEST_NAMESPACE,
+            )
+            .await
+            .unwrap_err();
+            if !matches!(error, StoreError::BackendUnavailable(_)) {
+                failures.push((mode, error));
+            }
+        }
+        assert!(
+            failures.is_empty(),
+            "malformed provider success became a data verdict: {failures:?}"
+        );
+    }
+
     struct UnavailableKeyProvider;
 
     #[async_trait]

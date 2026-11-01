@@ -1009,3 +1009,20 @@ pub fn validate_row(row: &Row) -> Result<(), Error> {
     }
     Ok(())
 }
+
+#[test]
+fn unsupported_crypto_configuration_is_not_checkpoint_corruption() {
+    for error in [
+        opc_proto_ikev2::Ikev2SaInitCryptoError::UnsupportedDhGroup {
+            transform_id: 65535,
+        },
+        opc_proto_ikev2::Ikev2SaInitCryptoError::UnsupportedPrf {
+            transform_id: 65535,
+        },
+        opc_proto_ikev2::Ikev2SaInitCryptoError::UnsupportedEncryptionTransform {
+            transform_id: 65535,
+        },
+    ] {
+        assert_eq!(crypto_error(error), Error::Backpressure);
+    }
+}

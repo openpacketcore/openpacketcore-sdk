@@ -588,6 +588,122 @@ mod tests {
         out
     }
 
+    struct VerdictProvider(opc_key::KeyError);
+    #[async_trait::async_trait]
+    impl KeyProvider for VerdictProvider {
+        async fn get_active_key(
+            &self,
+            _: KeyPurpose,
+            _: &TenantId,
+        ) -> Result<KeyHandle, opc_key::KeyError> {
+            Err(self.0.clone())
+        }
+        async fn get_key_by_id(&self, _: &KeyId) -> Result<KeyHandle, opc_key::KeyError> {
+            Err(self.0.clone())
+        }
+        async fn rotate_key(
+            &self,
+            _: KeyPurpose,
+            _: &TenantId,
+        ) -> Result<KeyId, opc_key::KeyError> {
+            Err(self.0.clone())
+        }
+    }
+    #[tokio::test]
+    async fn positive_key_verdicts_are_distinct_from_local_encryption_failure() {
+        let working = provider_with_active_key(KeyPurpose::Config, "verdict-key", 0x41);
+        let aad = config_aad();
+        let plaintext = b"{}";
+        let envelope = encrypt_envelope(&working, &aad, plaintext).await.unwrap();
+        let mut failures = Vec::new();
+        for error in [
+            opc_key::KeyError::NotFound,
+            opc_key::KeyError::OperationFailed,
+        ] {
+            let provider = VerdictProvider(error.clone());
+            let actual = [
+                encrypt_envelope(&provider, &aad, plaintext)
+                    .await
+                    .unwrap_err()
+                    .to_string(),
+                decrypt_envelope(&provider, &aad, &envelope)
+                    .await
+                    .unwrap_err()
+                    .to_string(),
+                encrypt_bounded_config_envelope(&provider, &aad, plaintext)
+                    .await
+                    .unwrap_err()
+                    .to_string(),
+            ];
+            if actual
+                .iter()
+                .any(|value| value != "key or ciphertext rejected")
+            {
+                failures.push((error, actual));
+            }
+        }
+        assert!(
+            failures.is_empty(),
+            "positive key verdicts lost their provenance: {failures:?}"
+        );
+    }
+
+    struct UnreadyProvider;
+    #[async_trait::async_trait]
+    impl KeyProvider for UnreadyProvider {
+        async fn get_active_key(
+            &self,
+            _: KeyPurpose,
+            _: &TenantId,
+        ) -> Result<KeyHandle, opc_key::KeyError> {
+            Err(opc_key::KeyCustodyOperationError::CapabilityWithdrawn.into())
+        }
+        async fn get_key_by_id(&self, _: &KeyId) -> Result<KeyHandle, opc_key::KeyError> {
+            Err(opc_key::KeyCustodyOperationError::CapabilityWithdrawn.into())
+        }
+        async fn rotate_key(
+            &self,
+            _: KeyPurpose,
+            _: &TenantId,
+        ) -> Result<KeyId, opc_key::KeyError> {
+            Err(opc_key::KeyCustodyOperationError::CapabilityWithdrawn.into())
+        }
+    }
+    #[tokio::test]
+    async fn custody_unready_is_nonterminal_through_all_envelope_apis() {
+        let working = provider_with_active_key(KeyPurpose::Config, "custody-key", 0x41);
+        let aad = config_aad();
+        let plaintext = br#"{"hostname":"amf-01"}"#;
+        let envelope = encrypt_envelope(&working, &aad, plaintext).await.unwrap();
+        let errors = [
+            encrypt_envelope(&UnreadyProvider, &aad, plaintext)
+                .await
+                .unwrap_err()
+                .to_string(),
+            decrypt_envelope(&UnreadyProvider, &aad, &envelope)
+                .await
+                .unwrap_err()
+                .to_string(),
+            encrypt_bounded_config_envelope(&UnreadyProvider, &aad, plaintext)
+                .await
+                .unwrap_err()
+                .to_string(),
+        ];
+        assert!(
+            errors
+                .iter()
+                .all(|error| error == "key provider unusable as configured"),
+            "custody state became rejection: {errors:?}"
+        );
+        assert_eq!(
+            decrypt_envelope(&working, &aad, &envelope)
+                .await
+                .unwrap()
+                .as_slice(),
+            plaintext
+        );
+    }
+
     #[tokio::test]
     async fn provider_configuration_survives_generic_envelope_operations() {
         let working = provider_with_active_key(KeyPurpose::Config, "configuration-key", 0x41);

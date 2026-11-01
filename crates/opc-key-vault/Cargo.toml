@@ -34,6 +34,8 @@ url = "2.5"
 base64 = { version = "0.23", default-features = false, features = ["std"] }
 
 [dev-dependencies]
+tokio-rustls = { workspace = true }
+rcgen = { workspace = true }
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
 serde_json = { workspace = true }
 opc-crypto = { path = "../opc-crypto", version = "0.2.0" }

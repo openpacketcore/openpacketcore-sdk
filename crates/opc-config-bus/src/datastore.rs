@@ -1239,3 +1239,13 @@ fn config_provider_error(error: opc_crypto::CryptoError, rejected: &'static str)
         _ => StoreError::crypto(rejected),
     }
 }
+
+#[cfg(test)]
+mod provider_failure_tests {
+    #[test]
+    fn local_encryption_failure_does_not_claim_corrupt_stored_data() {
+        let error =
+            super::config_provider_error(opc_crypto::CryptoError::EncryptionFailed, "rejected");
+        assert_eq!(error.code, crate::StoreErrorCode::Unavailable);
+    }
+}

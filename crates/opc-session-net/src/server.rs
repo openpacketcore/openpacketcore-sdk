@@ -4804,6 +4804,104 @@ mod tests {
     }
 
     #[test]
+    fn legacy_key_provider_outages_are_ambiguous_in_every_mutating_family() {
+        let error = || StoreError::KeyProviderUnavailable("provider unavailable".into());
+        assert!(matches!(
+            normalize_store_backend_outcome::<()>(Err(error()), BackendDeadlineOutcome::Preflight),
+            Err(StoreError::BackendUnavailable(_))
+        ));
+        assert_eq!(
+            normalize_store_backend_outcome::<()>(Err(error()), BackendDeadlineOutcome::Mutation),
+            Err(StoreError::BackendOperationOutcomeUnavailable)
+        );
+        assert_eq!(
+            normalize_store_backend_outcome::<()>(
+                Err(error()),
+                BackendDeadlineOutcome::CompareAndSet
+            ),
+            Err(StoreError::CasIdempotencyOutcomeUnavailable)
+        );
+    }
+
+    #[tokio::test]
+    async fn custody_failures_never_become_cached_final_cas_results() {
+        use opc_key::{
+            EncryptedPayload, EnvelopeAad, KeyCustodyOperationError as C, KeyError, KeyId,
+            RemoteSealProvider, Zeroizing,
+        };
+        struct Provider(C);
+        #[async_trait::async_trait]
+        impl RemoteSealProvider for Provider {
+            async fn seal(&self, _: &EnvelopeAad, _: &[u8]) -> Result<EncryptedPayload, KeyError> {
+                Err(self.0.into())
+            }
+            async fn unseal(
+                &self,
+                _: &KeyId,
+                _: &EnvelopeAad,
+                _: &[u8],
+            ) -> Result<Zeroizing<Vec<u8>>, KeyError> {
+                Err(self.0.into())
+            }
+        }
+        let mut failures = Vec::new();
+        for error in [
+            C::NotInstalled,
+            C::IdentityChanged,
+            C::ValidationChanged,
+            C::CapabilityNotAdmitted,
+            C::CapabilityWithdrawn,
+            C::ProviderOperationFailed,
+            C::InvalidProviderOutput,
+        ] {
+            let mapped = EncryptedSessionPayload::remote_seal(
+                &Provider(error),
+                &restore_record(b"custody", 16),
+                "custody",
+            )
+            .await
+            .unwrap_err();
+            let cache = Arc::new(StdMutex::new(CasIdempotencyCache::default()));
+            let peer = ReplicaId::new("replica-custody").unwrap();
+            let request_id = uuid::Uuid::from_u128(75);
+            let epoch = cache.lock().unwrap().epoch();
+            let CasIdempotencyAdmission::Execute(permit) = CasIdempotencyCache::begin(
+                &cache,
+                &peer,
+                request_id,
+                epoch,
+                [3; 32],
+                Instant::now(),
+            ) else {
+                panic!("execute first request")
+            };
+            let result = Err(mapped);
+            if cas_outcome_is_definitive(&result) {
+                permit.complete(result);
+            } else {
+                drop(permit);
+            }
+            if !matches!(
+                CasIdempotencyCache::begin(
+                    &cache,
+                    &peer,
+                    request_id,
+                    epoch,
+                    [3; 32],
+                    Instant::now()
+                ),
+                CasIdempotencyAdmission::Reject(StoreError::CasIdempotencyOutcomeUnavailable)
+            ) {
+                failures.push(error);
+            }
+        }
+        assert!(
+            failures.is_empty(),
+            "custody state was cached as a final rejection: {failures:?}"
+        );
+    }
+
+    #[test]
     fn cas_idempotency_cache_tombstones_key_provider_outages() {
         let cache = Arc::new(StdMutex::new(CasIdempotencyCache::default()));
         let peer = ReplicaId::new("replica-a").expect("peer");

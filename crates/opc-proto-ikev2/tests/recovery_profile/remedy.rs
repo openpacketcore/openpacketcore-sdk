@@ -218,3 +218,16 @@ impl Cleanup {
         Ok(())
     }
 }
+
+#[test]
+fn unavailable_sync_and_backoff_do_not_refuse_the_epoch() {
+    for error in [
+        Window::SyncUnavailable,
+        Window::SyncEntropy,
+        Window::LivenessBackoff,
+        Window::LivenessRetryLimit,
+        Window::SyncInProgress,
+    ] {
+        assert_eq!(window_failure(error), Remedy::Wait);
+    }
+}

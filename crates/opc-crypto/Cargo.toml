@@ -23,6 +23,7 @@ subtle = { workspace = true }
 thiserror = { workspace = true }
 
 [dev-dependencies]
+async-trait = { workspace = true }
 opc-types = { path = "../opc-types", version = "0.2.0" }
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
 

@@ -141,6 +141,14 @@ fn unix_connect_error(error: std::io::Error) -> KeyError {
     }
 }
 
+async fn connect_tcp(addr: &str) -> std::io::Result<tokio::net::TcpStream> {
+    #[cfg(test)]
+    if tests::TCP_CONNECT_DENIALS.lock().unwrap().contains(addr) {
+        return Err(std::io::ErrorKind::PermissionDenied.into());
+    }
+    tokio::net::TcpStream::connect(addr).await
+}
+
 fn kms_transport_error(error: std::io::Error) -> KeyError {
     // Rustls wraps certificate verification and fatal peer alerts in io::Error.
     // TLS 1.3 can deliver a peer authentication refusal on application I/O after
@@ -276,9 +284,7 @@ impl KmsKeyProvider {
                 let connector = self.connector.as_ref().ok_or(KeyError::ProviderUnusable)?;
                 let domain = rustls_pki_types::ServerName::try_from(self.server_name.clone())
                     .map_err(|_| KeyError::ProviderUnusable)?;
-                let stream = tokio::net::TcpStream::connect(addr)
-                    .await
-                    .map_err(kms_transport_error)?;
+                let stream = connect_tcp(addr).await.map_err(kms_transport_error)?;
                 let tls_stream = connector
                     .connect(domain, stream)
                     .await
@@ -498,9 +504,7 @@ impl KmsRemoteSealProvider {
                 let connector = self.connector.as_ref().ok_or(KeyError::ProviderUnusable)?;
                 let domain = rustls_pki_types::ServerName::try_from(self.server_name.clone())
                     .map_err(|_| KeyError::ProviderUnusable)?;
-                let stream = tokio::net::TcpStream::connect(addr)
-                    .await
-                    .map_err(kms_transport_error)?;
+                let stream = connect_tcp(addr).await.map_err(kms_transport_error)?;
                 let tls_stream = connector
                     .connect(domain, stream)
                     .await
@@ -631,6 +635,119 @@ mod tests {
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::time::Duration;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    #[tokio::test]
+    async fn kms_error_verdict_requires_a_recognized_machine_reason() {
+        let mut failures = Vec::new();
+        for reason in [
+            None,
+            Some(""),
+            Some("unknown"),
+            Some("KEY_NOT_FOUND"),
+            Some("key_not_found"),
+            Some("key_revoked"),
+            Some("ciphertext_rejected"),
+        ] {
+            for message in [
+                "access denied",
+                "authentication failed",
+                "internal server error",
+                "route not found",
+                "",
+            ] {
+                let mut reply = serde_json::json!({"status":"error", "error_message":message});
+                if let Some(reason) = reason {
+                    reply["reason"] = reason.into();
+                }
+                for operation in 0..5 {
+                    let mock = mock_kms(MockResponse::Bytes(reply.to_string().into_bytes())).await;
+                    let key_id = KeyId::new("machine-reason-key").unwrap();
+                    let local =
+                        KmsKeyProvider::new(mock.endpoint.clone(), None, Duration::from_secs(1));
+                    let remote = KmsRemoteSealProvider::new(
+                        mock.endpoint.clone(),
+                        None,
+                        Duration::from_secs(1),
+                        key_id.clone(),
+                    );
+                    let error = match operation {
+                        0 => local
+                            .get_active_key(KeyPurpose::Session, &tenant())
+                            .await
+                            .unwrap_err(),
+                        1 => local.get_key_by_id(&key_id).await.unwrap_err(),
+                        2 => local
+                            .rotate_key(KeyPurpose::Session, &tenant())
+                            .await
+                            .unwrap_err(),
+                        3 => remote.seal(&session_aad(), b"plaintext").await.unwrap_err(),
+                        4 => remote
+                            .unseal(&key_id, &session_aad(), b"ciphertext")
+                            .await
+                            .unwrap_err(),
+                        _ => unreachable!(),
+                    };
+                    let expected = match reason {
+                        Some("key_not_found") => KeyError::NotFound,
+                        Some("key_revoked") => KeyError::OperationFailed,
+                        Some("ciphertext_rejected") if operation == 4 => KeyError::OperationFailed,
+                        _ => KeyError::ProviderUnusable,
+                    };
+                    if error != expected {
+                        failures.push((reason, message, operation, error, expected));
+                    }
+                }
+            }
+        }
+        assert!(
+            failures.is_empty(),
+            "free text or unrecognized reasons became verdicts: {failures:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn kms_tls_internal_error_is_an_outage_for_all_operations() {
+        let errors = kms_peer_alert_errors(Some(80)).await;
+        assert!(
+            errors.iter().all(|error| *error == KeyError::Unavailable),
+            "peer internal fault is not provider configuration: {errors:?}"
+        );
+    }
+
+    #[test]
+    fn kms_transport_permission_denial_requires_operator_repair() {
+        assert_eq!(
+            kms_transport_error(std::io::Error::from(std::io::ErrorKind::PermissionDenied)),
+            KeyError::ProviderUnusable
+        );
+    }
+
+    pub(super) static TCP_CONNECT_DENIALS: std::sync::Mutex<std::collections::BTreeSet<String>> =
+        std::sync::Mutex::new(std::collections::BTreeSet::new());
+    #[tokio::test]
+    async fn kms_tcp_permission_denial_is_reported_by_both_adapters() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        TCP_CONNECT_DENIALS.lock().unwrap().insert(addr.clone());
+        let errors = kms_request_errors(
+            format!("tcp://{addr}"),
+            Some(kms_test_tls_connector()),
+            "kms.example",
+        )
+        .await;
+        TCP_CONNECT_DENIALS.lock().unwrap().remove(&addr);
+        assert!(
+            errors
+                .iter()
+                .all(|error| *error == KeyError::ProviderUnusable),
+            "TCP permission error lost its class: {errors:?}"
+        );
+        assert_eq!(
+            listener.accept().unwrap_err().kind(),
+            std::io::ErrorKind::WouldBlock
+        );
+    }
 
     static NEXT_SOCKET_ID: AtomicU64 = AtomicU64::new(0);
 

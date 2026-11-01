@@ -22,6 +22,22 @@ use crate::{
     KeyCustodyOperationError, KeyError, KeyId, RemoteSealProvider, SessionAad,
 };
 
+#[test]
+fn custody_mapper_preserves_positive_verdicts_and_retains_unknown_failures() {
+    assert_eq!(
+        super::map_provider_error(KeyError::OperationFailed),
+        KeyError::OperationFailed
+    );
+    for error in [
+        KeyError::RotationFailed,
+        KeyError::InvalidKeyId {
+            message: "wrong provider".into(),
+        },
+    ] {
+        assert_eq!(super::map_provider_error(error), KeyError::ProviderUnusable);
+    }
+}
+
 const KEY_MATERIAL_CANARY: &str = "provider-owned-key-material-canary";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
