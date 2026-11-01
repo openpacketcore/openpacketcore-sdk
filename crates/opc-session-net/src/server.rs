@@ -5743,4 +5743,10 @@ mod tests {
             StoreError::BackendUnavailable(_)
         ));
     }
+    #[test]
+    fn real_crypto_rejection_remains_a_definitive_store_outcome() {
+        assert!(store_error_is_definitive(&StoreError::Crypto(
+            "authenticated rejection".into()
+        )));
+    }
 }

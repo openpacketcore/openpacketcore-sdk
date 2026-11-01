@@ -1620,4 +1620,11 @@ mod tests {
         assert_eq!(counters.visit_bytes_copied_bytes, 0);
         assert_eq!(counters.visit_byte_buf_owners, 1);
     }
+    #[test]
+    fn local_encryption_failure_retains_stored_data() {
+        assert!(matches!(
+            super::envelope_encrypt_error(opc_crypto::CryptoError::EncryptionFailed),
+            StoreError::BackendUnavailable(_)
+        ));
+    }
 }

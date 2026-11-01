@@ -1053,4 +1053,28 @@ mod tests {
             .expect("decrypt");
         assert_eq!(round_trip.as_slice(), plaintext);
     }
+    #[tokio::test]
+    async fn damaged_key_binding_is_rejected_before_provider_lookup() {
+        let provider = provider_with_active_key(KeyPurpose::Config, "original-key", 7);
+        let aad = config_aad();
+        let bytes = encrypt_envelope(&provider, &aad, b"retained")
+            .await
+            .unwrap();
+        let mut envelope = CryptoEnvelopeV1::decode(&bytes).unwrap();
+        envelope.key_id = KeyId::new("damaged-key").unwrap();
+        let unavailable =
+            opc_key::KmsKeyProvider::new("unix://".into(), None, std::time::Duration::from_secs(1));
+        let error = decrypt_envelope(&unavailable, &aad, &envelope.encode().unwrap())
+            .await
+            .unwrap_err();
+        assert_eq!(error, CryptoError::DecryptionFailed);
+        assert!(error.is_definitive_rejection());
+        // Intact binding under a wrong deployment still retains the row.
+        assert_eq!(
+            decrypt_envelope(&unavailable, &aad, &bytes)
+                .await
+                .unwrap_err(),
+            CryptoError::ProviderUnusable
+        );
+    }
 }

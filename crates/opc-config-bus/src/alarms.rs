@@ -274,4 +274,35 @@ mod provider_failure_tests {
             [(); 4].map(|_| (Severity::Major, ProbableCause::ConfigApplyFailed))
         );
     }
+    #[test]
+    fn coarse_startup_and_state_machine_failures_are_not_data_evidence() {
+        for code in [
+            StoreErrorCode::OutcomeUnknown,
+            StoreErrorCode::Internal,
+            StoreErrorCode::RestoreRecoveryRequired,
+            StoreErrorCode::RestoreConfirmedDeadline,
+            StoreErrorCode::StartupValidationTaskFailed,
+            StoreErrorCode::NotFound,
+        ] {
+            assert_eq!(
+                startup_error_alarm_spec(code).1,
+                ProbableCause::ConfigApplyFailed,
+                "{code:?}"
+            );
+        }
+        assert_eq!(
+            commit_error_alarm_spec(CommitErrorCode::StateMachineFault).1,
+            ProbableCause::ConfigApplyFailed
+        );
+        for code in [
+            StoreErrorCode::Crypto,
+            StoreErrorCode::RestoreSchemaMismatch,
+            StoreErrorCode::InvalidHistorySequence,
+        ] {
+            assert_eq!(
+                startup_error_alarm_spec(code).1,
+                ProbableCause::StorageCorruption
+            );
+        }
+    }
 }

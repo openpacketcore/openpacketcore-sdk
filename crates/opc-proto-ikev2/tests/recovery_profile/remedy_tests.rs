@@ -379,3 +379,39 @@ fn refusal_classes_preserve_retry_and_trust_boundaries() {
     );
     let _ = Window::Drop;
 }
+
+#[test]
+fn undecodable_envelope_authorizes_scoped_terminal_cleanup() {
+    matrix(43_000_000, |row| {
+        let provider = Provider::new();
+        let mut store = CasStore::new(7);
+        let owners = EpochOwners::new(7);
+        let initial = driver::create(&provider, &mut store, &row).unwrap();
+        let mut damaged = store.inspect(row.key).unwrap().clone();
+        damaged.version = damaged.version.next();
+        damaged.envelope.truncate(1);
+        let write = Command::new(
+            store.next_request(),
+            vec![Mutation {
+                key: row.key,
+                expected: Some(row.version),
+                value: Some(damaged),
+            }],
+        )
+        .unwrap();
+        store.commit(&write).unwrap();
+        let before = module::counts();
+        let Recovery::Terminal(mut cleanup) = remedy::recover(
+            &provider,
+            &owners,
+            store.fenced_read(&write, row.key).unwrap(),
+        )
+        .unwrap() else {
+            panic!("undecodable envelope must authorize terminal cleanup");
+        };
+        cleanup.commit(&mut store, Cut::Complete).unwrap();
+        assert!(store.inspect(row.key).is_none());
+        assert_eq!(module::counts(), before);
+        drop(initial);
+    });
+}

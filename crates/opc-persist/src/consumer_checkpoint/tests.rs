@@ -1324,3 +1324,33 @@ fn completed_checkpoint_open_keeps_its_known_outcome_after_storage_latency() {
         }
     });
 }
+
+fn assert_checkpoint_write_diagnostic(
+    error: opc_crypto::CryptoError,
+    expected: &str,
+    forbidden: &str,
+) {
+    let diagnostics = CapturedDiagnostics::default();
+    let result =
+        tracing::subscriber::with_default(diagnostics.clone(), || checkpoint_encrypt_error(error));
+    assert_eq!(result, ConsumerCheckpointError::Unavailable);
+    let reports = diagnostics.0.lock().unwrap().join("\n");
+    assert!(reports.contains(expected), "{reports}");
+    assert!(!reports.contains(forbidden), "{reports}");
+}
+#[test]
+fn checkpoint_write_rejection_reports_provider_repair() {
+    assert_checkpoint_write_diagnostic(
+        opc_crypto::CryptoError::KeyRejected,
+        "checkpoint key provider configuration unavailable",
+        "local encryption",
+    );
+}
+#[test]
+fn checkpoint_local_write_failure_reports_local_fault() {
+    assert_checkpoint_write_diagnostic(
+        opc_crypto::CryptoError::EncryptionFailed,
+        "checkpoint local encryption failed",
+        "provider repair",
+    );
+}

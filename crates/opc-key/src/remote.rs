@@ -208,7 +208,7 @@ impl RemoteSealProvider for MemoryRemoteSealProvider {
             .await?;
         handle
             .encrypt_payload(aad, plaintext, self.nonce)
-            .map_err(|_| KeyError::OperationFailed)
+            .map_err(local_seal_error)
     }
 
     async fn unseal(
@@ -232,6 +232,11 @@ impl RemoteSealProvider for MemoryRemoteSealProvider {
             .map(Zeroizing::new)
             .map_err(|_| KeyError::OperationFailed)
     }
+}
+
+// Keep the local failure conversion independently testable.
+fn local_seal_error(_: crate::errors::CryptoOperationError) -> KeyError {
+    KeyError::OperationFailed
 }
 
 #[cfg(test)]
@@ -317,5 +322,11 @@ mod material_tests {
             controller.active_selection().expect("active selection"),
             (RemoteSealMaterialEpoch(u64::MAX), old_key)
         );
+    }
+    #[test]
+    fn local_remote_seal_failure_is_not_a_key_verdict() {
+        let error = local_seal_error(crate::errors::CryptoOperationError::EncryptionFailed);
+        assert_eq!(error, KeyError::ProviderUnusable);
+        assert!(!error.is_definitive_rejection());
     }
 }

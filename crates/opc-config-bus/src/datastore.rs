@@ -1250,4 +1250,50 @@ mod provider_failure_tests {
             super::config_provider_error(opc_crypto::CryptoError::EncryptionFailed, "rejected");
         assert_eq!(error.code, crate::StoreErrorCode::Unavailable);
     }
+    use std::sync::{Arc, Mutex};
+    #[derive(Clone, Default)]
+    struct CapturedDiagnostics(Arc<Mutex<Vec<String>>>);
+    impl tracing::Subscriber for CapturedDiagnostics {
+        fn enabled(&self, _: &tracing::Metadata<'_>) -> bool {
+            true
+        }
+        fn new_span(&self, _: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+            tracing::span::Id::from_u64(1)
+        }
+        fn record(&self, _: &tracing::span::Id, _: &tracing::span::Record<'_>) {}
+        fn record_follows_from(&self, _: &tracing::span::Id, _: &tracing::span::Id) {}
+        fn event(&self, event: &tracing::Event<'_>) {
+            struct Visitor(String);
+            impl tracing::field::Visit for Visitor {
+                fn record_debug(
+                    &mut self,
+                    field: &tracing::field::Field,
+                    value: &dyn std::fmt::Debug,
+                ) {
+                    use std::fmt::Write;
+                    let _ = write!(self.0, "{field}={value:?};");
+                }
+            }
+            let mut visitor = Visitor(String::new());
+            event.record(&mut visitor);
+            self.0.lock().unwrap().push(visitor.0);
+        }
+        fn enter(&self, _: &tracing::span::Id) {}
+        fn exit(&self, _: &tracing::span::Id) {}
+    }
+
+    #[test]
+    fn local_config_crypto_failure_diagnostic_does_not_blame_provider() {
+        let capture = CapturedDiagnostics::default();
+        let error = tracing::subscriber::with_default(capture.clone(), || {
+            super::config_provider_error(opc_crypto::CryptoError::EncryptionFailed, "rejected")
+        });
+        assert_eq!(error.code, crate::StoreErrorCode::Unavailable);
+        let reports = capture.0.lock().unwrap().join("\n");
+        assert!(
+            reports.contains("config local encryption failed"),
+            "{reports}"
+        );
+        assert!(!reports.contains("provider repair"), "{reports}");
+    }
 }

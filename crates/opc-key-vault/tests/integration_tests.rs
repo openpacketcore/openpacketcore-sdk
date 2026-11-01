@@ -673,3 +673,50 @@ async fn vault_tls_internal_error_uses_bounded_outage_retries() {
         .unwrap_err();
     assert_eq!((error, server.await.unwrap()), (KeyError::Unavailable, 3));
 }
+
+#[tokio::test]
+async fn vault_truncated_reply_is_an_outage_with_bounded_retries() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = url::Url::parse(&format!("http://{}/", listener.local_addr().unwrap())).unwrap();
+    let server = tokio::spawn(async move {
+        let mut attempts = 0;
+        while let Ok(Ok((mut stream, _))) =
+            tokio::time::timeout(std::time::Duration::from_millis(300), listener.accept()).await
+        {
+            attempts += 1;
+            let mut request = [0; 4096];
+            assert!(stream.read(&mut request).await.unwrap() > 0);
+            stream.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 1000\r\nConnection: close\r\n\r\n{\"data\":").await.unwrap();
+            stream.shutdown().await.unwrap();
+        }
+        attempts
+    });
+    let error = VaultKeyProvider::new(url, "token".into(), "transit".into())
+        .get_active_key(KeyPurpose::Config, &tenant())
+        .await
+        .unwrap_err();
+    assert_eq!((error, server.await.unwrap()), (KeyError::Unavailable, 3));
+}
+#[tokio::test]
+async fn vault_rotation_preserves_outage_and_repair_classes() {
+    for (status, expected, count) in [
+        (401, KeyError::ProviderUnusable, 1),
+        (503, KeyError::Unavailable, 3),
+    ] {
+        let mock = MockVault::new(Arc::new(Mutex::new(
+            (0..3)
+                .map(|_| MockResponse {
+                    status,
+                    body: "{}".into(),
+                })
+                .collect(),
+        )))
+        .await;
+        let error = mock_provider(&mock, "token")
+            .rotate_key(KeyPurpose::Session, &tenant())
+            .await
+            .unwrap_err();
+        assert_eq!(error, expected);
+        assert_eq!(mock.request_paths().await.len(), count);
+    }
+}

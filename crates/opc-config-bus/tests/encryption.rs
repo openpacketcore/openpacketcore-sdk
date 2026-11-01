@@ -1038,3 +1038,21 @@ async fn provider_failure_preserves_config_history(endpoint: String) {
         "retained"
     );
 }
+
+#[tokio::test]
+async fn missing_active_seed_key_does_not_claim_stored_data_damage() {
+    let inner = Arc::new(MockManagedDatastore::<SealedConfig<TestConfig>>::new());
+    let store = EncryptingManagedDatastore::new(inner.clone(), Arc::new(MemoryKeyProvider::new()));
+    let error = match ConfigBus::restore_or_new_dev_only(TestConfig::new("initial"), store).await {
+        Ok(_) => panic!("missing key must prevent seeding"),
+        Err(error) => error,
+    };
+    assert_eq!(error.code, StoreErrorCode::Unavailable);
+    let alarms = error.alarm_manager().unwrap().active_alarms();
+    assert_eq!(alarms.len(), 1);
+    assert_eq!(
+        alarms[0].probable_cause,
+        opc_alarm::ProbableCause::ConfigApplyFailed
+    );
+    assert!(inner.history().await.is_empty());
+}
