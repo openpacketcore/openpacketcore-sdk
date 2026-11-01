@@ -253,17 +253,10 @@ mod material_tests {
             controller.epoch().unwrap_err(),
             controller.active_selection().unwrap_err(),
         ];
-        assert_eq!(
-            errors,
-            [
-                KeyError::OperationFailed,
-                KeyError::OperationFailed,
-                KeyError::OperationFailed
-            ]
-        );
+        // Poisoned provider state says nothing about a request or ciphertext.
         for error in errors {
-            assert_eq!(error.to_string(), "key provider operation failed");
-            assert_eq!(format!("{error:?}"), "OperationFailed");
+            assert_eq!(error.to_string(), "key provider unusable as configured");
+            assert_eq!(format!("{error:?}"), "ProviderUnusable");
         }
         assert!(!format!("{controller:?}").contains(key_id.as_str()));
     }

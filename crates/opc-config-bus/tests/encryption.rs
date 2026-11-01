@@ -965,3 +965,76 @@ async fn test_config_classification_seam_regression() {
     assert!(!latest.encrypted_blob.is_empty());
     assert!(latest.config.legacy_plaintext_config().is_none());
 }
+
+#[tokio::test]
+async fn provider_configuration_preserves_config_history_without_crypto_rejection() {
+    provider_failure_preserves_config_history("unix://".into()).await;
+}
+
+#[tokio::test]
+async fn provider_outage_preserves_config_history_without_crypto_rejection() {
+    provider_failure_preserves_config_history(format!(
+        "/tmp/absent-kms-{}-config",
+        std::process::id()
+    ))
+    .await;
+}
+
+async fn provider_failure_preserves_config_history(endpoint: String) {
+    let inner = Arc::new(MockManagedDatastore::new());
+    let working = test_provider();
+    let store = EncryptingManagedDatastore::new(inner.clone(), working.clone());
+    let bus = ConfigBus::new_dev_only(TestConfig::new("initial"), store)
+        .await
+        .unwrap();
+    submit_commit(&bus, "retained").await;
+    let before = inner.history().await;
+    let provider = Arc::new(opc_key::KmsKeyProvider::new(
+        endpoint,
+        None,
+        Duration::from_secs(1),
+    ));
+    let broken = EncryptingManagedDatastore::new(inner.clone(), provider);
+    let error = match broken.load_latest().await {
+        Err(error) => error,
+        Ok(_) => panic!("provider failure must return no plaintext"),
+    };
+    assert_eq!(error.code, StoreErrorCode::Unavailable);
+    let record = StoredConfig::new(
+        TxId::new(),
+        ConfigVersion::new(2),
+        principal(),
+        RequestSource::Northbound,
+        TestConfig::new("unpublished"),
+    );
+    let write_error = match broken.append_commit_write(CommitWrite::new(record)).await {
+        Err(error) => error,
+        Ok(_) => panic!("provider failure must publish no config"),
+    };
+    assert_eq!(write_error.code, StoreErrorCode::Unavailable);
+    let startup =
+        match ConfigBus::restore_or_new_dev_only(TestConfig::new("fallback"), broken).await {
+            Err(error) => error,
+            Ok(_) => panic!("provider failure must not restore or replace the record"),
+        };
+    assert_eq!(startup.code, StoreErrorCode::Unavailable);
+    let alarms = startup.alarm_manager().unwrap().active_alarms();
+    assert!(!alarms.is_empty(), "operators must be notified");
+    for alarm in alarms {
+        assert_eq!(
+            alarm.probable_cause,
+            opc_alarm::ProbableCause::ConfigApplyFailed
+        );
+    }
+    let after = inner.history().await;
+    assert_eq!(before.len(), after.len());
+    for (before, after) in before.iter().zip(after.iter()) {
+        assert_eq!(before.tx_id, after.tx_id);
+        assert_eq!(before.encrypted_blob, after.encrypted_blob);
+    }
+    let repaired = EncryptingManagedDatastore::new(inner, working);
+    assert_eq!(
+        repaired.load_latest().await.unwrap().unwrap().config.name,
+        "retained"
+    );
+}

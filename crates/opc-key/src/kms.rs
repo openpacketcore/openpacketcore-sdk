@@ -602,6 +602,52 @@ mod tests {
 
     static NEXT_SOCKET_ID: AtomicU64 = AtomicU64::new(0);
 
+    fn assert_provider_configuration(errors: &[KeyError]) {
+        for error in errors {
+            assert_eq!(error.to_string(), "key provider unusable as configured");
+            assert_eq!(format!("{error:?}"), "ProviderUnusable");
+        }
+    }
+
+    #[tokio::test]
+    async fn kms_endpoint_configuration_is_not_a_key_verdict() {
+        assert_provider_configuration(
+            &kms_request_errors("unix://".into(), None, "kms.example").await,
+        );
+    }
+
+    #[tokio::test]
+    async fn kms_certificate_configuration_is_not_a_key_verdict() {
+        assert_provider_configuration(&kms_certificate_failure_errors(false).await);
+    }
+
+    #[tokio::test]
+    async fn kms_permission_configuration_is_not_a_key_verdict() {
+        use std::os::unix::fs::PermissionsExt;
+        let path = next_mock_socket_path();
+        let listener = std::os::unix::net::UnixListener::bind(&path).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0)).unwrap();
+        assert_eq!(
+            std::os::unix::net::UnixStream::connect(&path)
+                .unwrap_err()
+                .kind(),
+            std::io::ErrorKind::PermissionDenied
+        );
+        let errors = kms_request_errors(path.display().to_string(), None, "kms.example").await;
+        drop(listener);
+        std::fs::remove_file(path).unwrap();
+        assert_provider_configuration(&errors);
+    }
+
+    #[tokio::test]
+    async fn kms_regular_file_endpoint_is_configuration_not_an_outage() {
+        let path = next_mock_socket_path();
+        std::fs::write(&path, b"not a socket").unwrap();
+        let errors = kms_request_errors(path.display().to_string(), None, "kms.example").await;
+        std::fs::remove_file(path).unwrap();
+        assert_provider_configuration(&errors);
+    }
+
     #[test]
     fn kms_unix_connect_classification_preserves_outages_and_rejects_configuration() {
         for errno in [
@@ -1334,6 +1380,47 @@ mod tests {
         for (_, _, error) in errors {
             assert_eq!(error.to_string(), "key provider operation failed");
             assert_eq!(format!("{error:?}"), "OperationFailed");
+        }
+    }
+
+    #[tokio::test]
+    async fn provider_configuration_invalid_protocol_is_not_a_key_verdict() {
+        for operation in [
+            "get_active_key",
+            "get_key_by_id",
+            "rotate_key",
+            "seal",
+            "unseal",
+        ] {
+            for response in [
+                MockResponse::Bytes(br#"{"status":"success""#.to_vec()),
+                MockResponse::OversizedLength,
+                MockResponse::Bytes(br#"{"status":"success"}"#.to_vec()),
+            ] {
+                assert_provider_configuration(&[
+                    malformed_response_error(operation, response).await
+                ]);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn provider_configuration_unknown_status_cannot_reject_or_lose_a_key() {
+        for operation in [
+            "get_active_key",
+            "get_key_by_id",
+            "rotate_key",
+            "seal",
+            "unseal",
+        ] {
+            for status in ["UNAVAILABLE", "busy", "throttled", "unknown"] {
+                let response = serde_json::json!({"status": status, "error_message": "not found"});
+                assert_provider_configuration(&[malformed_response_error(
+                    operation,
+                    MockResponse::Bytes(response.to_string().into_bytes()),
+                )
+                .await]);
+            }
         }
     }
 

@@ -170,6 +170,54 @@ async fn checkpoint_drop_and_shutdown_hold_admission_through_sqlite_close() {
 }
 
 #[tokio::test]
+async fn provider_configuration_during_checkpoint_reopen_preserves_the_row() {
+    provider_failure_during_checkpoint_reopen_preserves_the_row("unix://".into()).await;
+}
+
+#[tokio::test]
+async fn provider_outage_during_checkpoint_reopen_preserves_the_row() {
+    provider_failure_during_checkpoint_reopen_preserves_the_row(format!(
+        "/tmp/absent-kms-{}-checkpoint",
+        std::process::id()
+    ))
+    .await;
+}
+
+async fn provider_failure_during_checkpoint_reopen_preserves_the_row(endpoint: String) {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("checkpoint.sqlite");
+    let options = options(&path);
+    let working = keys(0x51);
+    let mut store = ConsumerCheckpointStore::provision(options.clone(), working.clone())
+        .await
+        .unwrap();
+    let (generation, _) = store.read_back().await.unwrap().into_parts();
+    let payload = b"retain-the-checkpoint".to_vec();
+    let (generation, _) = store
+        .compare_and_set(generation, Zeroizing::new(payload.clone()))
+        .await
+        .unwrap()
+        .into_parts();
+    store.shutdown().await.unwrap();
+    let provider = Arc::new(opc_key::KmsKeyProvider::new(
+        endpoint,
+        None,
+        Duration::from_secs(1),
+    ));
+    let error = ConsumerCheckpointStore::reopen(options.clone(), provider)
+        .await
+        .unwrap_err();
+    assert_eq!(error, ConsumerCheckpointError::Unavailable);
+    let mut restored = ConsumerCheckpointStore::reopen(options, working)
+        .await
+        .unwrap();
+    let (actual, recovered) = restored.read_back().await.unwrap().into_parts();
+    assert_eq!(actual, generation);
+    assert_eq!(*recovered, payload);
+    restored.shutdown().await.unwrap();
+}
+
+#[tokio::test]
 async fn checkpoint_is_sealed_cas_storage_without_voter_or_authoring_tables() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("checkpoint.sqlite");

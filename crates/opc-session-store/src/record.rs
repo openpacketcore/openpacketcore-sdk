@@ -1012,6 +1012,27 @@ mod tests {
         provider
     }
 
+    #[tokio::test]
+    async fn provider_configuration_is_backpressure_not_protected_data_rejection() {
+        let provider =
+            opc_key::KmsKeyProvider::new("unix://".into(), None, std::time::Duration::from_secs(1));
+        let error = EncryptedSessionPayload::encrypt(
+            &provider,
+            &provider_test_record(),
+            PROVIDER_TEST_NAMESPACE,
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(
+            error,
+            StoreError::BackendUnavailable("session key provider configuration unavailable".into())
+        );
+        assert_eq!(
+            crate::SessionConsumerStoreError::from(error),
+            crate::SessionConsumerStoreError::Unavailable
+        );
+    }
+
     struct UnavailableKeyProvider;
 
     #[async_trait]

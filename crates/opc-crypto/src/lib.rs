@@ -574,6 +574,67 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn provider_configuration_survives_generic_envelope_operations() {
+        let working = provider_with_active_key(KeyPurpose::Config, "configuration-key", 0x41);
+        let aad = config_aad();
+        let plaintext = br#"{"hostname":"amf-01"}"#;
+        let envelope = encrypt_envelope(&working, &aad, plaintext).await.unwrap();
+        let provider =
+            opc_key::KmsKeyProvider::new("unix://".into(), None, std::time::Duration::from_secs(1));
+        let decrypt = decrypt_envelope(&provider, &aad, &envelope)
+            .await
+            .unwrap_err();
+        assert_eq!(decrypt.to_string(), "key provider unusable as configured");
+        let encrypt = encrypt_envelope(&provider, &aad, plaintext)
+            .await
+            .unwrap_err();
+        assert_eq!(encrypt.to_string(), "key provider unusable as configured");
+        assert_eq!(
+            decrypt_envelope(&working, &aad, &envelope)
+                .await
+                .unwrap()
+                .as_slice(),
+            plaintext
+        );
+    }
+
+    #[tokio::test]
+    async fn provider_configuration_survives_bounded_config_encryption() {
+        let provider =
+            opc_key::KmsKeyProvider::new("unix://".into(), None, std::time::Duration::from_secs(1));
+        let error =
+            encrypt_bounded_config_envelope(&provider, &config_aad(), br#"{"hostname":"amf-01"}"#)
+                .await
+                .unwrap_err();
+        assert_eq!(error.to_string(), "key provider unusable as configured");
+    }
+
+    #[tokio::test]
+    async fn provider_outage_survives_generic_and_bounded_envelope_operations() {
+        let working = provider_with_active_key(KeyPurpose::Config, "outage-key", 0x41);
+        let aad = config_aad();
+        let plaintext = br#"{"hostname":"amf-01"}"#;
+        let envelope = encrypt_envelope(&working, &aad, plaintext).await.unwrap();
+        let provider = opc_key::KmsKeyProvider::new(
+            format!("/tmp/absent-kms-{}-outage", std::process::id()),
+            None,
+            std::time::Duration::from_secs(1),
+        );
+        let decrypt = decrypt_envelope(&provider, &aad, &envelope)
+            .await
+            .unwrap_err();
+        assert_eq!(decrypt.to_string(), "key provider unavailable");
+        let encrypt = encrypt_envelope(&provider, &aad, plaintext)
+            .await
+            .unwrap_err();
+        assert_eq!(encrypt.to_string(), "key provider unavailable");
+        let bounded = encrypt_bounded_config_envelope(&provider, &aad, plaintext)
+            .await
+            .unwrap_err();
+        assert_eq!(bounded.to_string(), "key provider unavailable");
+    }
+
+    #[tokio::test]
     async fn deterministic_config_envelope_round_trip() {
         let provider = provider_with_active_key(KeyPurpose::Config, "config-key-2026-01", 0x41);
         let nonce = *b"0123456789ab";

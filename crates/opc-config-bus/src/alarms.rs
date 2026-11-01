@@ -215,3 +215,33 @@ pub(crate) fn clear_config_alarm_where(
         }
     }
 }
+
+#[cfg(test)]
+mod provider_failure_tests {
+    use super::*;
+
+    #[test]
+    fn provider_configuration_startup_backpressure_is_not_storage_corruption() {
+        assert_eq!(
+            startup_error_alarm_spec(StoreErrorCode::Unavailable),
+            (Severity::Critical, ProbableCause::ConfigApplyFailed)
+        );
+    }
+
+    #[test]
+    fn provider_configuration_commit_backpressure_is_not_storage_corruption() {
+        // These coarse outcomes can all arise from an unusable key provider.
+        // None alone proves that persisted bytes are corrupt.
+        let observed = [
+            CommitErrorCode::PersistFailed,
+            CommitErrorCode::OutcomeUnknown,
+            CommitErrorCode::RecoveryRequired,
+            CommitErrorCode::RollbackUnavailable,
+        ]
+        .map(commit_error_alarm_spec);
+        assert_eq!(
+            observed,
+            [(); 4].map(|_| (Severity::Major, ProbableCause::ConfigApplyFailed))
+        );
+    }
+}

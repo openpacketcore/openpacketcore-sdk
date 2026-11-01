@@ -42,6 +42,7 @@ pub enum Fault {
 /// the ordinary provider API. They are injected outcomes, not wall-clock sleeps.
 pub struct Provider {
     inner: MemoryKeyProvider,
+    injected_error: std::sync::Mutex<Option<KeyError>>,
     fault: AtomicU8,
     active: AtomicUsize,
     historical: AtomicUsize,
@@ -62,6 +63,7 @@ impl Provider {
             .unwrap();
         Self {
             inner,
+            injected_error: std::sync::Mutex::new(None),
             fault: AtomicU8::new(0),
             active: AtomicUsize::new(0),
             historical: AtomicUsize::new(0),
@@ -72,6 +74,9 @@ impl Provider {
 
     pub fn fail(&self, fault: Fault) {
         self.fault.store(fault as u8, Ordering::SeqCst);
+    }
+    pub fn inject_key_error(&self, error: Option<KeyError>) {
+        *self.injected_error.lock().unwrap() = error;
     }
     pub fn fail_on_active_call(&self, additional: usize, fault: Fault) {
         assert!(additional > 0);
@@ -88,6 +93,9 @@ impl Provider {
         )
     }
     fn available(&self) -> Result<(), KeyError> {
+        if let Some(error) = self.injected_error.lock().unwrap().clone() {
+            return Err(error);
+        }
         match self.fault.load(Ordering::SeqCst) {
             0 => Ok(()),
             1..=3 => Err(KeyError::Unavailable),

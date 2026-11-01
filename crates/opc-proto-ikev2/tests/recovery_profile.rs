@@ -106,6 +106,9 @@ mod remedy;
 #[path = "recovery_profile/remedy_tests.rs"]
 mod remedy_tests;
 
+#[path = "recovery_profile/provider_configuration_tests.rs"]
+mod provider_configuration_tests;
+
 #[path = "recovery_profile/endpoint.rs"]
 mod endpoint;
 

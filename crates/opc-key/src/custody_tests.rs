@@ -511,6 +511,20 @@ async fn provider_outputs_are_bounded_canonical_and_context_exact() {
 }
 
 #[tokio::test]
+async fn provider_configuration_survives_the_custody_error_boundary() {
+    use crate::KeyProvider;
+    let provider =
+        crate::KmsKeyProvider::new("unix://".into(), None, std::time::Duration::from_secs(1));
+    let error = provider
+        .get_key_by_id(&KeyId::new("configuration-boundary").unwrap())
+        .await
+        .unwrap_err();
+    let mapped = super::map_provider_error(error);
+    assert_eq!(mapped.to_string(), "key provider unusable as configured");
+    assert_eq!(format!("{mapped:?}"), "ProviderUnusable");
+}
+
+#[tokio::test]
 async fn provider_errors_preserve_only_safe_public_classifications() {
     let required = key_custody_required_capabilities();
     let module = Arc::new(CountingCustodyModule::new(required));

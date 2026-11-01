@@ -4778,6 +4778,31 @@ mod tests {
         ));
     }
 
+    #[tokio::test]
+    async fn provider_configuration_never_becomes_a_final_cached_or_integrity_result() {
+        let provider = opc_key::KmsKeyProvider::new("unix://".into(), None, Duration::from_secs(1));
+        let error = EncryptedSessionPayload::encrypt(
+            &provider,
+            &restore_record(b"provider-config", 16),
+            "provider-config",
+        )
+        .await
+        .unwrap_err();
+        let result: Result<CompareAndSetResult, StoreError> = Err(error.clone());
+        assert!(!cas_outcome_is_definitive(&result));
+        assert!(matches!(
+            normalize_store_backend_outcome::<()>(
+                Err(error.clone()),
+                BackendDeadlineOutcome::Mutation
+            ),
+            Err(StoreError::BackendOperationOutcomeUnavailable)
+        ));
+        assert_eq!(
+            opc_session_store::SessionConsumerStoreError::from(error),
+            opc_session_store::SessionConsumerStoreError::Unavailable
+        );
+    }
+
     #[test]
     fn cas_idempotency_cache_tombstones_key_provider_outages() {
         let cache = Arc::new(StdMutex::new(CasIdempotencyCache::default()));
