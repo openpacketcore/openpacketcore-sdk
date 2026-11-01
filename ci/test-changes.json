@@ -1613,6 +1613,16 @@
       "renamed_to": "rust:crates/opc-key-vault::test=integration_tests::rotate_key_failure_preserves_outage",
       "reason": "Rotation preserves the provider outage class instead of collapsing it to RotationFailed. The HTTP 500 failure and exact error assertion remain, with separate authentication and retry-count controls.",
       "issue": 1197
+    },
+    {
+      "test": "rust:crates/opc-sdk-integration::test=fault_injection::fault_injection_missing_key_fails_closed_without_secret_leak",
+      "kind": "assertions-decreased",
+      "reason": "Use an intact envelope with an empty key provider to test actual key absence. Removing header decode, mutated-key construction and re-encode expectations lowers the syntactic assertion count, while exact KeyRejected, redacted text, definitive classification and no-secret-leak assertions remain. Separate crypto tests retain header-binding damage and require rejection before provider lookup.",
+      "issue": 1197,
+      "replacements": [
+        "rust:crates/opc-crypto::lib=lib::tests::damaged_key_binding_is_rejected_before_provider_lookup",
+        "rust:crates/opc-crypto::lib=lib::tests::decrypt_rejects_wrong_key_aad_corrupt_tag_and_unknown_key_id_with_redacted_errors"
+      ]
     }
   ]
 }
