@@ -32,6 +32,8 @@ use crate::types::{extract_tenant, AuditKey, AuditOpType, AuditRecord, CommitSou
 use opc_types::TxId;
 
 mod ops;
+#[cfg(test)]
+mod tests;
 
 /// Connection storage shared with detached workers. Field order is deliberate:
 /// rusqlite must finish closing before the final retained admission is dropped.
@@ -387,8 +389,12 @@ impl SqliteBackend {
         }
 
         let conn = Self::open_connection(&path, &audit_key)?;
+        #[cfg(test)]
+        let heap_pressure = tests::before_metadata_read(&conn);
         let consensus_required = crate::consensus::history::has_consensus_metadata_sync(&conn)
             .map_err(|_| PersistError::corrupt_blob())?;
+        #[cfg(test)]
+        drop(heap_pressure);
 
         let backend = Self {
             db_path: path,

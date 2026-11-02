@@ -6,6 +6,63 @@ use opc_key::{KeyId, KeyPurpose, MemoryKeyProvider};
 use std::collections::BTreeMap;
 use std::str::FromStr;
 
+#[test]
+fn checkpoint_heap_outage_is_unavailable_without_changing_bytes() {
+    const CHILD: &str = "OPC_CHECKPOINT_HEAP_CHILD";
+    if let Some(directory) = std::env::var_os(CHILD) {
+        let path = Path::new(&directory).join("checkpoint.sqlite");
+        tokio::runtime::Runtime::new().unwrap().block_on(async {
+            ConsumerCheckpointStore::provision(options(&path), keys(0x51))
+                .await
+                .unwrap()
+                .shutdown()
+                .await
+                .unwrap();
+        });
+        let conn = Connection::open(&path).unwrap();
+        read_row(&conn, &options(&path)).unwrap();
+        let before = std::fs::read(&path).unwrap();
+        let wal = path.with_extension("sqlite-wal");
+        let wal_before = std::fs::read(&wal).unwrap_or_default();
+        let _pressure = crate::error::exhaust_sqlite_heap(&conn);
+        let probe = conn
+            .query_row("SELECT COUNT(*) FROM consumer_checkpoint", [], |row| {
+                row.get::<_, i64>(0)
+            })
+            .unwrap_err();
+        assert_eq!(
+            probe.sqlite_error_code(),
+            Some(rusqlite::ErrorCode::OutOfMemory)
+        );
+        let failure = read_row(&conn, &options(&path)).err().unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+        assert_eq!(std::fs::read(&wal).unwrap_or_default(), wal_before);
+        assert_eq!(failure, ConsumerCheckpointError::Unavailable);
+        return;
+    }
+    let directory = tempfile::tempdir().unwrap();
+    let child = std::process::Command::new(std::env::current_exe().unwrap())
+        .args(["--exact", "consumer_checkpoint::tests::checkpoint_heap_outage_is_unavailable_without_changing_bytes", "--test-threads=1", "--nocapture"])
+        .env(CHILD, directory.path()).output().unwrap();
+    assert!(
+        child.status.success(),
+        "{}\n{}",
+        String::from_utf8_lossy(&child.stdout),
+        String::from_utf8_lossy(&child.stderr)
+    );
+    tokio::runtime::Runtime::new().unwrap().block_on(async {
+        let mut repaired = ConsumerCheckpointStore::reopen(
+            options(&directory.path().join("checkpoint.sqlite")),
+            keys(0x51),
+        )
+        .await
+        .unwrap();
+        let (_, payload) = repaired.read_back().await.unwrap().into_parts();
+        assert!(payload.is_empty());
+        repaired.shutdown().await.unwrap();
+    });
+}
+
 #[derive(Clone, Default)]
 struct CapturedDiagnostics(Arc<Mutex<Vec<String>>>);
 impl tracing::Subscriber for CapturedDiagnostics {

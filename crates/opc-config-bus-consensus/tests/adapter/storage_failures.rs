@@ -42,6 +42,100 @@ async fn startup_error(backend: SqliteBackend, code: StoreErrorCode, cause: &str
     assert_eq!(format!("{:?}", alarms[0].severity), "Critical");
 }
 
+async fn missing_history_authority_row(table: &str) {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("config.sqlite");
+    let persistence = backend(&path).await;
+    let node = ConfigConsensusNodeId::new(1).unwrap();
+    let identity = ConfigConsensusIdentity::new(
+        ConfigConsensusClusterId::new("config-storage-failures").unwrap(),
+        ConfigConsensusConfigurationId::from_bytes([0x70; 32]),
+        ConfigConsensusConfigurationEpoch::new(1).unwrap(),
+    );
+    let topology =
+        ConfigConsensusTopology::try_new(identity, node, BTreeSet::from([node])).unwrap();
+    let consensus = Arc::new(
+        ConsensusConfigStore::open_with_operation_timeout(
+            topology,
+            persistence.clone(),
+            directory.path().join("snapshots"),
+            BTreeMap::new(),
+            Duration::from_secs(3),
+        )
+        .await
+        .unwrap(),
+    );
+    consensus.initialize_cluster().await.unwrap();
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while consensus.probe_durable_readiness().await.is_err() {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    EncryptingManagedDatastore::new(
+        Arc::new(RaftManagedDatastore::<TestConfig>::new(consensus.clone())),
+        provider(),
+    )
+    .append_commit_write(CommitWrite::new(record(TxId::new(), "stored")))
+    .await
+    .unwrap();
+    consensus.shutdown().await.unwrap();
+    let conn = rusqlite::Connection::open(&path).unwrap();
+    assert_eq!(
+        conn.execute(&format!("DELETE FROM {table}"), []).unwrap(),
+        1
+    );
+    let failure = ConfigStore::load_latest(&persistence).await.unwrap_err();
+    let adapter = Arc::new(PersistManagedDatastore::<TestConfig, _>::new(Arc::new(
+        persistence,
+    )));
+    let startup = match ConfigBus::restore_or_new_dev_only(
+        TestConfig {
+            name: "fallback".into(),
+        },
+        Arc::new(EncryptingManagedDatastore::new(adapter, provider())),
+    )
+    .await
+    {
+        Ok(_) => panic!("missing stored authority must fence startup"),
+        Err(error) => error,
+    };
+    assert_eq!(
+        conn.query_row("SELECT COUNT(*) FROM config_history", [], |row| row
+            .get::<_, i64>(0))
+            .unwrap(),
+        1
+    );
+    let alarms = startup.alarm_manager().unwrap().active_alarms();
+    assert_eq!(alarms.len(), 1);
+    assert_eq!(
+        (
+            matches!(failure.kind(), PersistErrorKind::CorruptBlob),
+            startup.code,
+            format!("{:?}", alarms[0].probable_cause),
+            format!("{:?}", alarms[0].severity),
+        ),
+        (
+            true,
+            StoreErrorCode::Crypto,
+            "StorageCorruption".to_owned(),
+            "Critical".to_owned(),
+        ),
+        "{table}: {failure:?}"
+    );
+}
+
+#[tokio::test]
+async fn missing_history_retention_row_keeps_corruption_alarm() {
+    missing_history_authority_row("config_raft_history_retention").await;
+}
+
+#[tokio::test]
+async fn missing_history_identity_row_keeps_corruption_alarm() {
+    missing_history_authority_row("config_raft_identity").await;
+}
+
 #[tokio::test]
 async fn rejected_stored_digest_length_keeps_corruption_alarm() {
     let directory = tempfile::tempdir().unwrap();

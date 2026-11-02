@@ -417,6 +417,28 @@ impl From<std::io::Error> for PersistError {
     }
 }
 
+// SQLite can still prepare small statements from its preallocated lookaside
+// pool after lowering the global heap limit. Hold those slots until the real
+// read under test completes. This helper is used only in isolated child tests.
+#[cfg(test)]
+pub(crate) fn exhaust_sqlite_heap(conn: &rusqlite::Connection) -> Vec<rusqlite::Statement<'_>> {
+    let _ = conn.execute_batch("PRAGMA hard_heap_limit=1");
+    let mut statements = Vec::new();
+    for _ in 0..1024 {
+        match conn.prepare("SELECT 1") {
+            Ok(statement) => statements.push(statement),
+            Err(error) => {
+                assert_eq!(
+                    error.sqlite_error_code(),
+                    Some(rusqlite::ErrorCode::OutOfMemory)
+                );
+                return statements;
+            }
+        }
+    }
+    panic!("SQLite heap limit must prevent further statement allocation");
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
