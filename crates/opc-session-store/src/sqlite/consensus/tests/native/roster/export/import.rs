@@ -513,48 +513,61 @@ fn retired_admission_witness_native_sqlite_snapshot_roundtrip_preserves_empty_hi
     initialize(&cold, &signed);
     let cold_conn = cold.conn.blocking_lock();
     complete_roundtrip(&snapshot, &cold_conn, &imported);
-    let snapshot_path = directory.path().join("retired-import.sqlite");
-    let (last_log_id, last_membership) =
-        build_snapshot_database_sync(&cold_conn, signed.identity, &snapshot_path).unwrap();
-    let meta = opc_consensus::engine::SnapshotMeta {
-        last_log_id,
-        last_membership,
-        snapshot_id: "retired-import".into(),
-    };
-    let target = SqliteSessionBackend::in_memory().unwrap();
+    let incoming = crate::sqlite::consensus::tests::sequential_wal::IncomingSnapshot::with_identity(
+        &cold_conn,
+        signed.identity,
+    );
+    let target_directory = tempfile::tempdir().unwrap();
+    let target = SqliteSessionBackend::open(target_directory.path().join("primary.sqlite")).unwrap();
     initialize(&target, &signed);
+    let target_wal = Wal::create_native_with_root(
+        &target_directory.path().join("wal"),
+        &target.conn.blocking_lock(),
+        signed.identity,
+        [0xED; 32],
+        Some(Arc::new(signed.root.clone())),
+        Limits::default(),
+        IoControl::default(),
+    )
+    .unwrap();
     let mut entries = setup(&signed);
     entries.extend([
         admission(&signed),
         terminal(&signed, 4),
         tick(&signed, 5, due),
     ]);
-    sql_apply(&target, &signed, &entries);
+    parity(&target_wal, &target, &signed, &entries);
     let target_conn = target.conn.blocking_lock();
     assert_eq!(
         count(&target_conn, "consensus_protected_roster_v2_admissions"),
         1
     );
-    install_snapshot_database_with_authority_sync(
-        &target_conn,
-        signed.identity,
-        ConsensusAuthorityProfile::FixedImmutable,
-        Some(&fixed_members()),
-        Some(&test_member_bindings(&fixed_members())),
-        FIXED_TEST_PLACEMENT_POLICY,
-        &snapshot_path,
-        &meta,
-        "snapshot-00000000-0000-4000-8000-000000001306.opc",
-        [0xE7; 32],
-        std::fs::metadata(&snapshot_path).unwrap().len(),
-    )
-    .unwrap();
+    // Native policy rows must use the native installation authority. The SQL
+    // cache alone cannot turn a native snapshot into an ordinary-profile image.
+    target_wal
+        .install_snapshot(&target_conn, incoming.source().unwrap())
+        .unwrap();
+    let installed = target_wal.native_export_install_base_for_test().unwrap();
+    let incarnation = crate::sqlite::ops::RestoreScanIncarnation::from_installed_sync(&installed)
+        .unwrap();
+    let _authority = incoming
+        .source()
+        .unwrap()
+        .apply_native_original(
+            &target_conn,
+            target_wal.binding(),
+            Some(&signed.root),
+            &incarnation,
+            &|| Ok(()),
+        )
+        .unwrap();
     assert_eq!(
         count(&target_conn, "consensus_protected_roster_v2_admissions"),
         0,
         "install replacement physically removes the retained target slot"
     );
     let installed_fence = witness_fence(read_witness(&target_conn));
+    target_wal.shutdown().unwrap();
     wal.shutdown().unwrap();
     assert_eq!([exported_fence, imported_fence, installed_fence], [Some(signed.authority.fence().get()); 3],
         "native export, cold SQLite import and nonempty install replacement must preserve the same retired maximum");

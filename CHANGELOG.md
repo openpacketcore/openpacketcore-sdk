@@ -9,6 +9,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Keep empty change-journal rows compact while fully accounting for optional
+  key-retirement witnesses. The existing history counts and verification-memory
+  limits remain unchanged.
+
 - `opc-persist`: missing mandatory configuration-history, machine, membership,
   and audit rows are rejected before history reads and runtime apply. Typed
   query errors in checkpoint row reads, retained catalog validation and backend
