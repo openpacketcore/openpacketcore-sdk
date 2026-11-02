@@ -518,7 +518,8 @@ fn retired_admission_witness_native_sqlite_snapshot_roundtrip_preserves_empty_hi
         signed.identity,
     );
     let target_directory = tempfile::tempdir().unwrap();
-    let target = SqliteSessionBackend::open(target_directory.path().join("primary.sqlite")).unwrap();
+    let target =
+        SqliteSessionBackend::open(target_directory.path().join("primary.sqlite")).unwrap();
     initialize(&target, &signed);
     let target_wal = Wal::create_native_with_root(
         &target_directory.path().join("wal"),
@@ -548,8 +549,8 @@ fn retired_admission_witness_native_sqlite_snapshot_roundtrip_preserves_empty_hi
         .install_snapshot(&target_conn, incoming.source().unwrap())
         .unwrap();
     let installed = target_wal.native_export_install_base_for_test().unwrap();
-    let incarnation = crate::sqlite::ops::RestoreScanIncarnation::from_installed_sync(&installed)
-        .unwrap();
+    let incarnation =
+        crate::sqlite::ops::RestoreScanIncarnation::from_installed_sync(&installed).unwrap();
     let _authority = incoming
         .source()
         .unwrap()
