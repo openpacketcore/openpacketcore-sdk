@@ -51,6 +51,7 @@ fn native_epoch_floor_prepared_create_survives_unrelated_retirement() {
 #[cfg(feature = "lab-memory")]
 #[tokio::test(start_paused = true)]
 async fn native_epoch_floor_matches_fake_through_two_real_threshold_rotations() {
+    use changes::tests::apply_after_journal_admission as apply;
     use crate::{Clock, FakeSessionBackend, SessionBackend, SessionLeaseManager};
     use futures_util::StreamExt;
     use std::time::Duration;

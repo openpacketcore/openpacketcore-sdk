@@ -3,9 +3,23 @@ use super::*;
 
 pub(super) fn admit<T>(
     mut operation: impl FnMut() -> std::io::Result<T>,
-    mut _on_pressure: impl FnMut(),
+    mut on_pressure: impl FnMut(),
 ) -> std::io::Result<T> {
-    operation()
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        match operation() {
+            Err(error)
+                if crate::consensus::verified_snapshot::VerificationMemory::journal_pressure(
+                    &error,
+                )
+                .is_some()
+                    && std::time::Instant::now() < deadline =>
+            {
+                on_pressure();
+            }
+            result => return result,
+        }
+    }
 }
 
 #[test]

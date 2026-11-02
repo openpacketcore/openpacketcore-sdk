@@ -395,27 +395,51 @@ pub(in crate::consensus::native) fn apply(
     storage: &mut NativeStorage,
     entries: &[Entry<SessionRaftTypeConfig>],
 ) -> NativeApplied {
+    apply_with_admission(storage, entries, false)
+}
+
+#[cfg(feature = "lab-memory")]
+pub(in crate::consensus::native) fn apply_after_journal_admission(
+    storage: &mut NativeStorage,
+    entries: &[Entry<SessionRaftTypeConfig>],
+) -> NativeApplied {
+    apply_with_admission(storage, entries, true)
+}
+
+fn apply_with_admission(
+    storage: &mut NativeStorage,
+    entries: &[Entry<SessionRaftTypeConfig>],
+    retry: bool,
+) -> NativeApplied {
+    fn ready<T>(retry: bool, mut operation: impl FnMut() -> std::io::Result<T>) -> T {
+        if retry {
+            journal_admission::admit(operation, || {
+                std::thread::sleep(Duration::from_millis(1));
+            })
+            .unwrap()
+        } else {
+            operation().unwrap()
+        }
+    }
     let encoded: Vec<_> = entries
         .iter()
         .map(|entry| serde_json::to_vec(entry).unwrap().into())
         .collect();
     // OpenRaft can deliver several bounded append batches in one apply call.
     for chunk in encoded.chunks(LOG_RPC_ENTRIES) {
-        storage
-            .log
-            .project(&Operation::Append(chunk.to_vec()), &storage.business, None)
-            .unwrap();
+        ready(retry, || {
+            storage.log.project(&Operation::Append(chunk.to_vec()), &storage.business, None)
+        });
     }
-    storage
-        .log
-        .project(
+    ready(retry, || {
+        storage.log.project(
             &Operation::Committed(entries.last().map(|entry| entry.log_id)),
             &storage.business,
             None,
         )
-        .unwrap();
-    let result = storage.business.apply(entries).unwrap();
-    storage.validate_image().unwrap();
+    });
+    let result = ready(retry, || storage.business.apply(entries));
+    ready(retry, || storage.validate_image());
     result
 }
 
