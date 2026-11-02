@@ -22,6 +22,9 @@ mod reclaim_memory;
 #[path = "retention_capture.rs"]
 mod retention_capture;
 
+#[path = "journal_admission.rs"]
+mod journal_admission;
+
 #[test]
 fn native_frontier_captures_preserve_nested_authority_without_allocating() {
     let (mut storage, _, _) = fixture();
