@@ -532,6 +532,51 @@ async fn fleet_cleanup_observes_a_drain_after_a_shutdown_caller_deadline() {
     }
 }
 
+#[cfg(feature = "test-vfs")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn fleet_cleanup_reports_a_stuck_drain_without_releasing_handles() {
+    let _timing_permit = crate::acquire_consensus_timing_test_permit().await;
+    let mut fleet = Fleet::new_native("cleanup-stuck-drain");
+    fleet.open().await;
+    let hold = fleet.stores[0].hold_raft_shutdown_before_core_for_test();
+    let wal = fleet.stores[0].inner.private_wal.clone().unwrap();
+    let expected = format!(
+        "retained shutdown drain timed out: case={} incarnation={} voter=0 after 60s",
+        fleet.case, fleet.incarnation,
+    );
+    let started = Instant::now();
+    let panic = AssertUnwindSafe(fleet.close())
+        .catch_unwind()
+        .await
+        .err()
+        .expect("a stuck retained drain must fail cleanup");
+    let elapsed = started.elapsed();
+    assert!(
+        panic.downcast_ref::<String>().unwrap().contains(&expected),
+        "the failure must identify the stuck retained drain",
+    );
+    assert!(
+        elapsed
+            < Duration::from_secs(60)
+                + super::DEFAULT_SESSION_CONSENSUS_OPERATION_TIMEOUT
+                + Duration::from_secs(10),
+        "stuck drain must fail within its real-time bound: {elapsed:?}",
+    );
+    assert!(hold.gate.wait_until_entered(Duration::ZERO));
+    assert_eq!(fleet.stores.len(), 3, "stores survive the refused cleanup");
+    for peer in &fleet.peers {
+        assert!(peer.handler.read().await.is_some(), "peer handles survive");
+    }
+    assert_eq!(
+        wal.integration_observations().unwrap()["writer_joined"],
+        false
+    );
+    // Only the negative test releases the hold, after the diagnostic and
+    // ownership checks; the fixture itself must not release anything early.
+    drop(hold);
+    assert_eq!(fleet.close().await.len(), 3);
+}
+
 fn test_result_after_shutdown<T, U>(
     result: std::thread::Result<T>,
     shutdown: std::thread::Result<U>,
