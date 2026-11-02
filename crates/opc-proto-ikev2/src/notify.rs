@@ -15,6 +15,15 @@ use crate::{
     HEADER_LEN,
 };
 
+/// RFC 5685 section 9.1 REDIRECT_SUPPORTED status Notify.
+pub const IKEV2_NOTIFY_REDIRECT_SUPPORTED: u16 = 16_406;
+
+/// RFC 5685 section 9.2 REDIRECT status Notify.
+pub const IKEV2_NOTIFY_REDIRECT: u16 = 16_407;
+
+/// RFC 5685 section 9.3 REDIRECTED_FROM status Notify.
+pub const IKEV2_NOTIFY_REDIRECTED_FROM: u16 = 16_408;
+
 /// IKEv2 Notify error type for UNSUPPORTED_CRITICAL_PAYLOAD.
 ///
 /// @spec IETF RFC7296 3.10.1

@@ -9,6 +9,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `opc-proto-ikev2`: typed RFC 5685 REDIRECT_SUPPORTED, REDIRECT and
+  REDIRECTED_FROM Notify codecs, with IPv4/IPv6/FQDN identities, explicit
+  exchange direction, echoed peer nonce bounds, named malformed-input errors,
+  redacted diagnostics and bounded atomic support metadata. REDIRECTED_FROM
+  holds only IP identities; gateway, notification and error enums are
+  non-exhaustive. FQDN backslashes are rejected. Initial-exchange builders emit
+  zero-responder-SPI redirects; admission accepts either SPIr with original
+  support and nonce correlation. Callers retain initial support before sending any redirect, send
+  REDIRECTED_FROM after redirection, and own authentication, first/final
+  IKE_AUTH placement, target trust and redirect policy.
+
 - `opc-proto-ikev2`: PKCS#1 v1.5 and PSS signing blind the RSA private operation
   with OS randomness; this hardening does not resolve RUSTSEC-2023-0071.
 
@@ -587,6 +598,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the client certificate's signing key. Refs #1353.
 
 ### Breaking
+
+- `opc-proto-ikev2`: added `Ikev2SaInitResponse::Redirect`,
+  `Ikev2SaInitInitiatorError::InvalidRedirect` and
+  `Ikev2SaInitNotifyBuildError::InvalidRedirect` to previously exhaustive public
+  enums. Those three enums are now `#[non_exhaustive]`; downstream matches
+  require a wildcard arm. `admit_ike_sa_init_response` now rejects REDIRECT
+  mixed into a success or other retry response. Alongside SA/KE/Nr it
+  previously remained in the accepted notification collection; alongside
+  COOKIE, INVALID_KE_PAYLOAD or NO_PROPOSAL_CHOSEN that retry was previously
+  returned. A standalone, nonce-correlated REDIRECT tolerates either responder
+  SPI value as for other no-SA outcomes in RFC 7296 §2.6; builders still emit zero.
 
 - `opc-ipsec-xfrm`: remove the unused `esp_dummy_payload` plaintext builder,
   which never shipped in a release.
