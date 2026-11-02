@@ -19901,26 +19901,43 @@ fn read_operator_recovery_after_schema_sync(
     Ok(state)
 }
 
+/// Operator recovery invalidation only; native retention is separate authority.
 pub(crate) fn read_watch_cursor_invalidation_floor_sync(conn: &Connection) -> io::Result<u64> {
-    #[cfg(target_os = "linux")]
-    let retained_floor = native_retention::read(conn)?
-        .unwrap_or_default()
-        .watch_retired_through;
-    #[cfg(not(target_os = "linux"))]
-    let retained_floor = 0;
     if !table_exists(conn, "consensus_operator_recovery").map_err(db_error)?
         || !operator_recovery_cursor_column_exists(conn)?
     {
-        return Ok(retained_floor);
+        return Ok(0);
     }
-    let floor: i64 = conn
-        .query_row(
-            "SELECT watch_cursor_invalidation_floor FROM consensus_operator_recovery WHERE singleton = 1",
-            [],
-            |row| row.get(0),
-        )
-        .map_err(db_error)?;
-    Ok(checked_u64(floor)?.max(retained_floor))
+    let floor: i64 = conn.query_row(
+        "SELECT watch_cursor_invalidation_floor FROM consensus_operator_recovery WHERE singleton = 1",
+        [], |row| row.get(0),
+    ).map_err(db_error)?;
+    checked_u64(floor)
+}
+
+/// Exact replay floor under the committed native profile, if present.
+pub(crate) fn read_replication_cursor_floor_sync(conn: &Connection) -> io::Result<u64> {
+    let operator_floor = read_watch_cursor_invalidation_floor_sync(conn)?;
+    #[cfg(target_os = "linux")]
+    if let Some(retention) = native_retention::read(conn)? {
+        let head: i64 = conn
+            .query_row(
+                "SELECT watch_sequence FROM consensus_machine WHERE singleton = 1",
+                [],
+                |row| row.get(0),
+            )
+            .map_err(db_error)?;
+        let next_fence: i64 = conn
+            .query_row(
+                "SELECT val FROM lease_globals WHERE key='next_fence'",
+                [],
+                |row| row.get(0),
+            )
+            .map_err(db_error)?;
+        retention.validate(checked_u64(head)?, checked_u64(next_fence)?)?;
+        return Ok(operator_floor.max(retention.watch_retired_through));
+    }
+    Ok(operator_floor)
 }
 
 fn operator_recovery_cursor_column_exists(conn: &Connection) -> io::Result<bool> {
@@ -35215,7 +35232,7 @@ fn validate_sealed_replication_log_sync(conn: &Connection) -> io::Result<()> {
             REPLICATION_TX_ID_MAX_BYTES
         ])
         .map_err(db_error)?;
-    let mut expected = read_watch_cursor_invalidation_floor_sync(conn)?
+    let mut expected = read_replication_cursor_floor_sync(conn)?
         .checked_add(1)
         .ok_or_else(|| invalid_data("session replication sequence exhausted"))?;
     let mut buffered = Vec::new();
@@ -41531,6 +41548,8 @@ mod tests {
     mod descriptor_locks;
     mod lease_deferral;
     mod mandatory_witness;
+    #[cfg(target_os = "linux")]
+    mod retained_snapshot;
     mod retired_admission;
     mod roster_maintenance_cutover;
     #[path = "scope_authority.rs"]
@@ -70697,7 +70716,7 @@ BEGIN IMMEDIATE;
                 },
             )
             .map_err(db_error)?;
-        let mut expected = read_watch_cursor_invalidation_floor_sync(conn)?
+        let mut expected = read_replication_cursor_floor_sync(conn)?
             .checked_add(1)
             .ok_or_else(|| invalid_data("session replication sequence exhausted"))?;
         for row in rows {

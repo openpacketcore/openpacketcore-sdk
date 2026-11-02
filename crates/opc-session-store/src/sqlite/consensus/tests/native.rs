@@ -13,6 +13,8 @@ mod policy_oracle;
 mod public_reads;
 mod purge_crash;
 mod purge_model;
+mod recovery_snapshot;
+mod retained_snapshot;
 mod retention;
 mod root_lock;
 mod roster;

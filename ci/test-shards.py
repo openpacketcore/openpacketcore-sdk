@@ -486,6 +486,22 @@ def quiescent_consensus_openraft_command(name: str) -> list[str]:
     ]
 
 
+QUIESCENT_RETAINED_SNAPSHOT_TARGET = "fenced_transition_v2_qualification"
+QUIESCENT_RETAINED_SNAPSHOT_TESTS = (
+    "retained_snapshot::durable_retained_notification_snapshot_boundary_round_trip",
+    "retained_snapshot::async_retained_notification_snapshot_boundary_round_trip",
+)
+
+
+def quiescent_retained_snapshot_command(name: str) -> list[str]:
+    """Keep the literal full-window proof in its checked optimized profile."""
+    return ["env", "CARGO_PROFILE_TEST_OPT_LEVEL=1",
+            "CARGO_PROFILE_TEST_DEBUG_ASSERTIONS=true",
+            "CARGO_PROFILE_TEST_OVERFLOW_CHECKS=true", *SELECTION,
+            "--test", QUIESCENT_RETAINED_SNAPSHOT_TARGET,
+            "--", "--test-threads=1", "--exact", name]
+
+
 def quiescent_contracts() -> tuple:
     """Integration-target contracts that require a fresh test process."""
     return (
@@ -493,6 +509,11 @@ def quiescent_contracts() -> tuple:
             QUIESCENT_CONSENSUS_OPENRAFT_TARGET,
             QUIESCENT_CONSENSUS_OPENRAFT_TESTS,
             quiescent_consensus_openraft_command,
+        ),
+        (
+            QUIESCENT_RETAINED_SNAPSHOT_TARGET,
+            QUIESCENT_RETAINED_SNAPSHOT_TESTS,
+            quiescent_retained_snapshot_command,
         ),
     )
 
@@ -1057,23 +1078,15 @@ def list_heavy_tests(plan: dict, extra: list[str]) -> list[str]:
 
 
 def list_quiescent_test(target: str, name: str) -> list[str]:
-    """Resolve the isolated timing contract using its exact CI invocation."""
-    command = SELECTION + [
-        "--test",
-        target,
-        "--",
-        "--list",
-        "--exact",
-        name,
-    ]
-    out = subprocess.run(
-        command, cwd=ROOT, text=True, stdout=subprocess.PIPE, check=True
-    ).stdout
-    return [
-        line.rsplit(":", 1)[0]
-        for line in out.splitlines()
-        if line.endswith(": test")
-    ]
+    factory = next(factory for declared, _, factory in quiescent_contracts()
+                   if declared == target)
+    command = factory(name)
+    cut = command.index("--")
+    command = command[:cut + 1] + ["--list"] + command[cut + 1:]
+    output = subprocess.run(command, cwd=ROOT, text=True,
+                            stdout=subprocess.PIPE, check=True).stdout
+    return [line.removesuffix(": test") for line in output.splitlines()
+            if line.endswith(": test")]
 
 
 def list_quiescent_lib_test(name: str) -> list[str]:

@@ -270,3 +270,56 @@ async fn round6_lab_absent_admission_uses_replayed_recovery_floor() {
         .expect("the observed current floor admits its successor");
     assert_eq!(result.lease().fence(), FenceToken::new(101));
 }
+
+#[tokio::test]
+async fn lab_successor_acquire_retires_a_live_pre_recovery_lease() {
+    let backend = FakeSessionBackend::in_memory_lab();
+    let old = backend
+        .acquire(&key(), record(1, 1).owner, Duration::from_secs(30))
+        .await
+        .unwrap();
+    let previous = backend.max_replication_sequence().await.unwrap();
+    let mut policy = crate::ReplicationReplayPolicy::preserve();
+    policy.async_fence_floor = 100;
+    policy.recovery = crate::ReplicationRecoveryBoundary::Recover {
+        previous_sequence: previous,
+    };
+    backend
+        .replicate_entry(crate::ReplicationEntry {
+            sequence: 101,
+            tx_id: crate::ReplicationTxId::from_request_bytes([0xB3; 16]),
+            timestamp: Timestamp::now_utc(),
+            replay_policy: policy,
+            op: crate::ReplicationOp::Batch { ops: Vec::new() },
+        })
+        .await
+        .unwrap();
+    assert!(old.expires_at() > Timestamp::now_utc());
+    let observed = backend.observe_fenced_transition(&key()).await.unwrap();
+    assert_eq!(observed.current_fence(), FenceToken::new(100));
+    let mut successor = record(1, 101);
+    successor.owner = OwnerId::new("successor-owner").unwrap();
+    let request = FencedTransitionRequest::new(
+        FencedTransitionRequestId::new(),
+        FencedTransitionLease::acquire(
+            key(),
+            successor.owner.clone(),
+            observed.current_fence(),
+            Duration::from_secs(30),
+        )
+        .unwrap(),
+        FencedTransitionMutation::create(successor),
+    )
+    .unwrap();
+    let prepared = backend.prepare_fenced_transition(request).await.unwrap();
+    let outcome = backend
+        .fenced_transition(&prepared)
+        .await
+        .expect("a recovered floor revokes the physically retained old holder");
+    assert_eq!(outcome.lease().fence(), FenceToken::new(101));
+    assert_eq!(backend.fenced_transition(&prepared).await.unwrap(), outcome);
+    assert_eq!(
+        backend.renew(&old, Duration::from_secs(30)).await,
+        Err(crate::LeaseError::StaleFence)
+    );
+}

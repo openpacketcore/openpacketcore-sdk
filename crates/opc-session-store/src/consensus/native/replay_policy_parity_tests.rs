@@ -82,13 +82,32 @@ fn native_state(native: &NativeStorage) -> ReplayStateForTest {
     }
 }
 
+// Optional page construction may refuse while another test owns the bounded
+// output pool. Retry only that value-free availability refusal, within a new
+// fixture guard; corruption or persistent refusal still fails the test.
+async fn journal_page_for_test(
+    native: &NativeStorage,
+    start: u64,
+    limit: usize,
+) -> Vec<ReplicationEntry> {
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        match native.business.replication_log(start, limit, &|| Ok(())) {
+            Ok(rows) => return rows,
+            Err(StoreError::BackendUnavailable(reason))
+                if reason == "native committed state unavailable"
+                    && std::time::Instant::now() < deadline =>
+            {
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+            Err(error) => panic!("native fixture journal remains unavailable: {error:?}"),
+        }
+    }
+}
+
 async fn replay_prefix(native: &NativeStorage, clock: Arc<ReplayClock>) -> FakeSessionBackend {
     let fake = FakeSessionBackend::new().with_clock(clock);
-    for row in native
-        .business
-        .replication_log(1, 1024, &|| Ok(()))
-        .unwrap()
-    {
+    for row in journal_page_for_test(native, 1, 1024).await {
         fake.replicate_entry(row).await.unwrap();
     }
     assert_eq!(native_state(native), replay_state_for_test(&fake).await);
@@ -683,10 +702,7 @@ async fn mixed_command_profile_parity(
     let template = first.lease().key().clone();
     let clock = Arc::new(ReplayClock(std::sync::Mutex::new(time(2))));
     let fake = replay_prefix(&native, clock.clone()).await;
-    let mut journal = native
-        .business
-        .replication_log(1, 4096, &|| Ok(()))
-        .unwrap();
+    let mut journal = journal_page_for_test(&native, 1, 4096).await;
     let scope = crate::scope_authority::ScopeId::new(
         native.business.identity,
         opc_types::TenantId::from_static("mixed-replay"),
@@ -1360,7 +1376,7 @@ async fn plain_v2_before_capacity_boundary_case(boundary: u8) {
     }
     let fake =
         FakeSessionBackend::new().with_clock(Arc::new(ReplayClock(std::sync::Mutex::new(time(2)))));
-    for entry in native.business.replication_log(1, 64, &|| Ok(())).unwrap() {
+    for entry in journal_page_for_test(&native, 1, 64).await {
         fake.replicate_entry(entry).await.unwrap();
     }
     // Lease storage timestamps have their own regression; start this probe
@@ -1494,3 +1510,44 @@ mod round6_replay_tests;
 
 #[path = "round6_roster_parity.rs"]
 mod round6_roster_parity;
+
+#[tokio::test]
+async fn parity_fixture_tolerates_transient_journal_page_admission_refusal() {
+    const CHILD: &str = "OPC_PARITY_PAGE_REFUSAL_CHILD";
+    const TEST: &str = "consensus::native::replay_policy_parity_tests::parity_fixture_tolerates_transient_journal_page_admission_refusal";
+    if std::env::var_os(CHILD).is_none() {
+        use crate::test_process::CommandExt as _;
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", TEST, "--test-threads=1", "--nocapture"])
+            .env(CHILD, "1")
+            .test_output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "isolated optional-page probe failed: {} {}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(String::from_utf8_lossy(&output.stdout).contains("1 passed; 0 failed; 0 ignored"));
+        return;
+    }
+    use futures_util::FutureExt;
+    let (native, _, _) = changes::tests::fixture();
+    let occupied =
+        crate::consensus::verified_snapshot::JournalPageMemory::reserve(32 * 1024 * 1024).unwrap();
+    let release = std::thread::spawn(move || {
+        std::thread::sleep(Duration::from_millis(50));
+        drop(occupied);
+    });
+    let result = std::panic::AssertUnwindSafe(replay_prefix(
+        &native,
+        Arc::new(ReplayClock(std::sync::Mutex::new(time(3)))),
+    ))
+    .catch_unwind()
+    .await;
+    release.join().unwrap();
+    assert!(
+        result.is_ok(),
+        "an optional page refusal must not fail a valid parity fixture"
+    );
+}

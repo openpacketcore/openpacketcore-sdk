@@ -191,6 +191,7 @@ impl FakeSessionBackend {
                 if !accepted {
                     return Err(StoreError::StaleFence);
                 }
+                Self::apply_async_floor_to_key(state, &mk);
                 if state.leases.get(&mk).is_some_and(|entry| {
                     entry.active && entry.expires_at > now && entry.owner != *owner
                 }) {
