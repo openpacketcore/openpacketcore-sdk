@@ -147,6 +147,38 @@ struct Fleet {
     void_election: Option<void_election::VoidElection>,
 }
 
+// Twice the sibling async fixture's 30-second physical drain bound gives
+// slow runners room without waiting until the CI job's terminal timeout.
+const FLEET_DRAIN_TIMEOUT: Duration = Duration::from_secs(60);
+
+async fn await_fleet_drain(
+    store: &ConsensusSessionStore,
+    case: &'static str,
+    incarnation: u64,
+    voter: usize,
+) -> Result<(), crate::StoreError> {
+    let completion = store
+        .inner
+        .shutdown
+        .start_or_subscribe(Arc::clone(&store.inner), true);
+    let deadline = Instant::now() + FLEET_DRAIN_TIMEOUT;
+    let (cancel, cancelled) = std::sync::mpsc::channel::<()>();
+    // A real clock keeps paused/advanced Tokio time from shortening or
+    // stretching this physical wait. Completing the drain cancels the timer.
+    let timer = tokio::task::spawn_blocking(move || {
+        cancelled.recv_timeout(deadline.saturating_duration_since(Instant::now()))
+    });
+    let result = tokio::select! {
+        biased;
+        result = super::await_consensus_session_store_shutdown(completion) => result,
+        _ = timer => panic!(
+            "retained shutdown drain timed out: case={case} incarnation={incarnation} voter={voter} after {FLEET_DRAIN_TIMEOUT:?}"
+        ),
+    };
+    drop(cancel);
+    result
+}
+
 impl Fleet {
     fn new(case: &'static str) -> Self {
         Self::new_with_mode(case, false)
@@ -460,21 +492,24 @@ impl Fleet {
             .iter()
             .filter_map(|store| store.inner.private_wal.clone())
             .collect::<Vec<_>>();
-        let results = join_all(self.stores.iter().map(|store| async {
-            let result = store.shutdown().await;
-            if result.is_err() {
-                // A caller deadline leaves the same drain running. Cleanup
-                // must join that retained condition before releasing handles;
-                // its final error still fails the original orderly assertion.
-                let completion = store
-                    .inner
-                    .shutdown
-                    .start_or_subscribe(Arc::clone(&store.inner), true);
-                super::await_consensus_session_store_shutdown(completion).await
-            } else {
-                result
-            }
-        }))
+        let case = self.case;
+        let incarnation = self.incarnation;
+        let results = join_all(
+            self.stores
+                .iter()
+                .enumerate()
+                .map(|(voter, store)| async move {
+                    let result = store.shutdown().await;
+                    if result.is_err() {
+                        // A caller deadline leaves the same drain running. Cleanup
+                        // must join that retained condition before releasing handles;
+                        // its final error still fails the original orderly assertion.
+                        await_fleet_drain(store, case, incarnation, voter).await
+                    } else {
+                        result
+                    }
+                }),
+        )
         .await;
         for peer in &self.peers {
             *peer.handler.write().await = None;
@@ -506,6 +541,8 @@ async fn fleet_cleanup_observes_a_drain_after_a_shutdown_caller_deadline() {
     let mut fleet = Fleet::new_native("cleanup-retained-drain");
     fleet.open().await;
     let store = fleet.stores[0].clone();
+    let case = fleet.case;
+    let incarnation = fleet.incarnation;
     let hold = store.hold_raft_shutdown_before_core_for_test();
     let gate = Arc::clone(&hold.gate);
     let closing = tokio::spawn(async move { fleet.close().await });
@@ -518,8 +555,7 @@ async fn fleet_cleanup_observes_a_drain_after_a_shutdown_caller_deadline() {
     // later observer must spend its complete unchanged public deadline too.
     assert_eq!(store.shutdown().await, Err(super::consensus_unavailable()));
     drop(hold);
-    store
-        .shutdown()
+    await_fleet_drain(&store, case, incarnation, 0)
         .await
         .expect("released shared drain completes");
     let wals = closing.await.expect("fixture cleanup waits for the drain");
@@ -551,6 +587,10 @@ async fn fleet_cleanup_reports_a_stuck_drain_without_releasing_handles() {
         .err()
         .expect("a stuck retained drain must fail cleanup");
     let elapsed = started.elapsed();
+    assert!(
+        elapsed >= FLEET_DRAIN_TIMEOUT,
+        "the guard uses real elapsed time"
+    );
     assert!(
         panic.downcast_ref::<String>().unwrap().contains(&expected),
         "the failure must identify the stuck retained drain",

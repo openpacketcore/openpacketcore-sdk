@@ -9,8 +9,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
-- Native snapshot validation preserves checkpoint memory headroom when no
-  roster is configured, while retaining the process cap and live-journal allowance.
+- Rootless full roster admission uses checkpoint memory headroom during store
+  creation, reopen, generation selection, snapshot export and install, while
+  retaining the process cap and live-journal allowance.
 
 - Keep empty change-journal rows compact while fully accounting for optional
   key-retirement witnesses. The existing history counts and verification-memory
