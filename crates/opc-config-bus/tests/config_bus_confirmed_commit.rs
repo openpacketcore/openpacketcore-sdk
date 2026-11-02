@@ -688,10 +688,34 @@ async fn replaying_an_older_commit_does_not_clear_a_newer_pending_deadline() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn commit_confirmed_expiry_rollback_failure_fences_and_alarms() {
+    check_expiry_failure_alarm(
+        StoreError::internal("disk full or similar write error"),
+        ProbableCause::ConfigApplyFailed,
+    )
+    .await;
+}
+#[tokio::test]
+async fn expiry_provider_unavailability_never_claims_storage_corruption() {
+    check_expiry_failure_alarm(
+        StoreError::unavailable("provider unavailable"),
+        ProbableCause::ConfigApplyFailed,
+    )
+    .await;
+}
+#[tokio::test]
+async fn expiry_positive_data_rejection_preserves_corruption_alarm() {
+    check_expiry_failure_alarm(
+        StoreError::crypto("rejected envelope"),
+        ProbableCause::StorageCorruption,
+    )
+    .await;
+}
+async fn check_expiry_failure_alarm(error: StoreError, cause: ProbableCause) {
     let alarms = SharedAlarmManager::default();
 
     struct RollbackFailureStore {
         inner: MockManagedDatastore<TestConfig>,
+        error: StoreError,
         rollback_append_attempts: Arc<AtomicUsize>,
     }
 
@@ -724,7 +748,7 @@ async fn commit_confirmed_expiry_rollback_failure_fences_and_alarms() {
         ) -> Result<(), StoreError> {
             if commit.record().source == RequestSource::Internal {
                 self.rollback_append_attempts.fetch_add(1, Ordering::SeqCst);
-                return Err(StoreError::internal("disk full or similar write error"));
+                return Err(self.error.clone());
             }
             self.inner.append_commit_write(commit).await
         }
@@ -747,6 +771,7 @@ async fn commit_confirmed_expiry_rollback_failure_fences_and_alarms() {
     let rollback_append_attempts = Arc::new(AtomicUsize::new(0));
     let store = Arc::new(RollbackFailureStore {
         inner: inner_store,
+        error,
         rollback_append_attempts: Arc::clone(&rollback_append_attempts),
     });
     let bus = ConfigBus::restore_or_new_with_alarm_manager_dev_only(
@@ -782,6 +807,7 @@ async fn commit_confirmed_expiry_rollback_failure_fences_and_alarms() {
 
     let alarm = single_active_alarm(&alarms, "config-bus.commit.failure");
     assert_eq!(alarm.severity, Severity::Major);
+    assert_eq!(alarm.probable_cause, cause);
 
     tokio::time::sleep(Duration::from_millis(50)).await;
     assert_eq!(

@@ -19,7 +19,7 @@ pub(crate) fn read_sync(conn: &Connection) -> io::Result<Option<VoterSlotDurable
             |row| row.get(0),
         )
         .optional()
-        .map_err(db_error)?;
+        .map_err(read_db_error)?;
     bytes
         .map(|bytes| {
             VoterSlotDurableState::decode(&bytes)
@@ -93,7 +93,7 @@ fn validate_intent_log_sync(
             .checked_add(1)
             .ok_or_else(|| invalid_data("config applied index exhausted"))
     })?;
-    let mut statement = conn.prepare("SELECT term, log_index, entry_json FROM config_raft_log WHERE log_index >= ?1 ORDER BY log_index").map_err(db_error)?;
+    let mut statement = conn.prepare("SELECT term, log_index, entry_json FROM config_raft_log WHERE log_index >= ?1 ORDER BY log_index").map_err(read_db_error)?;
     let rows = statement
         .query_map([checked_i64(start)?], |row| {
             Ok((
@@ -102,11 +102,11 @@ fn validate_intent_log_sync(
                 row.get::<_, Vec<u8>>(2)?,
             ))
         })
-        .map_err(db_error)?;
+        .map_err(read_db_error)?;
     let mut projected = state.table().clone();
     let mut found = false;
     for row in rows {
-        let (term, index, bytes) = row.map_err(db_error)?;
+        let (term, index, bytes) = row.map_err(read_db_error)?;
         if bytes.len() > CONFIG_CONSENSUS_LOG_ENTRY_MAX_BYTES {
             return Err(invalid_data("config voter log entry exceeds bound"));
         }

@@ -275,7 +275,9 @@ fn validate_config_replay_lookup_index(conn: &Connection) -> Result<(), rusqlite
 
 /// Compare retained base DDL with the SDK schema without initializing `conn`.
 /// The caller separately validates the exact consensus and admission catalogs.
-pub(crate) fn validate_retained_base_schema(conn: &Connection) -> Result<(), rusqlite::Error> {
+pub(crate) fn validate_retained_base_schema(conn: &Connection) -> Result<(), crate::PersistError> {
+    use crate::error::{history_read_error, sqlite_read_error, sqlite_reference_io_error};
+    let reference_error = |error| history_read_error(sqlite_reference_io_error(error));
     const OBJECTS: &str = "SELECT type, name, tbl_name, sql FROM sqlite_schema \
         WHERE sql IS NOT NULL AND name NOT GLOB 'sqlite_*' \
         AND NOT (name GLOB 'config_raft_*' OR tbl_name GLOB 'config_raft_*') \
@@ -283,26 +285,30 @@ pub(crate) fn validate_retained_base_schema(conn: &Connection) -> Result<(), rus
     // Only this private in-memory reference is initialized. The compatibility
     // digest in retained storage cannot authorize that storage's own DDL, and
     // its historical exclusions do not exempt any base object from admission.
-    let expected = Connection::open_in_memory()?;
-    initialize_schema(&expected)?;
+    let expected = Connection::open_in_memory().map_err(reference_error)?;
+    initialize_schema(&expected).map_err(reference_error)?;
     let count_query = format!("SELECT COUNT(*) FROM ({OBJECTS})");
-    let expected_count: i64 = expected.query_row(&count_query, [], |row| row.get(0))?;
-    let actual_count: i64 = conn.query_row(&count_query, [], |row| row.get(0))?;
+    let expected_count: i64 = expected
+        .query_row(&count_query, [], |row| row.get(0))
+        .map_err(reference_error)?;
+    let actual_count: i64 = conn
+        .query_row(&count_query, [], |row| row.get(0))
+        .map_err(sqlite_read_error)?;
     if actual_count != expected_count {
-        return Err(rusqlite::Error::InvalidQuery);
+        return Err(crate::PersistError::corrupt_blob());
     }
-    let mut statement = expected.prepare(OBJECTS)?;
-    let mut rows = statement.query([])?;
-    while let Some(row) = rows.next()? {
+    let mut statement = expected.prepare(OBJECTS).map_err(reference_error)?;
+    let mut rows = statement.query([]).map_err(reference_error)?;
+    while let Some(row) = rows.next().map_err(reference_error)? {
         // Read only bounded SDK-authored DDL into Rust memory. The supplied
         // catalog is compared inside SQLite instead of allocating its text.
         let matches: bool = conn.query_row(
             "SELECT EXISTS(SELECT 1 FROM sqlite_schema WHERE type = ?1 AND name = ?2 AND tbl_name = ?3 AND sql = ?4)",
-            rusqlite::params![row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, String>(2)?, row.get::<_, String>(3)?],
+            rusqlite::params![row.get::<_, String>(0).map_err(reference_error)?, row.get::<_, String>(1).map_err(reference_error)?, row.get::<_, String>(2).map_err(reference_error)?, row.get::<_, String>(3).map_err(reference_error)?],
             |row| row.get(0),
-        )?;
+        ).map_err(sqlite_read_error)?;
         if !matches {
-            return Err(rusqlite::Error::InvalidQuery);
+            return Err(crate::PersistError::corrupt_blob());
         }
     }
     Ok(())

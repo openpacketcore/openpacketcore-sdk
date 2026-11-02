@@ -94,7 +94,7 @@ struct DecodedPersistedBusMetadata {
 
 fn decode_persisted_bus_metadata(value: &str) -> Result<DecodedPersistedBusMetadata, StoreError> {
     let shape: serde_json::Value = serde_json::from_str(value)
-        .map_err(|_| StoreError::internal("stored config principal metadata is invalid"))?;
+        .map_err(|_| StoreError::crypto("stored config principal metadata is invalid"))?;
     let is_metadata_wrapper = shape.as_object().is_some_and(|fields| {
         fields.contains_key("principal")
             || fields.contains_key("replay_lookup_digest")
@@ -103,9 +103,9 @@ fn decode_persisted_bus_metadata(value: &str) -> Result<DecodedPersistedBusMetad
     });
     let metadata = if is_metadata_wrapper {
         let metadata: PersistedBusMetadata = serde_json::from_str(value)
-            .map_err(|_| StoreError::internal("stored config principal metadata is invalid"))?;
+            .map_err(|_| StoreError::crypto("stored config principal metadata is invalid"))?;
         let principal = serde_json::from_str(&metadata.principal)
-            .map_err(|_| StoreError::internal("stored authenticated principal is invalid"))?;
+            .map_err(|_| StoreError::crypto("stored authenticated principal is invalid"))?;
         DecodedPersistedBusMetadata {
             principal,
             aad_principal: metadata.principal,
@@ -115,7 +115,7 @@ fn decode_persisted_bus_metadata(value: &str) -> Result<DecodedPersistedBusMetad
         }
     } else {
         let principal = serde_json::from_str(value)
-            .map_err(|_| StoreError::internal("stored authenticated principal is invalid"))?;
+            .map_err(|_| StoreError::crypto("stored authenticated principal is invalid"))?;
         DecodedPersistedBusMetadata {
             principal,
             aad_principal: value.to_owned(),
@@ -124,12 +124,13 @@ fn decode_persisted_bus_metadata(value: &str) -> Result<DecodedPersistedBusMetad
             rollback_label: None,
         }
     };
-    validate_replay_lookup_digest(metadata.replay_lookup_digest.as_ref())?;
-    validate_rollback_label(metadata.rollback_label.as_deref())?;
+    validate_replay_lookup_digest(metadata.replay_lookup_digest.as_ref())
+        .map_err(StoreError::crypto)?;
+    validate_rollback_label(metadata.rollback_label.as_deref()).map_err(StoreError::crypto)?;
     Ok(metadata)
 }
 
-fn validate_replay_lookup_digest(digest: Option<&IdempotencyKey>) -> Result<(), StoreError> {
+fn validate_replay_lookup_digest(digest: Option<&IdempotencyKey>) -> Result<(), &'static str> {
     let Some(digest) = digest else {
         return Ok(());
     };
@@ -139,14 +140,12 @@ fn validate_replay_lookup_digest(digest: Option<&IdempotencyKey>) -> Result<(), 
             .iter()
             .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(byte))
     {
-        return Err(StoreError::internal(
-            "sealed config replay lookup value is not a SHA-256 digest",
-        ));
+        return Err("sealed config replay lookup value is not a SHA-256 digest");
     }
     Ok(())
 }
 
-fn validate_rollback_label(label: Option<&str>) -> Result<(), StoreError> {
+fn validate_rollback_label(label: Option<&str>) -> Result<(), &'static str> {
     let Some(label) = label else {
         return Ok(());
     };
@@ -155,9 +154,7 @@ fn validate_rollback_label(label: Option<&str>) -> Result<(), StoreError> {
         || label.trim() != label
         || label.chars().any(char::is_control)
     {
-        return Err(StoreError::internal(
-            "rollback label is not canonically representable",
-        ));
+        return Err("rollback label is not canonically representable");
     }
     Ok(())
 }
@@ -206,7 +203,7 @@ fn adapt_stored_config<C: OpcConfig>(
 ) -> Result<BusStoredConfig<SealedConfig<C>>, StoreError> {
     let metadata = decode_persisted_bus_metadata(&stored.record.principal)?;
     if metadata.rollback_label.is_some() && !stored.record.rollback_point {
-        return Err(StoreError::internal(
+        return Err(StoreError::crypto(
             "durable rollback label metadata is inconsistent",
         ));
     }
@@ -220,7 +217,7 @@ fn adapt_stored_config<C: OpcConfig>(
         .plaintext_digest
         .as_slice()
         .try_into()
-        .map_err(|_| StoreError::internal("invalid plaintext digest length"))?;
+        .map_err(|_| StoreError::crypto("invalid plaintext digest length"))?;
     Ok(BusStoredConfig {
         tx_id: stored.record.tx_id,
         parent_tx_id: stored.record.parent_tx_id,
@@ -376,7 +373,7 @@ where
         &self,
         idempotency_key: &IdempotencyKey,
     ) -> Result<Option<BusStoredConfig<SealedConfig<C>>>, StoreError> {
-        validate_replay_lookup_digest(Some(idempotency_key))?;
+        validate_replay_lookup_digest(Some(idempotency_key)).map_err(StoreError::internal)?;
         self.inner
             .load_by_replay_lookup_digest(idempotency_key.as_str())
             .await
@@ -431,8 +428,8 @@ fn attested_bus_commit<C: OpcConfig>(
     commit: BusCommitWrite<SealedConfig<C>>,
 ) -> Result<AttestedConfigCommit, StoreError> {
     let (commit, resolution) = commit.into_parts();
-    validate_replay_lookup_digest(commit.idempotency_key.as_ref())?;
-    validate_rollback_label(commit.rollback_label.as_deref())?;
+    validate_replay_lookup_digest(commit.idempotency_key.as_ref()).map_err(StoreError::internal)?;
+    validate_rollback_label(commit.rollback_label.as_deref()).map_err(StoreError::internal)?;
     if commit.apply_plan.is_some()
         || commit.request_fingerprint.is_some()
         || commit.request_id.is_some()
@@ -473,12 +470,12 @@ fn attested_bus_commit<C: OpcConfig>(
     };
     let claim = commit.config.claim_fresh_envelope()?;
     if !claim.matches(&record.encrypted_blob) {
-        return Err(StoreError::crypto(
+        return Err(StoreError::internal(
             "fresh config envelope bytes do not match durable record",
         ));
     }
     if !claim.matches_plaintext_digest(&record.plaintext_digest) {
-        return Err(StoreError::crypto(
+        return Err(StoreError::internal(
             "fresh config envelope digest does not match durable record",
         ));
     }
@@ -502,7 +499,7 @@ fn attested_bus_commit<C: OpcConfig>(
         }
         None => AttestedConfigCommit::try_new(record, audit, claim),
     }
-    .map_err(map_persist_error)?;
+    .map_err(|_| StoreError::internal("fresh config commit evidence is invalid"))?;
     Ok(commit)
 }
 
@@ -1070,7 +1067,10 @@ mod tests {
 
         for value in malformed {
             let encoded = serde_json::to_string(&value).expect("metadata JSON");
-            assert!(decode_persisted_bus_metadata(&encoded).is_err());
+            assert_eq!(
+                decode_persisted_bus_metadata(&encoded).err().unwrap().code,
+                opc_config_bus::StoreErrorCode::Crypto
+            );
         }
     }
 
@@ -1091,7 +1091,10 @@ mod tests {
             serde_json::Value::Bool(true),
         );
         let encoded = serde_json::Value::Object(principal).to_string();
-        assert!(decode_persisted_bus_metadata(&encoded).is_err());
+        assert_eq!(
+            decode_persisted_bus_metadata(&encoded).err().unwrap().code,
+            opc_config_bus::StoreErrorCode::Crypto
+        );
     }
 
     #[test]
@@ -1114,7 +1117,10 @@ mod tests {
             ),
         ];
         for encoded in duplicate {
-            assert!(decode_persisted_bus_metadata(&encoded).is_err());
+            assert_eq!(
+                decode_persisted_bus_metadata(&encoded).err().unwrap().code,
+                opc_config_bus::StoreErrorCode::Crypto
+            );
         }
     }
 

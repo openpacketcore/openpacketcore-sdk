@@ -325,10 +325,12 @@ async fn unseal_with_slot(
 }
 
 fn map_provider_error(error: KeyError) -> KeyError {
+    if error.is_definitive_rejection() {
+        return error;
+    }
     match error {
-        KeyError::NotFound => KeyError::NotFound,
-        KeyError::Unavailable => KeyError::Unavailable,
-        _ => KeyCustodyOperationError::ProviderOperationFailed.into(),
+        KeyError::Unavailable | KeyError::CustodyOperation(_) => error,
+        _ => KeyError::ProviderUnusable,
     }
 }
 

@@ -1603,8 +1603,8 @@
     {
       "test": "rust:crates/opc-security-testkit::test=security_tests::test_kms_fault_responses_return_unavailable",
       "kind": "removed",
-      "renamed_to": "rust:crates/opc-security-testkit::test=security_tests::test_kms_fault_responses_distinguish_outages_from_permanent_failures",
-      "reason": "Rename the fault classification matrix for RFC 003 section 9.3. The truncated frame still requires Unavailable; oversized frames and malformed key hex require OperationFailed. All three fixtures and exact error assertions remain.",
+      "renamed_to": "rust:crates/opc-security-testkit::test=security_tests::test_kms_fault_responses_preserve_failure_class",
+      "reason": "Name the explicit classification contract: truncated transport remains Unavailable; oversized responses and malformed key hex require provider repair (ProviderUnusable). All three original cases and exact equality assertions remain.",
       "issue": 1197
     },
     {
@@ -2146,6 +2146,23 @@
       "kind": "fixture-setup-changed",
       "issue": 1252,
       "reason": "Include the validated default native profile when comparing empty and unapplied converted images. Preserve equality for every original schema object and column, exact unapplied Raft positions, wrong-root refusal, cancellation rollback and unchanged source bytes. Native-to-native comparisons remain exact."
+    },
+    {
+      "test": "rust:crates/opc-key-vault::test=integration_tests::rotate_key_failure_maps_to_rotation_failed",
+      "kind": "removed",
+      "renamed_to": "rust:crates/opc-key-vault::test=integration_tests::rotate_key_failure_preserves_outage",
+      "reason": "Rotation preserves the provider outage class instead of collapsing it to RotationFailed. The HTTP 500 failure and exact error assertion remain, with separate authentication and retry-count controls.",
+      "issue": 1197
+    },
+    {
+      "test": "rust:crates/opc-sdk-integration::test=fault_injection::fault_injection_missing_key_fails_closed_without_secret_leak",
+      "kind": "assertions-decreased",
+      "reason": "Use an intact envelope with an empty key provider to test actual key absence. Removing header decode, mutated-key construction and re-encode expectations lowers the syntactic assertion count, while exact KeyRejected, redacted text, definitive classification and no-secret-leak assertions remain. Separate crypto tests retain header-binding damage and require rejection before provider lookup.",
+      "issue": 1197,
+      "replacements": [
+        "rust:crates/opc-crypto::lib=lib::tests::damaged_key_binding_is_rejected_before_provider_lookup",
+        "rust:crates/opc-crypto::lib=lib::tests::decrypt_rejects_wrong_key_aad_corrupt_tag_and_unknown_key_id_with_redacted_errors"
+      ]
     }
   ]
 }

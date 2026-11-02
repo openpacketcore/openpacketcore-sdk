@@ -21,17 +21,29 @@ pub const AES_256_GCM_SIV_NONCE_LEN: usize = 12;
 pub const AEAD_TAG_LEN: usize = 16;
 
 /// Serialized AEAD inputs returned to the envelope layer after encryption.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct EncryptedPayload {
     pub aad: Vec<u8>,
     pub ciphertext_and_tag: Vec<u8>,
 }
 
+impl fmt::Debug for EncryptedPayload {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("EncryptedPayload")
+            .field("aad", &"<redacted>")
+            .field("ciphertext_and_tag", &"<redacted>")
+            .finish()
+    }
+}
+
 /// Key-provider contract from RFC 003.
 ///
 /// Reserve [`KeyError::Unavailable`] for provider availability failures.
-/// Missing keys and completed request rejections must remain distinct from
-/// retryable outages; provider-specific context must not escape in errors.
+/// Use [`KeyError::ProviderUnusable`] for endpoint, channel, authentication or
+/// provider protocol/configuration failures. Neither class is a verdict on
+/// stored data. Callers retain pending work, back off and report configuration
+/// failures to operators. Positively missing keys and actual key/ciphertext rejections
+/// remain distinct; provider-specific context must not escape in errors.
 #[async_trait]
 pub trait KeyProvider: Send + Sync {
     async fn get_active_key(
@@ -226,4 +238,21 @@ fn append_digest_field(out: &mut Vec<u8>, field: &[u8]) {
     let len = u64::try_from(field.len()).expect("usize length fits in u64");
     out.extend_from_slice(&len.to_be_bytes());
     out.extend_from_slice(field);
+}
+
+#[cfg(test)]
+mod payload_debug_tests {
+    use super::EncryptedPayload;
+
+    #[test]
+    fn encrypted_payload_debug_redacts_aad_and_ciphertext() {
+        let payload = EncryptedPayload {
+            aad: b"aad-canary".to_vec(),
+            ciphertext_and_tag: b"ciphertext-canary".to_vec(),
+        };
+        assert_eq!(
+            format!("{payload:?}"),
+            "EncryptedPayload { aad: \"<redacted>\", ciphertext_and_tag: \"<redacted>\" }"
+        );
+    }
 }

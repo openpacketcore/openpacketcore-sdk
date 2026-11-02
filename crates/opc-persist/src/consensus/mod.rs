@@ -27,6 +27,8 @@ pub(crate) mod snapshot_timing;
 mod sqlite;
 pub(crate) use sqlite::run_backend_sqlite_with_timeout;
 mod storage;
+#[cfg(target_os = "linux")]
+pub(crate) use storage::ConfigConsensusStorageError;
 #[cfg(test)]
 pub(crate) use storage::SnapshotTestHooks;
 pub(crate) use storage::SnapshotWorkHooks;

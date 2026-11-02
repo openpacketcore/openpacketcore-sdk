@@ -1252,7 +1252,7 @@ async fn history_retention_releases_acknowledged_rolled_back_pending_commit() {
 
 #[tokio::test]
 async fn history_retention_authenticated_boundary_rejects_missing_or_tampered_state() {
-    for mutation in ["floor", "anchor", "record"] {
+    for mutation in ["floor", "anchor", "identity", "record"] {
         let dir = tempfile::tempdir().expect("directory");
         let database = dir.path().join("config.sqlite");
         let (store, _) = open_singleton(&database, &dir.path().join("snapshots")).await;
@@ -1289,6 +1289,11 @@ async fn history_retention_authenticated_boundary_rejects_missing_or_tampered_st
                     .execute("DELETE FROM config_raft_history_retention", [])
                     .expect("remove authenticated boundary");
             }
+            "identity" => {
+                attacker
+                    .execute("DELETE FROM config_raft_identity", [])
+                    .expect("remove mandatory identity");
+            }
             "record" => {
                 attacker
                     .execute_batch("PRAGMA foreign_keys = OFF")
@@ -1299,9 +1304,13 @@ async fn history_retention_authenticated_boundary_rejects_missing_or_tampered_st
             }
             _ => unreachable!(),
         }
+        let latest = store
+            .load_latest()
+            .await
+            .expect_err("no snapshot authority from corruption");
         assert!(
-            store.load_latest().await.is_err(),
-            "{mutation}: no snapshot authority from corruption"
+            matches!(latest.kind(), PersistErrorKind::CorruptBlob),
+            "{mutation}: {latest:?}"
         );
         let error = store
             .load_since(ConfigVersion::new(1), 8)
@@ -1311,6 +1320,10 @@ async fn history_retention_authenticated_boundary_rejects_missing_or_tampered_st
             error.kind(),
             PersistErrorKind::ConfigHistoryCompacted
         ));
+        assert!(
+            matches!(error.kind(), PersistErrorKind::CorruptBlob),
+            "{mutation}: {error:?}"
+        );
         store.shutdown().await.expect("shutdown");
     }
 }

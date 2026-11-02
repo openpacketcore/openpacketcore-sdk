@@ -677,13 +677,49 @@ fn backend_contract_error() -> StoreError {
     StoreError::BackendUnavailable(BACKEND_CONTRACT_MESSAGE.to_string())
 }
 
-fn cas_outcome_is_definitive(result: &Result<CompareAndSetResult, StoreError>) -> bool {
-    !matches!(
-        result,
-        Err(StoreError::BackendUnavailable(_)
-            | StoreError::BackendOperationOutcomeUnavailable
-            | StoreError::CasIdempotencyOutcomeUnavailable)
+fn store_error_is_definitive(error: &StoreError) -> bool {
+    matches!(
+        error,
+        StoreError::NotFound
+            | StoreError::StaleFence
+            | StoreError::CasConflict
+            | StoreError::CasIdempotencyConflict
+            | StoreError::TopologyAuthorityRevoked
+            | StoreError::CapabilityNotSupported(_)
+            | StoreError::InvalidKey(_)
+            | StoreError::InvalidReplicationSequence
+            | StoreError::InvalidReplicationLogRange
+            | StoreError::ReplicationLogPageTooLarge { .. }
+            | StoreError::ReplicationLogCursorCompacted { .. }
+            | StoreError::ReplicationWatchCatchUpRequired
+            | StoreError::ReplicationOperationLimitExceeded
+            | StoreError::InvalidSessionTtl
+            | StoreError::InvalidRecordExpiry
+            | StoreError::RecordExpiryPreflightLimitExceeded
+            | StoreError::LeaseHeld
+            | StoreError::LeaseExpired
+            | StoreError::Crypto(_)
+            | StoreError::Serialization(_)
+            | StoreError::PayloadTooLarge { .. }
+            | StoreError::InvalidRestoreScanRequest(_)
+            | StoreError::InvalidRestoreScanResponse(_)
+            | StoreError::RestoreScanPageTooLarge { .. }
+            | StoreError::RestoreScanCursorStale
+            | StoreError::RestoreScanWorkBudgetExceeded
+            | StoreError::RestoreScanResponseTooLarge { .. }
+            | StoreError::FencedTransitionRequestConflict
+            | StoreError::FencedTransitionHistoryFull
+            | StoreError::FencedTransitionRetentionExhausted
+            | StoreError::FencedTransitionStorageExhausted
+            | StoreError::FencedTransitionHistoryEpochRetired
+            | StoreError::FencedTransitionHistoryEpochNotActive
+            | StoreError::SessionRecordReserved
+            | StoreError::FencedTransitionVoided
     )
+}
+
+fn cas_outcome_is_definitive(result: &Result<CompareAndSetResult, StoreError>) -> bool {
+    result.as_ref().err().is_none_or(store_error_is_definitive)
 }
 
 fn backend_lease_contract_error() -> LeaseError {
@@ -916,34 +952,16 @@ fn normalize_store_backend_outcome<T>(
     result: Result<T, StoreError>,
     outcome: BackendDeadlineOutcome,
 ) -> Result<T, StoreError> {
-    match (outcome, result) {
-        (
-            BackendDeadlineOutcome::Preflight,
-            Err(
-                StoreError::BackendUnavailable(_)
-                | StoreError::BackendOperationOutcomeUnavailable
-                | StoreError::CasIdempotencyOutcomeUnavailable,
-            ),
-        ) => Err(StoreError::BackendUnavailable(
-            "backend record-expiry preflight unavailable".into(),
-        )),
-        (
-            BackendDeadlineOutcome::CompareAndSet,
-            Err(
-                StoreError::BackendUnavailable(_)
-                | StoreError::BackendOperationOutcomeUnavailable
-                | StoreError::CasIdempotencyOutcomeUnavailable,
-            ),
-        ) => Err(StoreError::CasIdempotencyOutcomeUnavailable),
-        (
-            BackendDeadlineOutcome::Mutation,
-            Err(
-                StoreError::BackendUnavailable(_)
-                | StoreError::BackendOperationOutcomeUnavailable
-                | StoreError::CasIdempotencyOutcomeUnavailable,
-            ),
-        ) => Err(StoreError::BackendOperationOutcomeUnavailable),
-        (_, result) => result,
+    match result {
+        Err(error) if !store_error_is_definitive(&error) => Err(match outcome {
+            BackendDeadlineOutcome::Read | BackendDeadlineOutcome::RestoreScan => error,
+            BackendDeadlineOutcome::Preflight => {
+                StoreError::BackendUnavailable("backend record-expiry preflight unavailable".into())
+            }
+            BackendDeadlineOutcome::CompareAndSet => StoreError::CasIdempotencyOutcomeUnavailable,
+            BackendDeadlineOutcome::Mutation => StoreError::BackendOperationOutcomeUnavailable,
+        }),
+        result => result,
     }
 }
 
@@ -4784,6 +4802,150 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn provider_configuration_never_becomes_a_final_cached_or_integrity_result() {
+        let provider = opc_key::KmsKeyProvider::new("unix://".into(), None, Duration::from_secs(1));
+        let error = EncryptedSessionPayload::encrypt(
+            &provider,
+            &restore_record(b"provider-config", 16),
+            "provider-config",
+        )
+        .await
+        .unwrap_err();
+        let result: Result<CompareAndSetResult, StoreError> = Err(error.clone());
+        assert!(!cas_outcome_is_definitive(&result));
+        assert!(matches!(
+            normalize_store_backend_outcome::<()>(
+                Err(error.clone()),
+                BackendDeadlineOutcome::Mutation
+            ),
+            Err(StoreError::BackendOperationOutcomeUnavailable)
+        ));
+        assert_eq!(
+            opc_session_store::SessionConsumerStoreError::from(error),
+            opc_session_store::SessionConsumerStoreError::Unavailable
+        );
+    }
+
+    #[test]
+    fn legacy_key_provider_outages_are_ambiguous_in_every_mutating_family() {
+        let error = || StoreError::KeyProviderUnavailable("provider unavailable".into());
+        assert!(matches!(
+            normalize_store_backend_outcome::<()>(Err(error()), BackendDeadlineOutcome::Preflight),
+            Err(StoreError::BackendUnavailable(_))
+        ));
+        assert_eq!(
+            normalize_store_backend_outcome::<()>(Err(error()), BackendDeadlineOutcome::Mutation),
+            Err(StoreError::BackendOperationOutcomeUnavailable)
+        );
+        assert_eq!(
+            normalize_store_backend_outcome::<()>(
+                Err(error()),
+                BackendDeadlineOutcome::CompareAndSet
+            ),
+            Err(StoreError::CasIdempotencyOutcomeUnavailable)
+        );
+    }
+
+    #[tokio::test]
+    async fn custody_failures_never_become_cached_final_cas_results() {
+        use opc_key::{
+            EncryptedPayload, EnvelopeAad, KeyCustodyOperationError as C, KeyError, KeyId,
+            RemoteSealProvider, Zeroizing,
+        };
+        struct Provider(C);
+        #[async_trait::async_trait]
+        impl RemoteSealProvider for Provider {
+            async fn seal(&self, _: &EnvelopeAad, _: &[u8]) -> Result<EncryptedPayload, KeyError> {
+                Err(self.0.into())
+            }
+            async fn unseal(
+                &self,
+                _: &KeyId,
+                _: &EnvelopeAad,
+                _: &[u8],
+            ) -> Result<Zeroizing<Vec<u8>>, KeyError> {
+                Err(self.0.into())
+            }
+        }
+        let mut failures = Vec::new();
+        for error in [
+            C::NotInstalled,
+            C::IdentityChanged,
+            C::ValidationChanged,
+            C::CapabilityNotAdmitted,
+            C::CapabilityWithdrawn,
+            C::ProviderOperationFailed,
+            C::InvalidProviderOutput,
+        ] {
+            let mapped = EncryptedSessionPayload::remote_seal(
+                &Provider(error),
+                &restore_record(b"custody", 16),
+                "custody",
+            )
+            .await
+            .unwrap_err();
+            let cache = Arc::new(StdMutex::new(CasIdempotencyCache::default()));
+            let peer = ReplicaId::new("replica-custody").unwrap();
+            let request_id = uuid::Uuid::from_u128(75);
+            let epoch = cache.lock().unwrap().epoch();
+            let CasIdempotencyAdmission::Execute(permit) = CasIdempotencyCache::begin(
+                &cache,
+                &peer,
+                request_id,
+                epoch,
+                [3; 32],
+                Instant::now(),
+            ) else {
+                panic!("execute first request")
+            };
+            let result = Err(mapped);
+            if cas_outcome_is_definitive(&result) {
+                permit.complete(result);
+            } else {
+                drop(permit);
+            }
+            if !matches!(
+                CasIdempotencyCache::begin(
+                    &cache,
+                    &peer,
+                    request_id,
+                    epoch,
+                    [3; 32],
+                    Instant::now()
+                ),
+                CasIdempotencyAdmission::Reject(StoreError::CasIdempotencyOutcomeUnavailable)
+            ) {
+                failures.push(error);
+            }
+        }
+        assert!(
+            failures.is_empty(),
+            "custody state was cached as a final rejection: {failures:?}"
+        );
+    }
+
+    #[test]
+    fn cas_idempotency_cache_tombstones_key_provider_outages() {
+        let cache = Arc::new(StdMutex::new(CasIdempotencyCache::default()));
+        let peer = ReplicaId::new("replica-a").expect("peer");
+        let request_id = uuid::Uuid::from_u128(74);
+        let epoch = cache.lock().expect("cache").epoch();
+        let digest = [3; 32];
+        let CasIdempotencyAdmission::Execute(permit) =
+            CasIdempotencyCache::begin(&cache, &peer, request_id, epoch, digest, Instant::now())
+        else {
+            panic!("first request must execute");
+        };
+        let unavailable = Err(StoreError::KeyProviderUnavailable("provider outage".into()));
+        assert!(!cas_outcome_is_definitive(&unavailable));
+        drop(permit);
+        assert!(matches!(
+            CasIdempotencyCache::begin(&cache, &peer, request_id, epoch, digest, Instant::now()),
+            CasIdempotencyAdmission::Reject(StoreError::CasIdempotencyOutcomeUnavailable)
+        ));
+    }
+
+    #[tokio::test]
     async fn backend_reported_ambiguity_is_counted_for_store_and_lease_families() {
         let before = METRICS
             .session_net_backend_ambiguous_outcomes
@@ -5587,5 +5749,11 @@ mod tests {
             ),
             StoreError::BackendUnavailable(_)
         ));
+    }
+    #[test]
+    fn real_crypto_rejection_remains_a_definitive_store_outcome() {
+        assert!(store_error_is_definitive(&StoreError::Crypto(
+            "authenticated rejection".into()
+        )));
     }
 }

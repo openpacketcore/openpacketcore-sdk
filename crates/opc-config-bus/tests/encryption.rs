@@ -443,8 +443,8 @@ async fn encrypting_store_append_commit_reports_missing_key() {
         .await
         .expect_err("append must fail without a config key");
 
-    assert_eq!(err.code, StoreErrorCode::Crypto);
-    assert_eq!(err.message, "config envelope encryption failed");
+    assert_eq!(err.code, StoreErrorCode::Unavailable);
+    assert_eq!(err.message, "config key provider configuration unavailable");
 }
 
 #[tokio::test]
@@ -964,4 +964,197 @@ async fn test_config_classification_seam_regression() {
     let latest = history.last().expect("latest history");
     assert!(!latest.encrypted_blob.is_empty());
     assert!(latest.config.legacy_plaintext_config().is_none());
+}
+
+#[tokio::test]
+async fn provider_configuration_preserves_config_history_without_crypto_rejection() {
+    provider_failure_preserves_config_history("unix://".into()).await;
+}
+
+#[tokio::test]
+async fn provider_outage_preserves_config_history_without_crypto_rejection() {
+    provider_failure_preserves_config_history(format!(
+        "/tmp/absent-kms-{}-config",
+        std::process::id()
+    ))
+    .await;
+}
+
+async fn provider_failure_preserves_config_history(endpoint: String) {
+    let inner = Arc::new(MockManagedDatastore::new());
+    let working = test_provider();
+    let store = EncryptingManagedDatastore::new(inner.clone(), working.clone());
+    let bus = ConfigBus::new_dev_only(TestConfig::new("initial"), store)
+        .await
+        .unwrap();
+    submit_commit(&bus, "retained").await;
+    let before = inner.history().await;
+    let provider = Arc::new(opc_key::KmsKeyProvider::new(
+        endpoint,
+        None,
+        Duration::from_secs(1),
+    ));
+    let broken = EncryptingManagedDatastore::new(inner.clone(), provider);
+    let error = match broken.load_latest().await {
+        Err(error) => error,
+        Ok(_) => panic!("provider failure must return no plaintext"),
+    };
+    assert_eq!(error.code, StoreErrorCode::Unavailable);
+    let record = StoredConfig::new(
+        TxId::new(),
+        ConfigVersion::new(2),
+        principal(),
+        RequestSource::Northbound,
+        TestConfig::new("unpublished"),
+    );
+    let write_error = match broken.append_commit_write(CommitWrite::new(record)).await {
+        Err(error) => error,
+        Ok(_) => panic!("provider failure must publish no config"),
+    };
+    assert_eq!(write_error.code, StoreErrorCode::Unavailable);
+    let startup =
+        match ConfigBus::restore_or_new_dev_only(TestConfig::new("fallback"), broken).await {
+            Err(error) => error,
+            Ok(_) => panic!("provider failure must not restore or replace the record"),
+        };
+    assert_eq!(startup.code, StoreErrorCode::Unavailable);
+    let alarms = startup.alarm_manager().unwrap().active_alarms();
+    assert!(!alarms.is_empty(), "operators must be notified");
+    for alarm in alarms {
+        assert_eq!(
+            alarm.probable_cause,
+            opc_alarm::ProbableCause::ConfigApplyFailed
+        );
+    }
+    let after = inner.history().await;
+    assert_eq!(before.len(), after.len());
+    for (before, after) in before.iter().zip(after.iter()) {
+        assert_eq!(before.tx_id, after.tx_id);
+        assert_eq!(before.encrypted_blob, after.encrypted_blob);
+    }
+    let repaired = EncryptingManagedDatastore::new(inner, working);
+    assert_eq!(
+        repaired.load_latest().await.unwrap().unwrap().config.name,
+        "retained"
+    );
+}
+
+#[tokio::test]
+async fn missing_active_seed_key_does_not_claim_stored_data_damage() {
+    let inner = Arc::new(MockManagedDatastore::<SealedConfig<TestConfig>>::new());
+    let store = EncryptingManagedDatastore::new(inner.clone(), Arc::new(MemoryKeyProvider::new()));
+    let error = match ConfigBus::restore_or_new_dev_only(TestConfig::new("initial"), store).await {
+        Ok(_) => panic!("missing key must prevent seeding"),
+        Err(error) => error,
+    };
+    assert_eq!(error.code, StoreErrorCode::Unavailable);
+    let alarms = error.alarm_manager().unwrap().active_alarms();
+    assert_eq!(alarms.len(), 1);
+    assert_eq!(
+        alarms[0].probable_cause,
+        opc_alarm::ProbableCause::ConfigApplyFailed
+    );
+    assert!(inner.history().await.is_empty());
+}
+
+#[tokio::test]
+async fn invalid_store_configuration_does_not_claim_seed_corruption() {
+    let inner = Arc::new(MockManagedDatastore::<SealedConfig<TestConfig>>::new());
+    let store = EncryptingManagedDatastore::with_store_kind(inner.clone(), test_provider(), " ");
+    let error = match ConfigBus::restore_or_new_dev_only(TestConfig::new("initial"), store).await {
+        Ok(_) => panic!("invalid configuration must prevent seeding"),
+        Err(error) => error,
+    };
+    assert_eq!(error.code, StoreErrorCode::Unavailable);
+    let alarms = error.alarm_manager().unwrap().active_alarms();
+    assert_eq!(alarms.len(), 1);
+    assert_eq!(
+        alarms[0].probable_cause,
+        opc_alarm::ProbableCause::ConfigApplyFailed
+    );
+    assert!(inner.history().await.is_empty());
+}
+
+#[tokio::test]
+async fn invalid_store_configuration_retains_intact_records() {
+    let inner = Arc::new(MockManagedDatastore::new());
+    let provider = test_provider();
+    let bus = ConfigBus::new_dev_only(
+        TestConfig::new("initial"),
+        EncryptingManagedDatastore::new(inner.clone(), provider.clone()),
+    )
+    .await
+    .unwrap();
+    submit_commit(&bus, "retained").await;
+    let before = inner.history().await;
+    let broken = EncryptingManagedDatastore::with_store_kind(inner.clone(), provider.clone(), " ");
+    let error = match broken.load_latest().await {
+        Ok(_) => panic!("invalid configuration must not release plaintext"),
+        Err(error) => error,
+    };
+    assert_eq!(error.code, StoreErrorCode::Unavailable);
+    let after = inner.history().await;
+    assert_eq!(before.len(), after.len());
+    assert_eq!(before[0].encrypted_blob, after[0].encrypted_blob);
+    let repaired = EncryptingManagedDatastore::new(inner, provider);
+    assert_eq!(
+        repaired.load_latest().await.unwrap().unwrap().config.name,
+        "retained"
+    );
+}
+
+async fn rejected_stored_json_keeps_corruption_alarm(plaintext: &[u8]) {
+    let inner = Arc::new(MockManagedDatastore::new());
+    let provider = test_provider();
+    let mut record = StoredConfig::new(
+        TxId::new(),
+        ConfigVersion::new(1),
+        principal(),
+        RequestSource::Northbound,
+        TestConfig::new("stored"),
+    );
+    record.plaintext_digest = Some(Sha256::digest(plaintext).into());
+    let aad = EnvelopeAad::config(
+        record.principal.tenant.clone(),
+        record.version.get(),
+        ConfigAad::new(
+            record.tx_id,
+            record.parent_tx_id,
+            record.committed_at,
+            serde_json::to_string(&record.principal).unwrap(),
+            record.schema_digest,
+            "running",
+        )
+        .unwrap(),
+    );
+    let envelope = encrypt_attested_envelope(provider.as_ref(), &aad, plaintext)
+        .await
+        .unwrap();
+    record.encrypted_blob = envelope.encoded().to_vec();
+    let schema = record.schema_digest;
+    inner
+        .seed(record.with_config(SealedConfig::new(schema)))
+        .await;
+    let reader = Arc::new(EncryptingManagedDatastore::new(inner.clone(), provider));
+    let error = match ConfigBus::restore_or_new_dev_only(TestConfig::new("fallback"), reader).await
+    {
+        Ok(_) => panic!("rejected stored JSON must fence startup"),
+        Err(error) => error,
+    };
+    assert_eq!(error.code, StoreErrorCode::Crypto);
+    let alarms = error.alarm_manager().unwrap().active_alarms();
+    assert_eq!(alarms.len(), 1);
+    assert_eq!(
+        alarms[0].probable_cause,
+        opc_alarm::ProbableCause::StorageCorruption
+    );
+    assert_eq!(inner.history().await.len(), 1);
+}
+#[tokio::test]
+async fn rejected_legacy_stored_json_keeps_corruption_alarm() {
+    rejected_stored_json_keeps_corruption_alarm(b"{").await;
+}
+#[tokio::test]
+async fn rejected_v2_stored_json_keeps_corruption_alarm() {
+    rejected_stored_json_keeps_corruption_alarm(b"\x89OPCCFG\x02\r\n\x1a\n{").await;
 }

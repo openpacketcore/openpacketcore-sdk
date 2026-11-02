@@ -20,6 +20,8 @@ use std::time::{Duration, Instant};
 use hmac::{Hmac, KeyInit, Mac};
 #[cfg(any(target_os = "linux", all(test, unix)))]
 use rusqlite::Connection;
+#[cfg(target_os = "linux")]
+use rusqlite::OptionalExtension;
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 
@@ -603,6 +605,38 @@ fn validate_copy(
 }
 
 #[cfg(target_os = "linux")]
+fn retained_read_error(error: rusqlite::Error) -> RetainedConfigError {
+    retained_persist_error(crate::error::sqlite_read_error(error))
+}
+
+#[cfg(target_os = "linux")]
+fn retained_persist_error(error: crate::PersistError) -> RetainedConfigError {
+    match error.kind() {
+        crate::PersistErrorKind::CorruptBlob => RetainedConfigError::Rejected,
+        crate::PersistErrorKind::Unavailable
+        | crate::PersistErrorKind::PreflightFailed(_)
+        | crate::PersistErrorKind::RollbackNotFound
+        | crate::PersistErrorKind::WalRecoveryFailed
+        | crate::PersistErrorKind::AuditChainBroken
+        | crate::PersistErrorKind::InconsistentState(_)
+        | crate::PersistErrorKind::ForeignKeyViolation
+        | crate::PersistErrorKind::ConstraintViolation(_)
+        | crate::PersistErrorKind::RequestIdCollision
+        | crate::PersistErrorKind::ConfigHistoryCompacted
+        | crate::PersistErrorKind::ConfigHistoryFull
+        | crate::PersistErrorKind::ConfigHistoryProtected
+        | crate::PersistErrorKind::OutcomeUnknown
+        | crate::PersistErrorKind::PathNotWritable(_)
+        | crate::PersistErrorKind::DatabaseLocked
+        | crate::PersistErrorKind::OutOfSpace { .. }
+        | crate::PersistErrorKind::Io(_)
+        | crate::PersistErrorKind::SchemaVersionMismatch { .. }
+        | crate::PersistErrorKind::SchemaDigestMismatch { .. }
+        | crate::PersistErrorKind::Sqlite(_) => RetainedConfigError::Unavailable,
+    }
+}
+
+#[cfg(target_os = "linux")]
 fn validate_connection(
     conn: &Connection,
     options: &RetainedConfigOptions,
@@ -615,39 +649,35 @@ fn validate_connection(
         .map_err(|_| RetainedConfigError::Unavailable)?;
     let integrity: String = conn
         .query_row("PRAGMA integrity_check", [], |row| row.get(0))
-        .map_err(|_| RetainedConfigError::Rejected)?;
+        .map_err(retained_read_error)?;
     if integrity != "ok" {
         return Err(RetainedConfigError::Rejected);
     }
     // A digest supplied by the retained database is only a compatibility
     // check. The independent SDK catalog includes the exact replay index.
-    crate::schema::validate_retained_base_schema(conn)
-        .map_err(|_| RetainedConfigError::Rejected)?;
-    let version =
-        crate::schema::get_schema_version(conn).map_err(|_| RetainedConfigError::Rejected)?;
-    let digest =
-        crate::schema::get_schema_digest(conn).map_err(|_| RetainedConfigError::Rejected)?;
+    crate::schema::validate_retained_base_schema(conn).map_err(retained_persist_error)?;
+    let version = crate::schema::get_schema_version(conn).map_err(retained_read_error)?;
+    let digest = crate::schema::get_schema_digest(conn).map_err(retained_read_error)?;
     if version.as_deref() != Some(crate::schema::SCHEMA_VERSION)
-        || digest
-            != Some(
-                crate::schema::current_schema_digest(conn)
-                    .map_err(|_| RetainedConfigError::Rejected)?,
-            )
+        || digest != Some(crate::schema::current_schema_digest(conn).map_err(retained_read_error)?)
     {
         return Err(RetainedConfigError::Rejected);
     }
     let schema_matches: bool = conn.query_row(
         "SELECT COUNT(*) = 1 AND MIN(sql) = ?1 FROM sqlite_schema WHERE name GLOB 'consensus_retained_*' OR tbl_name = 'consensus_retained_binding'",
         [BINDING_SCHEMA], |row| row.get(0),
-    ).map_err(|_| RetainedConfigError::Rejected)?;
+    ).map_err(retained_read_error)?;
+    if !schema_matches {
+        return Err(RetainedConfigError::Rejected);
+    }
     let count: i64 = conn
         .query_row(
             "SELECT COUNT(*) FROM consensus_retained_binding",
             [],
             |row| row.get(0),
         )
-        .map_err(|_| RetainedConfigError::Rejected)?;
-    if !schema_matches || count != 1 {
+        .map_err(retained_read_error)?;
+    if count != 1 {
         return Err(RetainedConfigError::Rejected);
     }
     let stored: Vec<u8> = conn
@@ -656,7 +686,9 @@ fn validate_connection(
             [],
             |row| row.get(0),
         )
-        .map_err(|_| RetainedConfigError::Rejected)?;
+        .optional()
+        .map_err(retained_read_error)?
+        .ok_or(RetainedConfigError::Rejected)?;
     let stored: &[u8; RECORD_BYTES] = stored
         .as_slice()
         .try_into()
@@ -671,7 +703,18 @@ fn validate_connection(
         key,
         work.deadline,
     )
-    .map_err(|_| RetainedConfigError::Rejected)?;
+    .map_err(|error| match error {
+        crate::consensus::ConfigConsensusStorageError::BackendUnavailable => {
+            RetainedConfigError::Unavailable
+        }
+        crate::consensus::ConfigConsensusStorageError::CorruptState
+        | crate::consensus::ConfigConsensusStorageError::SchemaVersionMismatch
+        | crate::consensus::ConfigConsensusStorageError::IdentityMismatch
+        | crate::consensus::ConfigConsensusStorageError::InvalidIdentity
+        | crate::consensus::ConfigConsensusStorageError::RecoveryRequired => {
+            RetainedConfigError::Rejected
+        }
+    })?;
     conn.progress_handler(0, None::<fn() -> bool>)
         .map_err(|_| RetainedConfigError::Unavailable)?;
     work.check()

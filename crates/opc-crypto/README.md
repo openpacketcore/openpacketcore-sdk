@@ -20,8 +20,12 @@ encrypted with tenant/purpose-bound additional authenticated data.
 - `encrypt_envelope_with_nonce` and
   `encrypt_envelope_with_handle_and_nonce` are deterministic test-vector
   helpers. Do not use fixed nonces in production.
-- `CryptoError` is intentionally small: invalid envelope, encryption failure,
-  or decryption failure.
+- `CryptoError` distinguishes invalid envelope/authenticated-decryption failure,
+  positive provider `KeyRejected`, local `EncryptionFailed`, provider outages
+  and unusable provider configuration. Call `is_definitive_rejection()` before
+  treating an error as evidence against stored data. Local encryption failures
+  and unknown/nonterminal provider failures retain data. Bounded configuration
+  encryption preserves provider verdicts as `ConfigCapacityError::KeyRejected`.
 
 ```rust,no_run
 use opc_crypto::{decrypt_envelope, encrypt_envelope};

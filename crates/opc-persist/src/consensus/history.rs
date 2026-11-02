@@ -149,12 +149,18 @@ fn corrupt() -> io::Error {
     )
 }
 
-fn database_error(_: rusqlite::Error) -> io::Error {
-    io::Error::other("config history storage unavailable")
+fn database_error(error: rusqlite::Error) -> io::Error {
+    crate::error::sqlite_read_io_error(error)
 }
 
-fn persist_error(_: io::Error) -> PersistError {
-    PersistError::corrupt_blob()
+fn persist_error(error: io::Error) -> PersistError {
+    crate::error::history_read_error(error)
+}
+
+fn write_error(_: rusqlite::Error) -> io::Error {
+    io::Error::other(PersistError::inconsistent_state(
+        "config history write failed",
+    ))
 }
 
 fn history_mac(key: &AuditKey, bytes: &[u8]) -> io::Result<Hmac<Sha256>> {
@@ -328,15 +334,21 @@ pub(crate) fn validate_record_chain_sync(
 }
 
 fn save_state(conn: &Connection, key: &AuditKey, state: &HistoryState) -> io::Result<()> {
-    let encoded = serde_json::to_vec(state).map_err(|_| corrupt())?;
+    let encoded = serde_json::to_vec(state).map_err(|_| {
+        io::Error::other(PersistError::inconsistent_state(
+            "config history encoding failed",
+        ))
+    })?;
     if encoded.len() > STATE_MAX_BYTES {
-        return Err(corrupt());
+        return Err(io::Error::other(PersistError::inconsistent_state(
+            "config history encoding exceeds bound",
+        )));
     }
     let tag = history_mac(key, &encoded)?.finalize().into_bytes();
     conn.execute(
         "INSERT INTO config_raft_history_retention (singleton, state_json, state_hmac) VALUES (1, ?1, ?2) ON CONFLICT(singleton) DO UPDATE SET state_json = excluded.state_json, state_hmac = excluded.state_hmac",
         params![encoded, tag.as_slice()],
-    ).map_err(database_error)?;
+    ).map_err(write_error)?;
     Ok(())
 }
 
@@ -392,7 +404,9 @@ fn load_state(conn: &Connection, key: &AuditKey) -> io::Result<Option<HistorySta
             [],
             |row| Ok((row.get(0)?, row.get(1)?)),
         )
-        .map_err(database_error)?;
+        .optional()
+        .map_err(database_error)?
+        .ok_or_else(corrupt)?;
     if encoded.len() > STATE_MAX_BYTES {
         return Err(corrupt());
     }
@@ -403,7 +417,7 @@ fn load_state(conn: &Connection, key: &AuditKey) -> io::Result<Option<HistorySta
     let (cluster, configuration, epoch): (Vec<u8>, Vec<u8>, i64) = conn.query_row(
         "SELECT cluster_id, configuration_id, configuration_epoch FROM config_raft_identity WHERE singleton = 1",
         [], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
-    ).map_err(database_error)?;
+    ).optional().map_err(database_error)?.ok_or_else(corrupt)?;
     if state.format_version != 1
         || state.key_epoch != key.epoch()
         || state.identity.cluster_id().as_bytes().as_slice() != cluster
@@ -440,7 +454,7 @@ fn validate_state(conn: &Connection, state: &HistoryState) -> io::Result<()> {
         let (first_tx, first_version, parent, blob): (Vec<u8>, i64, Option<Vec<u8>>, Vec<u8>) = conn.query_row(
             "SELECT tx_id, version, parent_tx_id, encrypted_blob FROM config_history ORDER BY version ASC LIMIT 1",
             [], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
-        ).map_err(database_error)?;
+        ).optional().map_err(database_error)?.ok_or_else(corrupt)?;
         if first_tx != boundary.first.tx_id.as_uuid().as_bytes()
             || u64::try_from(first_version).ok() != Some(boundary.first.version.get())
             || parent.is_some()
@@ -562,6 +576,18 @@ pub(crate) fn validate_access_sync(
 ) -> io::Result<()> {
     if consensus_required || has_consensus_metadata_sync(conn)? {
         super::sqlite::validate_live_history_schema_sync(conn, cancellation)?;
+        for query in [
+            "SELECT EXISTS(SELECT 1 FROM config_raft_machine WHERE singleton = 1)",
+            "SELECT EXISTS(SELECT 1 FROM config_raft_membership WHERE singleton = 1)",
+            "SELECT EXISTS(SELECT 1 FROM config_raft_management_audit WHERE singleton = 1)",
+        ] {
+            let present: bool = conn
+                .query_row(query, [], |row| row.get(0))
+                .map_err(database_error)?;
+            if !present {
+                return Err(corrupt());
+            }
+        }
     }
     let Some(state) = load_state(conn, key)? else {
         return if consensus_required {
@@ -614,7 +640,9 @@ pub(crate) fn refresh_sync(
                 [next.tx_id.as_uuid().as_bytes().as_slice()],
                 |row| Ok((row.get(0)?, row.get(1)?)),
             )
-            .map_err(database_error)?;
+            .optional()
+            .map_err(database_error)?
+            .ok_or_else(corrupt)?;
         if !updates_existing_records {
             state.record_chain = extend_record_chain(
                 state.record_chain,
@@ -732,7 +760,9 @@ pub(crate) fn retain_sync(
                 [from - 1],
                 |row| row.get(0),
             )
-            .map_err(database_error)?;
+            .optional()
+            .map_err(database_error)?
+            .ok_or_else(corrupt)?;
         if previous != parent {
             return Err(corrupt());
         }
@@ -748,11 +778,11 @@ pub(crate) fn retain_sync(
             "UPDATE config_history SET parent_tx_id = NULL WHERE tx_id = ?1",
             [&first_tx],
         )
-        .map_err(database_error)?;
-        conn.execute("DELETE FROM audit_trail WHERE tx_id IN (SELECT tx_id FROM config_history WHERE version < ?1)", [from]).map_err(database_error)?;
-        conn.execute("DELETE FROM config_lifecycle_audit WHERE tx_id IN (SELECT tx_id FROM config_history WHERE version < ?1)", [from]).map_err(database_error)?;
+        .map_err(write_error)?;
+        conn.execute("DELETE FROM audit_trail WHERE tx_id IN (SELECT tx_id FROM config_history WHERE version < ?1)", [from]).map_err(write_error)?;
+        conn.execute("DELETE FROM config_lifecycle_audit WHERE tx_id IN (SELECT tx_id FROM config_history WHERE version < ?1)", [from]).map_err(write_error)?;
         conn.execute("DELETE FROM config_history WHERE version < ?1", [from])
-            .map_err(database_error)?;
+            .map_err(write_error)?;
         state.record_chain = record_chain_sync(conn, cancellation)?;
     }
     state.records = record_count(conn)?;

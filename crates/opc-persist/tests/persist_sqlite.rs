@@ -950,8 +950,8 @@ async fn load_latest_fails_closed_on_corrupt_timestamp() {
         .await
         .expect_err("load_latest should fail on corrupt timestamp");
     assert!(
-        matches!(err.kind(), PersistErrorKind::InconsistentState(_)),
-        "expected InconsistentState for corrupt timestamp, got: {err:?}"
+        matches!(err.kind(), PersistErrorKind::CorruptBlob),
+        "expected CorruptBlob for corrupt timestamp, got: {err:?}"
     );
 }
 
@@ -986,8 +986,8 @@ async fn load_latest_fails_closed_on_corrupt_commit_source() {
         .await
         .expect_err("load_latest should fail on corrupt CommitSource");
     assert!(
-        matches!(err.kind(), PersistErrorKind::InconsistentState(_)),
-        "expected InconsistentState for corrupt source, got: {err:?}"
+        matches!(err.kind(), PersistErrorKind::CorruptBlob),
+        "expected CorruptBlob for corrupt source, got: {err:?}"
     );
 }
 
@@ -1105,8 +1105,8 @@ async fn load_latest_fails_closed_on_negative_version() {
         .await
         .expect_err("load_latest should fail on negative version");
     assert!(
-        matches!(err.kind(), PersistErrorKind::InconsistentState(_)),
-        "expected InconsistentState for negative version, got: {err:?}"
+        matches!(err.kind(), PersistErrorKind::CorruptBlob),
+        "expected CorruptBlob for negative version, got: {err:?}"
     );
 }
 
@@ -1147,8 +1147,8 @@ async fn load_latest_fails_closed_on_corrupt_confirmed_deadline() {
         .await
         .expect_err("load_latest should fail on corrupt confirmed_deadline");
     assert!(
-        matches!(err.kind(), PersistErrorKind::InconsistentState(_)),
-        "expected InconsistentState for corrupt confirmed_deadline, got: {err:?}"
+        matches!(err.kind(), PersistErrorKind::CorruptBlob),
+        "expected CorruptBlob for corrupt confirmed_deadline, got: {err:?}"
     );
 }
 
@@ -1189,7 +1189,7 @@ async fn load_latest_fails_closed_on_corrupt_confirmed_at() {
         .await
         .expect_err("load_latest should fail on corrupt confirmed_at");
     assert!(
-        matches!(err.kind(), PersistErrorKind::InconsistentState(_)),
-        "expected InconsistentState for corrupt confirmed_at, got: {err:?}"
+        matches!(err.kind(), PersistErrorKind::CorruptBlob),
+        "expected CorruptBlob for corrupt confirmed_at, got: {err:?}"
     );
 }

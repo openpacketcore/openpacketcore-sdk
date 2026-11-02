@@ -44,7 +44,7 @@ pub fn canonical_failure(error: Canonical) -> Remedy {
         | Canonical::QualificationFailed
         | Canonical::ValidationOptInRequired
         | Canonical::IntegrationReviewRequired => Remedy::RefuseEpoch,
-        _ => Remedy::RefuseEpoch,
+        _ => Remedy::Wait,
     }
 }
 fn window_failure(error: Window) -> Remedy {
@@ -56,7 +56,17 @@ fn window_failure(error: Window) -> Remedy {
             Remedy::Wait
         }
         Window::CommitUncertain => Remedy::Resolve,
-        _ => Remedy::RefuseEpoch,
+        Window::DomainMismatch
+        | Window::InvalidRecord
+        | Window::CommitMismatch
+        | Window::Exhausted
+        | Window::LivenessExpired
+        | Window::LivenessClock
+        | Window::LivenessRecoveryRequired
+        | Window::SyncClosed
+        | Window::OutcomeUncertain => Remedy::RefuseEpoch,
+        // Withhold effects while an unclassified refusal is investigated.
+        _ => Remedy::Wait,
     }
 }
 
@@ -216,5 +226,18 @@ impl Cleanup {
         }
         self.owner.revoke();
         Ok(())
+    }
+}
+
+#[test]
+fn unavailable_sync_and_backoff_do_not_refuse_the_epoch() {
+    for error in [
+        Window::SyncUnavailable,
+        Window::SyncEntropy,
+        Window::LivenessBackoff,
+        Window::LivenessRetryLimit,
+        Window::SyncInProgress,
+    ] {
+        assert_eq!(window_failure(error), Remedy::Wait);
     }
 }

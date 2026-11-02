@@ -7,6 +7,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- `opc-persist`: missing mandatory configuration-history, machine, membership,
+  and audit rows are rejected before history reads and runtime apply. Typed
+  query errors in checkpoint row reads, retained catalog validation and backend
+  metadata probes preserve read outages as unavailable. Earlier SQLite open and
+  integrity-check result interpretation are unchanged. `create_rollback_point`
+  reports `RollbackNotFound` for an absent target.
+- `opc-key`, `opc-crypto`, `opc-key-vault`, `opc-session-store`,
+  `opc-config-bus`, `opc-persist`: only positive key/ciphertext evidence authorizes
+  protected-data rejection. The exhaustive `KeyError::is_definitive_rejection`
+  predicate keeps every custody state and unclassified failure nonterminal.
+  KMS verdicts require recognized structured reasons, never diagnostic text.
+  Malformed provider output, authentication/configuration faults and local
+  encryption failures retain rows and pending work. Vault configuration faults
+  avoid transient retries; TLS `internal_error` remains an outage. Checkpoint
+  sealing and reading emit repair diagnostics. Rollback alarms preserve actual
+  data evidence without inferring corruption from unavailable dependencies.
+  `EncryptedPayload` debug output redacts AAD and ciphertext. Refs #1197.
+- `opc-session-net`: custom `KeyProviderUnavailable` results remain non-definitive
+  across CAS, legacy mutations and expiry preflight. Positive deterministic store
+  results are explicit; unknown failures retain ambiguity rather than becoming
+  a cached final rejection. Refs #1197.
+
 ### Added
 
 - `opc-proto-ikev2`: typed RFC 5685 REDIRECT_SUPPORTED, REDIRECT and
@@ -780,6 +804,74 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   through the shared one-second throttle and recover on a later successful
   refresh. Downstream exhaustive matches must handle the new variants.
   Refs #1246.
+
+- `opc-key`: add fieldless `KeyError::OperationFailed` and `ProviderUnusable`,
+  and the exhaustive positive-verdict predicate. Only `NotFound` and actual
+  key revocation/ciphertext rejection are definitive; every custody state and
+  unknown failure retains data. Custody now preserves positive `OperationFailed`
+  distinctly, and generic provider failures change from
+  `CustodyOperation(ProviderOperationFailed)` to `ProviderUnusable`. The SDK no
+  longer produces `ProviderOperationFailed` while converting provider errors.
+  JSON KMS `status: "error"` now requires exact `reason: "key_not_found"`,
+  `"key_revoked"`, or `"ciphertext_rejected"` (decrypt only) for a verdict.
+  Neither an `error` without a recognized reason nor any free-form `not found`
+  substring authorizes cleanup. Older providers lose precision until upgraded,
+  never retained data. Exact `status: "unavailable"` remains outage backpressure.
+  Newly rejected endpoint forms accepted by released versions are relative
+  `unix://` paths, `unix://\0` abstract sockets, repeated TCP/Unix prefixes and
+  existing non-socket paths. Refs #1197.
+- `opc-crypto`: add `ProviderUnavailable`, `ProviderUnusable` and `KeyRejected`
+  to `CryptoError` and `ConfigCapacityError`. Non-verdict provider failures no
+  longer become generic encryption/decryption rejection. Positive provider
+  verdicts use `KeyRejected`; local `EncryptionFailed` alone does not establish
+  rejected stored data. Callers use `CryptoError::is_definitive_rejection()`;
+  both enums remain non-exhaustive. `EncryptionFailureKind` and
+  `CryptoError::encryption_failure_kind()` expose the exhaustive classification
+  used for encryption diagnostics. Refs #1197.
+- `opc-session-store`: the new unreleased `KeyProviderUnavailable` variant keeps
+  its serialized position. Non-verdict key/custody failures and malformed remote
+  sealing responses return `BackendUnavailable`; positive key/data rejection
+  remains `Crypto`. Custom backend outages receive ambiguous mutation handling
+  in `opc-session-net`, including legacy preflight. No session wire positions
+  change. Refs #1197.
+- `opc-config-bus`: non-verdict provider failures change from `Crypto` to
+  `Unavailable`, so configuration watches retry instead of returning terminal
+  `ConfigWatchError::Integrity`. Unavailable dependencies and coarse failed or
+  unresolved commits use `ConfigApplyFailed` alarms; rollback retains a
+  `StorageCorruption` cause only when the original store error supplies positive
+  data evidence. Idempotency and retained-history unavailability return
+  `PersistFailed`; startup rollback preserves an already Critical source code
+  and otherwise retains its Critical recovery fence. Missing or revoked active
+  keys on new writes return `Unavailable`, without claiming
+  stored data damage. Coarse state-machine, recovery and startup task failures
+  use `ConfigApplyFailed`. Runtime append, reconciliation and recovery-marker
+  cleanup retain the source store code. Rejected stored JSON and metadata retain
+  `Crypto`; all store codes at startup rollback parent reads, appends and
+  marker clears retain Critical severity. Non-corruption codes retain
+  `ConfigApplyFailed`. A later read outage
+  does not replace stored-data evidence from an earlier append failure. Alarm
+  severity and recovery fencing remain intact.
+  Refs #1197.
+- `opc-persist`: checkpoint reopen/read-back provider failures change from
+  `Rejected` to `Unavailable`, preserving the checkpoint. Sealing and provisioning
+  also report repairable provider faults. Provisioning after storage preparation
+  retains its existing `Indeterminate` outcome. Config-history reads distinguish
+  rejected bytes (including SQLite corruption) from read outages at the storage
+  boundary, preserving the first read failure across transaction completion.
+  Missing mandatory authority rows remain corruption; missing live tables in
+  standalone stores are permanent invariant failures rather than retryable
+  outages. Consensus schema rejection remains corruption. Plain commits
+  refused by an initialized required-audit policy report a local conflict;
+  existing persisted rejection classes retain their meanings.
+  Refs #1197.
+- `opc-key-vault`: configuration/authentication, malformed-response and TLS
+  verification failures use `ProviderUnusable` and avoid transient retries.
+  Truncated response bodies retain outage retries except after successful
+  rotation responses: a truncated 2xx body is reported without replaying the
+  already-applied rotation POST. Rotation preserves
+  `Unavailable` versus `ProviderUnusable` instead of returning `RotationFailed`.
+  Outages, throttling and peer TLS internal errors remain `Unavailable`.
+  HTTP error messages cannot establish key or ciphertext rejection. Refs #1197.
 - `opc-session-store` and `opc-session-net`: protected-roster activation now
   binds the admission capacity policy, and authenticated admissions distinguish
   ordinary and emergency work. Crossing this storage boundary requires a fresh
@@ -1899,20 +1991,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   local journal preflight failure by checking the exact original binding on
   the next status call. Local failures still return immediately, and retries
   cannot adopt a substituted row or restore mutation authority. (#1378)
-
-- `opc-session-store`: local and remote envelope operations report key-provider
-  outages as retryable `BackendUnavailable`; unknown keys, invalid envelopes
-  and authentication failures retain their coarse crypto errors. (#1197)
-  `opc-key` reports AEAD rejection and completed KMS denials as fieldless
-  `KeyError::OperationFailed`, keeping them separate from provider outages.
-  Local configuration errors, including invalid TCP endpoints, missing TLS
-  connectors and invalid TLS server names, are permanent operation failures.
-  Both JSON KMS adapters retain absolute Unix paths, `unix://<path>`, bare
-  `host:port` and optional `tcp://` prefixes, including IPv4 and bracketed,
-  scoped or unbracketed numeric IPv6. Resolver-supported `u16` ports with a
-  leading `+` remain accepted. Hosts containing NUL, control characters or
-  whitespace fail permanently; resolution and connection failures remain
-  retryable availability errors.
 
 - `opc-session-store`: explicitly release WAL root locks when opening fails or
   the writer exits, so duplicated descriptors cannot block a successor after

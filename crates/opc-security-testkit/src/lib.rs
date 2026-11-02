@@ -267,6 +267,7 @@ async fn handle_kms_stream<S>(
             purpose: Option<String>,
             tenant: Option<String>,
             error_message: Option<String>,
+            reason: Option<String>,
         }
 
         let resp = if beh.simulate_error {
@@ -277,6 +278,7 @@ async fn handle_kms_stream<S>(
                 purpose: None,
                 tenant: None,
                 error_message: Some("simulated error".to_string()),
+                reason: None,
             }
         } else {
             match req.request_type.as_str() {
@@ -299,6 +301,7 @@ async fn handle_kms_stream<S>(
                                 purpose: Some(purpose),
                                 tenant: Some(tenant),
                                 error_message: None,
+                                reason: None,
                             }
                         } else {
                             KmsResponse {
@@ -308,6 +311,7 @@ async fn handle_kms_stream<S>(
                                 purpose: None,
                                 tenant: None,
                                 error_message: Some("not found".to_string()),
+                                reason: Some("key_not_found".to_string()),
                             }
                         }
                     } else {
@@ -318,6 +322,7 @@ async fn handle_kms_stream<S>(
                             purpose: None,
                             tenant: None,
                             error_message: Some("not found".to_string()),
+                            reason: Some("key_not_found".to_string()),
                         }
                     }
                 }
@@ -332,6 +337,7 @@ async fn handle_kms_stream<S>(
                             purpose: Some(entry.purpose.clone()),
                             tenant: Some(entry.tenant.clone()),
                             error_message: None,
+                            reason: None,
                         }
                     } else {
                         KmsResponse {
@@ -341,6 +347,7 @@ async fn handle_kms_stream<S>(
                             purpose: None,
                             tenant: None,
                             error_message: Some("not found".to_string()),
+                            reason: Some("key_not_found".to_string()),
                         }
                     }
                 }
@@ -379,6 +386,7 @@ async fn handle_kms_stream<S>(
                         purpose: None,
                         tenant: None,
                         error_message: None,
+                        reason: None,
                     }
                 }
                 _ => KmsResponse {
@@ -388,6 +396,7 @@ async fn handle_kms_stream<S>(
                     purpose: None,
                     tenant: None,
                     error_message: Some("unknown request type".to_string()),
+                    reason: None,
                 },
             }
         };
