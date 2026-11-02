@@ -189,6 +189,21 @@ impl std::ops::DerefMut for Edit {
 
 impl Edit {
     pub(super) fn new(ledger: &Ledger, rows: usize, partitions: usize) -> io::Result<Self> {
+        Self::with_reservation(ledger, rows, partitions, VerificationMemory::reserve_journal)
+    }
+
+    // Full admission is checkpoint work, not a retained live journal. Keep
+    // its exact allocation charge within the unchanged process allowance.
+    pub(super) fn empty_for_admission() -> io::Result<Self> {
+        Self::with_reservation(&Ledger::empty(), 0, 0, VerificationMemory::reserve)
+    }
+
+    fn with_reservation(
+        ledger: &Ledger,
+        rows: usize,
+        partitions: usize,
+        reserve: impl FnOnce(usize) -> io::Result<VerificationMemory>,
+    ) -> io::Result<Self> {
         let base = Arc::clone(ledger.certificate()?);
         // Includes the candidate vectors, both journal hash tables during
         // transfer/growth, and certificate/reference metadata. Actual row
@@ -202,7 +217,7 @@ impl Edit {
                 })
                 .and_then(|bytes| bytes.checked_add(4 * size_of::<Certificate>() + 1024))
                 .ok_or_else(|| invalid("native roster change allocation overflow"))?;
-        let memory = Arc::new(VerificationMemory::reserve_journal(bytes)?);
+        let memory = Arc::new(reserve(bytes)?);
         Ok(Self {
             ledger: ledger.clone(),
             tables: base.tables,
