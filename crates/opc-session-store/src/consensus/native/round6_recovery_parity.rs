@@ -94,10 +94,7 @@ async fn recovery_driver(seed: u64, coalesced: bool, inclusive: bool, local: boo
         let template = live.lease().key().clone();
         let clock = Arc::new(ReplayClock(std::sync::Mutex::new(time(2))));
         let fake = replay_prefix(&native, clock.clone()).await;
-        let mut journal = native
-            .business
-            .replication_log(1, 4096, &|| Ok(()))
-            .unwrap();
+        let mut journal = journal_page_for_test(&native, 1, 4096).await;
         let mut watch = SessionStore::new(fake.clone())
             .watch(fake.max_replication_sequence().await.unwrap() + 1)
             .await

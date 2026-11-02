@@ -10,6 +10,9 @@
 mod requests;
 #[path = "fenced_transition_v2_qualification/resources.rs"]
 mod resources;
+#[cfg(target_os = "linux")]
+#[path = "fenced_transition_v2_qualification/retained_snapshot.rs"]
+mod retained_snapshot;
 use requests::*;
 use resources::*;
 
@@ -1764,6 +1767,36 @@ async fn fixed_cluster_with_snapshot_integrity_and_persistence(
     Vec<std::path::PathBuf>,
     Vec<Arc<ScopedLoopbackPeer>>,
 ) {
+    let (stores, database_paths, snapshot_paths, peer_slots) =
+        open_fixed_cluster_with_snapshot_integrity_and_persistence(
+            directory,
+            snapshot_root,
+            clock,
+            snapshot_integrity,
+            persistence,
+        )
+        .await;
+    for result in
+        futures_util::future::join_all(stores.iter().map(ConsensusSessionStore::initialize_cluster))
+            .await
+    {
+        result.expect("initialize fixed durable quorum");
+    }
+    (stores, database_paths, snapshot_paths, peer_slots)
+}
+
+async fn open_fixed_cluster_with_snapshot_integrity_and_persistence(
+    directory: &Path,
+    snapshot_root: &Path,
+    clock: Arc<dyn Clock>,
+    snapshot_integrity: opc_session_store::SnapshotIntegrityPolicy,
+    persistence: opc_session_store::SessionPersistenceMode,
+) -> (
+    Vec<ConsensusSessionStore>,
+    Vec<std::path::PathBuf>,
+    Vec<std::path::PathBuf>,
+    Vec<Arc<ScopedLoopbackPeer>>,
+) {
     let placement_policy = PlacementResiliencePolicy::default();
     let members = members();
     let identity = fixed_identity(&members, placement_policy);
@@ -1821,12 +1854,6 @@ async fn fixed_cluster_with_snapshot_integrity_and_persistence(
     }
     for ((_, target), peer) in &paths {
         peer.install(stores[*target].rpc_handler()).await;
-    }
-    for result in
-        futures_util::future::join_all(stores.iter().map(ConsensusSessionStore::initialize_cluster))
-            .await
-    {
-        result.expect("initialize fixed durable quorum");
     }
     let peer_slots = paths.into_values().collect();
     (stores, database_paths, snapshot_paths, peer_slots)

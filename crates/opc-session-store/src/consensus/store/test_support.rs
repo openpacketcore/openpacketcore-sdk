@@ -2600,6 +2600,39 @@ pub fn consensus_native_current_snapshot_for_test(
     ))
 }
 
+/// Join every owned engine and storage lane without certifying a completed
+/// close. This fixture leaves the next asynchronous incarnation subject to
+/// ordinary cold admission; it grants no recovery authority and edits no file.
+#[cfg(target_os = "linux")]
+pub async fn shutdown_consensus_without_close_proof_for_test(
+    store: &ConsensusSessionStore,
+) -> Result<(), StoreError> {
+    store.shutdown_with_closed_proof(false).await
+}
+
+/// Observe the live native installation authority in either persistence mode.
+/// This reads the real owner without SQL or an admission predicate. A volatile
+/// observation is not evidence of durable publication or crash recovery.
+#[cfg(target_os = "linux")]
+pub fn consensus_native_snapshot_install_origin_for_test(
+    store: &ConsensusSessionStore,
+) -> std::io::Result<(bool, Option<String>)> {
+    let Some(wal) = store
+        .inner
+        .private_wal
+        .as_ref()
+        .filter(|wal| wal.is_native())
+    else {
+        return Ok((false, None));
+    };
+    let origin = wal.with_native_read(|state| {
+        Ok(state
+            .snapshot_install_origin_for_test()
+            .map(|current| current.1))
+    })?;
+    Ok((true, origin))
+}
+
 /// A scoped fixture fault. Explicit restoration reports errors; drop also
 /// attempts restoration during an unwinding test. No fault is persistent
 /// corruption evidence except the separately read-back filesystem latch.

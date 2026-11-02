@@ -4259,7 +4259,7 @@ impl SqliteSessionBackend {
         let sqlite_limit =
             i64::try_from(range.limit()).map_err(|_| StoreError::InvalidReplicationLogRange)?;
         self.run_store_sqlite_task(SqliteStoreWorkKind::Read, move |conn| {
-            let invalidation_floor = consensus::read_watch_cursor_invalidation_floor_sync(conn)
+            let invalidation_floor = consensus::read_replication_cursor_floor_sync(conn)
                 .map_err(|_| StoreError::BackendUnavailable("session store read failed".into()))?;
             range.ensure_not_compacted(invalidation_floor)?;
             let mut stmt = conn

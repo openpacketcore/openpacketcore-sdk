@@ -211,3 +211,80 @@ fn native_notification_retention_survives_full_image_round_trip() {
     assert_eq!(delivered, WATCH_WINDOW);
     assert_eq!(next, watch + 1);
 }
+
+/// An admitted complete window whose first row is a real committed recovery.
+/// Padding isolates physical snapshot coordinates from mutation workload cost.
+pub(crate) fn retained_recovery_notification_fixture() -> (NativeStorage, u64) {
+    let mut storage =
+        crate::consensus::native::key_retention_tests::explicit_replay_policy_fixture();
+    let mut original = Vec::new();
+    NativeNotification::visit_export(
+        &storage.business.notifications,
+        &storage.business.frontiers,
+        &|| Ok(()),
+        &mut |entry| {
+            original.push(owned::notification(entry)?);
+            Ok(())
+        },
+    )
+    .unwrap();
+    let first = original
+        .iter()
+        .find(|entry| {
+            matches!(
+                entry.replay_policy.recovery,
+                crate::ReplicationRecoveryBoundary::Recover { .. }
+            )
+        })
+        .unwrap()
+        .sequence;
+    let mut policy = crate::ReplicationReplayPolicy::preserve();
+    policy.async_fence_floor = storage.business.frontiers.async_fence_floor();
+    let head = first + WATCH_WINDOW as u64 - 1;
+    storage.business.notifications.clear();
+    for sequence in first..=head {
+        let entry = original
+            .iter()
+            .find(|entry| entry.sequence == sequence)
+            .cloned()
+            .unwrap_or_else(|| ReplicationEntry {
+                sequence,
+                tx_id: ReplicationTxId::from_request_bytes(u128::from(sequence).to_be_bytes()),
+                timestamp: time(6),
+                replay_policy: policy,
+                op: crate::ReplicationOp::Batch { ops: Vec::new() },
+            });
+        storage
+            .business
+            .notifications
+            .push_back(NotificationRow::new(NativeNotification::new(entry)).unwrap());
+    }
+    storage.business.frontiers.watch_sequence = head;
+    storage.business.frontiers.retention.watch_retired_through = first - 1;
+    storage.business.admit_business().unwrap();
+    storage.log.admit(&storage.business).unwrap();
+    storage.validate_image().unwrap();
+    (storage, first)
+}
+
+pub(crate) fn notify_after_retained_recovery_reopen(storage: &mut NativeStorage) {
+    let mut key = changes::tests::request(1, None).lease().key().clone();
+    key.stable_id = bytes::Bytes::from_static(b"notify-after-retained-recovery-reopen")
+        .try_into()
+        .unwrap();
+    let index = storage.business.applied().unwrap().index + 1;
+    let mut entry = crate::consensus::native::key_retention_tests::command_at(
+        index,
+        SessionMutationIntent::AcquireLease {
+            key,
+            owner: crate::OwnerId::new("recovery-retention-owner").unwrap(),
+            ttl: Duration::from_secs(60),
+        },
+        time(8),
+    );
+    entry.log_id.leader_id = storage.business.applied().unwrap().leader_id;
+    let applied = changes::tests::apply(storage, &[entry]);
+    assert!(applied.responses[0].result.is_ok());
+    assert_eq!(applied.notifications.len(), 1);
+    storage.validate_image().unwrap();
+}

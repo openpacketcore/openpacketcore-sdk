@@ -16,7 +16,8 @@
     "crossed-rekey test and is estimated at 1900s; the remainder is estimated at",
     "1300s. Reserve 800s for compilation/setup (observed max 781s), placing the",
     "longest lane near 75% of the unchanged 60m cap. Remeasure on hosted CI.",
-    "All recovery matrices keep their original four-thread profile and bounds."
+    "All recovery matrices keep their original four-thread profile and bounds.",
+    "The full-window portable snapshot proofs run alone in checked O1 and retain their literal row counts and operation guards."
   ],
   "integration_shards": 5,
   "default_weight": 1.5,
@@ -76,7 +77,7 @@
     "dynamic_membership": 95,
     "empty_recovery": 2,
     "fenced_transition_v2_consensus": 22,
-    "fenced_transition_v2_qualification": 54,
+    "fenced_transition_v2_qualification": 600,
     "fixed_quorum_authority": 151,
     "generated_features": 50,
     "generated_lint_matrix": 352,

@@ -898,6 +898,16 @@ impl NativeState {
         self.frontiers.current_snapshot.clone()
     }
 
+    /// Live installation authority; observing it does not prove durability.
+    #[cfg(feature = "test-control")]
+    pub(crate) fn snapshot_install_origin_for_test(
+        &self,
+    ) -> Option<crate::sqlite::consensus::CurrentSnapshot> {
+        self.snapshot_origin
+            .as_ref()
+            .map(|origin| origin.candidate().clone())
+    }
+
     pub(crate) fn retained_snapshots(&self) -> Vec<crate::sqlite::consensus::CurrentSnapshot> {
         let mut retained = self
             .snapshot_origin

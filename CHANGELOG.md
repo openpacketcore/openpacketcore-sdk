@@ -223,6 +223,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Portable snapshots validate retained notification rows against the committed
+  retirement frontier and physical watch head. Operator recovery invalidation
+  remains separate. Pre-format snapshots are refused; compatibility is not
+  required for this undeployed format. Stores above 65,536 notifications written
+  by an older build cannot reopen in place and require a fresh installation.
+- SQLite reads, local writes and replay require a decodable newest journal row.
+  An undecodable newest row requires `rebuild_replication_state` before those
+  operations can resume.
+
 - GTP-U N3 native and reassembled paths now reject BSSI/TTNBI conditional
   fields consistently with the codec. Required RAN/PDCP extensions retain
   Supported Extension Headers Notification authority despite known syntax.

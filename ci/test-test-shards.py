@@ -459,6 +459,36 @@ class ScopePayloadSerialPhaseTests(unittest.TestCase):
             TEST_SHARDS.verify_commands(self.plan, self.targets)
 
 
+class RetainedSnapshotProfileTests(unittest.TestCase):
+    def test_retained_snapshot_listing_uses_the_execution_profile(self):
+        name = TEST_SHARDS.QUIESCENT_RETAINED_SNAPSHOT_TESTS[0]
+        command = TEST_SHARDS.quiescent_retained_snapshot_command(name)
+        self.assertIn("CARGO_PROFILE_TEST_OPT_LEVEL=1", command)
+        self.assertIn("CARGO_PROFILE_TEST_DEBUG_ASSERTIONS=true", command)
+        self.assertIn("CARGO_PROFILE_TEST_OVERFLOW_CHECKS=true", command)
+        self.assertIn("--test-threads=1", command)
+        result = type("Result", (), {"stdout": name + ": test\n"})()
+        with patch.object(TEST_SHARDS.subprocess, "run", return_value=result) as run:
+            self.assertEqual(TEST_SHARDS.list_quiescent_test(
+                TEST_SHARDS.QUIESCENT_RETAINED_SNAPSHOT_TARGET, name), [name])
+        cut = command.index("--")
+        self.assertEqual(run.call_args.args[0],
+                         command[:cut + 1] + ["--list"] + command[cut + 1:])
+
+    def test_verifier_catches_a_dropped_snapshot_profile(self):
+        plan = TEST_SHARDS.load_plan()
+        targets = TEST_SHARDS.integration_targets()
+        original = TEST_SHARDS.commands
+        def dropped(plan, shard, targets):
+            commands = original(plan, shard, targets)
+            return [command[4:] if command[:1] == ["env"] and
+                    TEST_SHARDS.QUIESCENT_RETAINED_SNAPSHOT_TESTS[0] in command
+                    else command for command in commands]
+        with patch.object(TEST_SHARDS, "commands", side_effect=dropped), \
+                self.assertRaisesRegex(SystemExit, "isolated timing contracts"):
+            TEST_SHARDS.verify_commands(plan, targets)
+
+
 class IntegrationBalanceTests(unittest.TestCase):
     def plan(self):
         return {

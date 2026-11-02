@@ -587,3 +587,9 @@ diagnostic measurements select the execution profile; qualification still runs
 the complete 131,073-roster proof. Its timing output separates fixture creation,
 Q1/Q2 application, batch preparation/readback and every final persistence and
 cold-reopen stage.
+
+The two full-window portable snapshot proofs use separate test processes in the
+checked O1 profile, with debug assertions and overflow checks enabled. Their
+65,536 / 65,537 / 65,538 boundaries and operation guards remain literal. The
+planner lists them in the execution profile and excludes only those exact names
+from the ordinary target remainder.
