@@ -5,6 +5,29 @@ use opc_session_store::{RestoreScanCursor, RestoreScanPage};
 
 const PHASES: [&str; 2] = ["traffic_restore_scan", "recovery_restore_scan"];
 
+#[test]
+fn qualification_mutation_reply_keeps_backend_failures_unavailable() {
+    for error in [
+        StoreError::BackendUnavailable("backend down".into()),
+        StoreError::KeyProviderUnavailable("provider down".into()),
+        StoreError::BackendOperationOutcomeUnavailable,
+        StoreError::CasIdempotencyOutcomeUnavailable,
+        StoreError::Crypto("crypto unavailable".into()),
+        StoreError::Serialization("record unavailable".into()),
+    ] {
+        assert_eq!(
+            map_store_error(&error),
+            QualificationNodeErrorCode::BackendUnavailable,
+            "{} must keep its backend failure classification",
+            error.variant_name(),
+        );
+    }
+    assert_eq!(
+        map_store_error(&StoreError::NotFound),
+        QualificationNodeErrorCode::MutationRejected,
+    );
+}
+
 fn exact_page() -> (StoredSessionRecord, RestoreScanPage) {
     let key = qualification_traffic_key(0).unwrap();
     let expected = expected_traffic_record(&key, 37, 3, 0, 1, 1).unwrap();

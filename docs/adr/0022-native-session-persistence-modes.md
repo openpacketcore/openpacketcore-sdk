@@ -215,8 +215,8 @@ Live delivery keeps all committed notifications and sequence numbers continue
 across retirement. Crossing this stored-format boundary is a fresh install.
 Portable snapshots validate the committed retention frontier against the raw
 watch head; operator recovery invalidation is independent. Pre-format snapshots
-are refused. An older build's store above 65,536 notifications cannot reopen in
-place and needs a fresh installation.
+are refused. Every native store written by an earlier build requires a fresh
+installation and cannot reopen in place, regardless of its notification count.
 
 Ordinary dead-key retirement shares this pre-release format boundary. Committed
 metadata records the key epoch, previous and current absent-key floors, and the
@@ -372,13 +372,10 @@ Physical row reclamation removes the accumulated-row lifetime limit. The
 The selected generation retains the 32 GiB Durable and 8 GiB Async per-file
 validation limits. Size-triggered rollover below replaces accumulated append
 history with a compact base before those limits are reached.
-Stalled snapshot work and failed local builds are different
-cases: a failed local build is retried under a fixed bounded attempt budget and keeps
-the engine running on the unchanged published snapshot (SDK #1254); only an
-indeterminate publication state or a store with no published snapshot at all
-stops the engine. The bounded attempt/backoff, value-free failure classification
-and duplicate-build degradation are documented in the `opc-session-store`
-README. Generation-file rollover does not change ordinary-receipt retention
+Stalled snapshot work and failed local builds are different cases; any failed
+local build still stops the engine. Build/install recovery remains deferred
+until retained-log admission exists and is qualified. Generation-file rollover
+does not change ordinary-receipt retention
 or live-state limits. The key-retirement and notification-window policies are
 specified in the retention sections above.
 

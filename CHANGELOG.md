@@ -274,8 +274,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Portable snapshots validate retained notification rows against the committed
   retirement frontier and physical watch head. Operator recovery invalidation
   remains separate. Pre-format snapshots are refused; compatibility is not
-  required for this undeployed format. Stores above 65,536 notifications written
-  by an older build cannot reopen in place and require a fresh installation.
+  required for this undeployed format. Every native store written by an earlier
+  build is refused and requires a fresh installation, regardless of its
+  notification count.
 - SQLite reads, local writes and replay require a decodable newest journal row.
   An undecodable newest row requires `rebuild_replication_state` before those
   operations can resume.

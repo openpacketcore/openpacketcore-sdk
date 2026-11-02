@@ -87,14 +87,17 @@ impl KeyRetention {
         self.floor_cur.max(async_floor)
     }
 
+    #[cfg(any(target_os = "linux", feature = "lab-memory", test))]
     pub(crate) fn accepts_absent_fence(self, expected: u64, async_floor: u64) -> bool {
         expected == self.floor_prev.max(async_floor) || expected == self.floor_cur.max(async_floor)
     }
 
+    #[cfg(target_os = "linux")]
     pub(crate) fn retains_epoch(self, retired_epoch: u64) -> bool {
         retired_epoch == self.epoch || self.epoch.checked_sub(1) == Some(retired_epoch)
     }
 
+    #[cfg(target_os = "linux")]
     pub(crate) fn valid_retired_fence(self, retired_epoch: u64, fence: u64) -> bool {
         self.retains_epoch(retired_epoch)
             && if retired_epoch == self.epoch {
@@ -104,6 +107,7 @@ impl KeyRetention {
             }
     }
 
+    #[cfg(any(target_os = "linux", test))]
     pub(crate) fn valid(self, next_fence: u64) -> bool {
         self.floor_prev <= self.floor_cur
             && self.floor_cur < next_fence

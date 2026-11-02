@@ -6137,6 +6137,7 @@ fn map_lease_error(error: &LeaseError) -> QualificationNodeErrorCode {
 fn map_store_error(error: &StoreError) -> QualificationNodeErrorCode {
     match error {
         StoreError::BackendUnavailable(_)
+        | StoreError::KeyProviderUnavailable(_)
         | StoreError::BackendOperationOutcomeUnavailable
         | StoreError::CasIdempotencyOutcomeUnavailable
         | StoreError::Crypto(_)

@@ -37,6 +37,7 @@ impl LocalQuiescence {
     }
 }
 impl EffectGate {
+    #[cfg(any(target_os = "linux", test))]
     pub(super) fn new() -> Self {
         Self {
             phase: AtomicU8::new(CANDIDATE),
