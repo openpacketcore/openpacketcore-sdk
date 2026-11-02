@@ -271,6 +271,40 @@ async fn rollback_point_read_outage_is_unavailable() {
 }
 
 #[tokio::test]
+async fn unknown_rollback_point_target_is_not_found_without_writes() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("rollback.sqlite");
+    let backend =
+        SqliteBackend::open_with_audit_key(&path, true, 0, AuditKey::new([0x64; 32]).unwrap())
+            .await
+            .unwrap();
+    let (record, audit, _) = commit(TxId::new(), None, 1, false).into_parts();
+    backend.append_commit(record, audit).await.unwrap();
+    let before = std::fs::read(&path).unwrap();
+    let wal_before = std::fs::read(path.with_extension("sqlite-wal")).unwrap();
+    let mut errors = Vec::new();
+    for label in [None, Some("missing-target".to_owned())] {
+        errors.push(
+            backend
+                .create_rollback_point(TxId::new(), label)
+                .await
+                .unwrap_err(),
+        );
+    }
+    assert_eq!(std::fs::read(&path).unwrap(), before);
+    assert_eq!(
+        std::fs::read(path.with_extension("sqlite-wal")).unwrap(),
+        wal_before
+    );
+    assert!(
+        errors
+            .iter()
+            .all(|error| matches!(error.kind(), crate::PersistErrorKind::RollbackNotFound)),
+        "{errors:?}"
+    );
+}
+
+#[tokio::test]
 async fn append_replay_digest_read_outage_is_unavailable() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("replay.sqlite");

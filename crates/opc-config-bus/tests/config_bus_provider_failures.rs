@@ -161,17 +161,40 @@ async fn startup_rollback_failure_code(stage: &'static str, code: StoreErrorCode
     };
     assert_eq!(
         error.code,
-        if code == StoreErrorCode::NotFound {
-            StoreErrorCode::RestoreRecoveryRequired
-        } else {
-            code
+        match code {
+            StoreErrorCode::NotFound
+            | StoreErrorCode::StartupSyntaxValidationFailed
+            | StoreErrorCode::StartupSemanticValidationFailed
+            | StoreErrorCode::HistoryPageTooLarge
+            | StoreErrorCode::HistoryCompacted
+            | StoreErrorCode::HistoryCursorAhead => {
+                if stage == "rollback" {
+                    StoreErrorCode::RestoreConfirmedDeadline
+                } else {
+                    StoreErrorCode::RestoreRecoveryRequired
+                }
+            }
+            StoreErrorCode::Unavailable
+            | StoreErrorCode::OutcomeUnknown
+            | StoreErrorCode::Internal
+            | StoreErrorCode::Crypto
+            | StoreErrorCode::RestoreSchemaMismatch
+            | StoreErrorCode::RestoreRecoveryRequired
+            | StoreErrorCode::RestoreConfirmedDeadline
+            | StoreErrorCode::StartupValidationTaskFailed
+            | StoreErrorCode::InvalidHistorySequence => code,
         }
     );
     let alarms = error.alarm_manager().unwrap().active_alarms();
     assert_eq!(alarms.len(), 1);
     assert_eq!(
         alarms[0].probable_cause,
-        if code == StoreErrorCode::Crypto {
+        if matches!(
+            code,
+            StoreErrorCode::Crypto
+                | StoreErrorCode::RestoreSchemaMismatch
+                | StoreErrorCode::InvalidHistorySequence
+        ) {
             ProbableCause::StorageCorruption
         } else {
             ProbableCause::ConfigApplyFailed
@@ -615,4 +638,230 @@ async fn corrupt_append_evidence_survives_unavailable_reconciliation() {
         .await
         .unwrap_err();
     assert_eq!(fenced.code, CommitErrorCode::RecoveryRequired);
+}
+
+#[tokio::test]
+async fn startup_rollback_matrix_rollback_not_found() {
+    startup_rollback_failure_code("rollback", StoreErrorCode::NotFound).await;
+}
+
+#[tokio::test]
+async fn startup_rollback_matrix_rollback_unavailable() {
+    startup_rollback_failure_code("rollback", StoreErrorCode::Unavailable).await;
+}
+
+#[tokio::test]
+async fn startup_rollback_matrix_rollback_outcome_unknown() {
+    startup_rollback_failure_code("rollback", StoreErrorCode::OutcomeUnknown).await;
+}
+
+#[tokio::test]
+async fn startup_rollback_matrix_rollback_internal() {
+    startup_rollback_failure_code("rollback", StoreErrorCode::Internal).await;
+}
+
+#[tokio::test]
+async fn startup_rollback_matrix_rollback_crypto() {
+    startup_rollback_failure_code("rollback", StoreErrorCode::Crypto).await;
+}
+
+#[tokio::test]
+async fn startup_rollback_matrix_rollback_restore_schema_mismatch() {
+    startup_rollback_failure_code("rollback", StoreErrorCode::RestoreSchemaMismatch).await;
+}
+
+#[tokio::test]
+async fn startup_rollback_matrix_rollback_restore_recovery_required() {
+    startup_rollback_failure_code("rollback", StoreErrorCode::RestoreRecoveryRequired).await;
+}
+
+#[tokio::test]
+async fn startup_rollback_matrix_rollback_restore_confirmed_deadline() {
+    startup_rollback_failure_code("rollback", StoreErrorCode::RestoreConfirmedDeadline).await;
+}
+
+#[tokio::test]
+async fn startup_rollback_matrix_rollback_startup_syntax_validation_failed() {
+    startup_rollback_failure_code("rollback", StoreErrorCode::StartupSyntaxValidationFailed).await;
+}
+
+#[tokio::test]
+async fn startup_rollback_matrix_rollback_startup_semantic_validation_failed() {
+    startup_rollback_failure_code("rollback", StoreErrorCode::StartupSemanticValidationFailed)
+        .await;
+}
+
+#[tokio::test]
+async fn startup_rollback_matrix_rollback_startup_validation_task_failed() {
+    startup_rollback_failure_code("rollback", StoreErrorCode::StartupValidationTaskFailed).await;
+}
+
+#[tokio::test]
+async fn startup_rollback_matrix_rollback_history_page_too_large() {
+    startup_rollback_failure_code("rollback", StoreErrorCode::HistoryPageTooLarge).await;
+}
+
+#[tokio::test]
+async fn startup_rollback_matrix_rollback_invalid_history_sequence() {
+    startup_rollback_failure_code("rollback", StoreErrorCode::InvalidHistorySequence).await;
+}
+
+#[tokio::test]
+async fn startup_rollback_matrix_rollback_history_compacted() {
+    startup_rollback_failure_code("rollback", StoreErrorCode::HistoryCompacted).await;
+}
+
+#[tokio::test]
+async fn startup_rollback_matrix_rollback_history_cursor_ahead() {
+    startup_rollback_failure_code("rollback", StoreErrorCode::HistoryCursorAhead).await;
+}
+
+#[tokio::test]
+async fn startup_rollback_matrix_append_not_found() {
+    startup_rollback_failure_code("append", StoreErrorCode::NotFound).await;
+}
+
+#[tokio::test]
+async fn startup_rollback_matrix_append_unavailable() {
+    startup_rollback_failure_code("append", StoreErrorCode::Unavailable).await;
+}
+
+#[tokio::test]
+async fn startup_rollback_matrix_append_outcome_unknown() {
+    startup_rollback_failure_code("append", StoreErrorCode::OutcomeUnknown).await;
+}
+
+#[tokio::test]
+async fn startup_rollback_matrix_append_internal() {
+    startup_rollback_failure_code("append", StoreErrorCode::Internal).await;
+}
+
+#[tokio::test]
+async fn startup_rollback_matrix_append_crypto() {
+    startup_rollback_failure_code("append", StoreErrorCode::Crypto).await;
+}
+
+#[tokio::test]
+async fn startup_rollback_matrix_append_restore_schema_mismatch() {
+    startup_rollback_failure_code("append", StoreErrorCode::RestoreSchemaMismatch).await;
+}
+
+#[tokio::test]
+async fn startup_rollback_matrix_append_restore_recovery_required() {
+    startup_rollback_failure_code("append", StoreErrorCode::RestoreRecoveryRequired).await;
+}
+
+#[tokio::test]
+async fn startup_rollback_matrix_append_restore_confirmed_deadline() {
+    startup_rollback_failure_code("append", StoreErrorCode::RestoreConfirmedDeadline).await;
+}
+
+#[tokio::test]
+async fn startup_rollback_matrix_append_startup_syntax_validation_failed() {
+    startup_rollback_failure_code("append", StoreErrorCode::StartupSyntaxValidationFailed).await;
+}
+
+#[tokio::test]
+async fn startup_rollback_matrix_append_startup_semantic_validation_failed() {
+    startup_rollback_failure_code("append", StoreErrorCode::StartupSemanticValidationFailed).await;
+}
+
+#[tokio::test]
+async fn startup_rollback_matrix_append_startup_validation_task_failed() {
+    startup_rollback_failure_code("append", StoreErrorCode::StartupValidationTaskFailed).await;
+}
+
+#[tokio::test]
+async fn startup_rollback_matrix_append_history_page_too_large() {
+    startup_rollback_failure_code("append", StoreErrorCode::HistoryPageTooLarge).await;
+}
+
+#[tokio::test]
+async fn startup_rollback_matrix_append_invalid_history_sequence() {
+    startup_rollback_failure_code("append", StoreErrorCode::InvalidHistorySequence).await;
+}
+
+#[tokio::test]
+async fn startup_rollback_matrix_append_history_compacted() {
+    startup_rollback_failure_code("append", StoreErrorCode::HistoryCompacted).await;
+}
+
+#[tokio::test]
+async fn startup_rollback_matrix_append_history_cursor_ahead() {
+    startup_rollback_failure_code("append", StoreErrorCode::HistoryCursorAhead).await;
+}
+
+#[tokio::test]
+async fn startup_rollback_matrix_clear_not_found() {
+    startup_rollback_failure_code("clear", StoreErrorCode::NotFound).await;
+}
+
+#[tokio::test]
+async fn startup_rollback_matrix_clear_unavailable() {
+    startup_rollback_failure_code("clear", StoreErrorCode::Unavailable).await;
+}
+
+#[tokio::test]
+async fn startup_rollback_matrix_clear_outcome_unknown() {
+    startup_rollback_failure_code("clear", StoreErrorCode::OutcomeUnknown).await;
+}
+
+#[tokio::test]
+async fn startup_rollback_matrix_clear_internal() {
+    startup_rollback_failure_code("clear", StoreErrorCode::Internal).await;
+}
+
+#[tokio::test]
+async fn startup_rollback_matrix_clear_crypto() {
+    startup_rollback_failure_code("clear", StoreErrorCode::Crypto).await;
+}
+
+#[tokio::test]
+async fn startup_rollback_matrix_clear_restore_schema_mismatch() {
+    startup_rollback_failure_code("clear", StoreErrorCode::RestoreSchemaMismatch).await;
+}
+
+#[tokio::test]
+async fn startup_rollback_matrix_clear_restore_recovery_required() {
+    startup_rollback_failure_code("clear", StoreErrorCode::RestoreRecoveryRequired).await;
+}
+
+#[tokio::test]
+async fn startup_rollback_matrix_clear_restore_confirmed_deadline() {
+    startup_rollback_failure_code("clear", StoreErrorCode::RestoreConfirmedDeadline).await;
+}
+
+#[tokio::test]
+async fn startup_rollback_matrix_clear_startup_syntax_validation_failed() {
+    startup_rollback_failure_code("clear", StoreErrorCode::StartupSyntaxValidationFailed).await;
+}
+
+#[tokio::test]
+async fn startup_rollback_matrix_clear_startup_semantic_validation_failed() {
+    startup_rollback_failure_code("clear", StoreErrorCode::StartupSemanticValidationFailed).await;
+}
+
+#[tokio::test]
+async fn startup_rollback_matrix_clear_startup_validation_task_failed() {
+    startup_rollback_failure_code("clear", StoreErrorCode::StartupValidationTaskFailed).await;
+}
+
+#[tokio::test]
+async fn startup_rollback_matrix_clear_history_page_too_large() {
+    startup_rollback_failure_code("clear", StoreErrorCode::HistoryPageTooLarge).await;
+}
+
+#[tokio::test]
+async fn startup_rollback_matrix_clear_invalid_history_sequence() {
+    startup_rollback_failure_code("clear", StoreErrorCode::InvalidHistorySequence).await;
+}
+
+#[tokio::test]
+async fn startup_rollback_matrix_clear_history_compacted() {
+    startup_rollback_failure_code("clear", StoreErrorCode::HistoryCompacted).await;
+}
+
+#[tokio::test]
+async fn startup_rollback_matrix_clear_history_cursor_ahead() {
+    startup_rollback_failure_code("clear", StoreErrorCode::HistoryCursorAhead).await;
 }

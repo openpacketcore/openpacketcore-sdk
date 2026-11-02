@@ -136,6 +136,123 @@ async fn missing_history_identity_row_keeps_corruption_alarm() {
     missing_history_authority_row("config_raft_identity").await;
 }
 
+async fn missing_runtime_authority_row(table: &str) {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("config.sqlite");
+    let persistence = backend(&path).await;
+    let node = ConfigConsensusNodeId::new(1).unwrap();
+    let identity = ConfigConsensusIdentity::new(
+        ConfigConsensusClusterId::new("runtime-storage-failures").unwrap(),
+        ConfigConsensusConfigurationId::from_bytes([0x70; 32]),
+        ConfigConsensusConfigurationEpoch::new(1).unwrap(),
+    );
+    let topology =
+        ConfigConsensusTopology::try_new(identity, node, BTreeSet::from([node])).unwrap();
+    let consensus = Arc::new(
+        ConsensusConfigStore::open_with_operation_timeout(
+            topology,
+            persistence.clone(),
+            directory.path().join("snapshots"),
+            BTreeMap::new(),
+            Duration::from_secs(3),
+        )
+        .await
+        .unwrap(),
+    );
+    consensus.initialize_cluster().await.unwrap();
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while consensus.probe_durable_readiness().await.is_err() {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    let source = Arc::new(EncryptingManagedDatastore::new(
+        Arc::new(RaftManagedDatastore::<TestConfig>::new_local_authority(
+            consensus.clone(),
+        )),
+        provider(),
+    ));
+    source
+        .append_commit_write(CommitWrite::new(record(TxId::new(), "stored")))
+        .await
+        .unwrap();
+    let bus = ConfigBus::restore_or_new_dev_only(
+        TestConfig {
+            name: "fallback".into(),
+        },
+        source,
+    )
+    .await
+    .unwrap();
+    let initial_name = bus.load().name.clone();
+    let conn = rusqlite::Connection::open(&path).unwrap();
+    assert_eq!(
+        conn.execute(&format!("DELETE FROM {table}"), []).unwrap(),
+        1
+    );
+    let error = bus
+        .submit(
+            CommitRequest::commit(
+                RequestId::new(),
+                principal(),
+                TransportType::Internal,
+                RequestSource::Northbound,
+                ConfigOperation::Replace,
+                TestConfig {
+                    name: "refused".into(),
+                },
+                Vec::new(),
+                Instant::now() + Duration::from_secs(10),
+            )
+            .with_base_version(ConfigVersion::new(1)),
+        )
+        .await
+        .unwrap_err();
+    let read = ConfigStore::load_latest(&persistence).await;
+    let alarms = bus.alarm_manager().active_alarms();
+    assert_eq!(alarms.len(), 1);
+    assert_eq!(bus.load().name, initial_name);
+    assert_eq!(
+        conn.query_row("SELECT COUNT(*) FROM config_history", [], |row| row
+            .get::<_, i64>(0))
+            .unwrap(),
+        1
+    );
+    // The damaged consensus engine can already be stopped after apply rejects it.
+    let _ = consensus.shutdown().await;
+    assert_eq!(
+        (
+            error.code,
+            format!("{:?}", alarms[0].severity),
+            format!("{:?}", alarms[0].probable_cause),
+            matches!(&read, Err(error) if matches!(error.kind(), PersistErrorKind::CorruptBlob)),
+        ),
+        (
+            opc_config_model::CommitErrorCode::StateMachineFault,
+            "Major".to_owned(),
+            "StorageCorruption".to_owned(),
+            true,
+        ),
+        "{table}: {read:?}"
+    );
+}
+
+#[tokio::test]
+async fn missing_runtime_machine_row_keeps_corruption_alarm() {
+    missing_runtime_authority_row("config_raft_machine").await;
+}
+
+#[tokio::test]
+async fn missing_runtime_membership_row_keeps_corruption_alarm() {
+    missing_runtime_authority_row("config_raft_membership").await;
+}
+
+#[tokio::test]
+async fn missing_runtime_audit_row_keeps_corruption_alarm() {
+    missing_runtime_authority_row("config_raft_management_audit").await;
+}
+
 #[tokio::test]
 async fn rejected_stored_digest_length_keeps_corruption_alarm() {
     let directory = tempfile::tempdir().unwrap();
