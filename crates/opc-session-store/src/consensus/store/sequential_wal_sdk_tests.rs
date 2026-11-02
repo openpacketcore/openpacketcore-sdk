@@ -460,7 +460,22 @@ impl Fleet {
             .iter()
             .filter_map(|store| store.inner.private_wal.clone())
             .collect::<Vec<_>>();
-        let results = join_all(self.stores.iter().map(ConsensusSessionStore::shutdown)).await;
+        let results = join_all(self.stores.iter().map(|store| async {
+            let result = store.shutdown().await;
+            if result.is_err() {
+                // A caller deadline leaves the same drain running. Cleanup
+                // must join that retained condition before releasing handles;
+                // its final error still fails the original orderly assertion.
+                let completion = store.inner.shutdown.start_or_subscribe(
+                    Arc::clone(&store.inner),
+                    true,
+                );
+                super::await_consensus_session_store_shutdown(completion).await
+            } else {
+                result
+            }
+        }))
+        .await;
         for peer in &self.peers {
             *peer.handler.write().await = None;
         }
