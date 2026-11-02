@@ -774,3 +774,38 @@ fn scope_authority_commands_do_not_trigger_unrelated_roster_maintenance() {
         sql_row(&sql, binding)
     );
 }
+
+// Admission headroom belongs to snapshot verification as well as live edits.
+// Isolate the real process counter so parallel tests cannot spend this probe.
+#[test]
+fn native_empty_roster_snapshot_validation_uses_checkpoint_headroom() {
+    const CHILD: &str = "OPC_NATIVE_CHECKPOINT_HEADROOM_TEST_CHILD";
+    if std::env::var_os(CHILD).is_none() {
+        let name = format!(
+            "{}::native_empty_roster_snapshot_validation_uses_checkpoint_headroom",
+            module_path!().split_once("::").unwrap().1,
+        );
+        let status = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", &name, "--nocapture", "--test-threads=1"])
+            .env(CHILD, "1")
+            .status()
+            .unwrap();
+        assert!(status.success(), "checkpoint headroom child must pass");
+        return;
+    }
+    use crate::consensus::verified_snapshot::{VerificationMemory, PROCESS_VERIFICATION_BYTES};
+    let (storage, _, _) = crate::consensus::native::changes::tests::fixture();
+    assert!(storage.business.roster_root.is_none());
+    assert!(storage.business.roster.rows.is_empty());
+    let used = VerificationMemory::used_bytes();
+    let occupied = PROCESS_VERIFICATION_BYTES * 7 / 8 + 64 * 1024;
+    let _held = VerificationMemory::reserve(occupied.checked_sub(used).unwrap()).unwrap();
+    storage
+        .validate_image()
+        .expect("snapshot validation must use its reserved checkpoint headroom");
+    assert_eq!(VerificationMemory::used_bytes(), occupied);
+    let admitted = storage.business.admit_full_roster(&|| Ok(())).unwrap();
+    assert_eq!(admitted.certificate().unwrap().counts(), [0, 0]);
+    assert_eq!(admitted.witness, storage.business.roster.witness);
+    assert_eq!(VerificationMemory::used_bytes(), occupied);
+}

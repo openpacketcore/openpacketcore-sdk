@@ -484,6 +484,39 @@ impl Fleet {
     }
 }
 
+#[cfg(feature = "test-vfs")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn fleet_cleanup_observes_a_drain_after_a_shutdown_caller_deadline() {
+    let _timing_permit = crate::acquire_consensus_timing_test_permit().await;
+    let mut fleet = Fleet::new_native("cleanup-retained-drain");
+    fleet.open().await;
+    let store = fleet.stores[0].clone();
+    let hold = store.hold_raft_shutdown_before_core_for_test();
+    let gate = Arc::clone(&hold.gate);
+    let closing = tokio::spawn(async move { fleet.close().await });
+    assert!(tokio::task::spawn_blocking(move || {
+        gate.wait_until_entered(super::DEFAULT_SESSION_CONSENSUS_OPERATION_TIMEOUT)
+    })
+    .await
+    .unwrap());
+    // The fixture's first caller is already waiting at the held drain. This
+    // later observer must spend its complete unchanged public deadline too.
+    assert_eq!(store.shutdown().await, Err(super::consensus_unavailable()));
+    drop(hold);
+    store
+        .shutdown()
+        .await
+        .expect("released shared drain completes");
+    let wals = closing.await.expect("fixture cleanup waits for the drain");
+    assert_eq!(wals.len(), 3);
+    for wal in wals {
+        assert_eq!(
+            wal.integration_observations().unwrap()["writer_joined"],
+            true
+        );
+    }
+}
+
 fn test_result_after_shutdown<T, U>(
     result: std::thread::Result<T>,
     shutdown: std::thread::Result<U>,
