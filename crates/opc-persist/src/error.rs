@@ -231,7 +231,11 @@ pub(crate) fn sqlite_read_error(error: rusqlite::Error) -> PersistError {
 
 /// Preserve the source classification across the consensus I/O interface.
 pub(crate) fn sqlite_read_io_error(error: rusqlite::Error) -> std::io::Error {
-    let error = sqlite_read_error(error);
+    persist_read_io_error(sqlite_read_error(error))
+}
+
+/// Carry an existing read classification without deriving a new verdict.
+pub(crate) fn persist_read_io_error(error: PersistError) -> std::io::Error {
     let kind = if matches!(error.kind(), PersistErrorKind::CorruptBlob) {
         std::io::ErrorKind::InvalidData
     } else {

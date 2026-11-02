@@ -404,7 +404,9 @@ fn load_state(conn: &Connection, key: &AuditKey) -> io::Result<Option<HistorySta
             [],
             |row| Ok((row.get(0)?, row.get(1)?)),
         )
-        .map_err(database_error)?;
+        .optional()
+        .map_err(database_error)?
+        .ok_or_else(corrupt)?;
     if encoded.len() > STATE_MAX_BYTES {
         return Err(corrupt());
     }
@@ -415,7 +417,7 @@ fn load_state(conn: &Connection, key: &AuditKey) -> io::Result<Option<HistorySta
     let (cluster, configuration, epoch): (Vec<u8>, Vec<u8>, i64) = conn.query_row(
         "SELECT cluster_id, configuration_id, configuration_epoch FROM config_raft_identity WHERE singleton = 1",
         [], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
-    ).map_err(database_error)?;
+    ).optional().map_err(database_error)?.ok_or_else(corrupt)?;
     if state.format_version != 1
         || state.key_epoch != key.epoch()
         || state.identity.cluster_id().as_bytes().as_slice() != cluster
@@ -452,7 +454,7 @@ fn validate_state(conn: &Connection, state: &HistoryState) -> io::Result<()> {
         let (first_tx, first_version, parent, blob): (Vec<u8>, i64, Option<Vec<u8>>, Vec<u8>) = conn.query_row(
             "SELECT tx_id, version, parent_tx_id, encrypted_blob FROM config_history ORDER BY version ASC LIMIT 1",
             [], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
-        ).map_err(database_error)?;
+        ).optional().map_err(database_error)?.ok_or_else(corrupt)?;
         if first_tx != boundary.first.tx_id.as_uuid().as_bytes()
             || u64::try_from(first_version).ok() != Some(boundary.first.version.get())
             || parent.is_some()
@@ -626,7 +628,9 @@ pub(crate) fn refresh_sync(
                 [next.tx_id.as_uuid().as_bytes().as_slice()],
                 |row| Ok((row.get(0)?, row.get(1)?)),
             )
-            .map_err(database_error)?;
+            .optional()
+            .map_err(database_error)?
+            .ok_or_else(corrupt)?;
         if !updates_existing_records {
             state.record_chain = extend_record_chain(
                 state.record_chain,
@@ -744,7 +748,9 @@ pub(crate) fn retain_sync(
                 [from - 1],
                 |row| row.get(0),
             )
-            .map_err(database_error)?;
+            .optional()
+            .map_err(database_error)?
+            .ok_or_else(corrupt)?;
         if previous != parent {
             return Err(corrupt());
         }

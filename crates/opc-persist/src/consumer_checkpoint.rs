@@ -12,7 +12,7 @@ use std::time::{Duration, Instant};
 use opc_crypto::{decrypt_envelope, encrypt_envelope};
 use opc_key::{ConsumerCheckpointAad, EnvelopeAad, KeyProvider};
 use opc_types::{SchemaDigest, SpiffeId, TenantId};
-use rusqlite::Connection;
+use rusqlite::{Connection, OptionalExtension};
 use sha2::{Digest, Sha256};
 use zeroize::Zeroizing;
 
@@ -909,7 +909,7 @@ fn prepare_files(
             .map_err(|_| ConsumerCheckpointError::Unavailable)?;
         let integrity: String = conn
             .query_row("PRAGMA integrity_check", [], |r| r.get(0))
-            .map_err(|_| ConsumerCheckpointError::Rejected)?;
+            .map_err(checkpoint_read_error)?;
         if integrity != "ok" {
             return Err(ConsumerCheckpointError::Rejected);
         }
@@ -1004,6 +1004,14 @@ fn finish_open(
     Ok(BackendConnection::retained(conn, prepared.admission))
 }
 
+// Only a read that actually rejected stored data authorizes Rejected.
+fn checkpoint_read_error(error: rusqlite::Error) -> ConsumerCheckpointError {
+    match crate::error::sqlite_read_error(error).kind() {
+        crate::PersistErrorKind::CorruptBlob => ConsumerCheckpointError::Rejected,
+        _ => ConsumerCheckpointError::Unavailable,
+    }
+}
+
 fn configure_connection(
     conn: &Connection,
     options: &ConsumerCheckpointOptions,
@@ -1015,7 +1023,7 @@ fn configure_connection(
     crate::schema::apply_pragma_profile(conn).map_err(|_| ConsumerCheckpointError::Unavailable)?;
     let page_size: u64 = conn
         .pragma_query_value(None, "page_size", |r| r.get(0))
-        .map_err(|_| ConsumerCheckpointError::Rejected)?;
+        .map_err(checkpoint_read_error)?;
     if page_size != SQLITE_PAGE_BYTES {
         return Err(ConsumerCheckpointError::Rejected);
     }
@@ -1029,7 +1037,7 @@ fn configure_connection(
     .map_err(|_| ConsumerCheckpointError::Unavailable)?;
     let pages: u64 = conn
         .pragma_query_value(None, "max_page_count", |r| r.get(0))
-        .map_err(|_| ConsumerCheckpointError::Rejected)?;
+        .map_err(checkpoint_read_error)?;
     if pages > (options.max_storage_bytes - STORAGE_RESERVE_BYTES) / (3 * SQLITE_PAGE_BYTES) {
         return Err(ConsumerCheckpointError::Limit);
     }
@@ -1052,7 +1060,7 @@ fn read_row(
             [SCHEMA],
             |r| r.get(0),
         )
-        .map_err(|_| ConsumerCheckpointError::Rejected)?;
+        .map_err(checkpoint_read_error)?;
     if !schema_ok {
         return Err(ConsumerCheckpointError::Rejected);
     }
@@ -1062,7 +1070,7 @@ fn read_row(
             [],
             |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
         )
-        .map_err(|_| ConsumerCheckpointError::Rejected)?;
+        .map_err(checkpoint_read_error)?;
     if count != 1
         || generation <= 0
         || length <= 0
@@ -1076,7 +1084,9 @@ fn read_row(
             [],
             |r| r.get(0),
         )
-        .map_err(|_| ConsumerCheckpointError::Rejected)?;
+        .optional()
+        .map_err(checkpoint_read_error)?
+        .ok_or(ConsumerCheckpointError::Rejected)?;
     Ok(EncodedRow {
         generation: generation as u64,
         envelope,

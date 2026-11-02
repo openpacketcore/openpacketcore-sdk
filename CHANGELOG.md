@@ -9,6 +9,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- `opc-persist`: missing mandatory configuration-history and consensus-state
+  rows retain their corruption classification. Checkpoint, retained-database and
+  backend admission readers preserve read outages as unavailable while rejecting
+  invalid stored data and schema.
 - `opc-key`, `opc-crypto`, `opc-key-vault`, `opc-session-store`,
   `opc-config-bus`, `opc-persist`: only positive key/ciphertext evidence authorizes
   protected-data rejection. The exhaustive `KeyError::is_definitive_rejection`

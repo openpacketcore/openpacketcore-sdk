@@ -1415,26 +1415,29 @@ fn validate_existing_schema(
 ) -> Result<(), ConfigConsensusStorageError> {
     // The format marker is authoritative before inspecting a schema or identity
     // belonging to another format. Crossing this boundary requires a fresh install.
+    if !table_exists(conn, "config_raft_identity").map_err(storage_sqlite_read_error)? {
+        return Err(ConfigConsensusStorageError::CorruptState);
+    }
     let version: i64 = conn
         .query_row(
             "SELECT schema_version FROM config_raft_identity WHERE singleton = 1",
             [],
             |row| row.get(0),
         )
-        .map_err(|_| ConfigConsensusStorageError::CorruptState)?;
+        .optional()
+        .map_err(storage_sqlite_read_error)?
+        .ok_or(ConfigConsensusStorageError::CorruptState)?;
     if version != i64::from(CONFIG_CONSENSUS_STORAGE_VERSION) {
         return Err(ConfigConsensusStorageError::SchemaVersionMismatch);
     }
     for table in RAFT_TABLES {
         cancellation.check()?;
-        if !table_exists(conn, table)
-            .map_err(|_| ConfigConsensusStorageError::BackendUnavailable)?
-        {
+        if !table_exists(conn, table).map_err(storage_sqlite_read_error)? {
             return Err(ConfigConsensusStorageError::CorruptState);
         }
     }
-    let schema_manifest_digest = config_schema_manifest_digest(conn, cancellation)
-        .map_err(|_| ConfigConsensusStorageError::CorruptState)?;
+    let schema_manifest_digest =
+        config_schema_manifest_digest(conn, cancellation).map_err(storage_read_error)?;
     let row = conn
         .query_row(
             "SELECT schema_version, cluster_id, configuration_id, configuration_epoch, audit_key_epoch, audit_key_fingerprint, schema_manifest_digest FROM config_raft_identity WHERE singleton = 1",
@@ -1442,7 +1445,7 @@ fn validate_existing_schema(
             |row| Ok((row.get::<_, i64>(0)?, row.get::<_, Vec<u8>>(1)?, row.get::<_, Vec<u8>>(2)?, row.get::<_, i64>(3)?, row.get::<_, i64>(4)?, row.get::<_, Vec<u8>>(5)?, row.get::<_, Vec<u8>>(6)?)),
         )
         .optional()
-        .map_err(|_| ConfigConsensusStorageError::BackendUnavailable)?
+        .map_err(storage_sqlite_read_error)?
         .ok_or(ConfigConsensusStorageError::CorruptState)?;
     if row.0 != i64::from(CONFIG_CONSENSUS_STORAGE_VERSION) {
         return Err(ConfigConsensusStorageError::SchemaVersionMismatch);
@@ -1462,23 +1465,21 @@ fn validate_existing_schema(
         .query_row("SELECT COUNT(*) FROM config_raft_machine", [], |row| {
             row.get(0)
         })
-        .map_err(|_| ConfigConsensusStorageError::BackendUnavailable)?;
+        .map_err(storage_sqlite_read_error)?;
     let membership_rows: i64 = conn
         .query_row("SELECT COUNT(*) FROM config_raft_membership", [], |row| {
             row.get(0)
         })
-        .map_err(|_| ConfigConsensusStorageError::BackendUnavailable)?;
+        .map_err(storage_sqlite_read_error)?;
     if machine_rows != 1 || membership_rows != 1 {
         return Err(ConfigConsensusStorageError::CorruptState);
     }
-    let membership = read_membership_unchecked_sync(conn, identity)
-        .map_err(|_| ConfigConsensusStorageError::CorruptState)?;
+    let membership = read_membership_unchecked_sync(conn, identity).map_err(storage_read_error)?;
     if !is_pristine_membership(&membership) {
         voter_slots::validate_membership_sync(conn, &membership, expected_members, false)
-            .map_err(|_| ConfigConsensusStorageError::CorruptState)?;
+            .map_err(storage_read_error)?;
     }
-    read_vote_sync(conn, identity, expected_members)
-        .map_err(|_| ConfigConsensusStorageError::CorruptState)?;
+    read_vote_sync(conn, identity, expected_members).map_err(storage_read_error)?;
     cancellation.check()?;
     validate_durable_log_state_sync(
         conn,
@@ -1487,9 +1488,8 @@ fn validate_existing_schema(
         allow_detached_snapshot,
         cancellation,
     )
-    .map_err(|_| ConfigConsensusStorageError::CorruptState)?;
-    validate_sealed_state_sync(conn, audit_key, cancellation)
-        .map_err(|_| ConfigConsensusStorageError::CorruptState)
+    .map_err(storage_read_error)?;
+    validate_sealed_state_sync(conn, audit_key, cancellation).map_err(storage_read_error)
 }
 
 const CONFIG_SCHEMA_OBJECTS: &str = "SELECT type, name, tbl_name, sql FROM main.sqlite_schema \
@@ -1586,12 +1586,8 @@ pub(super) fn validate_live_history_schema_sync(
     if unexpected {
         return Err(invalid_data("config history schema is not admitted"));
     }
-    crate::schema::validate_retained_base_schema(conn).map_err(|error| match error {
-        // The schema validator uses InvalidQuery solely for a compared
-        // catalog mismatch. Allocation and I/O failures are not evidence.
-        rusqlite::Error::InvalidQuery => invalid_data("config history base schema does not match"),
-        error => crate::error::sqlite_read_io_error(error),
-    })?;
+    crate::schema::validate_retained_base_schema(conn)
+        .map_err(crate::error::persist_read_io_error)?;
     config_schema_manifest_digest(conn, cancellation)?;
     cancellation.check_io()
 }
@@ -1625,6 +1621,21 @@ pub(crate) fn invalid_data(message: &'static str) -> io::Error {
 
 fn timed_out(message: &'static str) -> io::Error {
     io::Error::new(io::ErrorKind::TimedOut, message)
+}
+
+fn storage_read_error(error: io::Error) -> ConfigConsensusStorageError {
+    match crate::error::history_read_error(error).kind() {
+        crate::PersistErrorKind::CorruptBlob => ConfigConsensusStorageError::CorruptState,
+        _ => ConfigConsensusStorageError::BackendUnavailable,
+    }
+}
+
+fn storage_sqlite_read_error(error: rusqlite::Error) -> ConfigConsensusStorageError {
+    storage_read_error(read_db_error(error))
+}
+
+fn read_db_error(error: rusqlite::Error) -> io::Error {
+    crate::error::sqlite_read_io_error(error)
 }
 
 fn db_error(_: rusqlite::Error) -> io::Error {
@@ -1759,7 +1770,7 @@ pub(crate) fn read_vote_sync(
             |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?, row.get::<_, Option<i64>>(2)?, row.get::<_, Vec<u8>>(3)?)),
         )
         .optional()
-        .map_err(db_error)?;
+        .map_err(read_db_error)?;
     let Some((epoch, term, node_id, encoded)) = row else {
         return Ok(None);
     };
@@ -1846,7 +1857,7 @@ fn read_log_pointer(
             ))
         })
         .optional()
-        .map_err(db_error)?;
+        .map_err(read_db_error)?;
     let Some((epoch, term, index, encoded)) = row else {
         return Ok(None);
     };
@@ -2016,7 +2027,7 @@ fn read_log_id_at_sync(
             },
         )
         .optional()
-        .map_err(db_error)?;
+        .map_err(read_db_error)?;
     let Some((epoch, term, encoded)) = row else {
         return Ok(None);
     };
@@ -2133,7 +2144,7 @@ fn validate_durable_log_state_sync(
             [],
             |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
         )
-        .map_err(db_error)?;
+        .map_err(read_db_error)?;
     match (minimum, maximum, count) {
         (None, None, 0) => {}
         (Some(minimum), Some(maximum), count) if count > 0 => {
@@ -2253,7 +2264,7 @@ fn read_log_rows_unchecked_sync(
         .prepare(
             "SELECT configuration_epoch, term, log_index, entry_json FROM config_raft_log WHERE log_index >= ?1 AND (?2 IS NULL OR log_index < ?2) ORDER BY log_index ASC LIMIT ?3",
         )
-        .map_err(db_error)?;
+        .map_err(read_db_error)?;
     let rows = statement
         .query_map(params![start, end, limit], |row| {
             Ok((
@@ -2263,7 +2274,7 @@ fn read_log_rows_unchecked_sync(
                 row.get::<_, Vec<u8>>(3)?,
             ))
         })
-        .map_err(db_error)?;
+        .map_err(read_db_error)?;
     let mut entries = Vec::new();
     let mut batch = read
         .append_entries_batch
@@ -2272,7 +2283,7 @@ fn read_log_rows_unchecked_sync(
         if let Some(cancellation) = read.cancellation {
             cancellation.check_io()?;
         }
-        let (epoch, term, index, encoded) = row.map_err(db_error)?;
+        let (epoch, term, index, encoded) = row.map_err(read_db_error)?;
         validate_epoch(epoch, identity)?;
         if encoded.len() > CONFIG_CONSENSUS_LOG_ENTRY_MAX_BYTES {
             return Err(invalid_data(
@@ -2576,7 +2587,7 @@ fn read_membership_unchecked_sync(
             [],
             |row| Ok((row.get(0)?, row.get(1)?)),
         )
-        .map_err(db_error)?;
+        .optional().map_err(read_db_error)?.ok_or_else(|| invalid_data("missing required config consensus row"))?;
     validate_epoch(epoch, identity)?;
     decode_json(&encoded)
 }
@@ -2622,7 +2633,7 @@ pub(crate) fn read_machine_sync(
             [],
             |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
         )
-        .map_err(db_error)?;
+        .optional().map_err(read_db_error)?.ok_or_else(|| invalid_data("missing required config consensus row"))?;
     validate_epoch(epoch, identity)?;
     let digest: [u8; 32] = digest
         .try_into()
@@ -3506,7 +3517,7 @@ fn validate_sealed_state_sync(
         .prepare(
             "SELECT tx_id, parent_tx_id, version, committed_at, principal, schema_digest, plaintext_digest, encrypted_blob, audit_count, audit_terminal_hash FROM config_history ORDER BY version ASC",
         )
-        .map_err(db_error)?;
+        .map_err(read_db_error)?;
     let rows = statement
         .query_map([], |row| {
             Ok((
@@ -3522,7 +3533,7 @@ fn validate_sealed_state_sync(
                 row.get::<_, Vec<u8>>(9)?,
             ))
         })
-        .map_err(db_error)?;
+        .map_err(read_db_error)?;
     for row in rows {
         cancellation.check_io()?;
         let (
@@ -3536,7 +3547,7 @@ fn validate_sealed_state_sync(
             encrypted_blob,
             audit_count,
             terminal_hash,
-        ) = row.map_err(db_error)?;
+        ) = row.map_err(read_db_error)?;
         let parent_tx_id =
             super::history::original_parent_sync(conn, audit_key, &tx_id, version, parent_tx_id)?;
         if tx_id.len() != 16
@@ -3608,7 +3619,7 @@ fn validate_sealed_state_sync(
             .prepare(
                 "SELECT sequence, yang_path, op_type, previous_value, new_value, redaction_applied, previous_hash, entry_hmac FROM audit_trail WHERE tx_id = ?1 ORDER BY sequence ASC",
             )
-            .map_err(db_error)?;
+            .map_err(read_db_error)?;
         let rows = audit
             .query_map([tx_id.as_slice()], |row| {
                 Ok((
@@ -3622,13 +3633,13 @@ fn validate_sealed_state_sync(
                     row.get::<_, Vec<u8>>(7)?,
                 ))
             })
-            .map_err(db_error)?;
+            .map_err(read_db_error)?;
         let mut previous = [0_u8; 32];
         let mut seen = 0_usize;
         for row in rows {
             cancellation.check_io()?;
             let (sequence, yang_path, op_type, old, new, redacted, previous_hash, entry_hmac) =
-                row.map_err(db_error)?;
+                row.map_err(read_db_error)?;
             let previous_hash: [u8; 32] = previous_hash
                 .try_into()
                 .map_err(|_| invalid_data("config consensus audit predecessor is invalid"))?;
@@ -3689,16 +3700,16 @@ fn validate_sealed_state_sync(
 
     let mut statement = conn
         .prepare("SELECT applied_sequence, response_json FROM config_raft_request_outcomes")
-        .map_err(db_error)?;
+        .map_err(read_db_error)?;
     let rows = statement
         .query_map([], |row| {
             Ok((row.get::<_, i64>(0)?, row.get::<_, Vec<u8>>(1)?))
         })
-        .map_err(db_error)?;
+        .map_err(read_db_error)?;
     let mut outcome_count = 0_u64;
     for row in rows {
         cancellation.check_io()?;
-        let (applied_sequence, encoded) = row.map_err(db_error)?;
+        let (applied_sequence, encoded) = row.map_err(read_db_error)?;
         let response: ConfigConsensusResponse = decode_json(&encoded)?;
         if checked_positive_u64(applied_sequence)? != response.sequence {
             return Err(invalid_data(
@@ -3729,7 +3740,7 @@ fn validate_history_chain_cancellable_sync(
         .prepare(
             "SELECT tx_id, parent_tx_id, version FROM config_history ORDER BY version ASC, tx_id ASC",
         )
-        .map_err(db_error)?;
+        .map_err(read_db_error)?;
     let rows = statement
         .query_map([], |row| {
             Ok((
@@ -3738,11 +3749,11 @@ fn validate_history_chain_cancellable_sync(
                 row.get::<_, i64>(2)?,
             ))
         })
-        .map_err(db_error)?;
+        .map_err(read_db_error)?;
     let mut head: Option<(Vec<u8>, u64)> = None;
     for row in rows {
         cancellation.check_io()?;
-        let (tx_id, parent_tx_id, version) = row.map_err(db_error)?;
+        let (tx_id, parent_tx_id, version) = row.map_err(read_db_error)?;
         if tx_id.len() != 16
             || parent_tx_id
                 .as_ref()
@@ -4212,7 +4223,7 @@ pub(crate) fn read_current_snapshot_sync(
             |row| Ok((row.get::<_, i64>(0)?, row.get::<_, Vec<u8>>(1)?, row.get::<_, String>(2)?, row.get::<_, Vec<u8>>(3)?, row.get::<_, i64>(4)?)),
         )
         .optional()
-        .map_err(db_error)?;
+        .map_err(read_db_error)?;
     let Some((epoch, encoded, file_name, checksum, length)) = row else {
         return Ok(None);
     };

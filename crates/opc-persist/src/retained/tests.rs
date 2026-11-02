@@ -5,6 +5,8 @@ use crate::{
 };
 use std::collections::{BTreeMap, BTreeSet};
 
+// Retained schema admission is implemented only for the Linux runtime.
+#[cfg(target_os = "linux")]
 #[test]
 fn retained_heap_outage_is_unavailable_without_changing_bytes() {
     const CHILD: &str = "OPC_RETAINED_HEAP_CHILD";
@@ -93,6 +95,8 @@ fn retained_heap_outage_is_unavailable_without_changing_bytes() {
     .expect("unchanged retained storage reopens after outage repair");
 }
 
+// Retained schema admission is implemented only for the Linux runtime.
+#[cfg(target_os = "linux")]
 #[test]
 fn retained_missing_binding_schema_is_rejected() {
     let directory = tempfile::tempdir().unwrap();

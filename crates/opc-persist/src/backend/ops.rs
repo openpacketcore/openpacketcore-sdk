@@ -895,7 +895,9 @@ impl SqliteBackend {
                         [&pending_tx_id],
                         |row| row.get(0),
                     )
-                    .map_err(sqlite_read_error)?;
+                    .optional()
+                    .map_err(sqlite_read_error)?
+                    .ok_or_else(PersistError::corrupt_blob)?;
                 let now = Timestamp::now_utc().to_string();
                 let rows = tx
                     .execute(

@@ -392,7 +392,7 @@ impl SqliteBackend {
         #[cfg(test)]
         let heap_pressure = tests::before_metadata_read(&conn);
         let consensus_required = crate::consensus::history::has_consensus_metadata_sync(&conn)
-            .map_err(|_| PersistError::corrupt_blob())?;
+            .map_err(crate::error::history_read_error)?;
         #[cfg(test)]
         drop(heap_pressure);
 
