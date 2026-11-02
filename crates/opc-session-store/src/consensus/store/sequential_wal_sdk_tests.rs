@@ -460,7 +460,22 @@ impl Fleet {
             .iter()
             .filter_map(|store| store.inner.private_wal.clone())
             .collect::<Vec<_>>();
-        let results = join_all(self.stores.iter().map(ConsensusSessionStore::shutdown)).await;
+        let results = join_all(self.stores.iter().map(|store| async {
+            let result = store.shutdown().await;
+            if result.is_err() {
+                // A caller deadline leaves the same drain running. Cleanup
+                // must join that retained condition before releasing handles;
+                // its final error still fails the original orderly assertion.
+                let completion = store
+                    .inner
+                    .shutdown
+                    .start_or_subscribe(Arc::clone(&store.inner), true);
+                super::await_consensus_session_store_shutdown(completion).await
+            } else {
+                result
+            }
+        }))
+        .await;
         for peer in &self.peers {
             *peer.handler.write().await = None;
         }
@@ -481,6 +496,39 @@ impl Fleet {
             result.expect("private WAL SDK orderly shutdown");
         }
         wals
+    }
+}
+
+#[cfg(feature = "test-vfs")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn fleet_cleanup_observes_a_drain_after_a_shutdown_caller_deadline() {
+    let _timing_permit = crate::acquire_consensus_timing_test_permit().await;
+    let mut fleet = Fleet::new_native("cleanup-retained-drain");
+    fleet.open().await;
+    let store = fleet.stores[0].clone();
+    let hold = store.hold_raft_shutdown_before_core_for_test();
+    let gate = Arc::clone(&hold.gate);
+    let closing = tokio::spawn(async move { fleet.close().await });
+    assert!(tokio::task::spawn_blocking(move || {
+        gate.wait_until_entered(super::DEFAULT_SESSION_CONSENSUS_OPERATION_TIMEOUT)
+    })
+    .await
+    .unwrap());
+    // The fixture's first caller is already waiting at the held drain. This
+    // later observer must spend its complete unchanged public deadline too.
+    assert_eq!(store.shutdown().await, Err(super::consensus_unavailable()));
+    drop(hold);
+    store
+        .shutdown()
+        .await
+        .expect("released shared drain completes");
+    let wals = closing.await.expect("fixture cleanup waits for the drain");
+    assert_eq!(wals.len(), 3);
+    for wal in wals {
+        assert_eq!(
+            wal.integration_observations().unwrap()["writer_joined"],
+            true
+        );
     }
 }
 

@@ -298,7 +298,7 @@ impl NativeState {
             }
             // Activation has no signed rows and can precede root configuration.
             // Preserve its explicit virgin witness in the admitted certificate.
-            let mut edit = Edit::new(&Ledger::empty(), 0, 0)?;
+            let mut edit = Edit::empty_for_admission()?;
             edit.witness = witness;
             edit.finish()?.0
         };

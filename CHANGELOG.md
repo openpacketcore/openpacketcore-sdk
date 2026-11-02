@@ -9,6 +9,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Native snapshot validation preserves checkpoint memory headroom when no
+  roster is configured, while retaining the process cap and live-journal allowance.
+
 - Keep empty change-journal rows compact while fully accounting for optional
   key-retirement witnesses. The existing history counts and verification-memory
   limits remain unchanged.
