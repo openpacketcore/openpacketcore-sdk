@@ -215,8 +215,8 @@ Live delivery keeps all committed notifications and sequence numbers continue
 across retirement. Crossing this stored-format boundary is a fresh install.
 Portable snapshots validate the committed retention frontier against the raw
 watch head; operator recovery invalidation is independent. Pre-format snapshots
-are refused. An older build's store above 65,536 notifications cannot reopen in
-place and needs a fresh installation.
+are refused. Every native store written by an earlier build requires a fresh
+installation and cannot reopen in place, regardless of its notification count.
 
 Ordinary dead-key retirement shares this pre-release format boundary. Committed
 metadata records the key epoch, previous and current absent-key floors, and the

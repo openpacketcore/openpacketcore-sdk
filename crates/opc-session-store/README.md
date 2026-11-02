@@ -829,8 +829,8 @@ global sequence numbers continue across retirement. Crossing this storage
 format boundary requires a fresh installation.
 Portable snapshots validate the committed retention frontier against the raw
 watch head; operator recovery invalidation is independent. Pre-format snapshots
-are refused. An older build's store above 65,536 notifications cannot reopen in
-place and needs a fresh installation.
+are refused. Every native store written by an earlier build requires a fresh
+installation and cannot reopen in place, regardless of its notification count.
 
 Successful ordinary mutations and V1 fenced transitions tag touched keys as
 retired once pruning has removed their record and lease, and no roster reserves
