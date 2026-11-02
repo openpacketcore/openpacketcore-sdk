@@ -4562,6 +4562,66 @@ mod tests {
         }
     }
 
+    async fn missing_required_state_row(table: &str) {
+        let temp = tempfile::tempdir().expect("config consensus directory");
+        let backend = SqliteBackend::open_with_audit_key(
+            temp.path().join("missing-state.sqlite"),
+            true,
+            0,
+            AuditKey::new([0x57; 32]).expect("audit key"),
+        )
+        .await
+        .expect("open config database");
+        let shared = backend.conn();
+        let conn = shared.lock().await;
+        initialize_schema(
+            &conn,
+            identity(),
+            &expected_members(),
+            backend.audit_key(),
+            None,
+            &Arc::new(SqliteWorkCancellation::new()),
+            None,
+        )
+        .expect("config consensus schema");
+        // A pristine vote is optional. The persistent machine and membership
+        // rows are required even before any configuration was committed.
+        assert!(read_vote_sync(&conn, identity(), &expected_members())
+            .unwrap()
+            .is_none());
+        assert_eq!(
+            conn.execute(&format!("DELETE FROM {table}"), []).unwrap(),
+            1
+        );
+        let error = match table {
+            "config_raft_machine" => read_machine_sync(&conn, identity()).map(|_| ()),
+            "config_raft_membership" => {
+                read_membership_unchecked_sync(&conn, identity()).map(|_| ())
+            }
+            _ => unreachable!(),
+        }
+        .expect_err("missing mandatory state must fail");
+        assert_eq!(
+            error.kind(),
+            io::ErrorKind::InvalidData,
+            "{table}: {error:?}"
+        );
+        assert!(matches!(
+            crate::error::history_read_error(error).kind(),
+            crate::PersistErrorKind::CorruptBlob
+        ));
+    }
+
+    #[tokio::test]
+    async fn mandatory_consensus_machine_absence_is_corruption() {
+        missing_required_state_row("config_raft_machine").await;
+    }
+
+    #[tokio::test]
+    async fn mandatory_consensus_membership_absence_is_corruption() {
+        missing_required_state_row("config_raft_membership").await;
+    }
+
     #[tokio::test]
     async fn persisted_revision_one_pending_successor_and_late_confirmation_replay() {
         let temp = tempfile::tempdir().expect("config consensus directory");

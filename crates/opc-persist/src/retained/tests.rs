@@ -93,6 +93,40 @@ fn retained_heap_outage_is_unavailable_without_changing_bytes() {
     .expect("unchanged retained storage reopens after outage repair");
 }
 
+#[test]
+fn retained_missing_binding_schema_is_rejected() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("retained.sqlite");
+    let backend = open_authority_sync(
+        options(&path),
+        key(),
+        OpenIntent::NewAuthority,
+        &Arc::new(work()),
+    )
+    .unwrap();
+    let conn = backend.conn().try_lock_owned().unwrap();
+    let record: Vec<u8> = conn
+        .query_row(
+            "SELECT record FROM consensus_retained_binding WHERE singleton=1",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    let record = record.try_into().unwrap();
+    conn.execute_batch("DROP TABLE consensus_retained_binding")
+        .unwrap();
+    let before = std::fs::read(&path).unwrap();
+    let wal = path.with_extension("sqlite-wal");
+    let wal_before = std::fs::read(&wal).unwrap_or_default();
+    assert_eq!(
+        validate_connection(&conn, &options(&path), &record, &key(), &Arc::new(work()))
+            .unwrap_err(),
+        RetainedConfigError::Rejected,
+    );
+    assert_eq!(before, std::fs::read(&path).unwrap());
+    assert_eq!(wal_before, std::fs::read(&wal).unwrap_or_default());
+}
+
 pub(super) fn options(path: &Path) -> RetainedConfigOptions {
     let node = ConfigConsensusNodeId::new(1).expect("node");
     let topology = ConfigConsensusTopology::try_new(
