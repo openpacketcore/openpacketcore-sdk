@@ -380,3 +380,29 @@ async fn rejected_stored_scalar_shapes_keep_corruption_alarm() {
     }
     assert_eq!(observed, vec![StoreErrorCode::Crypto; 3]);
 }
+
+async fn dropped_history_table_is_permanent(table: &str) {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("config.sqlite");
+    let persistence = backend(&path).await;
+    seed(&persistence).await;
+    let conn = rusqlite::Connection::open(&path).unwrap();
+    conn.execute_batch("PRAGMA foreign_keys=OFF").unwrap();
+    conn.execute_batch(&format!("DROP TABLE {table}")).unwrap();
+    let error = ConfigStore::load_latest(&persistence).await.unwrap_err();
+    assert!(
+        matches!(error.kind(), PersistErrorKind::InconsistentState(_)),
+        "{error:?}"
+    );
+    startup_error(persistence, StoreErrorCode::Internal, "ConfigApplyFailed").await;
+}
+
+#[tokio::test]
+async fn dropped_config_history_table_is_not_retryable() {
+    dropped_history_table_is_permanent("config_history").await;
+}
+
+#[tokio::test]
+async fn dropped_audit_trail_table_is_not_retryable() {
+    dropped_history_table_is_permanent("audit_trail").await;
+}

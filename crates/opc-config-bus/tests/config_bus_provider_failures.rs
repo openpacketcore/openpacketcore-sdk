@@ -51,6 +51,12 @@ impl ManagedDatastore<TestConfig> for FaultStore {
         &self,
         id: RequestId,
     ) -> Result<Option<StoredConfig<TestConfig>>, StoreError> {
+        if self.stage == "corrupt-append-unavailable-reconcile" {
+            return Err(StoreError::new(
+                StoreErrorCode::Unavailable,
+                "read unavailable",
+            ));
+        }
         self.fail("reconcile")?;
         self.inner.load_by_request_id(id).await
     }
@@ -61,6 +67,9 @@ impl ManagedDatastore<TestConfig> for FaultStore {
     async fn append_commit_write(&self, write: CommitWrite<TestConfig>) -> Result<(), StoreError> {
         if self.stage == "reconcile" {
             return Err(StoreError::internal("append rejected"));
+        }
+        if self.stage == "corrupt-append-unavailable-reconcile" {
+            return Err(StoreError::crypto("stored bytes rejected during append"));
         }
         self.fail("append")?;
         if self.stage == "pending-append" && self.inner.history().await.len() == 2 {
@@ -150,7 +159,14 @@ async fn startup_rollback_failure_code(stage: &'static str, code: StoreErrorCode
         Ok(_) => panic!("unavailable recovery must fence startup"),
         Err(error) => error,
     };
-    assert_eq!(error.code, code);
+    assert_eq!(
+        error.code,
+        if code == StoreErrorCode::NotFound {
+            StoreErrorCode::RestoreRecoveryRequired
+        } else {
+            code
+        }
+    );
     let alarms = error.alarm_manager().unwrap().active_alarms();
     assert_eq!(alarms.len(), 1);
     assert_eq!(
@@ -161,6 +177,7 @@ async fn startup_rollback_failure_code(stage: &'static str, code: StoreErrorCode
             ProbableCause::ConfigApplyFailed
         }
     );
+    assert_eq!(alarms[0].severity, Severity::Critical);
     let history = store.inner.history().await;
     assert_eq!(history.len(), if stage == "clear" { 3 } else { 2 });
     if stage == "clear" {
@@ -555,4 +572,47 @@ async fn expiry_latest_parent_and_append_preserve_failure_alarm() {
             );
         }
     }
+}
+
+#[tokio::test]
+async fn missing_startup_rollback_append_keeps_critical_fence() {
+    startup_rollback_failure_code("append", StoreErrorCode::NotFound).await;
+}
+
+#[tokio::test]
+async fn missing_startup_rollback_clear_keeps_critical_fence() {
+    startup_rollback_failure_code("clear", StoreErrorCode::NotFound).await;
+}
+
+#[tokio::test]
+async fn corrupt_append_evidence_survives_unavailable_reconciliation() {
+    let store = Arc::new(FaultStore {
+        inner: MockManagedDatastore::new(),
+        stage: "corrupt-append-unavailable-reconcile",
+        code: StoreErrorCode::Crypto,
+    });
+    let bus = ConfigBus::new_dev_only(TestConfig::new("initial"), store.clone())
+        .await
+        .unwrap();
+    let error = bus
+        .submit(commit_request(
+            "next",
+            Instant::now() + Duration::from_secs(2),
+        ))
+        .await
+        .unwrap_err();
+    assert_eq!(error.code, CommitErrorCode::OutcomeUnknown);
+    assert_eq!(bus.load().name, "initial");
+    assert!(store.inner.history().await.is_empty());
+    let alarms = bus.alarm_manager().active_alarms();
+    assert_eq!(alarms.len(), 1);
+    assert_eq!(alarms[0].probable_cause, ProbableCause::StorageCorruption);
+    let fenced = bus
+        .submit(commit_request(
+            "later",
+            Instant::now() + Duration::from_secs(2),
+        ))
+        .await
+        .unwrap_err();
+    assert_eq!(fenced.code, CommitErrorCode::RecoveryRequired);
 }

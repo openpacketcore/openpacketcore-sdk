@@ -208,3 +208,158 @@ async fn genuine_standalone_history_keeps_its_read_and_write_contract() {
         1
     );
 }
+
+// Refuse one actual SQLite read without modifying stored bytes. The source
+// boundary must retain the failed-read class, including inside write APIs.
+fn deny_column_read(
+    conn: &rusqlite::Connection,
+    table: &'static str,
+    column: &'static str,
+    occurrence: usize,
+) -> Arc<std::sync::atomic::AtomicUsize> {
+    use rusqlite::hooks::{AuthAction, AuthContext, Authorization};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let reads = Arc::new(AtomicUsize::new(0));
+    let hook_reads = reads.clone();
+    conn.authorizer(Some(move |context: AuthContext<'_>| {
+        if matches!(context.action, AuthAction::Read { table_name, column_name }
+            if table_name == table && column_name == column)
+            && hook_reads.fetch_add(1, Ordering::SeqCst) + 1 == occurrence
+        {
+            Authorization::Deny
+        } else {
+            Authorization::Allow
+        }
+    }))
+    .unwrap();
+    reads
+}
+
+#[tokio::test]
+async fn rollback_point_read_outage_is_unavailable() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("rollback.sqlite");
+    let backend =
+        SqliteBackend::open_with_audit_key(&path, true, 0, AuditKey::new([0x64; 32]).unwrap())
+            .await
+            .unwrap();
+    let tx_id = TxId::new();
+    let (record, audit, _) = commit(tx_id, None, 1, false).into_parts();
+    backend.append_commit(record, audit).await.unwrap();
+    let before = std::fs::read(&path).unwrap();
+    let wal_before = std::fs::read(path.with_extension("sqlite-wal")).unwrap();
+    let reads = deny_column_read(
+        &*backend.conn.lock().await,
+        "config_history",
+        "principal",
+        1,
+    );
+    let error = backend
+        .create_rollback_point(tx_id, None)
+        .await
+        .unwrap_err();
+    assert_eq!(reads.load(std::sync::atomic::Ordering::SeqCst), 1);
+    assert_eq!(std::fs::read(&path).unwrap(), before);
+    assert_eq!(
+        std::fs::read(path.with_extension("sqlite-wal")).unwrap(),
+        wal_before
+    );
+    assert!(
+        matches!(error.kind(), crate::PersistErrorKind::Unavailable),
+        "{error:?}"
+    );
+}
+
+#[tokio::test]
+async fn append_replay_digest_read_outage_is_unavailable() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("replay.sqlite");
+    let backend =
+        SqliteBackend::open_with_audit_key(&path, true, 0, AuditKey::new([0x64; 32]).unwrap())
+            .await
+            .unwrap();
+    let tx_id = TxId::new();
+    let (mut record, audit, _) = commit(tx_id, None, 1, false).into_parts();
+    record.principal =
+        serde_json::json!({"principal": record.principal, "replay_lookup_digest": "a".repeat(64), "recovery_required": false})
+            .to_string();
+    let before = std::fs::read(&path).unwrap();
+    let wal_before = std::fs::read(path.with_extension("sqlite-wal")).unwrap();
+    // The latest-head query reads principal first; the replay-index query is second.
+    let reads = deny_column_read(
+        &*backend.conn.lock().await,
+        "config_history",
+        "principal",
+        2,
+    );
+    let error = backend.append_commit(record, audit).await.unwrap_err();
+    assert!(reads.load(std::sync::atomic::Ordering::SeqCst) >= 2);
+    assert_eq!(std::fs::read(&path).unwrap(), before);
+    assert_eq!(
+        std::fs::read(path.with_extension("sqlite-wal")).unwrap(),
+        wal_before
+    );
+    assert!(
+        matches!(error.kind(), crate::PersistErrorKind::Unavailable),
+        "{error:?}"
+    );
+}
+
+async fn audit_read_outage_is_unavailable(table: &'static str, column: &'static str) {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("audit.sqlite");
+    let key = AuditKey::new([0x64; 32]).unwrap();
+    let backend = SqliteBackend::open_with_audit_key(&path, true, 0, key.clone())
+        .await
+        .unwrap();
+    let node = ConfigConsensusNodeId::new(1).unwrap();
+    let identity = ConfigConsensusIdentity::new(
+        ConfigConsensusClusterId::new("audit-read-test").unwrap(),
+        ConfigConsensusConfigurationId::from_bytes([0x64; 32]),
+        ConfigConsensusConfigurationEpoch::new(1).unwrap(),
+    );
+    let topology =
+        ConfigConsensusTopology::try_new(identity, node, [node].into_iter().collect()).unwrap();
+    let store = ConsensusConfigStore::open(
+        topology,
+        backend.clone(),
+        dir.path().join("snapshots"),
+        BTreeMap::new(),
+    )
+    .await
+    .unwrap();
+    store.initialize_cluster().await.unwrap();
+    store.shutdown().await.unwrap();
+    let conn = backend.conn.lock().await;
+    assert!(crate::consensus::read_sync(&conn, &key, identity)
+        .unwrap()
+        .is_none());
+    let before = std::fs::read(&path).unwrap();
+    let wal_before = std::fs::read(path.with_extension("sqlite-wal")).unwrap();
+    let reads = deny_column_read(&conn, table, column, 1);
+    let error = crate::error::history_read_error(
+        crate::consensus::read_sync(&conn, &key, identity)
+            .err()
+            .unwrap(),
+    );
+    assert!(reads.load(std::sync::atomic::Ordering::SeqCst) >= 1);
+    assert_eq!(std::fs::read(&path).unwrap(), before);
+    assert_eq!(
+        std::fs::read(path.with_extension("sqlite-wal")).unwrap(),
+        wal_before
+    );
+    assert!(
+        matches!(error.kind(), crate::PersistErrorKind::Unavailable),
+        "{error:?}"
+    );
+}
+
+#[tokio::test]
+async fn audit_ledger_read_outage_is_unavailable() {
+    audit_read_outage_is_unavailable("config_raft_management_audit", "state_json").await;
+}
+
+#[tokio::test]
+async fn audit_identity_read_outage_is_unavailable() {
+    audit_read_outage_is_unavailable("config_raft_identity", "cluster_id").await;
+}
