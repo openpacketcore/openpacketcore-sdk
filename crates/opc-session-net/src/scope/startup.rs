@@ -138,12 +138,11 @@ impl ScopeProcess {
             lock
         };
         #[cfg(not(target_os = "linux"))]
-        let lock = {
-            let _ = scope;
-            return Err(StartupError::Unavailable);
-            #[allow(unreachable_code)]
-            directory
-        };
+        {
+            let _ = (scope, workload, boot, directory);
+            Err(StartupError::Unavailable)
+        }
+        #[cfg(target_os = "linux")]
         Ok(Self {
             scope,
             workload,
