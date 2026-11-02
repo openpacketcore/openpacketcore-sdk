@@ -2492,10 +2492,10 @@ impl Wal {
         let mut started = None;
         while state.native_ceiling_wait {
             ensure_readable(&state)?;
-            if state.status != Status::Running
-                || state.retirement_stopped
-                || state.snapshot.is_some()
-            {
+            // Pre-projection log admission owns no operation permit or
+            // captured state. An armed install can finish independently;
+            // admit_inner rechecks its normal snapshot gate after this wait.
+            if state.status != Status::Running || state.retirement_stopped {
                 return Err(io::Error::new(
                     io::ErrorKind::Interrupted,
                     "native file backpressure interrupted by ownership handoff",
