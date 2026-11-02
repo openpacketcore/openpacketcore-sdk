@@ -17,10 +17,12 @@ must not be read as the current public configuration or qualification status.
 The current native path in [ADR 0022](0022-native-session-persistence-modes.md)
 physically removes its purged log prefix. The SQLite projection and logical-only
 purge described in the historical body below remain private fixture behavior.
-New native roots use `OPCNR002` (Durable) or `OPCNA004` (Async); old roots require
+New native roots use `OPCNR003` (Durable) or `OPCNA005` (Async); old roots require
 a fresh installation and are never migrated implicitly. The native base/delta
-vocabularies advance; the ordered WAL record, portable snapshot and Raft wire
-formats do not change.
+vocabularies advance, and portable native SQLite snapshots carry canonical
+retention frontiers in `consensus_native_retention`. The ordered WAL record and
+Raft wire formats do not change. ADR 0022 defines the current root and snapshot
+compatibility boundary.
 
 The selected context binds the full purge LogId, applied cut, current snapshot
 and membership. Purge requires applied and selected-snapshot coverage. Missing
@@ -35,16 +37,21 @@ A generation file may be replaced by another file epoch carrying the same contex
 A higher checkpoint epoch may reselect the same logical position. A rowless
 delta with unchanged context remains valid. Native recovery validates the
 selected state before reclaiming one unselected next file and up to two
-previous files; this reservation does not implement file rollover. Later
+previous files. Generation rollover uses this reservation to select a compact
+replacement before accumulated append history reaches a file ceiling. Later
 state-machine vocabularies can advance the generation format in place under
 the same root, through committed activation and supported optional frontier
 fields. Unknown discriminators or fields are refused before writes.
 
 Prefix reclamation releases resident log rows and their checkpoint inventory;
-it does not shrink the append-only generation file. Generation-file rollover
-is tracked separately in SDK #1253. Until then, the Durable 32 GiB and Async
-8 GiB file ceilings remain lifetime limits. A failed local snapshot build still
-stops the engine; changing that behavior is separate work (SDK #1254).
+generation-file rollover (SDK #1253) also replaces the old file with a compact
+base. The Durable 32 GiB and Async 8 GiB ceilings bound the current generation,
+not cumulative append history; live compact data must still fit. ADR 0022
+records the implemented trigger and selection contract. A failed local snapshot build is
+retried under a fixed bounded attempt/backoff budget and keeps the engine on the
+unchanged published snapshot (ADR 0022, SDK #1254); only an indeterminate
+publication state or a store with no published snapshot at all stops the
+engine.
 
 ## Decision
 

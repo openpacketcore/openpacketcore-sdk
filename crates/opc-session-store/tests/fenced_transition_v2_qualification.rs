@@ -6129,7 +6129,7 @@ const RELEASE_EVIDENCE_LIBTEST_ARGS: [&str; 4] = [
 ];
 const RELEASE_EVIDENCE_EXISTING_ARTIFACT_VALIDATION_RECIPE: &str = "OPC_QUAL_EVIDENCE_VALIDATE=<absolute-external-evidence-namespace> CARGO_TARGET_DIR=<absolute-external-target> cargo test --locked -p opc-session-store --release --test fenced_transition_v2_qualification -- --ignored --exact validate_existing_release_evidence_artifact --nocapture";
 const PROCESS_LOSS_V9_SCHEMA_SHA256: &str =
-    "sha256:65d456edc15359e9cbac25a6771822219797c53f03aa6ca5d8837e43a6dbc018";
+    "sha256:eb410e3be0c2260ebefc8567507941f9b08d06f5280a0ac43aebef9b7b60039e";
 const PROCESS_LOSS_V9_PAIR_DIRECTORY: &str = "session-ha-persistent-consumer-v9";
 const PROCESS_LOSS_REPRODUCTION_COMMAND_MAX_CHARS: usize = 16 * 1024;
 const PROCESS_LOSS_CANONICAL_CARGO_ARGV: [&str; 15] = [
@@ -8382,7 +8382,7 @@ fn strict_decode_process_loss_companion(
             .any(|(lane, expected)| {
                 lane.lane != expected.0
                     || lane.transport_revision != expected.1
-                    || lane.application_revision != 4
+                    || lane.application_revision != 5
                     || lane.sdk_protocol_revision != 5
                     || lane.consumer_alpn != expected.2
                     || !lane.executed
@@ -11013,7 +11013,7 @@ fn process_loss_v9_test_fixture(source: &ReleaseEvidenceSource) -> ProcessLossCo
         |lane: &str, transport_revision: u16, consumer_alpn: &str| ProcessLossCompanionLane {
             lane: lane.to_owned(),
             transport_revision,
-            application_revision: 4,
+            application_revision: 5,
             sdk_protocol_revision: 5,
             consumer_alpn: consumer_alpn.to_owned(),
             executed: true,

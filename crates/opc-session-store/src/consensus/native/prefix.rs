@@ -25,12 +25,31 @@ use zeroize::Zeroizing;
 
 use crate::consensus::verified_snapshot::VerificationMemory;
 
+#[path = "prefix_compare.rs"]
+mod compare;
+#[path = "prefix_created.rs"]
+mod created;
+#[cfg(test)]
+#[path = "prefix_section.rs"]
+mod section;
+pub(crate) use compare::CompareWriter;
+pub(crate) use created::Created;
+#[cfg(test)]
+pub(crate) use section::with_read_section;
+
 const MIN_BLOCK: usize = 64 * 1024;
 const MAX_BLOCK: usize = 2 * 1024 * 1024;
 const MAX_BLOCKS: usize = 16 * 1024 * 1024 / 32;
 const PAGE_BLOCKS: usize = 256;
 const INDEX_PAGES: usize = MAX_BLOCKS / PAGE_BLOCKS;
 const ARC_HEADER: usize = 2 * size_of::<usize>();
+
+pub(crate) fn maximum_length(block_bytes: usize) -> io::Result<u64> {
+    if !(MIN_BLOCK..=MAX_BLOCK).contains(&block_bytes) || !block_bytes.is_power_of_two() {
+        return Err(invalid());
+    }
+    Ok(block_bytes as u64 * MAX_BLOCKS as u64)
+}
 
 #[cfg_attr(feature = "test-control", track_caller)]
 fn invalid() -> io::Error {
@@ -113,7 +132,13 @@ struct MetadataIdentity {
 
 impl MetadataIdentity {
     fn read(metadata: &Metadata) -> io::Result<Self> {
-        if !metadata.is_file() || metadata.nlink() == 0 {
+        Self::read_with_retirement(metadata, false)
+    }
+
+    fn read_with_retirement(metadata: &Metadata, retired: bool) -> io::Result<Self> {
+        #[cfg(test)]
+        super::rollover_costs::record(|costs| costs.metadata += 1);
+        if !metadata.is_file() || (metadata.nlink() == 0 && !retired) {
             return Err(invalid());
         }
         Ok(Self {
@@ -190,6 +215,7 @@ pub(crate) struct VerifiedAppendSource {
     pages: Vec<OnceLock<Box<DigestPage>>>,
     admitted_length: AtomicU64,
     failed: AtomicBool,
+    retired: AtomicBool,
     cache: Mutex<Option<CachedBlocks>>,
     #[cfg(test)]
     blocks_read: AtomicU64,
@@ -200,6 +226,11 @@ pub(crate) struct VerifiedAppendSource {
 }
 
 impl VerifiedAppendSource {
+    #[cfg(test)]
+    pub(crate) fn failed_for_test(&self) -> bool {
+        self.failed.load(Ordering::Acquire)
+    }
+
     fn allocate(
         file: File,
         pinned: MetadataIdentity,
@@ -228,6 +259,7 @@ impl VerifiedAppendSource {
             pages,
             admitted_length: AtomicU64::new(identity.length),
             failed: AtomicBool::new(false),
+            retired: AtomicBool::new(false),
             cache: Mutex::new(None),
             #[cfg(test)]
             blocks_read: AtomicU64::new(0),
@@ -239,9 +271,12 @@ impl VerifiedAppendSource {
         if self.failed.load(Ordering::Acquire) {
             return Err(invalid());
         }
-        // An append may publish during stat; sample its committed lower bound first.
+        // Sample the published lower bound before stat; an append can publish during it.
         let admitted_length = self.admitted_length.load(Ordering::Acquire);
-        let metadata = MetadataIdentity::read(&self.file.metadata()?)?;
+        let metadata = MetadataIdentity::read_with_retirement(
+            &self.file.metadata()?,
+            self.retired.load(Ordering::Acquire),
+        )?;
         #[cfg(test)]
         tests::after_metadata();
         if !self.pinned.same_file(metadata)
@@ -277,13 +312,26 @@ impl VerifiedAppendSource {
             .checked_add(output.len() as u64)
             .filter(|end| *end <= length)
             .ok_or_else(invalid)?;
+        #[cfg(test)]
+        super::rollover_costs::record(|costs| {
+            costs.read_calls += 1;
+            costs.empty_reads += u64::from(output.is_empty());
+        });
         let mut fence = FailureFence::new(&self.failed);
-        self.metadata()?;
+        let before = self.metadata()?;
+        #[cfg(test)]
+        super::rollover_costs::record(|costs| costs.cache_locks += 1);
         let mut cache = self.cache.lock().map_err(|_| invalid())?;
         let mut position = offset;
         let mut written = 0;
         while position < end {
-            let metadata = self.metadata()?;
+            #[cfg(test)]
+            super::rollover_costs::record(|costs| costs.read_blocks += 1);
+            let metadata = if written == 0 {
+                before
+            } else {
+                self.metadata()?
+            };
             let index =
                 usize::try_from(position / self.block_bytes as u64).map_err(|_| invalid())?;
             let hit = cache.as_ref().and_then(|cache| {
@@ -353,6 +401,43 @@ impl VerifiedAppendSource {
     }
 }
 
+#[derive(Debug)]
+struct CapacityLimit;
+impl std::fmt::Display for CapacityLimit {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("native prefix integrity check failed")
+    }
+}
+impl std::error::Error for CapacityLimit {}
+fn capacity_limit() -> io::Error {
+    io::Error::new(io::ErrorKind::InvalidData, CapacityLimit)
+}
+pub(crate) fn is_capacity_limit(error: &io::Error) -> bool {
+    error
+        .get_ref()
+        .is_some_and(|inner| inner.is::<CapacityLimit>())
+}
+
+/// Discard only a failed new-file creation still pinned by its creating
+/// descriptor. No selected source or persisted tuple grants this authority.
+pub(crate) fn discard_owned_preparing(file: &File, path: &Path, maximum: u64) -> io::Result<()> {
+    let before = MetadataIdentity::read(&file.metadata()?)?;
+    if before.length > maximum {
+        return Err(invalid());
+    }
+    let named = OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK)
+        .open(path)?;
+    if MetadataIdentity::read(&named.metadata()?)? != before
+        || MetadataIdentity::read(&file.metadata()?)? != before
+    {
+        return Err(invalid());
+    }
+    std::fs::remove_file(path)?;
+    File::open(path.parent().ok_or_else(invalid)?)?.sync_all()
+}
+
 struct FailureFence<'a> {
     failed: &'a AtomicBool,
     accepted: bool,
@@ -401,9 +486,18 @@ impl VerifiedPrefix {
         self.identity
     }
 
+    #[cfg(test)]
+    pub(crate) fn weak_source_for_test(&self) -> std::sync::Weak<VerifiedAppendSource> {
+        Arc::downgrade(&self.source)
+    }
+
     // A process-local ordering hint only. All views of one append source
     // share its cache even when they certify different immutable prefixes.
     // A caller must still read through its own exact view and validate rows.
+    pub(crate) fn same_source(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.source, &other.source)
+    }
+
     pub(super) fn source_order(&self) -> usize {
         Arc::as_ptr(&self.source) as usize
     }
@@ -414,6 +508,10 @@ impl VerifiedPrefix {
     }
 
     pub(crate) fn read_exact_at(&self, offset: u64, output: &mut [u8]) -> io::Result<()> {
+        #[cfg(test)]
+        if let Some(result) = section::read(&self.source, self.identity.length, offset, output) {
+            return result;
+        }
         self.source.read(self.identity.length, offset, output)
     }
 
@@ -459,6 +557,25 @@ pub(crate) struct VerifiedAppendOwner {
 }
 
 impl VerifiedAppendOwner {
+    /// Bookend the pinned and newly named descriptor after no-replace rename.
+    pub(crate) fn confirm_named(&self, path: &Path) -> io::Result<()> {
+        let mut fence = FailureFence::new(&self.current.source.failed);
+        let before = self.current.source.metadata()?;
+        if before.length != self.current.identity.length {
+            return Err(invalid());
+        }
+        let named = OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK)
+            .open(path)?;
+        if MetadataIdentity::read(&named.metadata()?)? != before
+            || self.current.source.metadata()? != before
+        {
+            return Err(invalid());
+        }
+        fence.accept();
+        Ok(())
+    }
     /// The parent directory is already admitted by the WAL directory owner.
     /// Opening the final component never follows a symlink or blocks on a FIFO.
     /// Unselected tail bytes remain untouched and are not semantic authority.
@@ -521,6 +638,14 @@ impl VerifiedAppendOwner {
         Arc::clone(&self.current)
     }
 
+    /// Only the WAL writer may retire a predecessor, after its successor's
+    /// selector is durable. Consuming the append owner prevents later writes.
+    /// Existing views retain the descriptor and all block authentication; the
+    /// expected unlink changes only whether a zero link count is permitted.
+    pub(crate) fn retire(self) {
+        self.current.source.retired.store(true, Ordering::Release);
+    }
+
     /// Cold-open finalization only, outside State and before owner exposure.
     /// The caller has admitted CURRENT, every selected row, strict snapshot
     /// descriptor and the complete WAL suffix. Recheck every selected byte on
@@ -531,6 +656,8 @@ impl VerifiedAppendOwner {
         path: &Path,
         check: &impl Fn() -> io::Result<()>,
     ) -> io::Result<()> {
+        #[cfg(test)]
+        super::rollover_costs::record(|costs| costs.repairs += 1);
         let source = Arc::clone(&self.current.source);
         let mut fence = FailureFence::new(&source.failed);
         let before = self.opened.take().ok_or_else(invalid)?;
@@ -588,6 +715,39 @@ impl VerifiedAppendOwner {
         }
         fence.accept();
         Ok(())
+    }
+
+    /// Scheduling only: an already aligned prefix plus the padded frame and
+    /// caller's independently derived switch reserve must fit the same owner
+    /// ceiling. This neither authenticates bytes nor replaces append checks.
+    pub(crate) fn fits_append(&self, payload_bytes: u64, reserve: u64) -> bool {
+        let current = self.current.identity;
+        payload_bytes != 0
+            && payload_bytes
+                .checked_add(current.block_bytes as u64 - 1)
+                .map(|bytes| bytes / current.block_bytes as u64 * current.block_bytes as u64)
+                .and_then(|padded| current.length.checked_add(padded))
+                .and_then(|length| length.checked_add(reserve))
+                .is_some_and(|length| length <= self.current.source.maximum)
+    }
+
+    /// Insufficient candidate capacity is a scheduling result, before the
+    /// append failure fence, callbacks, writes or source mutation. Every actual
+    /// append still executes the original complete authenticated transaction.
+    pub(crate) fn append_with_reserve(
+        &mut self,
+        predecessor: &Arc<VerifiedPrefix>,
+        transaction: AppendTransaction,
+        reserve: u64,
+        check: impl FnMut() -> io::Result<()>,
+        encode: impl FnOnce(&mut dyn Write) -> io::Result<()>,
+        validate: impl FnOnce(&mut dyn Read) -> io::Result<()>,
+    ) -> io::Result<Option<Arc<VerifiedPrefix>>> {
+        if !self.fits_append(transaction.payload_bytes, reserve) {
+            return Ok(None);
+        }
+        self.append(predecessor, transaction, check, encode, validate)
+            .map(Some)
     }
 
     /// Write exactly one complete encoded transaction, append canonical zero
@@ -834,6 +994,10 @@ impl Read for ExtentReader<'_> {
         let block_bytes = self.buffer.len();
         let index = usize::try_from(self.position / block_bytes as u64).map_err(|_| invalid())?;
         if index == self.loaded {
+            #[cfg(test)]
+            crate::consensus::native::rollover_costs::adapter(
+                crate::consensus::native::rollover_costs::Adapter::ExtentRead,
+            );
             (self.check)()?;
             self.source.metadata()?;
             self.source.file.read_exact_at(

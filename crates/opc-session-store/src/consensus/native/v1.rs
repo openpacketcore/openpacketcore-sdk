@@ -410,18 +410,13 @@ impl NativeDelta<'_> {
                 .map_err(|_| invalid("native V1 applied digest invalid"))?
         };
         let executed = if authorized {
-            business::transition_v1(
-                request,
-                &self.key(request.lease().key()),
-                &self.frontiers,
-                now,
-            )
+            self.staged_v1(request, now)
         } else {
             Err(StoreError::TopologyAuthorityRevoked)
         };
         let result = match executed {
             Ok(_) if terminal => Err(StoreError::FencedTransitionStorageExhausted),
-            Ok(effect) => {
+            Ok((effect, key_effects)) => {
                 let watch = self
                     .frontiers
                     .watch_sequence
@@ -429,6 +424,7 @@ impl NativeDelta<'_> {
                     .filter(|next| *next <= COUNTER_MAX)
                     .ok_or_else(|| invalid("native V1 watch exhausted"))?;
                 let notification = ReplicationEntry {
+                    replay_policy: crate::ReplicationReplayPolicy::prune_and_retire(),
                     sequence: watch,
                     tx_id: ReplicationTxId::from_request_bytes(*command.request_id.as_bytes()),
                     op: effect.replication,
@@ -437,10 +433,7 @@ impl NativeDelta<'_> {
                 notification
                     .validate()
                     .map_err(|_| invalid("native V1 notification invalid"))?;
-                self.set_key(effect.key, effect.value);
-                self.frontiers.next_fence = effect.next_fence;
-                self.frontiers.next_credential = effect.next_credential;
-                self.frontiers.restore_revision += 1;
+                key_effects.publish(self);
                 self.frontiers.watch_sequence = watch;
                 self.notifications.push(notification);
                 Ok(SessionMutationOutcome::FencedTransition(effect.outcome))

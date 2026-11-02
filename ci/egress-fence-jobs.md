@@ -43,6 +43,7 @@ the split requires them; each privileged runner verifies its own cleanup.
 | Full-bound native leader, Durable and Async log proofs | `host-native-log-proofs (4, 5, 6)`, one proof per runner at O1 |
 | Full-bound lease-deferral receipt-history proofs | `host-native-log-proofs (7–17)`, one proof per runner at O1 |
 | 131,073 completed rosters and authenticated cold reopen | `host-native-log-proofs (18)`, one proof at O3 |
+| Full-bound notification and dead-key retention proofs | `host-native-log-proofs (19, 20)`, one proof per runner at O1 |
 | Gate every eBPF feature surface: pinned fmt and all four Clippy commands | `sources` |
 | Rebuild production and test-only objects: all four independent double builds and production byte comparison | `sources` |
 | Build and gate independent host oracles: all bin tests, build, Clippy and redaction check | `oracles` |

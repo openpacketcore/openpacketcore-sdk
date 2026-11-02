@@ -3644,7 +3644,7 @@ pub(crate) mod tests {
         )
     }
 
-    fn roster_v2_persistence_fixture_for_authority(
+    pub(crate) fn roster_v2_persistence_fixture_for_authority(
         phase: Phase,
         roster_id: [u8; 16],
         epoch: u64,

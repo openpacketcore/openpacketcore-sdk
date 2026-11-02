@@ -1197,7 +1197,6 @@ async fn qualification_activation_attempt(
 fn qualification_store_error_class(error: &StoreError) -> QualificationTrafficErrorClass {
     match error {
         StoreError::BackendUnavailable(_)
-        | StoreError::KeyProviderUnavailable(_)
         | StoreError::FencedTransitionRecoveryJournalUnavailable => {
             QualificationTrafficErrorClass::BackendUnavailable
         }
@@ -3239,13 +3238,20 @@ impl QualificationNode {
             let mut expected_sequence = requested_after_journal_sequence.saturating_add(1);
             loop {
                 let entry = match tokio::time::timeout_at(deadline, watch.stream.next()).await {
-                    Ok(Some(Ok(entry))) if entry.sequence == expected_sequence => entry,
+                    Ok(Some(Ok(entry)))
+                        if entry
+                            .matches_watch_cursor(expected_sequence)
+                            .unwrap_or(false) =>
+                    {
+                        entry
+                    }
                     Ok(Some(Ok(_))) | Ok(Some(Err(_))) | Ok(None) | Err(_) => {
                         return QualificationNodeReply::Error {
                             code: QualificationNodeErrorCode::ConcurrentWatchUnavailable,
                         };
                     }
                 };
+                expected_sequence = entry.sequence;
                 if append_concurrent_watch_events(entry, &mut events).is_err() {
                     return QualificationNodeReply::Error {
                         code: QualificationNodeErrorCode::ConcurrentWatchOverflow,
@@ -5253,7 +5259,9 @@ async fn reconcile_traffic_watch_stream<B: TrafficWatchBackend + ?Sized>(
                         QualificationTrafficFailureStage::Watch,
                     ));
                 };
-                if entry.sequence != expected_sequence
+                if !entry
+                    .matches_watch_cursor(expected_sequence)
+                    .unwrap_or(false)
                     || reconcile_applied_traffic_records(
                         &entry.op,
                         traffic_keys,
@@ -5454,7 +5462,7 @@ async fn run_traffic_watch_task<B: TrafficWatchBackend + 'static>(
                         return Err(failure);
                     }
                 };
-                if entry.sequence != expected_sequence {
+                if !entry.matches_watch_cursor(expected_sequence).unwrap_or(false) {
                     let failure = QualificationTrafficFailure::fixed(
                         QualificationTrafficFailureCode::InvariantViolation,
                         QualificationTrafficFailureStage::Watch,
@@ -5484,7 +5492,7 @@ async fn run_traffic_watch_task<B: TrafficWatchBackend + 'static>(
                 }
                 #[cfg(test)]
                 observation.watch_progress.send_replace(());
-                let Some(next_sequence) = expected_sequence.checked_add(1) else {
+                let Some(next_sequence) = entry.sequence.checked_add(1) else {
                     let failure = QualificationTrafficFailure::fixed(
                         QualificationTrafficFailureCode::InvariantViolation,
                         QualificationTrafficFailureStage::Watch,
@@ -6128,7 +6136,6 @@ fn map_lease_error(error: &LeaseError) -> QualificationNodeErrorCode {
 fn map_store_error(error: &StoreError) -> QualificationNodeErrorCode {
     match error {
         StoreError::BackendUnavailable(_)
-        | StoreError::KeyProviderUnavailable(_)
         | StoreError::BackendOperationOutcomeUnavailable
         | StoreError::CasIdempotencyOutcomeUnavailable
         | StoreError::Crypto(_)
@@ -8632,6 +8639,7 @@ mod tests {
 
     fn scripted_traffic_replication_entry(sequence: u64, op: ReplicationOp) -> ReplicationEntry {
         ReplicationEntry {
+            replay_policy: opc_session_store::ReplicationReplayPolicy::prune_expired(),
             sequence,
             tx_id: opc_session_store::ReplicationTxId::new(
                 format!("scripted-traffic-{sequence}").as_str(),
@@ -9405,12 +9413,14 @@ mod tests {
     fn concurrent_watch_projects_roster_create_direct_and_nested() {
         let timestamp = opc_types::Timestamp::now_utc();
         let direct = ReplicationEntry {
+            replay_policy: opc_session_store::ReplicationReplayPolicy::prune_expired(),
             sequence: 7,
             tx_id: "concurrent-v2-direct".try_into().expect("transaction ID"),
             op: concurrent_roster_create("concurrent-v2-direct"),
             timestamp,
         };
         let nested = ReplicationEntry {
+            replay_policy: opc_session_store::ReplicationReplayPolicy::prune_expired(),
             sequence: 8,
             tx_id: "concurrent-v2-nested".try_into().expect("transaction ID"),
             op: ReplicationOp::Batch {

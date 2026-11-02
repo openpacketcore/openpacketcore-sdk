@@ -260,7 +260,7 @@ impl<'a> Cursor<'a> {
     }
 }
 
-fn key_scratch(bytes: &[u8]) -> io::Result<usize> {
+fn key_scratch(bytes: &[u8], format: Format) -> io::Result<usize> {
     let mut row = Cursor { rest: bytes };
     row.key()?;
     let mut payload = 0;
@@ -281,8 +281,31 @@ fn key_scratch(bytes: &[u8]) -> io::Result<usize> {
         }
         row.scalar::<u64>()?;
         row.scalar::<bool>()?;
+        if format.vocabulary >= Format::V7.vocabulary && row.scalar::<bool>()? {
+            row.scalar::<u64>()?;
+        }
     }
     row.end(payload)
+}
+
+/// Framing preflight reads only the bounded identifier and presence marker,
+/// never allocates or decodes a potentially large record payload.
+pub(super) fn key_row_present(prefix: &[u8]) -> io::Result<bool> {
+    const _: () = assert!(128 + 64 + SESSION_KEY_TYPE_MAX_BYTES + STABLE_ID_MAX_BYTES + 41 <= 8192);
+    let mut row = Cursor { rest: prefix };
+    row.key()?;
+    row.scalar::<bool>()
+}
+
+fn notification_leaf_scratch(row: &mut Cursor<'_>, tag: u32) -> io::Result<usize> {
+    if matches!(tag, 6 | 8) {
+        row.roster_effect(tag)
+    } else if matches!(tag, 3..=5) {
+        row.lease_effect(tag)?;
+        Ok(0)
+    } else {
+        row.mutation_effect(tag)
+    }
 }
 
 fn notification_scratch(bytes: &[u8]) -> io::Result<usize> {
@@ -291,29 +314,48 @@ fn notification_scratch(bytes: &[u8]) -> io::Result<usize> {
     row.string(crate::backend::REPLICATION_TX_ID_MAX_BYTES)?;
     let tag = row.scalar::<u32>()?;
     let payload = if tag == 7 {
-        if row.scalar::<usize>()? != 2 {
-            return Err(invalid(
-                "native generation notification batch shape invalid",
-            ));
+        match row.scalar::<usize>()? {
+            0 => 0,
+            1 => {
+                let leaf = row.scalar::<u32>()?;
+                notification_leaf_scratch(&mut row, leaf)?
+            }
+            2 => {
+                let lease = row.scalar::<u32>()?;
+                if !matches!(lease, 3 | 4) {
+                    return Err(invalid("native notification lease shape invalid"));
+                }
+                row.lease_effect(lease)?;
+                let mutation = row.scalar::<u32>()?;
+                row.mutation_effect(mutation)?
+            }
+            _ => return Err(invalid("native notification batch shape invalid")),
         }
-        let lease = row.scalar::<u32>()?;
-        if !matches!(lease, 3 | 4) {
-            return Err(invalid(
-                "native generation notification lease shape invalid",
-            ));
-        }
-        row.lease_effect(lease)?;
-        let mutation = row.scalar::<u32>()?;
-        row.mutation_effect(mutation)?
-    } else if matches!(tag, 6 | 8) {
-        row.roster_effect(tag)?
-    } else if matches!(tag, 3..=5) {
-        row.lease_effect(tag)?;
-        0
     } else {
-        row.mutation_effect(tag)?
+        notification_leaf_scratch(&mut row, tag)?
     };
     row.timestamp()?;
+    row.scalar::<bool>()?;
+    row.scalar::<bool>()?;
+    row.scalar::<u64>()?;
+    row.scalar::<u8>()?;
+    row.scalar::<u32>()?;
+    match row.scalar::<u32>()? {
+        0 => {}
+        1 | 2 => {
+            row.scalar::<[u8; 16]>()?;
+            row.scalar::<u16>()?;
+        }
+        _ => return Err(invalid("native notification command policy invalid")),
+    }
+    match row.scalar::<u32>()? {
+        0 => {}
+        1 => {
+            row.scalar::<u64>()?;
+        }
+        _ => return Err(invalid("native notification recovery policy invalid")),
+    }
+
     row.end(payload)
 }
 
@@ -414,7 +456,16 @@ pub(super) fn inspect_key(
     frontiers: &NativeFrontiers,
     check: &impl Fn() -> io::Result<()>,
 ) -> io::Result<(facts::KeyId, Option<facts::Row<facts::Key>>)> {
-    inspect_key_format(bytes, Format::V3, frontiers, check)
+    inspect_key_format(bytes, Format::V7, frontiers, check)
+}
+
+fn decode_key(bytes: &[u8], format: Format) -> io::Result<(SessionKey, Option<NativeKeyState>)> {
+    if format.vocabulary >= Format::V7.vocabulary {
+        binary::decode(bytes)
+    } else {
+        let (key, row): (SessionKey, Option<key_codec::BeforeEpoch>) = binary::decode(bytes)?;
+        Ok((key, row.map(key_codec::BeforeEpoch::into_current)))
+    }
 }
 
 pub(super) fn inspect_key_format(
@@ -424,8 +475,8 @@ pub(super) fn inspect_key_format(
     check: &impl Fn() -> io::Result<()>,
 ) -> io::Result<(facts::KeyId, Option<facts::Row<facts::Key>>)> {
     check()?;
-    let _memory = VerificationMemory::reserve(key_scratch(bytes)?)?;
-    let (key, row): (SessionKey, Option<NativeKeyState>) = binary::decode(bytes)?;
+    let _memory = VerificationMemory::reserve(key_scratch(bytes, format)?)?;
+    let (key, row) = decode_key(bytes, format)?;
     if let Some(row) = &row {
         if row.reserved && format.vocabulary < Format::V4.vocabulary {
             return Err(invalid(
@@ -433,6 +484,8 @@ pub(super) fn inspect_key_format(
             ));
         }
         validation::validate_key(&key, row, frontiers)?;
+    } else {
+        frontiers.retention.validate_key_removal(&key, None)?;
     }
     let id = facts::KeyId::of(&key)?;
     let facts = row
@@ -470,8 +523,8 @@ pub(super) fn owned_key(
     check: &impl Fn() -> io::Result<()>,
 ) -> io::Result<OwnedKey> {
     check()?;
-    let memory = VerificationMemory::reserve(key_scratch(bytes)?)?;
-    let (decoded_key, decoded): (SessionKey, Option<NativeKeyState>) = binary::decode(bytes)?;
+    let memory = VerificationMemory::reserve(key_scratch(bytes, expected.facts.format)?)?;
+    let (decoded_key, decoded) = decode_key(bytes, expected.facts.format)?;
     let decoded = decoded.ok_or_else(|| invalid("native resident key selected a tombstone"))?;
     if decoded.reserved && expected.facts.format.vocabulary < Format::V4.vocabulary {
         return Err(invalid(
@@ -492,6 +545,7 @@ pub(super) fn owned_key(
         lease: decoded.lease.clone(),
         fence: decoded.fence,
         reserved: decoded.reserved,
+        retired_epoch: decoded.retired_epoch,
     };
     drop(decoded);
     drop(decoded_key);

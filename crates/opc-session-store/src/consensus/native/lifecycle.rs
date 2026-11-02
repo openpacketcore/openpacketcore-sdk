@@ -425,17 +425,41 @@ impl NativeDelta<'_> {
 }
 
 impl NativeState {
-    /// Exact deletion count for a maintenance-only delivery. This scalar hint
-    /// does not evaluate receipt bindings from other commands in a mixed
-    /// delivery, so it can underestimate or skip admission on a follower.
-    /// Authoritative evaluation still reserves any shortfall fail-closed before
-    /// allocating the exact before-row vector; it does not bypass the cap.
+    /// Conservative reservation for every maintenance operation in a mixed
+    /// delivery, independent of the state changes made by preceding commands.
+    pub(crate) fn maximum_reclaim_candidate_bytes(
+        entries: &[Entry<SessionRaftTypeConfig>],
+    ) -> io::Result<usize> {
+        let maintenance = entries
+            .iter()
+            .filter(|entry| {
+                matches!(&entry.payload,
+            EntryPayload::Normal(command) if matches!(command.intent,
+                SessionMutationIntent::MaintainFencedTransitionV2History { .. }))
+            })
+            .count();
+        Self::reclaim_rows_bytes(
+            maintenance
+                .checked_mul(FENCED_TRANSITION_V2_RECLAIM_BATCH)
+                .ok_or_else(|| invalid("native mixed reclaim candidate overflow"))?,
+        )
+    }
+
+    /// Exact deletion reservation for maintenance-only deliveries, or the
+    /// conservative bound when other commands can affect receipt bindings.
     pub(crate) fn reclaim_candidate_bytes(
         &self,
         entries: &[Entry<SessionRaftTypeConfig>],
     ) -> io::Result<usize> {
         // Scalar copies only: admission must not allocate a candidate before
         // it obtains its reservation, even for a very large delivery.
+        if entries.iter().any(|entry| {
+            matches!(&entry.payload,
+            EntryPayload::Normal(command) if !matches!(command.intent,
+                SessionMutationIntent::MaintainFencedTransitionV2History { .. }))
+        }) {
+            return Self::maximum_reclaim_candidate_bytes(entries);
+        }
         let mut history = self.frontiers.history;
         let mut sequence = self.frontiers.sequence;
         let mut logical_time = self.frontiers.logical_time;

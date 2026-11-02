@@ -21,9 +21,13 @@ const V2_MAGIC: &[u8; 8] = b"OPCNAT02";
 #[cfg(test)]
 const V3_MAGIC: &[u8; 8] = b"OPCNAT03";
 #[cfg(test)]
-const MAGIC: &[u8; 8] = b"OPCNAT04";
+const V4_MAGIC: &[u8; 8] = b"OPCNAT04";
 #[cfg(test)]
-const SLOT_MAGIC: &[u8; 8] = b"OPCNAT05";
+const V5_MAGIC: &[u8; 8] = b"OPCNAT05";
+#[cfg(test)]
+const MAGIC: &[u8; 8] = b"OPCNAT06";
+#[cfg(test)]
+const SLOT_MAGIC: &[u8; 8] = b"OPCNAT07";
 #[cfg(test)]
 const MAX_ITEMS: usize = 1_048_576;
 #[cfg(test)]
@@ -137,11 +141,31 @@ impl NativeStorage {
             wal_sequence,
             snapshot,
             if self.business.frontiers.voter_slots.is_some() {
-                5
+                7
             } else {
-                4
+                6
             },
         )
+    }
+
+    #[cfg(test)]
+    pub(crate) fn write_legacy_v4_image_for_test(
+        &self,
+        writer: &mut impl Write,
+        root: [u8; 32],
+        wal_sequence: u64,
+    ) -> io::Result<()> {
+        self.write_version(writer, root, wal_sequence, None, 4)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn write_legacy_v5_image_for_test(
+        &self,
+        writer: &mut impl Write,
+        root: [u8; 32],
+        wal_sequence: u64,
+    ) -> io::Result<()> {
+        self.write_version(writer, root, wal_sequence, None, 5)
     }
 
     #[cfg(test)]
@@ -185,6 +209,14 @@ impl NativeStorage {
     ) -> io::Result<()> {
         self.business.require_legacy_roster_absent()?;
         self.validate_image()?;
+        if version < 6
+            && self.business.frontiers.retention.keys
+                != crate::key_retention::KeyRetention::default()
+        {
+            return Err(invalid(
+                "legacy native image cannot carry key retirement frontiers",
+            ));
+        }
         if version < 5
             && (self.business.frontiers.voter_slots.is_some() || self.log.slot_intent.is_some())
         {
@@ -225,13 +257,21 @@ impl NativeStorage {
             1 => LEGACY_MAGIC,
             2 => V2_MAGIC,
             3 => V3_MAGIC,
-            5 => SLOT_MAGIC,
+            4 => V4_MAGIC,
+            5 => V5_MAGIC,
+            7 => SLOT_MAGIC,
             _ => MAGIC,
         })?;
         write_item(writer, &header, MAX_HEADER)?;
         for (key, row) in &self.business.keys {
             if version < 3 {
                 write_row(writer, &(key, legacy::Key::from_current(key, row)?), legacy)?;
+            } else if version < 6 {
+                write_row(
+                    writer,
+                    &(key, key_codec::BeforeEpoch::from_current(row)?),
+                    false,
+                )?;
             } else {
                 write_row(writer, &(key, row), false)?;
             }
@@ -277,16 +317,20 @@ impl NativeStorage {
             2
         } else if &magic == V3_MAGIC {
             3
-        } else if &magic == SLOT_MAGIC {
-            5
-        } else if &magic == MAGIC {
+        } else if &magic == V4_MAGIC {
             4
+        } else if &magic == V5_MAGIC {
+            5
+        } else if &magic == SLOT_MAGIC {
+            7
+        } else if &magic == MAGIC {
+            6
         } else {
             return Err(invalid("native image discriminator differs"));
         };
         let legacy = version == 1;
         let header: Header = read_item(reader, MAX_HEADER)?;
-        if (version == 5) != header.frontiers.voter_slots.is_some()
+        if matches!(version, 5 | 7) != header.frontiers.voter_slots.is_some()
             || (version < 5 && header.slot_intent.is_some())
         {
             return Err(invalid("native image voter-slot format differs"));
@@ -305,7 +349,7 @@ impl NativeStorage {
             || header.wal_sequence != wal_sequence
             || header.identity != identity
             || !(matches!(header.members.len(), 3 | 5)
-                || (version == 5 && header.members.len() == 9))
+                || (matches!(version, 5 | 7) && header.members.len() == 9))
             || [header.keys, header.generic_receipts, header.notifications]
                 .into_iter()
                 .any(|count| count > MAX_ITEMS)
@@ -333,6 +377,9 @@ impl NativeStorage {
                 let (key, value): (SessionKey, legacy::Key) = read_row(reader, legacy)?;
                 let value = SharedRow::new(value.into_current(&key)?)?;
                 (key, value)
+            } else if version < 6 {
+                let (key, value): (SessionKey, key_codec::BeforeEpoch) = read_row(reader, false)?;
+                (key, SharedRow::new(value.into_current())?)
             } else {
                 read_row(reader, false)?
             };
@@ -388,7 +435,7 @@ impl NativeStorage {
                     SharedRow::new(log::NativeLogEntry::new_with_profile(
                         encoded.into(),
                         entry,
-                        version == 5,
+                        matches!(version, 5 | 7),
                     ))?,
                 )
                 .is_some()

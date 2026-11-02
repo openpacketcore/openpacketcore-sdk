@@ -56,6 +56,7 @@ fn predecessor(
             lease: Some(NativeLease::from_guard(&guard).unwrap()),
             fence: authority.fence().get(),
             reserved: false,
+            retired_epoch: None,
         })
         .unwrap(),
     );
@@ -544,6 +545,7 @@ fn native_v2_successor_recovery_distinguishes_retired_history_from_missing() {
             lease: Some(NativeLease::from_guard(&guard).unwrap()),
             fence: guard.fence().get(),
             reserved: false,
+            retired_epoch: None,
         })
         .unwrap(),
     );

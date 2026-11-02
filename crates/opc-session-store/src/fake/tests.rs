@@ -3,13 +3,30 @@ use crate::model::{Generation, StateClass};
 use bytes::Bytes;
 use futures_util::StreamExt;
 use opc_types::{NetworkFunctionKind, TenantId};
+use std::collections::{BTreeMap, HashMap};
+
+#[path = "replay_time_tests.rs"]
+mod replay_time;
+
+#[path = "clock_isolation_tests.rs"]
+mod clock_isolation;
+
+#[path = "commit_tests.rs"]
+mod commit;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-struct FakeBackendDataSnapshot {
+pub(crate) struct FakeBackendDataSnapshot {
     records: BTreeMap<FakeMapKey, StoredSessionRecord>,
     leases: HashMap<FakeMapKey, LeaseEntry>,
     key_fences: HashMap<FakeMapKey, FenceToken>,
-    retired_fence_high_water: FenceToken,
+    key_retention: crate::key_retention::KeyRetention,
+    async_fence_floor: u64,
+    internal_key_count: u32,
+    pending_replay_command: Option<PendingReplayCommand>,
+    retired_keys: HashMap<FakeMapKey, u64>,
+    retired_index: std::collections::BTreeSet<(u64, FakeMapKey)>,
+    retirement_candidates: std::collections::BTreeSet<FakeMapKey>,
+    committed_time: Option<Timestamp>,
     next_fence: u64,
     next_credential_id: u64,
     compacted_replication_sequence: u64,
@@ -20,22 +37,152 @@ struct FakeBackendDataSnapshot {
 
 fn data_snapshot(state: &FakeBackendState) -> FakeBackendDataSnapshot {
     FakeBackendDataSnapshot {
-        records: state.records.clone(),
-        leases: state.leases.clone(),
-        key_fences: state.key_fences.clone(),
-        retired_fence_high_water: state.retired_fence_high_water,
+        records: state
+            .records
+            .iter()
+            .map(|(key, row)| (key.clone(), row.clone()))
+            .collect(),
+        leases: state
+            .leases
+            .iter()
+            .map(|(key, row)| (key.clone(), row.clone()))
+            .collect(),
+        key_fences: state
+            .key_fences
+            .iter()
+            .map(|(key, fence)| (key.clone(), *fence))
+            .collect(),
+        key_retention: state.key_retention,
+        async_fence_floor: state.async_fence_floor,
+        internal_key_count: state.internal_key_count,
+        pending_replay_command: state.pending_replay_command.clone(),
+        retired_keys: state
+            .retired_keys
+            .iter()
+            .map(|(key, epoch)| (key.clone(), *epoch))
+            .collect(),
+        retired_index: state.retired_index.iter().cloned().collect(),
+        retirement_candidates: state.retirement_candidates.iter().cloned().collect(),
+        committed_time: state.committed_time,
         next_fence: state.next_fence,
         next_credential_id: state.next_credential_id,
         compacted_replication_sequence: state.compacted_replication_sequence,
         last_replication_sequence: state.last_replication_sequence,
-        replication_log: state.replication_log.clone(),
+        replication_log: state.replication_log.iter().cloned().collect(),
         watcher_count: state.watchers.len(),
     }
 }
 
-async fn backend_data_snapshot(backend: &FakeSessionBackend) -> FakeBackendDataSnapshot {
+pub(crate) async fn backend_data_snapshot(backend: &FakeSessionBackend) -> FakeBackendDataSnapshot {
     let state = backend.inner.lock().await;
     data_snapshot(&state)
+}
+
+pub(crate) type ReplayKeyIdForTest = (String, String, String, Vec<u8>);
+pub(crate) type ReplayLeaseForTest = (
+    bool,
+    OwnerId,
+    FenceToken,
+    u64,
+    Option<Timestamp>,
+    i64,
+    Timestamp,
+);
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ReplayRowForTest {
+    pub(crate) fence: u64,
+    pub(crate) record: Option<StoredSessionRecord>,
+    pub(crate) lease: Option<ReplayLeaseForTest>,
+    pub(crate) retired_epoch: Option<u64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ReplayStateForTest {
+    pub(crate) async_fence_floor: u64,
+    pub(crate) internal_key_count: u32,
+    pub(crate) retention: crate::key_retention::KeyRetention,
+    pub(crate) retired_index: std::collections::BTreeSet<(u64, ReplayKeyIdForTest)>,
+    pub(crate) keys: BTreeMap<ReplayKeyIdForTest, ReplayRowForTest>,
+    pub(crate) next_fence: u64,
+    pub(crate) next_credential: u64,
+}
+
+pub(crate) fn replay_key_id_for_test(key: &SessionKey) -> ReplayKeyIdForTest {
+    (
+        key.tenant.as_str().to_owned(),
+        key.nf_kind.as_str().to_owned(),
+        key.key_type.as_str().to_owned(),
+        key.stable_id.as_bytes().to_vec(),
+    )
+}
+
+pub(crate) async fn replay_state_for_test(backend: &FakeSessionBackend) -> ReplayStateForTest {
+    let state = backend.inner.lock().await;
+    ReplayStateForTest {
+        async_fence_floor: state.async_fence_floor,
+        internal_key_count: state.internal_key_count,
+        retention: state.key_retention,
+        retired_index: state
+            .retired_index
+            .iter()
+            .map(|(epoch, key)| {
+                (
+                    *epoch,
+                    (
+                        key.tenant.clone(),
+                        key.nf_kind.clone(),
+                        key.key_type.as_str().to_owned(),
+                        key.stable_id.as_bytes().to_vec(),
+                    ),
+                )
+            })
+            .collect(),
+        keys: state
+            .key_fences
+            .iter()
+            .map(|(key, fence)| {
+                let id = (
+                    key.tenant.clone(),
+                    key.nf_kind.clone(),
+                    key.key_type.as_str().to_owned(),
+                    key.stable_id.as_bytes().to_vec(),
+                );
+                let lease = state.leases.get(key).map(|lease| {
+                    (
+                        lease.active,
+                        lease.owner.clone(),
+                        lease.fence,
+                        lease.credential_id,
+                        Some(lease.acquired_at),
+                        crate::sqlite::ops::timestamp_unix_millis(lease.expires_at).unwrap(),
+                        lease.guard_expires_at,
+                    )
+                });
+                (
+                    id,
+                    ReplayRowForTest {
+                        fence: fence.get(),
+                        record: state.records.get(key).cloned(),
+                        lease,
+                        retired_epoch: state.retired_keys.get(key).copied(),
+                    },
+                )
+            })
+            .collect(),
+        next_fence: state.next_fence,
+        next_credential: state.next_credential_id,
+    }
+}
+
+pub(crate) async fn pending_replay_entries_for_test(backend: &FakeSessionBackend) -> Option<u16> {
+    backend
+        .inner
+        .lock()
+        .await
+        .pending_replay_command
+        .as_ref()
+        .map(|pending| pending.remaining)
 }
 
 fn replication_entry(
@@ -45,6 +192,7 @@ fn replication_entry(
     op: ReplicationOp,
 ) -> ReplicationEntry {
     ReplicationEntry {
+        replay_policy: crate::ReplicationReplayPolicy::prune_and_retire(),
         sequence,
         tx_id: tx_id.try_into().expect("valid transaction ID"),
         op,
@@ -74,6 +222,291 @@ fn test_record(key: SessionKey, generation: u64, fence: u64, owner: &str) -> Sto
         expires_at: None,
         payload: crate::record::EncryptedSessionPayload::new(Bytes::from_static(b"payload")),
     }
+}
+
+#[cfg(feature = "lab-memory")]
+#[tokio::test]
+async fn fake_key_retention_retires_dead_keys_without_reviving_stale_credentials() {
+    let backend = FakeSessionBackend::in_memory_lab();
+    let live_key = test_key("retention", b"live");
+    let key = test_key("retention", b"retired");
+    let owner = OwnerId::new("retention-owner").unwrap();
+    let live = backend
+        .acquire(&live_key, owner.clone(), Duration::from_secs(60))
+        .await
+        .unwrap();
+    let old = backend
+        .acquire(&key, owner.clone(), Duration::from_secs(60))
+        .await
+        .unwrap();
+    backend.release(old.clone()).await.unwrap();
+    assert_eq!(
+        backend.inner.lock().await.key_fences.len(),
+        2,
+        "live and recently dead keys remain exact"
+    );
+    let observation = backend.observe_fenced_transition(&key).await.unwrap();
+    assert!(observation.record().is_none());
+    assert_eq!(observation.current_fence(), old.fence());
+    assert_eq!(
+        backend
+            .renew(&old, Duration::from_secs(60))
+            .await
+            .unwrap_err(),
+        LeaseError::StaleFence
+    );
+    let new = backend
+        .acquire(&key, owner, Duration::from_secs(60))
+        .await
+        .unwrap();
+    assert!(new.fence() > observation.current_fence());
+    assert_eq!(
+        backend.release(old).await.unwrap_err(),
+        LeaseError::StaleFence
+    );
+    assert!(backend.renew(&live, Duration::from_secs(60)).await.is_ok());
+}
+
+#[tokio::test(start_paused = true)]
+async fn expired_retired_lease_mutations_preserve_the_expiry_answer() {
+    let backend = FakeSessionBackend::new();
+    let key = test_key("retention", b"expired-owned-lease");
+    let lease = backend
+        .acquire(
+            &key,
+            OwnerId::new("expiry-owner").unwrap(),
+            Duration::from_secs(5),
+        )
+        .await
+        .unwrap();
+    tokio::time::advance(Duration::from_secs(6)).await;
+    // Commit expiry cleanup before testing mutations against a retired key.
+    // Reads filter expiry without publishing retirement.
+    let maintenance = backend
+        .acquire(
+            &test_key("retention", b"expiry-maintenance"),
+            OwnerId::new("maintenance-owner").unwrap(),
+            Duration::from_secs(60),
+        )
+        .await
+        .unwrap();
+    backend.release(maintenance).await.unwrap();
+    assert!(backend.get(&key).await.unwrap().is_none());
+    assert_eq!(
+        backend
+            .inner
+            .lock()
+            .await
+            .key_fences
+            .get(&FakeSessionBackend::map_key(&key)),
+        Some(&lease.fence())
+    );
+    let before = backend_data_snapshot(&backend).await;
+    assert_eq!(
+        backend
+            .compare_and_set(cas_for_lease(key.clone(), &lease, None, 1))
+            .await,
+        Err(StoreError::LeaseExpired)
+    );
+    assert_eq!(
+        backend.delete_fenced(&lease).await,
+        Err(StoreError::LeaseExpired)
+    );
+    assert_eq!(
+        backend.refresh_ttl(&lease, Duration::from_secs(60)).await,
+        Err(StoreError::LeaseExpired)
+    );
+    assert_eq!(backend_data_snapshot(&backend).await, before);
+}
+
+#[cfg(feature = "lab-memory")]
+#[tokio::test(start_paused = true)]
+async fn fake_key_retention_passes_original_distinct_key_limit() {
+    let backend = FakeSessionBackend::in_memory_lab();
+    let owner = OwnerId::new("retention-owner").unwrap();
+    let live_key = test_key("retention", b"live");
+    let live = backend
+        .acquire(&live_key, owner.clone(), Duration::from_secs(60))
+        .await
+        .unwrap();
+    let mut first = None;
+    for number in 0_u64..100_001 {
+        let key = test_key("retention", &number.to_be_bytes());
+        let lease = backend
+            .acquire(&key, owner.clone(), Duration::from_secs(60))
+            .await
+            .unwrap();
+        assert_eq!(
+            backend
+                .compare_and_set(cas_for_lease(key.clone(), &lease, None, 1))
+                .await
+                .unwrap(),
+            CompareAndSetResult::Success
+        );
+        assert!(backend.get(&key).await.unwrap().is_some());
+        backend.delete_fenced(&lease).await.unwrap();
+        backend.release(lease.clone()).await.unwrap();
+        if first.is_none() {
+            first = Some(lease);
+        }
+        let state = backend.inner.lock().await;
+        // The preceding released key is retired by the next committing
+        // acquire; this iteration retains its own inactive lease until then.
+        let window = crate::key_retention::RETIRED_KEYS_PER_EPOCH;
+        let retained = if number < window {
+            number
+        } else {
+            window + number % window
+        };
+        assert_eq!(state.key_fences.len(), 2 + retained as usize);
+        assert_eq!(state.retired_keys.len(), retained as usize);
+        assert!(state.retired_keys.len() <= 2 * window as usize);
+        assert_eq!(state.key_retention.epoch, number / window);
+        assert_eq!(state.key_retention.retired_count, number % window);
+        assert_eq!(state.leases.len(), 2);
+        assert!(state.records.is_empty());
+        assert!(state.replication_log.len() <= 65_536);
+        assert!(state.lab_transitions.is_empty());
+    }
+    let first = first.unwrap();
+    let observation = backend
+        .observe_fenced_transition(first.key())
+        .await
+        .unwrap();
+    assert!(observation.current_fence() > first.fence());
+    assert!(observation.record().is_none());
+    assert_eq!(
+        backend
+            .renew(&first, Duration::from_secs(60))
+            .await
+            .unwrap_err(),
+        LeaseError::StaleFence
+    );
+    let recreated = backend
+        .acquire(first.key(), owner, Duration::from_secs(60))
+        .await
+        .unwrap();
+    assert!(recreated.fence() > observation.current_fence());
+    assert_eq!(
+        backend.release(first).await.unwrap_err(),
+        LeaseError::StaleFence
+    );
+    assert_eq!(
+        backend
+            .renew(&live, Duration::from_secs(60))
+            .await
+            .unwrap()
+            .fence(),
+        live.fence()
+    );
+    assert!(matches!(
+        backend.get_replication_log(1, 1).await,
+        Err(StoreError::ReplicationLogCursorCompacted { .. })
+    ));
+}
+
+#[tokio::test(start_paused = true)]
+async fn fake_key_retention_replays_and_rebuilds_the_same_absent_floor() {
+    let clock: Arc<dyn Clock> = Arc::new(TokioVirtualClock::new());
+    let limits = FakeBackendLimits {
+        max_tracked_keys: 2,
+        max_replication_entries: 64,
+    };
+    let source = FakeSessionBackend::with_limits(limits).with_clock(Arc::clone(&clock));
+    let replica = FakeSessionBackend::with_limits(limits).with_clock(Arc::clone(&clock));
+    let rebuilt = FakeSessionBackend::with_limits(limits).with_clock(clock);
+    let live_key = test_key("retention", b"live");
+    let live = acquire_test_lease(&source, &live_key, "owner").await;
+    let mut first = None;
+    for number in 0_u64..10 {
+        let key = test_key("retention", &number.to_be_bytes());
+        let lease = acquire_test_lease(&source, &key, "owner").await;
+        source
+            .compare_and_set(cas_for_lease(key, &lease, None, 1))
+            .await
+            .unwrap();
+        source.delete_fenced(&lease).await.unwrap();
+        source.release(lease.clone()).await.unwrap();
+        first.get_or_insert(lease);
+    }
+    let entries = source.get_replication_log(1, 64).await.unwrap();
+    for entry in &entries {
+        replica.replicate_entry(entry.clone()).await.unwrap();
+    }
+    rebuilt.rebuild_replication_state(entries).await.unwrap();
+    let source_snapshot = backend_data_snapshot(&source).await;
+    assert_eq!(source_snapshot.key_fences.len(), 2);
+    assert!(source_snapshot.key_retention.floor_cur > first.as_ref().unwrap().fence().get());
+    assert_eq!(backend_data_snapshot(&replica).await, source_snapshot);
+    assert_eq!(backend_data_snapshot(&rebuilt).await, source_snapshot);
+    for backend in [&replica, &rebuilt] {
+        assert_eq!(
+            backend
+                .renew(first.as_ref().unwrap(), Duration::from_secs(60))
+                .await
+                .unwrap_err(),
+            LeaseError::StaleFence
+        );
+        assert_eq!(
+            backend
+                .renew(&live, Duration::from_secs(60))
+                .await
+                .unwrap()
+                .fence(),
+            live.fence()
+        );
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn fake_key_retention_reclaims_imported_delete_floors() {
+    let backend = FakeSessionBackend::with_limits(FakeBackendLimits {
+        max_tracked_keys: 1,
+        max_replication_entries: 8,
+    });
+    let now = backend.clock.now_utc();
+    for sequence in 1_u64..=3 {
+        let before = backend_data_snapshot(&backend).await;
+        assert_eq!(
+            backend
+                .replicate_entry(replication_entry(
+                    1,
+                    &format!("retired-{sequence}"),
+                    now,
+                    ReplicationOp::DeleteFenced {
+                        key: test_key("retention", &sequence.to_be_bytes()),
+                        owner: OwnerId::new("owner").unwrap(),
+                        fence: FenceToken::new(sequence),
+                    },
+                ))
+                .await,
+            Err(StoreError::StaleFence)
+        );
+        assert_eq!(backend_data_snapshot(&backend).await, before);
+        let state = backend.inner.lock().await;
+        assert!(state.key_fences.is_empty());
+        assert_eq!(state.key_retention.floor_cur, 0);
+        assert_eq!(state.next_fence, 1);
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn fake_key_retention_keeps_counter_horizon_fences() {
+    let backend = FakeSessionBackend::new();
+    let key = test_key("retention", b"horizon");
+    let mk = FakeSessionBackend::map_key(&key);
+    let mut state = backend.inner.lock().await;
+    state.next_fence = u64::MAX;
+    state
+        .key_fences
+        .insert(mk.clone(), FenceToken::new(u64::MAX - 1));
+    FakeSessionBackend::prune_state(&mut state, backend.clock.now_utc());
+    assert_eq!(
+        state.key_fences.get(&mk),
+        Some(&FenceToken::new(u64::MAX - 1))
+    );
+    assert_eq!(state.next_fence, u64::MAX);
+    assert_eq!(state.key_retention.floor_cur, 0);
 }
 
 fn test_record_with_state_class(
@@ -224,7 +657,7 @@ async fn failed_replication_preserves_expired_internal_state_and_watchers() {
         state.next_fence = 8;
         state.next_credential_id = 9;
         state.last_replication_sequence = 1;
-        state.replication_log.push(existing_entry);
+        state.replication_log.push_back(existing_entry);
     }
     let mut watch = backend.watch(2).await.expect("watch rejected append");
     let before = backend_data_snapshot(&backend).await;
@@ -365,7 +798,7 @@ async fn protected_roster_v2_create_rebuild_is_rejected_without_state_change() {
 }
 
 #[tokio::test]
-async fn late_capacity_failure_rolls_back_batch_and_preserves_watcher() {
+async fn late_capacity_failure_after_dead_child_rolls_back_batch_and_preserves_watcher() {
     let backend = FakeSessionBackend::with_limits(FakeBackendLimits {
         max_tracked_keys: 1,
         max_replication_entries: 8,
@@ -374,32 +807,40 @@ async fn late_capacity_failure_rolls_back_batch_and_preserves_watcher() {
     let key_b = test_key("t1", b"capacity-b");
     let owner = OwnerId::new("owner-a").expect("owner");
     let now = backend.clock.now_utc();
-    let lease_expires_at = checked_session_deadline(now, Duration::from_secs(60))
-        .expect("capacity fixture lease expiry");
+    let expires_at = checked_session_deadline(now, Duration::from_secs(60)).unwrap();
+    let acquire = ReplicationOp::AcquireLease {
+        key: key_a.clone(),
+        owner: owner.clone(),
+        fence: FenceToken::new(1),
+        credential_id: 1,
+        ttl: Duration::from_secs(60),
+        expires_at,
+    };
+    let release = ReplicationOp::ReleaseLease {
+        key: key_a.clone(),
+        owner: owner.clone(),
+        fence: FenceToken::new(1),
+        credential_id: 1,
+    };
     let mut watch = backend.watch(1).await.expect("watch rejected batch");
     let before = backend_data_snapshot(&backend).await;
-    // The first child establishes authoritative state (a live lease), so the
-    // second child genuinely exceeds the tracked-key bound. A fence floor with
-    // no record or lease is dead state and may now be retired under capacity
-    // pressure instead of forming a deterministic refusal.
     let rejected = replication_entry(
         1,
         "capacity-rejected",
         now,
         ReplicationOp::Batch {
             ops: vec![
+                acquire.clone(),
+                release.clone(),
+                // The first key has no record or active authority. Its
+                // inactive lease must not be pruned between Batch children.
                 ReplicationOp::AcquireLease {
-                    key: key_a.clone(),
-                    owner: owner.clone(),
-                    fence: FenceToken::new(1),
-                    credential_id: 1,
-                    ttl: Duration::from_secs(60),
-                    expires_at: lease_expires_at,
-                },
-                ReplicationOp::DeleteFenced {
-                    key: key_b.clone(),
+                    key: key_b,
                     owner: owner.clone(),
                     fence: FenceToken::new(2),
+                    credential_id: 2,
+                    ttl: Duration::from_secs(60),
+                    expires_at,
                 },
             ],
         },
@@ -419,10 +860,91 @@ async fn late_capacity_failure_rolls_back_batch_and_preserves_watcher() {
         1,
         "capacity-accepted",
         now,
-        ReplicationOp::DeleteFenced {
+        ReplicationOp::Batch {
+            ops: vec![acquire, release],
+        },
+    );
+    backend
+        .replicate_entry(accepted.clone())
+        .await
+        .expect("a valid entry must remain appendable");
+    assert_eq!(next_replication_entry(&mut watch).await, accepted);
+    assert_no_replication_entry(&mut watch).await;
+    assert_eq!(backend.inner.lock().await.watchers.len(), 1);
+    let state = backend.inner.lock().await;
+    assert!(
+        !state
+            .leases
+            .get(&FakeSessionBackend::map_key(&key_a))
+            .unwrap()
+            .active
+    );
+    assert_eq!(state.key_retention.epoch, 0);
+}
+
+#[tokio::test]
+async fn late_capacity_failure_rolls_back_batch_and_preserves_watcher() {
+    let backend = FakeSessionBackend::with_limits(FakeBackendLimits {
+        max_tracked_keys: 1,
+        max_replication_entries: 8,
+    });
+    let key_a = test_key("t1", b"capacity-a");
+    let key_b = test_key("t1", b"capacity-b");
+    let owner = OwnerId::new("owner-a").expect("owner");
+    let now = backend.clock.now_utc();
+    let lease_expires_at = checked_session_deadline(now, Duration::from_secs(60))
+        .expect("capacity fixture lease expiry");
+    let mut watch = backend.watch(1).await.expect("watch rejected batch");
+    let before = backend_data_snapshot(&backend).await;
+    // A late refusal must roll back a live first child as well as the dead
+    // first child covered above. Cleanup never runs between batch children.
+    let rejected = replication_entry(
+        1,
+        "capacity-rejected",
+        now,
+        ReplicationOp::Batch {
+            ops: vec![
+                ReplicationOp::AcquireLease {
+                    key: key_a.clone(),
+                    owner: owner.clone(),
+                    fence: FenceToken::new(1),
+                    credential_id: 1,
+                    ttl: Duration::from_secs(60),
+                    expires_at: lease_expires_at,
+                },
+                ReplicationOp::AcquireLease {
+                    key: key_b.clone(),
+                    owner: owner.clone(),
+                    fence: FenceToken::new(2),
+                    credential_id: 2,
+                    ttl: Duration::from_secs(60),
+                    expires_at: lease_expires_at,
+                },
+            ],
+        },
+    );
+
+    assert_eq!(
+        backend
+            .replicate_entry(rejected)
+            .await
+            .expect_err("the final child must exceed the key limit"),
+        StoreError::BackendUnavailable("fake backend tracked-key limit reached".into())
+    );
+    assert_eq!(backend_data_snapshot(&backend).await, before);
+    assert_no_replication_entry(&mut watch).await;
+
+    let accepted = replication_entry(
+        1,
+        "capacity-accepted",
+        now,
+        ReplicationOp::AcquireLease {
             key: key_a,
             owner,
             fence: FenceToken::new(1),
+            credential_id: 1,
+            ttl: Duration::from_secs(60),
+            expires_at: lease_expires_at,
         },
     );
     backend
@@ -459,22 +981,37 @@ async fn failed_rebuild_preserves_every_internal_state_dimension() {
             1,
             "replacement-first",
             now,
-            ReplicationOp::DeleteFenced {
+            ReplicationOp::AcquireLease {
                 key: replacement_key,
                 owner: owner.clone(),
                 fence: FenceToken::new(20),
+                credential_id: 20,
+                ttl,
+                expires_at,
             },
         ),
         replication_entry(
             2,
             "replacement-failure",
             now,
-            ReplicationOp::RefreshTtl {
-                key: missing_key,
-                owner,
-                fence: FenceToken::new(21),
-                ttl,
-                expires_at,
+            ReplicationOp::Batch {
+                ops: vec![
+                    ReplicationOp::AcquireLease {
+                        key: missing_key.clone(),
+                        owner: owner.clone(),
+                        fence: FenceToken::new(21),
+                        credential_id: 21,
+                        ttl,
+                        expires_at,
+                    },
+                    ReplicationOp::RefreshTtl {
+                        key: missing_key,
+                        owner,
+                        fence: FenceToken::new(21),
+                        ttl,
+                        expires_at,
+                    },
+                ],
             },
         ),
     ];
@@ -502,24 +1039,31 @@ async fn staging_preserves_and_advances_nonzero_compaction_state() {
     let third_key = test_key("t1", b"next-third");
     let missing_key = test_key("t1", b"missing-final");
     let now = backend.clock.now_utc();
+    let expires_at = checked_session_deadline(now, Duration::from_secs(60)).unwrap();
     let first = replication_entry(
         1,
         "compacted-first",
         now,
-        ReplicationOp::DeleteFenced {
+        ReplicationOp::AcquireLease {
             key: first_key,
             owner: owner.clone(),
             fence: FenceToken::new(1),
+            credential_id: 1,
+            ttl: Duration::from_secs(60),
+            expires_at,
         },
     );
     let second = replication_entry(
         2,
         "retained-second",
         now,
-        ReplicationOp::DeleteFenced {
+        ReplicationOp::AcquireLease {
             key: second_key,
             owner: owner.clone(),
             fence: FenceToken::new(2),
+            credential_id: 2,
+            ttl: Duration::from_secs(60),
+            expires_at,
         },
     );
     backend
@@ -536,20 +1080,33 @@ async fn staging_preserves_and_advances_nonzero_compaction_state() {
     assert_eq!(compacted.last_replication_sequence, 2);
     assert_eq!(compacted.replication_log, vec![second]);
 
-    let expires_at =
-        Timestamp::from_offset_datetime(*now.as_offset_datetime() + time::Duration::seconds(60));
     let rejected_ops = vec![
-        ReplicationOp::DeleteFenced {
+        ReplicationOp::AcquireLease {
             key: third_key.clone(),
             owner: owner.clone(),
             fence: FenceToken::new(3),
-        },
-        ReplicationOp::RefreshTtl {
-            key: missing_key,
-            owner: owner.clone(),
-            fence: FenceToken::new(4),
+            credential_id: 3,
             ttl: Duration::from_secs(60),
             expires_at,
+        },
+        ReplicationOp::Batch {
+            ops: vec![
+                ReplicationOp::AcquireLease {
+                    key: missing_key.clone(),
+                    owner: owner.clone(),
+                    fence: FenceToken::new(4),
+                    credential_id: 4,
+                    ttl: Duration::from_secs(60),
+                    expires_at,
+                },
+                ReplicationOp::RefreshTtl {
+                    key: missing_key,
+                    owner: owner.clone(),
+                    fence: FenceToken::new(4),
+                    ttl: Duration::from_secs(60),
+                    expires_at,
+                },
+            ],
         },
     ];
     let rejected_append = replication_entry(
@@ -595,10 +1152,13 @@ async fn staging_preserves_and_advances_nonzero_compaction_state() {
         3,
         "accepted-after-compaction",
         now,
-        ReplicationOp::DeleteFenced {
+        ReplicationOp::AcquireLease {
             key: third_key,
             owner,
             fence: FenceToken::new(3),
+            credential_id: 3,
+            ttl: Duration::from_secs(60),
+            expires_at,
         },
     );
     backend
@@ -2014,101 +2574,68 @@ async fn repeated_idle_watch_disconnects_do_not_accumulate_in_fake_backend() {
     drop(live);
 }
 
-#[tokio::test]
-async fn dead_key_fences_are_retired_under_capacity_and_stale_guards_stay_refused() {
-    let backend = FakeSessionBackend::with_limits(FakeBackendLimits {
-        max_tracked_keys: 2,
-        max_replication_entries: 16,
-    });
-    let stale_key = test_key("t1", b"dead-fence-stale-guard");
-    let lease = acquire_test_lease(&backend, &stale_key, "owner-a").await;
-    backend
-        .compare_and_set(cas_for_lease(stale_key.clone(), &lease, None, 1))
-        .await
-        .unwrap();
-    backend.delete_fenced(&lease).await.unwrap();
-    let stale_guard = lease.clone();
-    backend.release(lease).await.unwrap();
+#[path = "capacity_replay_tests.rs"]
+mod capacity_replay;
 
-    // A live record plus a live lease keep the second slot authoritative.
-    let live_key = test_key("t1", b"live-record");
-    let live_lease = acquire_test_lease(&backend, &live_key, "owner-a").await;
-    backend
-        .compare_and_set(cas_for_lease(live_key.clone(), &live_lease, None, 1))
-        .await
-        .unwrap();
-    {
-        let state = backend.inner.lock().await;
-        assert_eq!(state.key_fences.len(), 2);
-        assert!(state
-            .key_fences
-            .contains_key(&FakeSessionBackend::map_key(&stale_key)));
-    }
+#[path = "command_clock_regression_tests.rs"]
+mod command_clock_regressions;
 
-    // Capacity pressure retires only the dead floor, so the newcomer fits.
-    let newcomer = test_key("t1", b"newcomer");
-    let newcomer_lease = acquire_test_lease(&backend, &newcomer, "owner-c").await;
-    assert!(newcomer_lease.fence().get() > 0);
-    {
-        let state = backend.inner.lock().await;
-        assert_eq!(state.key_fences.len(), 2);
-        assert!(!state
-            .key_fences
-            .contains_key(&FakeSessionBackend::map_key(&stale_key)));
-        assert!(state
-            .key_fences
-            .contains_key(&FakeSessionBackend::map_key(&live_key)));
-        assert!(state
-            .key_fences
-            .contains_key(&FakeSessionBackend::map_key(&newcomer)));
-    }
-    // The stale credential is still refused: mutations require the exact live
-    // lease, and the retired floor cannot admit it.
-    assert_eq!(
-        backend
-            .compare_and_set(cas_for_lease(stale_key.clone(), &stale_guard, None, 1))
-            .await
-            .unwrap_err(),
-        StoreError::StaleFence
-    );
+pub(crate) fn with_tracked_key_limit_for_test(
+    source: &FakeSessionBackend,
+    maximum: usize,
+) -> FakeSessionBackend {
+    assert!(maximum > 0);
+    let mut backend = source.clone();
+    backend.limits.max_tracked_keys = maximum;
+    backend
 }
 
-#[tokio::test(start_paused = true)]
-async fn expired_record_and_lease_retire_their_key_floor_at_capacity() {
-    let backend = FakeSessionBackend::with_limits(FakeBackendLimits {
-        max_tracked_keys: 1,
-        max_replication_entries: 16,
-    });
-    let key = test_key("t1", b"expired-dead-key");
-    let lease = acquire_test_lease(&backend, &key, "owner-a").await;
-    let now = backend.clock.now_utc();
-    let mut record = test_record_for_lease(key.clone(), 1, &lease);
-    record.expires_at =
-        Some(checked_session_deadline(now, Duration::from_secs(30)).expect("record expiry"));
+#[path = "literal_renewal_tests.rs"]
+mod literal_renewal;
+
+#[cfg(feature = "lab-memory")]
+pub(crate) async fn canonical_record_for_test(
+    backend: &FakeSessionBackend,
+    key: &SessionKey,
+) -> Option<StoredSessionRecord> {
     backend
-        .compare_and_set(CompareAndSet {
-            key: key.clone(),
-            lease,
-            expected_generation: None,
-            new_record: record,
-        })
+        .inner
+        .lock()
+        .await
+        .records
+        .get(&FakeSessionBackend::map_key(key))
+        .cloned()
+}
+
+pub(crate) async fn retained_record_count_for_test(backend: &FakeSessionBackend) -> usize {
+    backend.inner.lock().await.records.len()
+}
+
+#[tokio::test]
+async fn round6_non_journal_batch_keeps_its_original_write_exemption() {
+    let mut caps = BackendCapabilities::all_enabled();
+    caps.ordered_replication_log = false;
+    caps.watch = false;
+    let backend = FakeSessionBackend::with_capabilities(caps);
+    let key = test_key("batch-bound", b"non-journal");
+    let lease = acquire_test_lease(&backend, &key, "batch-owner").await;
+    backend
+        .compare_and_set(cas_for_lease(key.clone(), &lease, None, 1))
         .await
         .unwrap();
-    // Both the record TTL (30 s) and the lease TTL (60 s) must elapse before
-    // the key is genuinely dead; a live lease still owns its fence floor.
-    tokio::time::advance(Duration::from_secs(61)).await;
-
-    let newcomer = test_key("t1", b"after-expiry");
-    let newcomer_lease = acquire_test_lease(&backend, &newcomer, "owner-b").await;
-    assert!(newcomer_lease.fence().get() > 0);
-    let state = backend.inner.lock().await;
-    assert_eq!(state.key_fences.len(), 1);
-    assert!(!state
-        .key_fences
-        .contains_key(&FakeSessionBackend::map_key(&key)));
-    assert!(state
-        .key_fences
-        .contains_key(&FakeSessionBackend::map_key(&newcomer)));
-    assert!(state.records.is_empty());
-    assert!(state.leases.len() <= 1);
+    let ops = (0..256)
+        .map(|_| SessionOp::RefreshTtl {
+            lease: lease.clone(),
+            ttl: Duration::from_secs(60),
+        })
+        .collect();
+    let results = backend
+        .batch(ops)
+        .await
+        .expect("no serialized journal entry exists to exceed its node limit");
+    assert_eq!(results.len(), 256);
+    assert!(results
+        .iter()
+        .all(|r| matches!(r, SessionOpResult::RefreshTtl(Ok(())))));
+    assert_eq!(backend.max_replication_sequence().await.unwrap(), 0);
 }

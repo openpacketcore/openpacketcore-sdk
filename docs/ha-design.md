@@ -969,7 +969,7 @@ limits, soak, production payload-key operation, supported platforms, and signed
 candidate-release evidence remain under #164/#143 and related gates.
 
 The closed V9 contract uses schema digest
-`sha256:65d456edc15359e9cbac25a6771822219797c53f03aa6ca5d8837e43a6dbc018`.
+`sha256:eb410e3be0c2260ebefc8567507941f9b08d06f5280a0ac43aebef9b7b60039e`.
 It binds canonical absolute producer Cargo-target, external evidence-root, and
 owner-private fs-verity snapshot-base paths, the root-derived pair directory,
 domain-separated commitments for those raw paths, and the snapshot-base

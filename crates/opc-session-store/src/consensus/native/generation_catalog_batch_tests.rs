@@ -170,9 +170,11 @@ impl Fixture {
 
     fn empty(&self) -> Rows {
         Rows {
+            base_bytes: 0,
             base_format: Format::V3,
             context: self.after.clone(),
             keys: HashMap::new(),
+            retired_counts: BTreeMap::new(),
             receipts: HashMap::new(),
             generic: HashMap::new(),
             v1_count: 0,

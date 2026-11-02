@@ -147,6 +147,16 @@ impl NativeDelta<'_> {
                     .map_err(|_| invalid("scope checkpoint invalid"))?,
             )
         };
+        if result.is_ok()
+            && self.frontiers.watch_sequence >= COUNTER_MAX
+            && self.requires_capacity_notification(if initialize_ledger { 2 } else { 0 })?
+        {
+            return Ok(self.clock_response(
+                now,
+                index,
+                StoreError::FencedTransitionStorageExhausted,
+            ));
+        }
         let sequence = self
             .frontiers
             .sequence
@@ -170,7 +180,7 @@ impl NativeDelta<'_> {
                 ))
                 .to_record()
                 .map_err(|_| invalid("scope initial ledger invalid"))?;
-                self.keys.insert(
+                self.set_key(
                     ledger.key.clone(),
                     NativeKeyState {
                         record: Some(ledger),
@@ -178,7 +188,7 @@ impl NativeDelta<'_> {
                     },
                 );
             }
-            self.keys.insert(
+            self.set_key(
                 key,
                 NativeKeyState {
                     record: Some(

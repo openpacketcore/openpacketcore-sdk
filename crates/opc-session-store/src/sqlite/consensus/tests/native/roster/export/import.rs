@@ -137,8 +137,8 @@ pub(super) fn complete_roundtrip(conn: &Connection, target: &Connection, storage
         .unwrap();
     assert_eq!(
         database(target),
-        database(conn),
-        "SQL -> streamed V4 -> complete cold SQL preserves every schema object and column"
+        expected_with_native_profile(target, conn),
+        "SQL -> native generation -> complete cold SQL preserves every original schema object and column plus its canonical native profile"
     );
 }
 

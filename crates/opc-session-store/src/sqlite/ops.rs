@@ -538,9 +538,18 @@ pub(crate) fn current_fence_sync(conn: &Connection, key: &SessionKey) -> Result<
         .optional()
         .map_err(|e| StoreError::BackendUnavailable(e.to_string()))?;
 
-    row.map(persisted_u64)
-        .transpose()
-        .map(Option::unwrap_or_default)
+    if let Some(fence) = row {
+        return persisted_u64(fence);
+    }
+    #[cfg(target_os = "linux")]
+    {
+        let retention = super::consensus::native_retention::read(conn)
+            .map_err(|error| StoreError::BackendUnavailable(error.to_string()))?
+            .unwrap_or_default();
+        Ok(retention.absent_fence(key))
+    }
+    #[cfg(not(target_os = "linux"))]
+    Ok(0)
 }
 
 pub(crate) fn get_sync(

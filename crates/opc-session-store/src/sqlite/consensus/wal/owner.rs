@@ -17,10 +17,11 @@ use crate::consensus::SessionPersistenceMode;
 use crate::sqlite::consensus::{self, SqliteConsensusCore};
 
 pub(super) const ROOT_BYTES: u64 = 168;
-// Readers predating frontier-implied log removal must fail before reading
-// CURRENT. Both formats retain the existing selector and root record layout.
-const ROOT_MAGIC: &[u8; 8] = b"OPCNR002";
-const ASYNC_RECOVERY_ROOT_MAGIC: &[u8; 8] = b"OPCNA004";
+// This retention boundary covers notification and ordinary-key retirement.
+// Older readers must fail before CURRENT or any application I/O.
+// Both modes retain the existing selector and root record layout.
+const ROOT_MAGIC: &[u8; 8] = b"OPCNR003";
+const ASYNC_RECOVERY_ROOT_MAGIC: &[u8; 8] = b"OPCNA005";
 const SELECTION_ATTRIBUTE: &str = "user.opc.native-root-v1";
 
 #[derive(Debug, thiserror::Error)]
@@ -53,6 +54,7 @@ type PreflightHookForTest = Arc<dyn Fn() -> io::Result<()> + Send + Sync>;
 #[cfg(test)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum RootPointForTest {
+    BeforeCreationDispatch,
     BeforeCreate,
     AfterCreate,
     AfterWrite,
@@ -528,18 +530,29 @@ impl NativeOwner {
             let mut generation = [0; 32];
             generation[..16].copy_from_slice(uuid::Uuid::new_v4().as_bytes());
             generation[16..].copy_from_slice(uuid::Uuid::new_v4().as_bytes());
-            let wal = Wal::create_native_with_persistence(
-                &path,
-                &conn,
-                core.storage_identity,
-                generation,
-                core.configured_roster_root.clone(),
-                Limits::default(),
-                self.io_control(),
-                persistence,
-            )?;
-            self.write_root(&wal)?;
-            (wal, conn)
+            let owner = Arc::clone(self);
+            let identity = core.storage_identity;
+            let roster_root = core.configured_roster_root.clone();
+            #[cfg(test)]
+            self.root_point_for_test(RootPointForTest::BeforeCreationDispatch)?;
+            crate::sqlite::SqliteSessionBackend::run_native_creation_blocking(move || {
+                // Preserve verification ownership through complete creation,
+                // including ROOT, even if its caller abandons the queued job.
+                let _descriptors = descriptors;
+                let wal = Wal::create_native_with_persistence(
+                    &path,
+                    &conn,
+                    identity,
+                    generation,
+                    roster_root,
+                    Limits::default(),
+                    owner.io_control(),
+                    persistence,
+                )?;
+                owner.write_root(&wal)?;
+                Ok((wal, conn))
+            })
+            .await?
         };
         self.verify_database(core)?;
         let placement = core

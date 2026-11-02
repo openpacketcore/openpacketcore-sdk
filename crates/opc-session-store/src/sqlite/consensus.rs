@@ -8,6 +8,10 @@
 pub(crate) mod async_recovery;
 pub(crate) mod consumer_receipts;
 #[cfg(target_os = "linux")]
+pub(crate) mod native_retention;
+#[cfg(target_os = "linux")]
+pub(crate) mod native_retired;
+#[cfg(target_os = "linux")]
 pub(crate) mod native_snapshot;
 pub(crate) mod roster_engine;
 pub(crate) mod roster_reads;
@@ -19898,10 +19902,16 @@ fn read_operator_recovery_after_schema_sync(
 }
 
 pub(crate) fn read_watch_cursor_invalidation_floor_sync(conn: &Connection) -> io::Result<u64> {
+    #[cfg(target_os = "linux")]
+    let retained_floor = native_retention::read(conn)?
+        .unwrap_or_default()
+        .watch_retired_through;
+    #[cfg(not(target_os = "linux"))]
+    let retained_floor = 0;
     if !table_exists(conn, "consensus_operator_recovery").map_err(db_error)?
         || !operator_recovery_cursor_column_exists(conn)?
     {
-        return Ok(0);
+        return Ok(retained_floor);
     }
     let floor: i64 = conn
         .query_row(
@@ -19910,7 +19920,7 @@ pub(crate) fn read_watch_cursor_invalidation_floor_sync(conn: &Connection) -> io
             |row| row.get(0),
         )
         .map_err(db_error)?;
-    checked_u64(floor)
+    Ok(checked_u64(floor)?.max(retained_floor))
 }
 
 fn operator_recovery_cursor_column_exists(conn: &Connection) -> io::Result<bool> {
@@ -30253,6 +30263,48 @@ fn fenced_transition_v2_replayed_outcome(
     }
 }
 
+/// Frame only the rows actually emitted by this command, in its transaction.
+fn frame_sqlite_command_notifications(
+    tx: &Transaction<'_>,
+    entries: &mut [ReplicationEntry],
+    id: [u8; 16],
+) -> io::Result<()> {
+    let count = entries.len();
+    if count > crate::MAX_SESSION_FENCED_TRANSITION_V2_BATCH_OPERATIONS {
+        return Err(invalid_data("application command framing exceeds bound"));
+    }
+    for (position, entry) in entries.iter_mut().enumerate() {
+        entry.replay_policy.command = if count == 1 {
+            crate::ReplicationCommandBoundary::Single
+        } else if position == 0 {
+            crate::ReplicationCommandBoundary::Start {
+                id,
+                following_entries: (count - 1) as u16,
+            }
+        } else {
+            crate::ReplicationCommandBoundary::Continue {
+                id,
+                remaining_entries: (count - position - 1) as u16,
+            }
+        };
+        entry
+            .validate()
+            .map_err(|_| invalid_data("application command framing invalid"))?;
+        let encoded = serde_json::to_string(entry)
+            .map_err(|_| invalid_data("application command framing encoding invalid"))?;
+        let changed = tx
+            .execute(
+                "UPDATE session_replication_log SET entry_json = ?1 WHERE sequence = ?2",
+                params![encoded, entry.sequence],
+            )
+            .map_err(db_error)?;
+        if changed != 1 {
+            return Err(invalid_data("application command framing row absent"));
+        }
+    }
+    Ok(())
+}
+
 /// Apply one ordered V2 batch under the already-open outer SQLite
 /// transaction. Fresh identities consume the remaining receipt capacity in
 /// slot order; deterministic item failures bind and return in slot order,
@@ -30474,6 +30526,7 @@ fn apply_fenced_transition_v2_batch_command_sync(
                             ),
                             replication,
                             logical_time,
+                            crate::ReplicationReplayPolicy::preserve(),
                         )?);
                     }
                     Ok(outcome)
@@ -30968,6 +31021,7 @@ fn apply_fenced_transition_v2_command_sync(
             command.request_id,
             replication,
             logical_time,
+            crate::ReplicationReplayPolicy::preserve(),
         )?);
     }
     Ok(response)
@@ -31370,8 +31424,7 @@ fn is_deterministic_intent_rejection(error: &StoreError) -> bool {
         | StoreError::PayloadTooLarge { .. }
         | StoreError::FencedTransitionRequestExpired
         | StoreError::FencedTransitionVoided
-        | StoreError::FencedTransitionStorageExhausted
-        | StoreError::KeyCapacityExhausted => true,
+        | StoreError::FencedTransitionStorageExhausted => true,
         StoreError::CapabilityNotSupported(_)
         | StoreError::CasIdempotencyConflict
         | StoreError::CasIdempotencyOutcomeUnavailable
@@ -31384,7 +31437,6 @@ fn is_deterministic_intent_rejection(error: &StoreError) -> bool {
         | StoreError::FencedTransitionRetentionExhausted
         | StoreError::BackendOperationOutcomeUnavailable
         | StoreError::BackendUnavailable(_)
-        | StoreError::KeyProviderUnavailable(_)
         | StoreError::FencedTransitionRecoveryJournalUnavailable
         | StoreError::InvalidReplicationSequence
         | StoreError::InvalidReplicationLogRange
@@ -32169,8 +32221,10 @@ fn store_replication_notification_sync(
     request_id: SessionConsensusRequestId,
     op: ReplicationOp,
     logical_time: Timestamp,
+    replay_policy: crate::ReplicationReplayPolicy,
 ) -> io::Result<ReplicationEntry> {
     let entry = ReplicationEntry {
+        replay_policy,
         sequence: watch_sequence,
         tx_id: ReplicationTxId::from_request_bytes(*request_id.as_bytes()),
         op,
@@ -32458,6 +32512,7 @@ fn apply_protected_roster_command_sync(
             command.request_id,
             replication,
             logical_time,
+            crate::ReplicationReplayPolicy::preserve(),
         )?);
         #[cfg(any(test, feature = "test-control"))]
         record_protected_roster_terminal_apply_timing(
@@ -32911,7 +32966,8 @@ fn apply_entries_with_authority_and_diagnostics_and_hooks_sync(
                         }
                     }
                 } else if fenced_transition_v2_batch(&command.intent).is_some() {
-                    apply_fenced_transition_v2_batch_command_sync(
+                    let first_notification = notifications.len();
+                    let response = apply_fenced_transition_v2_batch_command_sync(
                         &mut tx,
                         identity,
                         &scope,
@@ -32920,7 +32976,13 @@ fn apply_entries_with_authority_and_diagnostics_and_hooks_sync(
                         entry.log_id.index,
                         &mut machine,
                         &mut notifications,
-                    )?
+                    )?;
+                    frame_sqlite_command_notifications(
+                        &tx,
+                        &mut notifications[first_notification..],
+                        *command.request_id.as_bytes(),
+                    )?;
+                    response
                 } else if fenced_transition_v2_request(&command.intent).is_some() {
                     apply_fenced_transition_v2_command_sync(
                         &mut tx,
@@ -33297,6 +33359,7 @@ fn apply_entries_with_authority_and_diagnostics_and_hooks_sync(
                                                     command.request_id,
                                                     replication,
                                                     logical_time,
+                                                    crate::ReplicationReplayPolicy::preserve(),
                                                 )?,
                                             );
                                         }
@@ -33435,6 +33498,7 @@ fn apply_entries_with_authority_and_diagnostics_and_hooks_sync(
                                 command.request_id,
                                 replication,
                                 logical_time,
+                                crate::ReplicationReplayPolicy::prune_expired(),
                             )?);
                         }
                         response
@@ -34907,6 +34971,7 @@ pub(crate) fn validate_sealed_state_sync(conn: &Connection) -> io::Result<()> {
 }
 
 struct EncodedSealedReplicationAuditRow {
+    native_retention: bool,
     sequence: i64,
     tx_id: Option<String>,
     encoded: String,
@@ -34917,7 +34982,10 @@ fn validate_sealed_replication_audit_row(
     stored_tx_id: Option<&str>,
     encoded: &str,
     expected: u64,
+    native_retention: bool,
 ) -> io::Result<u64> {
+    #[cfg(not(target_os = "linux"))]
+    debug_assert!(!native_retention);
     let stored_sequence = checked_u64(stored_sequence)?;
     let stored_tx_id: ReplicationTxId = stored_tx_id
         .ok_or_else(|| invalid_data("persisted session replication transaction ID is invalid"))?
@@ -34938,7 +35006,22 @@ fn validate_sealed_replication_audit_row(
     entry
         .validate()
         .map_err(|_| invalid_data("persisted session replication entry is invalid"))?;
-    validate_sealed_replication_op(&entry.op)?;
+    #[cfg(target_os = "linux")]
+    if native_retention {
+        validate_native_sealed_replication_op(&entry.op)?;
+    } else {
+        super::replication::validate_standalone_replay_policy(&entry).map_err(|_| {
+            invalid_data("session replication replay policy requires native namespace")
+        })?;
+        validate_sealed_replication_op(&entry.op)?;
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        super::replication::validate_standalone_replay_policy(&entry).map_err(|_| {
+            invalid_data("session replication replay policy requires native namespace")
+        })?;
+        validate_sealed_replication_op(&entry.op)?;
+    }
     expected
         .checked_add(1)
         .ok_or_else(|| invalid_data("session replication sequence exhausted"))
@@ -34954,6 +35037,7 @@ fn validate_sealed_replication_audit_rows(
             row.tx_id.as_deref(),
             &row.encoded,
             expected,
+            row.native_retention,
         )?;
     }
     Ok(expected)
@@ -35114,6 +35198,10 @@ fn finish_sealed_replication_audit_batch(
 }
 
 fn validate_sealed_replication_log_sync(conn: &Connection) -> io::Result<()> {
+    #[cfg(target_os = "linux")]
+    let native_retention = native_retention::read(conn)?.is_some();
+    #[cfg(not(target_os = "linux"))]
+    let native_retention = false;
     let mut stmt = conn
         .prepare(
             "SELECT sequence, CASE WHEN typeof(tx_id) = 'text' \
@@ -35189,6 +35277,7 @@ fn validate_sealed_replication_log_sync(conn: &Connection) -> io::Result<()> {
                 tx_id.as_deref(),
                 encoded,
                 expected,
+                native_retention,
             )?;
             continue;
         }
@@ -35206,6 +35295,7 @@ fn validate_sealed_replication_log_sync(conn: &Connection) -> io::Result<()> {
                 .map_err(|_| io::Error::other("session replication audit allocation failed"))?;
             owned.push_str(encoded);
             Ok::<_, io::Error>(EncodedSealedReplicationAuditRow {
+                native_retention,
                 sequence,
                 tx_id,
                 encoded: owned,
@@ -35427,11 +35517,29 @@ pub(crate) fn validate_lease_state_sync(conn: &Connection) -> io::Result<()> {
 }
 
 pub(crate) fn validate_sealed_replication_op(root: &ReplicationOp) -> io::Result<()> {
-    super::replication::validate_replication_payloads(
-        root,
-        super::SQLITE_CONSENSUS_MAX_VALUE_BYTES,
-    )
-    .map_err(|_| invalid_data("session replication log violates consensus admission"))?;
+    validate_sealed_replication_op_for_profile(root, false)
+}
+
+#[cfg(target_os = "linux")]
+pub(crate) fn validate_native_sealed_replication_op(root: &ReplicationOp) -> io::Result<()> {
+    validate_sealed_replication_op_for_profile(root, true)
+}
+
+fn validate_sealed_replication_op_for_profile(
+    root: &ReplicationOp,
+    native_retention: bool,
+) -> io::Result<()> {
+    let validate = if native_retention {
+        super::replication::validate_native_replication_payloads
+    } else {
+        super::replication::validate_replication_payloads
+    };
+    validate(root, super::SQLITE_CONSENSUS_MAX_VALUE_BYTES)
+        .map_err(|_| invalid_data("session replication log violates consensus admission"))?;
+    #[cfg(target_os = "linux")]
+    if native_retention {
+        crate::consensus::native::validate_retention_notification_op(root)?;
+    }
     let mut pending = vec![root];
     let mut visited = 0_usize;
     while let Some(op) = pending.pop() {
@@ -68402,6 +68510,28 @@ BEGIN IMMEDIATE;
         validate_sealed_state_sync(&conn).expect("claimed state remains valid");
     }
 
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn native_retention_notification_admission_preserves_shape_key_and_payload_bounds() {
+        let envelope = |op| ReplicationOp::Batch { ops: vec![op] };
+        let valid = envelope(sealed_replication_cas(key(), key(), 1_048_576));
+        validate_native_sealed_replication_op(&valid).unwrap();
+        validate_sealed_replication_op(&valid).unwrap();
+        validate_native_sealed_replication_op(&ReplicationOp::Batch { ops: vec![] }).unwrap();
+        let mut other = key();
+        other.stable_id = Bytes::from_static(b"cross-key-retention")
+            .try_into()
+            .unwrap();
+        for malformed in [
+            envelope(sealed_replication_cas(key(), key(), 1_048_577)),
+            envelope(sealed_replication_cas(key(), other, 64 * 1024)),
+            envelope(valid.clone()),
+            envelope(ReplicationOp::Batch { ops: vec![] }),
+        ] {
+            assert!(validate_native_sealed_replication_op(&malformed).is_err());
+        }
+    }
+
     #[test]
     fn sealed_replication_validation_enforces_the_consensus_payload_cap() {
         validate_sealed_replication_op(&sealed_replication_cas(key(), key(), 1_048_576))
@@ -68672,6 +68802,7 @@ BEGIN IMMEDIATE;
                 initialize_schema(&conn, identity(), &expected_members())
                     .expect("consensus schema");
                 let entry = ReplicationEntry {
+                    replay_policy: crate::ReplicationReplayPolicy::prune_expired(),
                     sequence: 1,
                     tx_id: "persisted-read"
                         .to_string()
@@ -70239,6 +70370,7 @@ BEGIN IMMEDIATE;
 
     fn sealed_audit_fixture_row(sequence: u64) -> EncodedSealedReplicationAuditRow {
         let entry = ReplicationEntry {
+            replay_policy: crate::ReplicationReplayPolicy::prune_expired(),
             sequence,
             tx_id: format!("sealed-audit-{sequence}")
                 .try_into()
@@ -70251,6 +70383,7 @@ BEGIN IMMEDIATE;
             timestamp: timestamp(1),
         };
         EncodedSealedReplicationAuditRow {
+            native_retention: false,
             sequence: i64::try_from(sequence).expect("fixture SQLite sequence"),
             tx_id: Some(entry.tx_id.as_str().to_owned()),
             encoded: serde_json::to_string(&entry).expect("fixture row"),
@@ -70541,6 +70674,10 @@ BEGIN IMMEDIATE;
     // Retain the original serial snapshot journal audit as an independent
     // acceptance/error-order oracle for the bounded audit implementation.
     fn sealed_replication_log_serial_reference(conn: &Connection) -> io::Result<()> {
+        #[cfg(target_os = "linux")]
+        let native_retention = native_retention::read(conn)?.is_some();
+        #[cfg(not(target_os = "linux"))]
+        let native_retention = false;
         let mut stmt = conn
             .prepare(
                 "SELECT sequence, CASE WHEN typeof(tx_id) = 'text' \
@@ -70589,7 +70726,7 @@ BEGIN IMMEDIATE;
             entry
                 .validate()
                 .map_err(|_| invalid_data("persisted session replication entry is invalid"))?;
-            validate_sealed_replication_op(&entry.op)?;
+            validate_sealed_replication_op_for_profile(&entry.op, native_retention)?;
             expected = expected
                 .checked_add(1)
                 .ok_or_else(|| invalid_data("session replication sequence exhausted"))?;

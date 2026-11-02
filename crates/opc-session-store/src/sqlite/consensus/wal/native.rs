@@ -7,7 +7,7 @@ use super::*;
 use crate::consensus::native::{
     ApplicationCapture, NativeState, NativeStorage, ReceiptCopies, ReceiptReads, ResolvedReceipts,
 };
-use crate::consensus::verified_snapshot::PortableSnapshot;
+use crate::consensus::verified_snapshot::{PortableSnapshot, VerificationMemory};
 
 #[path = "scope_scan.rs"]
 mod scope_scan;
@@ -237,6 +237,7 @@ pub(in crate::sqlite::consensus) struct Opening {
     selected: Option<native_basis::Selected>,
     audit: Option<RecoveryAudit>,
     pending_origin: Option<checkpoint::Anchor>,
+    recovery_rebased: bool,
     roster_root: Option<Arc<RosterAttestationTrustRootV1>>,
 }
 
@@ -246,6 +247,7 @@ fn audit_native_recovery(
     limits: Limits,
     anchor: Option<checkpoint::Anchor>,
     native: &mut NativeStorage,
+    recovery_rebased: &mut bool,
     check: &impl Fn() -> io::Result<()>,
 ) -> io::Result<RecoveryAudit> {
     check()?;
@@ -291,11 +293,20 @@ fn audit_native_recovery(
         false,
         native.log.committed,
         check,
-        |operation| native.log.project(operation, &native.business, frozen),
+        |operation| {
+            let committed = native.log.project(operation, &native.business, frozen)?;
+            *recovery_rebased |= native.rebase_recovery_journal(check)?;
+            Ok(committed)
+        },
     )
 }
 
 impl Opening {
+    #[cfg(test)]
+    pub(in crate::sqlite::consensus) fn duplicate_root_lock_for_test(&self) -> io::Result<File> {
+        self.lock.file.try_clone()
+    }
+
     #[cfg(test)]
     pub(in crate::sqlite::consensus) fn new(
         directory: &Path,
@@ -323,7 +334,7 @@ impl Opening {
         let directory_pin = owner::pin_directory(directory)?;
         let pinned_path = owner::directory_path(&directory_pin);
         let directory = pinned_path.as_path();
-        let lock = RootLock::acquire_existing(&directory.join("LOCK"))?;
+        let lock = RootLock::acquire(file_read(&directory.join("LOCK"))?)?;
         let conn = cold_basis(directory, binding)?;
         check()?;
         let authority = Authority::load(&conn, binding.identity)?;
@@ -351,6 +362,7 @@ impl Opening {
                 selected: None,
                 audit: None,
                 pending_origin: anchor,
+                recovery_rebased: false,
                 roster_root,
             });
         }
@@ -377,8 +389,11 @@ impl Opening {
                 check()?;
                 (control.hook)(Point::AfterNativeBasisAdmission)?;
                 check()?;
+                let base_bytes = catalog.base_bytes();
                 native = catalog.into_storage(check)?;
-                selected = Some(native_basis::Selected::admitted(append, &native)?);
+                selected = Some(native_basis::Selected::admitted(
+                    append, &native, base_bytes,
+                )?);
                 // Track the complete unpublished WAL suffix from this exact
                 // selected process version, before projecting or replaying it.
                 native.begin_changes()?;
@@ -394,10 +409,22 @@ impl Opening {
                 ));
             }
         }
-        let audit = audit_native_recovery(directory, binding, limits, anchor, &mut native, check)?;
+        let mut recovery_rebased = false;
+        let audit = audit_native_recovery(
+            directory,
+            binding,
+            limits,
+            anchor,
+            &mut native,
+            &mut recovery_rebased,
+            check,
+        )?;
         // The audit sees only complete published cuts. Replay the exact committed
         // prefix before file repair, selection stabilization or owner exposure.
-        native.replay_committed_with_check(check)?;
+        native.replay_committed_observed(check, &mut |native| {
+            recovery_rebased |= native.rebase_recovery_journal(check)?;
+            Ok(())
+        })?;
         native.validate_image()?;
         check()?;
         Ok(Self {
@@ -412,6 +439,7 @@ impl Opening {
             selected,
             audit: Some(audit),
             pending_origin: None,
+            recovery_rebased,
             roster_root,
         })
     }
@@ -502,6 +530,7 @@ impl Opening {
         check()?;
         (self.control.hook)(Point::AfterNativeBasisAdmission)?;
         check()?;
+        let base_bytes = catalog.base_bytes();
         self.native = catalog.into_storage(check)?;
         if self.native.business.members() != &authority.members
             || self.native.business.applied() != anchor.native_applied()
@@ -512,7 +541,11 @@ impl Opening {
                 "native installed image differs from selected source and cut",
             ));
         }
-        self.selected = Some(native_basis::Selected::admitted(append, &self.native)?);
+        self.selected = Some(native_basis::Selected::admitted(
+            append,
+            &self.native,
+            base_bytes,
+        )?);
         self.native.begin_changes()?;
         self.audit = Some(audit_native_recovery(
             &self.directory,
@@ -520,9 +553,14 @@ impl Opening {
             self.limits,
             Some(anchor),
             &mut self.native,
+            &mut self.recovery_rebased,
             check,
         )?);
-        self.native.replay_committed_with_check(check)?;
+        self.native
+            .replay_committed_observed(check, &mut |native| {
+                self.recovery_rebased |= native.rebase_recovery_journal(check)?;
+                Ok(())
+            })?;
         self.native.validate_image()?;
         source.verify()?;
         check()?;
@@ -563,6 +601,7 @@ impl Opening {
             native,
             mut selected,
             audit,
+            recovery_rebased,
             ..
         } = self.admit_origin(source, check)?;
         let audit = audit.ok_or_else(|| invalid_data("native recovery audit missing"))?;
@@ -580,8 +619,9 @@ impl Opening {
         check()?;
         let (mut disk, history_bytes) = audit.finish(&directory, lock, &control)?;
         let (native, selected, history_bytes) = match selected {
-            Some(selected) => (native, selected, history_bytes),
-            None => {
+            Some(selected) if !recovery_rebased => (native, selected, history_bytes),
+            prior => {
+                drop(prior);
                 let (native, selected) =
                     native_basis::bootstrap(native, &mut disk, binding, limits, &control)?;
                 (native, selected, 0)
@@ -1228,10 +1268,81 @@ impl Wal {
             response,
             keep_first,
         );
+        // Async's selected native cut is independent of the pristine WAL cut.
+        // Keep its exact generation/sequence instead of routing this synthetic
+        // fixture through Durable's WAL-cut bootstrap requirement.
+        if binding.persistence == SessionPersistenceMode::Async {
+            return seed_async_reclaim_fixture(opening);
+        }
         // Seed is audited in full and goes through the ordinary base writer,
         // readback and CURRENT selection before any tested command is applied.
         opening.selected = None;
         opening.finish(|| Ok(()))
+    }
+
+    #[cfg(test)]
+    pub(in crate::sqlite::consensus) fn open_reclaim_fixture_with_root_for_test(
+        directory: &Path,
+        binding: Binding,
+        root: Arc<RosterAttestationTrustRootV1>,
+        history: crate::FencedTransitionV2HistoryState,
+        now: opc_types::Timestamp,
+        control: IoControl,
+    ) -> io::Result<Self> {
+        let mut opening = Opening::new(directory, binding, Some(root), Limits::default(), control)?;
+        opening.native = opening.native.clone();
+        crate::consensus::native::lifecycle_tests::seed(
+            &mut opening.native,
+            history,
+            now,
+            None,
+            false,
+        );
+        opening.selected = None;
+        opening.finish(|| Ok(()))
+    }
+
+    #[cfg(test)]
+    pub(in crate::sqlite::consensus) fn native_journal_owners_for_test(
+        &self,
+    ) -> io::Result<[usize; 4]> {
+        let state = lock_state(&self.shared)?;
+        let native = state
+            .native
+            .as_ref()
+            .ok_or_else(|| invalid_data("native journal fixture missing"))?;
+        Ok([
+            native.business.changed_verification_bytes(),
+            native.business.roster_journal_bytes_for_test(),
+            native.log.changed_verification_bytes(),
+            crate::consensus::verified_snapshot::VerificationMemory::used_bytes(),
+        ])
+    }
+
+    #[cfg(test)]
+    pub(in crate::sqlite::consensus) fn open_mixed_replay_for_test(
+        directory: &Path,
+        binding: Binding,
+        root: Arc<RosterAttestationTrustRootV1>,
+    ) -> io::Result<(Self, [usize; 4])> {
+        use crate::consensus::verified_snapshot::VerificationMemory;
+        VerificationMemory::begin_retirement_phase_for_test();
+        let opening = Opening::new(
+            directory,
+            binding,
+            Some(root),
+            Limits::default(),
+            IoControl::default(),
+        )?;
+        let mut observation = [
+            usize::from(opening.recovery_rebased),
+            opening.native.changed_verification_bytes(),
+            VerificationMemory::used_bytes(),
+            VerificationMemory::retirement_peak_for_test(),
+        ];
+        let wal = opening.finish(|| Ok(()))?;
+        observation[3] = VerificationMemory::retirement_peak_for_test();
+        Ok((wal, observation))
     }
 
     #[cfg(test)]
@@ -1922,11 +2033,25 @@ impl Wal {
         stage: SessionStorageFailureStage,
         work: impl FnOnce() -> io::Result<T>,
     ) -> io::Result<T> {
+        self.native_detached_checked(stage, false, work)
+    }
+
+    fn native_detached_checked<T>(
+        &self,
+        stage: SessionStorageFailureStage,
+        retry_pressure: bool,
+        work: impl FnOnce() -> io::Result<T>,
+    ) -> io::Result<T> {
         // State has already been released. Keep all captures and decoder
         // guards inside this unwind boundary, then fence the existing owner
         // and wake queue retirement before propagating the original panic.
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(work));
         let failure = match &result {
+            Ok(Err(error))
+                if retry_pressure && VerificationMemory::journal_pressure(error).is_some() =>
+            {
+                None
+            }
             Ok(Err(error)) => Some(SessionStorageFailure::from_io(stage, error)),
             Err(_) => Some(SessionStorageFailure::panic(stage)),
             Ok(Ok(_)) => None,
@@ -2362,6 +2487,139 @@ impl Wal {
             .changed_verification_bytes()
     }
 
+    pub(super) fn wait_for_native_file_guard(&self) -> io::Result<Duration> {
+        let mut state = lock_state(&self.shared)?;
+        let mut started = None;
+        while state.native_ceiling_wait {
+            ensure_readable(&state)?;
+            if state.status != Status::Running
+                || state.retirement_stopped
+                || state.snapshot.is_some()
+            {
+                return Err(io::Error::new(
+                    io::ErrorKind::Interrupted,
+                    "native file backpressure interrupted by ownership handoff",
+                ));
+            }
+            if started.is_none() {
+                started = Some(Instant::now());
+                #[cfg(test)]
+                (self.control.hook)(Point::NativeFileGuardWaitStarted)?;
+            }
+            state = self
+                .shared
+                .ready
+                .wait(state)
+                .map_err(|_| io::Error::other("native file backpressure wait poisoned"))?;
+        }
+        ensure_readable(&state)?;
+        Ok(started.map_or(Duration::ZERO, |started| started.elapsed()))
+    }
+
+    /// An application waiting for memory must retry its own reservation even
+    /// while foreground admission stays file-guarded. Global refunds do not
+    /// notify this store, so retain the existing resource polling interval.
+    /// This interval remains excluded from the journal-pressure episode.
+    pub(super) fn wait_for_native_resource_guard(&self) -> io::Result<Duration> {
+        let mut state = lock_state(&self.shared)?;
+        ensure_readable(&state)?;
+        if !state.native_ceiling_wait {
+            return Ok(Duration::ZERO);
+        }
+        if state.status != Status::Running || state.retirement_stopped || state.snapshot.is_some() {
+            return Err(io::Error::new(
+                io::ErrorKind::Interrupted,
+                "native file backpressure interrupted by ownership handoff",
+            ));
+        }
+        // A journal drain is useful even if no operation/applied cut advanced.
+        // The pending owner detaches and authenticates it outside State; it
+        // does not serialize another base for an unchanged cut.
+        if state.native_pending_base
+            && state
+                .native
+                .as_ref()
+                .is_some_and(|native| native.changed_verification_bytes() != 0)
+        {
+            state.native_pending_journal_pressure = true;
+            self.shared.ready.notify_all();
+        }
+        let started = Instant::now();
+        #[cfg(test)]
+        (self.control.hook)(Point::NativeFileGuardWaitStarted)?;
+        let (state, _) = self
+            .shared
+            .ready
+            .wait_timeout(state, Duration::from_millis(20))
+            .map_err(|_| io::Error::other("native resource backpressure wait poisoned"))?;
+        ensure_readable(&state)?;
+        if state.status != Status::Running || state.retirement_stopped || state.snapshot.is_some() {
+            return Err(io::Error::new(
+                io::ErrorKind::Interrupted,
+                "native resource backpressure interrupted by ownership handoff",
+            ));
+        }
+        Ok(started.elapsed())
+    }
+
+    /// Called only after a failed pre-publication reservation has destroyed
+    /// its candidate and released its operation permit. The writer and install
+    /// owner remain free to drain; no captured roots survive this wait.
+    pub(super) fn wait_for_journal_memory(
+        &self,
+        progress: &mut Option<native_basis::PressureProgress>,
+        candidate_bytes: usize,
+    ) -> io::Result<()> {
+        use crate::consensus::verified_snapshot::VerificationMemory;
+        let mut state = lock_state(&self.shared)?;
+        ensure_readable(&state)?;
+        if state.status != Status::Running || state.retirement_stopped {
+            return Err(io::Error::other("native journal admission stopped"));
+        }
+        if state.native_ceiling_wait {
+            drop(state);
+            if let Some(progress) = progress {
+                progress.pause_for_file_guard();
+            }
+            self.wait_for_native_resource_guard()?;
+            return Ok(());
+        }
+        if let Some(progress) = progress {
+            progress.resume_after_file_guard();
+        }
+        let used = VerificationMemory::used_bytes();
+        let journal = state
+            .native
+            .as_ref()
+            .map_or(0, NativeStorage::changed_verification_bytes);
+        #[cfg(test)]
+        if progress.is_none() {
+            (self.control.hook)(Point::NativeJournalWaitStarted)?;
+        }
+        let progress =
+            progress.get_or_insert_with(|| native_basis::PressureProgress::new(used, journal));
+        progress.observe(used, journal);
+        #[cfg(test)]
+        if let Some(clock) = &self.control.native_pressure_clock {
+            clock(progress);
+        }
+        if progress.total_expired() || progress.stalled() {
+            application::fence(&mut state);
+            self.shared.ready.notify_all();
+            return Err(io::Error::other("native journal admission timed out"));
+        }
+        if native_basis::request_journal_checkpoint(&mut state, candidate_bytes) {
+            self.shared.ready.notify_all();
+        }
+        let (state, _) = self
+            .shared
+            .ready
+            .wait_timeout(state, Duration::from_millis(20))
+            .map_err(|_| io::Error::other("native journal admission poisoned"))?;
+        drop(state);
+        Ok(())
+    }
+
     pub(crate) fn native_apply_committed(
         &self,
         entries: &[Entry<SessionRaftTypeConfig>],
@@ -2372,7 +2630,8 @@ impl Wal {
             opc_consensus::engine::EntryPayload::Normal(command) if matches!(command.intent,
                 crate::SessionMutationIntent::MaintainFencedTransitionV2History { .. }))
         });
-        let mut pressure_progress = None;
+        let mut pressure_progress: Option<native_basis::PressureProgress> = None;
+        let mut journal_progress: Option<native_basis::PressureProgress> = None;
         let mut lock_wait = Duration::ZERO;
         let mut preflight = Duration::ZERO;
         let mut apply = Duration::ZERO;
@@ -2402,7 +2661,7 @@ impl Wal {
                             .application_costs
                             .retirement_plan_fallbacks
                             .saturating_add(1);
-                        0
+                        NativeState::maximum_reclaim_candidate_bytes(entries)?
                     }
                 };
                 if bytes != 0 {
@@ -2416,21 +2675,34 @@ impl Wal {
                         drop(state);
                         drop(permit);
                         let mut waiting = lock_state(&self.shared)?;
+                        if waiting.native_ceiling_wait {
+                            drop(waiting);
+                            if let Some(progress) = &mut pressure_progress {
+                                progress.pause_for_file_guard();
+                            }
+                            if let Some(progress) = &mut journal_progress {
+                                progress.pause_for_file_guard();
+                            }
+                            self.wait_for_native_resource_guard()?;
+                            continue;
+                        }
+                        if let Some(progress) = &mut pressure_progress {
+                            progress.resume_after_file_guard();
+                        }
                         #[cfg(test)]
                         let first_wait = pressure_progress.is_none();
-                        let (last_progress, lowest_shortfall, lowest_journal) = pressure_progress
-                            .get_or_insert_with(|| {
-                                waiting.application_costs.retirement_waits += 1;
-                                #[cfg(feature = "test-control")]
-                                eprintln!("native_retirement_admission_wait");
-                                (
-                                    Instant::now(),
-                                    native_basis::retirement_shortfall(bytes),
-                                    waiting.native.as_ref().map_or(0, |native| {
-                                        native.business.changed_verification_bytes()
-                                    }),
-                                )
-                            });
+                        let progress = pressure_progress.get_or_insert_with(|| {
+                            waiting.application_costs.retirement_waits += 1;
+                            #[cfg(feature = "test-control")]
+                            eprintln!("native_retirement_admission_wait");
+                            native_basis::PressureProgress::new(
+                                native_basis::retirement_shortfall(bytes),
+                                waiting
+                                    .native
+                                    .as_ref()
+                                    .map_or(0, |native| native.changed_verification_bytes()),
+                            )
+                        });
                         #[cfg(test)]
                         if first_wait {
                             (self.control.hook)(Point::NativeRetirementWaitStarted)?;
@@ -2445,28 +2717,34 @@ impl Wal {
                                     "native retirement admission stopped",
                                 ));
                             }
+                            if waiting.native_ceiling_wait {
+                                progress.pause_for_file_guard();
+                                if native_basis::retirement_ready(&waiting, bytes) {
+                                    break;
+                                }
+                                drop(waiting);
+                                self.wait_for_native_resource_guard()?;
+                                waiting = lock_state(&self.shared)?;
+                                continue;
+                            }
+                            progress.resume_after_file_guard();
                             let current_journal = waiting
                                 .native
                                 .as_ref()
-                                .map_or(0, |native| native.business.changed_verification_bytes());
+                                .map_or(0, |native| native.changed_verification_bytes());
                             let current_shortfall = native_basis::retirement_shortfall(bytes);
-                            if current_shortfall < *lowest_shortfall
-                                || current_journal < *lowest_journal
-                            {
-                                *last_progress = Instant::now();
+                            progress.observe(current_shortfall, current_journal);
+                            #[cfg(test)]
+                            if let Some(clock) = &self.control.native_pressure_clock {
+                                clock(progress);
                             }
-                            // Only new lows demonstrate relief. A temporary
-                            // checkpoint allocation growing and then shrinking
-                            // must not keep an otherwise stalled wait alive.
-                            *lowest_shortfall = (*lowest_shortfall).min(current_shortfall);
-                            *lowest_journal = (*lowest_journal).min(current_journal);
                             let ready = native_basis::retirement_ready(&waiting, bytes);
                             // Newly observed relief gets a fresh atomic
                             // reservation attempt even at the deadline. If
                             // that attempt loses a counter race, it cannot
                             // keep renewing the wait without further relief.
-                            if last_progress.elapsed() >= native_basis::RETIREMENT_WAIT_TIMEOUT
-                                && (!ready || just_failed_admission)
+                            if progress.total_expired()
+                                || (progress.stalled() && (!ready || just_failed_admission))
                             {
                                 waiting.application_costs.retirement_timeouts += 1;
                                 application::fence(&mut waiting);
@@ -2489,13 +2767,7 @@ impl Wal {
                             (waiting, _) = self
                                 .shared
                                 .ready
-                                .wait_timeout(
-                                    waiting,
-                                    Duration::from_millis(20).min(
-                                        native_basis::RETIREMENT_WAIT_TIMEOUT
-                                            .saturating_sub(last_progress.elapsed()),
-                                    ),
-                                )
+                                .wait_timeout(waiting, Duration::from_millis(20))
                                 .map_err(|_| {
                                     io::Error::other("native reclaim admission poisoned")
                                 })?;
@@ -2528,6 +2800,12 @@ impl Wal {
             let captured = match captured {
                 Ok(captured) => captured,
                 Err(error) => {
+                    if let Some(bytes) = VerificationMemory::journal_pressure(&error) {
+                        drop(state);
+                        drop(permit);
+                        self.wait_for_journal_memory(&mut journal_progress, bytes)?;
+                        continue;
+                    }
                     application::fence(&mut state);
                     self.shared.ready.notify_all();
                     return Err(error);
@@ -2535,19 +2813,37 @@ impl Wal {
             };
             drop(state);
             let preparing = Instant::now();
-            let prepared = self.native_detached(move || {
-                (self.control.hook)(Point::BeforeNativeApplyPrepare)?;
-                let prepared = captured.prepare(
-                    entries,
-                    &|| {
-                        let state = lock_state(&self.shared)?;
-                        ensure_native_application_owner(&state)
-                    },
-                    || (self.control.hook)(Point::BeforeNativeReceiptRead),
-                )?;
-                (self.control.hook)(Point::BeforeNativeApplyPublish)?;
-                Ok(prepared)
-            })?;
+            let prepared = self.native_detached_checked(
+                SessionStorageFailureStage::Storage,
+                true,
+                move || {
+                    (self.control.hook)(Point::BeforeNativeApplyPrepare)?;
+                    let prepared = captured.prepare(
+                        entries,
+                        &|| {
+                            let state = lock_state(&self.shared)?;
+                            ensure_native_application_owner(&state)
+                        },
+                        || (self.control.hook)(Point::BeforeNativeReceiptRead),
+                    )?;
+                    (self.control.hook)(Point::BeforeNativeApplyPublish)?;
+                    Ok(prepared)
+                },
+            );
+            let prepared = match prepared {
+                Ok(prepared) => prepared,
+                Err(error) => {
+                    if let Some(bytes) = VerificationMemory::journal_pressure(&error) {
+                        drop(permit);
+                        self.wait_for_journal_memory(&mut journal_progress, bytes)?;
+                        continue;
+                    }
+                    return Err(error);
+                }
+            };
+            // Successful preparation ends this pressure episode. A stale
+            // predecessor may require another capture with its own budget.
+            journal_progress = None;
             apply += preparing.elapsed();
             let waiting = Instant::now();
             let mut state = lock_state(&self.shared)?;
@@ -2706,5 +3002,171 @@ impl Wal {
             last_purged_log_id: native.log.purged,
             last_log_id: native.log.last(),
         })
+    }
+}
+
+#[cfg(test)]
+impl Wal {
+    pub(in crate::sqlite::consensus) fn native_pending_wake_for_test(&self) {
+        // Taking the same mutex after the idle hook makes this wake lossless.
+        // This changes no cut, generation, journal or scheduling predicate.
+        let _state = lock_state(&self.shared).unwrap();
+        self.shared.ready.notify_all();
+    }
+}
+
+/// Test-fixture construction only. The existing lifecycle seed changes receipt
+/// contents, never the selected Async operation/applied/committed cut. Serialize
+/// that audited image under exactly that cut, then cold-open through production
+/// admission. No production bootstrap or recovery authority check is relaxed.
+#[cfg(test)]
+fn seed_async_reclaim_fixture(opening: Opening) -> io::Result<Wal> {
+    use crate::consensus::native::generation::{
+        BaseParameters, Catalog, CatalogScope, StreamingBase,
+    };
+    let mut anchor = opening
+        .audit
+        .as_ref()
+        .and_then(|audit| audit.anchor.clone())
+        .ok_or_else(|| invalid_data("Async reclaim fixture has no selected cut"))?;
+    let cut = anchor
+        .async_cut
+        .ok_or_else(|| invalid_data("Async reclaim fixture lacks generation"))?;
+    if cut.committed != opening.native.log.committed
+        || cut.applied != opening.native.business.applied()
+    {
+        return Err(invalid_data(
+            "Async reclaim seed changed selected operation/application cut",
+        ));
+    }
+    opening.native.validate_image()?;
+    let file_epoch = anchor
+        .file_epoch()
+        .checked_add(1)
+        .ok_or_else(|| invalid_data("fixture file epoch overflow"))?;
+    anchor.epoch = anchor
+        .epoch
+        .checked_add(1)
+        .ok_or_else(|| invalid_data("fixture checkpoint epoch overflow"))?;
+    anchor
+        .native_generation
+        .as_mut()
+        .ok_or_else(|| invalid_data("fixture native selector missing"))?
+        .file_epoch = file_epoch;
+    let path = anchor.basis_path(&opening.directory);
+    let prefix = {
+        let base = StreamingBase::prepare(
+            &opening.native,
+            BaseParameters {
+                binding: opening.binding.digest()?,
+                file_epoch,
+                checkpoint_epoch: anchor.epoch,
+                operation_sequence: cut.sequence,
+                cut_binding: anchor.native_cut_binding()?,
+                block_bytes: 64 * 1024,
+                maximum: MAX_BASIS,
+            },
+            &|| Ok(()),
+        )?;
+        let file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+            .open(&path)?;
+        let created = base.write_new_concurrent(file, MAX_BASIS, &|| Ok(()))?;
+        created.file().sync_all()?;
+        created.admit(&path, &|| Ok(()))?.current().identity()
+    };
+    anchor.basis = prefix.digest;
+    anchor.basis_bytes = prefix.length;
+    anchor.native_generation.as_mut().unwrap().frontiers = prefix.frontiers;
+    anchor.validate(opening.binding, opening.limits)?;
+    let (_, catalog) = Catalog::open(
+        &path,
+        prefix,
+        MAX_BASIS,
+        CatalogScope {
+            identity: opening.binding.identity,
+            members: opening.native.business.members(),
+            roster_root: opening.native.business.roster_root().cloned(),
+        },
+        anchor.native_cut_binding()?,
+        &|| Ok(()),
+    )?;
+    let restored = catalog.into_storage(&|| Ok(()))?;
+    if crate::consensus::native::generation::Version::capture(&restored)?.context_digest()?
+        != prefix.frontiers
+    {
+        return Err(invalid_data("Async reclaim fixture cold context differs"));
+    }
+    checkpoint::select(&opening.directory, &anchor, &opening.control)?;
+    File::open(&opening.directory)?.sync_all()?;
+    // directory is a /proc/self/fd path. Keep its exact pin alive until the
+    // ordinary opener has acquired its own pin after releasing the old LOCK.
+    let directory_pin = Arc::clone(&opening.directory_pin);
+    let directory = owner::directory_path(&directory_pin);
+    let binding = opening.binding;
+    let limits = opening.limits;
+    let control = opening.control.clone();
+    drop(restored);
+    drop(opening);
+    Wal::open(&directory, binding, limits, control)
+}
+
+#[cfg(test)]
+impl Wal {
+    pub(in crate::sqlite::consensus) fn native_capacity_handoff_for_test(
+        &self,
+    ) -> io::Result<serde_json::Value> {
+        let state = lock_state(&self.shared)?;
+        ensure_readable(&state)?;
+        Ok(serde_json::json!({
+            "install_pending": state.native_install_pending,
+            "live_capacity": state.native_live_capacity,
+            "pending_base": state.native_pending_base,
+            "pending_ready": state.native_pending_ready,
+            "checkpoint_active": state.native_basis_active,
+            "checkpoint_requested": state.checkpoint_requested,
+            "native_operations": state.native_operations,
+            "queued": state.queue.len(), "outstanding": state.outstanding,
+            "running": state.status == Status::Running,
+            "sequence": state.sequence, "base_sequence": state.base_sequence,
+        }))
+    }
+
+    pub(in crate::sqlite::consensus) fn native_guard_admission_cut_for_test(
+        &self,
+    ) -> io::Result<(u64, usize, usize, Option<u64>)> {
+        let state = lock_state(&self.shared)?;
+        ensure_readable(&state)?;
+        Ok((
+            state.sequence,
+            state.history_bytes,
+            state
+                .native
+                .as_ref()
+                .ok_or_else(|| invalid_data("native guard cut owner missing"))?
+                .changed_verification_bytes(),
+            state
+                .asynchronous
+                .as_ref()
+                .map(|progress| progress.generation),
+        ))
+    }
+
+    pub(in crate::sqlite::consensus) fn native_receipt_source_for_test(
+        &self,
+        id: crate::FencedTransitionV2RequestId,
+    ) -> io::Result<Option<std::sync::Weak<crate::consensus::native::prefix::VerifiedAppendSource>>>
+    {
+        let state = lock_state(&self.shared)?;
+        ensure_readable(&state)?;
+        Ok(state
+            .native
+            .as_ref()
+            .ok_or_else(|| invalid_data("native source test owner missing"))?
+            .receipt_source_for_test(id))
     }
 }

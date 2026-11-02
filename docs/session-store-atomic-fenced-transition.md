@@ -54,9 +54,13 @@ receipt across the rollover.
 ## Lease and mutation rules
 
 `FencedTransitionLease::Acquire` is a new credential allocation. It carries
-the exact observed durable per-key fence floor, including deleted history. At
-the transition point that floor MUST still equal `expected_fence`; the committed
-fence is exactly `expected_fence + 1`, the owner is the requested owner, and a
+the observed durable per-key fence. A live or recently retired retained row MUST
+still have exactly `expected_fence` at the transition point. For a key with no
+retained row, the native and memory-only fake backends accept exactly the current
+or previous published epoch floor, after applying any Async recovery floor.
+Other backends retain exact equality to their observed fence. See RFC 004 §9.2
+and ADR 0022 for retirement and retry rules. The committed fence is exactly
+`expected_fence + 1`, the owner is the requested owner, and a
 new nonzero credential ID and expiry are minted. An unexpired active lease
 still prevents acquisition. `FencedTransitionObservation` is the preparation
 read for this rule; its observation does not reserve a fence.

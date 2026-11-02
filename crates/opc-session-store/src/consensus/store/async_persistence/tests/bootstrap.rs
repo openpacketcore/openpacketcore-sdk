@@ -77,7 +77,12 @@ async fn async_persistence_public_root_interruption_never_reseeds_or_admits() {
             let opened = fleet
                 .open_with_hooks(0, SessionPersistenceMode::Async, None, Some(hook))
                 .await;
-            assert_eq!(*observed.lock().unwrap(), points[..=cut]);
+            // Fresh creation is dispatched before the original ROOT cuts.
+            // Require that extra boundary as well as every durable cut.
+            let expected = std::iter::once(RootPointForTest::BeforeCreationDispatch)
+                .chain(points[..=cut].iter().copied())
+                .collect::<Vec<_>>();
+            assert_eq!(*observed.lock().unwrap(), expected);
             // Attachment errors preserve the public storage CorruptState ->
             // RecoveryRequired mapping; the earlier read-only reopen
             // preflight separately reports StorageUnavailable below.

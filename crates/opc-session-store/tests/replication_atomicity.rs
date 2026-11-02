@@ -89,6 +89,7 @@ fn entry(
     op: ReplicationOp,
 ) -> ReplicationEntry {
     ReplicationEntry {
+        replay_policy: opc_session_store::ReplicationReplayPolicy::prune_expired(),
         sequence,
         tx_id: tx_id.into().try_into().expect("valid transaction ID"),
         op,
@@ -772,4 +773,96 @@ async fn sqlite_exact_replication_payload_is_accepted() {
 #[tokio::test]
 async fn sqlite_exact_replication_payload_rebuild_is_accepted() {
     assert_sqlite_exact_replication_payload_is_accepted(true).await;
+}
+
+#[tokio::test]
+async fn sqlite_refuses_key_retention_batches_without_partial_append_or_rebuild() {
+    let backend = SqliteSessionBackend::in_memory().unwrap();
+    let owner = OwnerId::new("retention-owner").unwrap();
+    let original_key = key(b"retention-original");
+    let sentinel = key(b"retention-sentinel");
+    let now = timestamp();
+    let original = lease_and_record_entry(
+        1,
+        "retention-original",
+        original_key.clone(),
+        &owner,
+        1,
+        1,
+        now,
+    );
+    backend.replicate_entry(original.clone()).await.unwrap();
+    let before = replication_snapshot(&backend).await;
+    let record_before = backend.get(&original_key).await.unwrap();
+    let mut unsupported = entry(
+        2,
+        "retention-new",
+        now,
+        ReplicationOp::Batch {
+            ops: vec![acquire(sentinel.clone(), &owner, 2, 2, now)],
+        },
+    );
+    unsupported.replay_policy.capacity_rotations = 2;
+    let expected = Err(StoreError::CapabilityNotSupported(
+        "replication_replay_policy".into(),
+    ));
+    assert_eq!(backend.replicate_entry(unsupported.clone()).await, expected);
+    assert_eq!(replication_snapshot(&backend).await, before);
+    assert_eq!(backend.get(&original_key).await.unwrap(), record_before);
+    assert!(backend.get(&sentinel).await.unwrap().is_none());
+    assert_eq!(
+        backend
+            .rebuild_replication_state(vec![original, unsupported])
+            .await,
+        expected
+    );
+    assert_eq!(replication_snapshot(&backend).await, before);
+    assert_eq!(backend.get(&original_key).await.unwrap(), record_before);
+    assert!(backend.get(&sentinel).await.unwrap().is_none());
+}
+
+#[tokio::test]
+async fn sqlite_refuses_key_retention_boundaries_without_partial_append_or_rebuild() {
+    let backend = SqliteSessionBackend::in_memory().unwrap();
+    let owner = OwnerId::new("retention-owner").unwrap();
+    let original_key = key(b"retention-original");
+    let sentinel = key(b"retention-sentinel");
+    let now = timestamp();
+    let original = lease_and_record_entry(
+        1,
+        "retention-original",
+        original_key.clone(),
+        &owner,
+        1,
+        1,
+        now,
+    );
+    backend.replicate_entry(original.clone()).await.unwrap();
+    let before = replication_snapshot(&backend).await;
+    let record_before = backend.get(&original_key).await.unwrap();
+    let mut unsupported = entry(
+        2,
+        "retention-new",
+        now,
+        ReplicationOp::Batch {
+            ops: vec![acquire(sentinel.clone(), &owner, 2, 2, now)],
+        },
+    );
+    unsupported.replay_policy.capacity_rotations = 2;
+    let expected = Err(StoreError::CapabilityNotSupported(
+        "replication_replay_policy".into(),
+    ));
+    assert_eq!(backend.replicate_entry(unsupported.clone()).await, expected);
+    assert_eq!(replication_snapshot(&backend).await, before);
+    assert_eq!(backend.get(&original_key).await.unwrap(), record_before);
+    assert!(backend.get(&sentinel).await.unwrap().is_none());
+    assert_eq!(
+        backend
+            .rebuild_replication_state(vec![original, unsupported])
+            .await,
+        expected
+    );
+    assert_eq!(replication_snapshot(&backend).await, before);
+    assert_eq!(backend.get(&original_key).await.unwrap(), record_before);
+    assert!(backend.get(&sentinel).await.unwrap().is_none());
 }

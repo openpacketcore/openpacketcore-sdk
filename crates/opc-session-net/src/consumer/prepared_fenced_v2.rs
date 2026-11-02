@@ -4826,4 +4826,104 @@ mod tests {
     async fn v2_failure_diagnostics_confirmed_rejection_preserves_release() {
         assert_failure_diagnostics(DiagnosticFailure::Rejected).await;
     }
+    /// A resolved rejection carries no diagnostic because no transport stage
+    /// exists for it.
+    #[tokio::test]
+    async fn v2_failure_diagnostic_absent_for_resolved_rejection() {
+        let harness = harness(vec![Step::Reject(
+            StoreError::FencedTransitionRequestConflict,
+        )])
+        .await;
+        let mut handle = diagnosed_handle(harness.prepare().await);
+        let failure = handle
+            .execute_once_with_failure_diagnostic()
+            .await
+            .expect_err("a conflict is a rejection");
+        assert!(matches!(
+            failure.error(),
+            FencedTransitionExecuteError::Rejected(StoreError::FencedTransitionRequestConflict)
+        ));
+        assert!(failure.diagnostic().is_none());
+    }
+
+    /// The wrapper debug/display surface never renders the exact request
+    /// identity, a scope/identity/endpoint, or payload material.
+    #[test]
+    fn v2_failure_diagnostic_is_value_free() {
+        use SessionConsumerPreparedFencedTransitionV2FailureStage as Stage;
+        let request_id = FencedTransitionRequestId::from_bytes([0x74; 16]);
+        let failure = SessionConsumerPreparedFencedTransitionV2Failure {
+            error: FencedTransitionExecuteError::OutcomeUnknown { request_id },
+            diagnostic: Some(
+                SessionConsumerPreparedFencedTransitionV2FailureDiagnostic::new(
+                    Stage::AwaitingReply,
+                    987,
+                ),
+            ),
+        };
+        let debug = format!("{failure:?}");
+        assert!(debug.contains("outcome_unknown"), "{debug}");
+        assert!(debug.contains("awaiting_reply"), "{debug}");
+        assert!(debug.contains("987"), "{debug}");
+        let rendered_id = format!("{request_id:?}");
+        for forbidden in [
+            "prepared-fenced-v2-unit",
+            "spiffe://",
+            "tenant",
+            "owner",
+            "endpoint",
+            "request_id",
+            "credential",
+            rendered_id.as_str(),
+        ] {
+            assert!(
+                !debug.contains(forbidden),
+                "debug surface leaked {forbidden:?}: {debug}"
+            );
+        }
+        let display = format!("{failure}");
+        for forbidden in [
+            "prepared-fenced-v2-unit",
+            "spiffe://",
+            "0x74",
+            rendered_id.as_str(),
+        ] {
+            assert!(!display.contains(forbidden), "display leaked {forbidden:?}");
+        }
+    }
+
+    #[test]
+    fn v2_preflight_failure_classification_separates_final_from_transient() {
+        for definitive in [
+            StoreError::FencedTransitionRequestConflict,
+            // The store's fixed row-absence reason. `require_exact_journal`
+            // reports a cleanly absent exact row this way; the matching
+            // predicate is also covered end to end by
+            // `v2_status_missing_exact_row_stays_final`.
+            StoreError::BackendUnavailable(
+                "protected fenced-transition V2 recovery row unavailable".into(),
+            ),
+            StoreError::CapabilityNotSupported("no protected V2 boundary".into()),
+            // Defensive arms only: require_exact_journal currently collapses
+            // corrupt/undecodable rows into journal unavailability.
+            StoreError::Crypto("content-dependent failure".into()),
+            StoreError::Serialization("undecodable row".into()),
+        ] {
+            assert!(
+                prepared_fenced_v2_preflight_failure_is_definitive(&definitive),
+                "{definitive:?} must stay final"
+            );
+        }
+        for transient in [
+            StoreError::FencedTransitionRecoveryJournalUnavailable,
+            StoreError::BackendUnavailable("journal locked by a live owner".into()),
+            StoreError::BackendUnavailable("session key provider unavailable".into()),
+            StoreError::BackendOperationOutcomeUnavailable,
+        ] {
+            assert!(
+                !prepared_fenced_v2_preflight_failure_is_definitive(&transient),
+                "{transient:?} must stay re-checkable"
+            );
+        }
+    }
 }

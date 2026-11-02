@@ -19,6 +19,21 @@ pub(crate) struct SnapshotCapture {
 }
 
 impl SnapshotCapture {
+    /// Use the checkpoint's already admitted metadata on this detached root.
+    /// The live journal is published separately, only after durable selection.
+    pub(crate) fn select_checkpoint_snapshot(
+        &mut self,
+        selection: &changes::SnapshotSelection,
+    ) -> io::Result<()> {
+        let proof = selection.selected_proof(&self.storage.business)?;
+        self.storage.business.frontiers = proof.context().2.clone();
+        self.storage.business.proof = Some(proof);
+        self.storage
+            .log
+            .generation_version(&self.storage.business)?;
+        Ok(())
+    }
+
     /// Application may advance during export. The immutable snapshot keeps
     /// its captured cut, but a different live authority cannot authorize its
     /// return. The WAL adapter separately checks its current running owner.
@@ -53,6 +68,18 @@ impl NativeChanges {
 
 impl NativeStorage {
     #[cfg(test)]
+    pub(crate) fn receipt_source_for_test(
+        &self,
+        id: FencedTransitionV2RequestId,
+    ) -> Option<std::sync::Weak<prefix::VerifiedAppendSource>> {
+        self.business
+            .receipts
+            .get(&id)?
+            .cold_range()
+            .map(|(source, _)| source.weak_source_for_test())
+    }
+
+    #[cfg(test)]
     pub(crate) fn cold_counts_for_test(&self) -> [usize; 3] {
         [
             self.business
@@ -83,6 +110,31 @@ impl NativeStorage {
             storage: self.clone(),
             _memory: memory,
         })
+    }
+
+    pub(crate) fn snapshot_origin(&self) -> Option<Arc<NativeSnapshotAuthority>> {
+        self.business.snapshot_origin.clone()
+    }
+
+    /// Cold recovery has exclusive ownership and has not exposed or selected
+    /// its candidate. Authenticate each complete journal before discarding it;
+    /// the caller must select a fully revalidated base after the entire audit.
+    pub(crate) fn rebase_recovery_journal(
+        &mut self,
+        check: &impl Fn() -> io::Result<()>,
+    ) -> io::Result<bool> {
+        use crate::consensus::verified_snapshot::{VerificationMemory, PROCESS_VERIFICATION_BYTES};
+        let journal = self.changed_verification_bytes();
+        if journal == 0
+            || (journal < PROCESS_VERIFICATION_BYTES * 3 / 16
+                && VerificationMemory::used_bytes() < PROCESS_VERIFICATION_BYTES / 2)
+        {
+            return Ok(false);
+        }
+        let (changes, _) = self.take_checkpoint_changes(None)?;
+        changes.validate(check)?;
+        drop(changes);
+        Ok(true)
     }
 
     pub(crate) fn begin_changes(&mut self) -> io::Result<()> {

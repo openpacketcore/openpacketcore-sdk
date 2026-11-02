@@ -213,6 +213,7 @@ fn nested_refresh_replication_entry(
     ttl: Duration,
 ) -> ReplicationEntry {
     ReplicationEntry {
+        replay_policy: opc_session_store::ReplicationReplayPolicy::prune_expired(),
         sequence,
         tx_id: format!("ttl-boundary-{sequence}")
             .try_into()
@@ -243,6 +244,7 @@ fn forged_refresh_deadline_entry(
             .expect("representable test deadline"),
     );
     ReplicationEntry {
+        replay_policy: opc_session_store::ReplicationReplayPolicy::prune_expired(),
         sequence,
         tx_id: format!("forged-deadline-{sequence}")
             .try_into()
@@ -268,6 +270,7 @@ fn operation_tree_at_depth(depth: usize) -> ReplicationOp {
 
 fn over_depth_replication_entry(sequence: u64) -> ReplicationEntry {
     ReplicationEntry {
+        replay_policy: opc_session_store::ReplicationReplayPolicy::prune_expired(),
         sequence,
         tx_id: format!("over-depth-{sequence}")
             .try_into()
@@ -282,6 +285,7 @@ fn over_count_replication_entry(sequence: u64) -> ReplicationEntry {
         .map(|_| ReplicationOp::Batch { ops: Vec::new() })
         .collect();
     ReplicationEntry {
+        replay_policy: opc_session_store::ReplicationReplayPolicy::prune_expired(),
         sequence,
         tx_id: format!("over-count-{sequence}")
             .try_into()
@@ -298,6 +302,7 @@ fn payload_replication_entry(sequence: u64, payload_len: usize) -> ReplicationEn
     record.payload = EncryptedSessionPayload::new(vec![255; payload_len]);
     let timestamp = Timestamp::now_utc();
     ReplicationEntry {
+        replay_policy: opc_session_store::ReplicationReplayPolicy::prune_expired(),
         sequence,
         tx_id: format!("log-{sequence}")
             .try_into()
@@ -1968,6 +1973,7 @@ async fn remote_client_rejects_zero_sequence_before_resolve_or_retry() {
     let error = tokio::time::timeout(
         Duration::from_millis(100),
         remote.replicate_entry(ReplicationEntry {
+            replay_policy: opc_session_store::ReplicationReplayPolicy::prune_expired(),
             sequence: 0,
             tx_id: "untrusted-transaction-canary"
                 .try_into()
@@ -1987,12 +1993,14 @@ async fn remote_client_rejects_zero_sequence_before_resolve_or_retry() {
     let rebuild_error = remote
         .rebuild_replication_state(vec![
             ReplicationEntry {
+                replay_policy: opc_session_store::ReplicationReplayPolicy::prune_expired(),
                 sequence: 1,
                 tx_id: "prefix-one".try_into().expect("valid transaction ID"),
                 op: ReplicationOp::Batch { ops: Vec::new() },
                 timestamp: Timestamp::now_utc(),
             },
             ReplicationEntry {
+                replay_policy: opc_session_store::ReplicationReplayPolicy::prune_expired(),
                 sequence: 3,
                 tx_id: "prefix-gap".try_into().expect("valid transaction ID"),
                 op: ReplicationOp::Batch { ops: Vec::new() },
@@ -2222,6 +2230,7 @@ async fn authenticated_server_rejects_wire_zero_and_keeps_connection_usable() {
 
     let mut malformed = serde_json::to_value(Request::ReplicateEntry {
         entry: ReplicationEntry {
+            replay_policy: opc_session_store::ReplicationReplayPolicy::prune_expired(),
             sequence: 1,
             tx_id: "wire-transaction-canary"
                 .try_into()
@@ -2250,12 +2259,14 @@ async fn authenticated_server_rejects_wire_zero_and_keeps_connection_usable() {
         &Request::RebuildReplicationState {
             entries: vec![
                 ReplicationEntry {
+                    replay_policy: opc_session_store::ReplicationReplayPolicy::prune_expired(),
                     sequence: 1,
                     tx_id: "wire-prefix-one".try_into().expect("valid transaction ID"),
                     op: ReplicationOp::Batch { ops: Vec::new() },
                     timestamp: Timestamp::now_utc(),
                 },
                 ReplicationEntry {
+                    replay_policy: opc_session_store::ReplicationReplayPolicy::prune_expired(),
                     sequence: 3,
                     tx_id: "wire-prefix-gap".try_into().expect("valid transaction ID"),
                     op: ReplicationOp::Batch { ops: Vec::new() },
@@ -2340,6 +2351,7 @@ async fn authenticated_server_rejects_operation_limits_and_keeps_connection_usab
 
     let mut request = serde_json::to_value(Request::ReplicateEntry {
         entry: ReplicationEntry {
+            replay_policy: opc_session_store::ReplicationReplayPolicy::prune_expired(),
             sequence: 1,
             tx_id: "wire-over-depth".try_into().expect("valid transaction ID"),
             op: operation_tree_at_depth(MAX_REPLICATION_OPERATION_DEPTH),
@@ -3738,6 +3750,7 @@ async fn transport_payload_limit_preflights_all_mutation_families_atomically() {
     replication_record.payload = EncryptedSessionPayload::new(vec![0; max_payload]);
     let timestamp = Timestamp::now_utc();
     let exact_entry = ReplicationEntry {
+        replay_policy: opc_session_store::ReplicationReplayPolicy::prune_expired(),
         sequence: backend
             .max_replication_sequence()
             .await
@@ -4140,6 +4153,7 @@ async fn plaintext_rebuild_is_rejected_before_backend_dispatch() {
         &mut stream,
         &opc_session_net::Request::RebuildReplicationState {
             entries: vec![ReplicationEntry {
+                replay_policy: opc_session_store::ReplicationReplayPolicy::prune_expired(),
                 sequence: 1,
                 tx_id: "plaintext-rebuild"
                     .try_into()
@@ -4918,3 +4932,6 @@ async fn durable_readiness_probe_classifies_untrusted_peer_as_authentication() {
     );
     handle.abort();
 }
+
+#[path = "three_node_quorum/round6_watch.rs"]
+mod round6_watch;

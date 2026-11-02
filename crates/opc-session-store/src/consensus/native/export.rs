@@ -214,8 +214,17 @@ impl NativeStorage {
             return Err(invalid("legacy export cannot carry voter-slot seed"));
         }
 
+        // Preserve the original SQL schema when no epoch history exists.
+        // Nondefault metadata requires the namespace even after every tagged
+        // row was recreated or forgotten.
+        if frontiers.retention.keys != crate::key_retention::KeyRetention::default() {
+            sql::native_retired::create(&tx)?;
+        }
         for (key, value) in &state.keys {
             check()?;
+            if let Some(epoch) = value.retired_epoch {
+                sql::native_retired::insert(&tx, key, epoch)?;
+            }
             if let Some(record) = &value.record {
                 ops::insert_or_replace_record_sync(&tx, record).map_err(store)?;
             }
@@ -466,6 +475,7 @@ impl NativeStorage {
             .map_err(|_| invalid("native snapshot exported roster recovery validation failed"))?;
         check()?;
         sql::async_recovery::write(&tx, frontiers.async_recovery.as_ref())?;
+        sql::native_retention::write(&tx, frontiers.retention)?;
         tx.commit().map_err(|error| db!(error))?;
         conn.pragma_update(None, "query_only", true)
             .map_err(|error| db!(error))?;

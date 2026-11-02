@@ -77,9 +77,10 @@ fn native_public_record_journal_and_restore_pages_preserve_sql_cursors_across_co
         })
         .unwrap()
         .unwrap();
-    assert_eq!(
-        encode_json(&journal).unwrap(),
-        encode_json(&expected_journal).unwrap()
+    policy_oracle::page(
+        &journal,
+        &expected_journal,
+        &fixture.oracle.conn.blocking_lock(),
     );
     let first_page = scan(&fixture.wal, RestoreScanRequest::all(2), timestamp(3)).unwrap();
     assert_eq!(
@@ -97,9 +98,10 @@ fn native_public_record_journal_and_restore_pages_preserve_sql_cursors_across_co
         })
         .unwrap()
         .unwrap();
-    assert_eq!(
-        encode_json(&cold_journal).unwrap(),
-        encode_json(&expected_journal).unwrap()
+    policy_oracle::page(
+        &cold_journal,
+        &expected_journal,
+        &fixture.oracle.conn.blocking_lock(),
     );
     let mut cursor = first_page.next_cursor;
     let mut total = 2;
@@ -229,10 +231,7 @@ fn native_public_selected_journal_ranges_preserve_sql_bytes_and_cancellation() {
             })
             .unwrap()
             .unwrap();
-        assert_eq!(
-            encode_json(&actual).unwrap(),
-            encode_json(&expected).unwrap()
-        );
+        policy_oracle::page(&actual, &expected, &fixture.oracle.conn.blocking_lock());
         retained.push((actual, expected));
     }
     // Cancellation at different checked-work boundaries must discard the
@@ -263,9 +262,6 @@ fn native_public_selected_journal_ranges_preserve_sql_bytes_and_cancellation() {
     // Completed public pages own their exact payloads after the native owner
     // and all decoder workers have stopped.
     for (actual, expected) in retained {
-        assert_eq!(
-            encode_json(&actual).unwrap(),
-            encode_json(&expected).unwrap()
-        );
+        policy_oracle::page(&actual, &expected, &fixture.oracle.conn.blocking_lock());
     }
 }

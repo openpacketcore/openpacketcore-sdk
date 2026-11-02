@@ -61,6 +61,10 @@ impl super::super::resident::RowFingerprint for Row {
 }
 
 impl Row {
+    pub(in crate::consensus::native) fn selected_range(&self) -> Option<&SelectedRange> {
+        self.cold.as_ref().map(|cold| &cold.range)
+    }
+
     // Synthetic scalar-only index fixtures are never production carriers.
     #[cfg(test)]
     pub(super) fn index_fixture(

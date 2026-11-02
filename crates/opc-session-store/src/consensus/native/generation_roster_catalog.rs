@@ -257,14 +257,17 @@ impl Rosters {
         &mut self,
         id: facts::KeyId,
         before: Option<&facts::Key>,
-        after: &facts::Key,
+        after: Option<&facts::Key>,
     ) -> io::Result<()> {
         self.reserved_keys = self
             .reserved_keys
             .checked_sub(usize::from(before.is_some_and(|row| row.reserved)))
-            .and_then(|count| count.checked_add(usize::from(after.reserved)))
+            .and_then(|count| count.checked_add(usize::from(after.is_some_and(|row| row.reserved))))
             .ok_or_else(|| invalid("native catalog reserved business count overflow"))?;
-        if let Some(binding) = self.index.reservation_commitment(after.commitment) {
+        if let Some(binding) = after
+            .or(before)
+            .and_then(|row| self.index.reservation_commitment(row.commitment))
+        {
             let row = &self
                 .rows
                 .get(&binding)
@@ -278,9 +281,7 @@ impl Rosters {
             self.invalid_business = self
                 .invalid_business
                 .checked_sub(usize::from(!row.matches_business(before)))
-                .and_then(|count| {
-                    count.checked_add(usize::from(!row.matches_business(Some(after))))
-                })
+                .and_then(|count| count.checked_add(usize::from(!row.matches_business(after))))
                 .ok_or_else(|| invalid("native catalog business predicate count overflow"))?;
         }
         Ok(())

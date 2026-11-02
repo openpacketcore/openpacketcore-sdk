@@ -94,14 +94,20 @@ impl ReservedFrame<'_, '_> {
 fn frame<'a, 'r>(
     reader: &'a mut Cursor<'r>,
     table: Table,
-    notification_sequence: u64,
+    notifications: usize,
+    retired: u64,
     check: &impl Fn() -> io::Result<()>,
 ) -> io::Result<(Header, Frame<'a, 'r>)> {
     check()?;
     expect(reader, &[table.index() as u8])?;
     let header = match table {
         Table::Generic => Header::Generic(reader.before()?),
-        Table::Notification => Header::Notification(notification_sequence),
+        Table::Notification => {
+            if notifications >= validation::MAX_ITEMS {
+                return Err(invalid("native catalog watch count exceeds original bound"));
+            }
+            Header::Notification(retired + notifications as u64 + 1)
+        }
     };
     let offset = reader
         .position
@@ -276,7 +282,7 @@ impl Batch {
                     .take()
                     .unwrap_or_else(|| invalid("native catalog inspection result absent"))
             })??;
-            destination.accept_inspected(staged.header, staged.range, row, section)?;
+            destination.accept_inspected(staged.header, staged.range, row, after, section)?;
         }
         self.bytes = 0;
         if let Some(error) = failure {
@@ -322,34 +328,21 @@ impl Rows {
         resources: &Resources<'_>,
         check: &impl Fn() -> io::Result<()>,
     ) -> io::Result<()> {
-        if table.index() == 3
-            && self
-                .notifications
-                .len()
-                .checked_add(section.counts[3])
-                .is_none_or(|count| count > validation::MAX_ITEMS)
-        {
-            return Err(invalid("native catalog watch count exceeds original bound"));
-        }
         let mut batch = if section.counts[table.index()] < PARALLEL_MIN || resources.available <= 1
         {
             None
         } else {
             Batch::new(resources).ok()
         };
-        for row_index in 0..section.counts[table.index()] {
-            // Every notification appended by this generation has a committed
-            // raw sequence continuing from its predecessor watch sequence.
-            // Retirement removes a prefix but never renumbers a survivor.
-            let notification_sequence = after
-                .business
-                .frontiers
-                .watch_sequence
-                .checked_sub(section.counts[3] as u64)
-                .and_then(|first| first.checked_add(row_index as u64))
-                .and_then(|position| position.checked_add(1))
-                .ok_or_else(|| invalid("native catalog notification sequence overflow"))?;
-            let (header, mut frame) = match frame(reader, table, notification_sequence, check) {
+        for _ in 0..section.counts[table.index()] {
+            let pending = batch.as_ref().map_or(0, |batch| batch.rows.len());
+            let (header, mut frame) = match frame(
+                reader,
+                table,
+                self.notifications.len() + pending,
+                after.business.frontiers.retention.watch_retired_through,
+                check,
+            ) {
                 Ok(frame) => frame,
                 Err(error) => {
                     if let Some(batch) = &mut batch {
@@ -372,7 +365,7 @@ impl Rows {
                     &after.business.frontiers,
                     check,
                 )?;
-                self.accept_inspected(header, range, row, section)?;
+                self.accept_inspected(header, range, row, after, section)?;
                 continue;
             };
             if current.rows.len() == ROWS || current.bytes + frame.range.length as usize > BYTES {
@@ -390,7 +383,7 @@ impl Rows {
                         &after.business.frontiers,
                         check,
                     )?;
-                    self.accept_inspected(header, range, row, section)?;
+                    self.accept_inspected(header, range, row, after, section)?;
                     continue;
                 }
             };
@@ -421,7 +414,7 @@ impl Rows {
             if bytes > BYTES {
                 batch = None;
                 let row = input.inspect_serial(&after.business.frontiers, check)?;
-                self.accept_inspected(header, range, row, section)?;
+                self.accept_inspected(header, range, row, after, section)?;
                 continue;
             }
             let input = match input.reserve(&|bytes| (resources.reserve)(bytes)) {
@@ -430,7 +423,7 @@ impl Rows {
                     current.finish(self, after, section, resources, check)?;
                     batch = None;
                     let row = input.inspect_serial(&after.business.frontiers, check)?;
-                    self.accept_inspected(header, range, row, section)?;
+                    self.accept_inspected(header, range, row, after, section)?;
                     continue;
                 }
             };
@@ -459,6 +452,7 @@ impl Rows {
         header: Header,
         range: Range,
         row: CatalogRow,
+        after: &Context,
         section: RowSection,
     ) -> io::Result<()> {
         let RowSection {
@@ -466,31 +460,10 @@ impl Rows {
         } = section;
         match (header, row) {
             (Header::Generic(before), CatalogRow::Generic(id, row)) => {
-                let Some(row) = row else {
-                    // Bounded ordinary-receipt retention encodes a retirement as
-                    // an after-image removal. The predecessor must be the exact
-                    // ordinary receipt row and base generations never remove.
-                    if base {
-                        return Err(invalid("native generation base removes a generic receipt"));
-                    }
-                    let existing = self.generic.get(&id).ok_or_else(|| {
-                        invalid("native catalog removed an absent generic receipt")
-                    })?;
-                    if existing.row.facts.retained_until.is_some() {
-                        return Err(invalid(
-                            "native catalog removed a V1 receipt without its lifecycle codec",
-                        ));
-                    }
-                    if before != Some(existing.row.content) || existing.checkpoint == checkpoint {
-                        return Err(invalid(
-                            "native catalog generic removal predecessor differs",
-                        ));
-                    }
-                    self.summary[2].replace(Some(existing.row.content), None)?;
-                    self.generic.remove(&id);
-                    return Ok(());
-                };
                 predecessor(self.generic.get(&id), before, checkpoint, base)?;
+                let row = row.ok_or_else(|| {
+                    invalid("native generation generic removal lacks its lifecycle codec")
+                })?;
                 if let Some(before) = self.generic.get(&id) {
                     row.facts.validate_replacement(
                         before.row.facts,
@@ -519,11 +492,12 @@ impl Rows {
                 )?;
             }
             (Header::Notification(sequence), CatalogRow::Notification(row)) => {
-                let ordered = self
-                    .notifications
-                    .last()
-                    .is_none_or(|last| last.row.facts.sequence.checked_add(1) == Some(sequence));
-                if !ordered || row.facts.sequence != sequence {
+                if sequence
+                    != after.business.frontiers.retention.watch_retired_through
+                        + self.notifications.len() as u64
+                        + 1
+                    || row.facts.sequence != sequence
+                {
                     return Err(invalid(
                         "native catalog inspected notification order differs",
                     ));

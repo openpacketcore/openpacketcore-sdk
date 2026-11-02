@@ -369,6 +369,23 @@ fn native_prefix_path_replacement_keeps_original_descriptor_and_symlink_rejects(
 }
 
 #[test]
+fn native_prefix_rollover_retirement_keeps_pinned_authenticated_bytes() {
+    let fixture = Fixture::new(2);
+    let owner = fixture.open();
+    let pinned = owner.current();
+    owner.retire();
+    std::fs::remove_file(&fixture.path).unwrap();
+    check_bytes(&mut pinned.reader(), pinned.identity().length, 0x51).unwrap();
+    assert!(!pinned.is_failed());
+    fixture.file.write_all_at(&[0xff], 0).unwrap();
+    assert!(pinned.read_exact_at(0, &mut [0]).is_err());
+    assert!(
+        pinned.is_failed(),
+        "retirement never disables block authentication"
+    );
+}
+
+#[test]
 fn native_prefix_mutation_truncation_and_appended_bytes_never_replace_admitted_values() {
     for corruption in 0..4 {
         let fixture = Fixture::new(2);
@@ -724,4 +741,215 @@ fn native_prefix_old_corruption_cannot_become_reused_typed_bytes_or_cold_authori
         "cold row must verify the old digest"
     );
     assert!(next.is_failed());
+}
+
+fn created(fixture: &Fixture, payload: &[u8]) -> Created {
+    Created::encode(
+        fixture.file.try_clone().unwrap(),
+        fixture.identity,
+        64 * 1024 * 1024,
+        &|| Ok(()),
+        |output| {
+            for bytes in payload.chunks(31) {
+                output.write_all(bytes)?;
+            }
+            Ok(())
+        },
+    )
+    .unwrap()
+}
+
+#[test]
+fn native_prefix_created_base_compares_once_then_authenticates_synced_payload_and_padding() {
+    let payload = (0..2 * MIN_BLOCK + 17)
+        .map(|n| (n ^ (n >> 7)) as u8)
+        .collect::<Vec<_>>();
+    let fixture = Fixture::new(0);
+    let pending = created(&fixture, &payload);
+    pending.file().sync_all().unwrap();
+    let owner = pending.admit(&fixture.path, &|| Ok(())).unwrap();
+    assert!(
+        owner.opened.is_none(),
+        "fresh expected readback carries no cold repair token"
+    );
+    assert_eq!(owner.current().identity().length, (3 * MIN_BLOCK) as u64);
+    let mut expected = payload.clone();
+    expected.resize(3 * MIN_BLOCK, 0);
+    let mut actual = vec![0; expected.len()];
+    owner.current().reader().read_exact(&mut actual).unwrap();
+    assert_eq!(actual, expected);
+    assert_eq!(
+        owner.current().identity().digest,
+        <[u8; 32]>::from(Sha256::digest(&expected))
+    );
+    for offset in [
+        0,
+        17,
+        8191,
+        MIN_BLOCK,
+        2 * MIN_BLOCK + 16,
+        3 * MIN_BLOCK - 1,
+    ] {
+        let fixture = Fixture::new(0);
+        let pending = created(&fixture, &payload);
+        pending.file().sync_all().unwrap();
+        fixture
+            .file
+            .write_all_at(&[expected[offset] ^ 0x80], offset as u64)
+            .unwrap();
+        fixture.file.sync_all().unwrap();
+        let error = pending
+            .admit(&fixture.path, &|| Ok(()))
+            .err()
+            .expect("post-comparison corruption must fail");
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData, "offset={offset}");
+    }
+}
+
+#[test]
+fn native_prefix_created_base_rejects_changed_extent_namespace_and_overflow() {
+    let payload = vec![0x39; MIN_BLOCK + 17];
+    for length in [(2 * MIN_BLOCK - 1) as u64, (2 * MIN_BLOCK + 1) as u64] {
+        let fixture = Fixture::new(0);
+        let pending = created(&fixture, &payload);
+        pending.file().sync_all().unwrap();
+        fixture.file.set_len(length).unwrap();
+        assert!(pending.admit(&fixture.path, &|| Ok(())).is_err());
+    }
+    for symlink in [false, true] {
+        let fixture = Fixture::new(0);
+        let pending = created(&fixture, &payload);
+        pending.file().sync_all().unwrap();
+        let old = fixture.directory.path().join("original");
+        std::fs::rename(&fixture.path, &old).unwrap();
+        if symlink {
+            std::os::unix::fs::symlink(&old, &fixture.path).unwrap();
+        } else {
+            std::fs::copy(&old, &fixture.path).unwrap();
+        }
+        assert!(pending.admit(&fixture.path, &|| Ok(())).is_err());
+    }
+    let fixture = Fixture::new(0);
+    let result = Created::encode(
+        fixture.file.try_clone().unwrap(),
+        fixture.identity,
+        MIN_BLOCK as u64,
+        &|| Ok(()),
+        |writer| writer.write_all(&payload),
+    );
+    assert!(result.is_err());
+    assert!(fixture.file.metadata().unwrap().len() <= MIN_BLOCK as u64);
+    let fixture = Fixture::new(1);
+    assert!(
+        Created::encode(
+            fixture.file.try_clone().unwrap(),
+            fixture.identity,
+            4 * MIN_BLOCK as u64,
+            &|| Ok(()),
+            |writer| writer.write_all(&payload)
+        )
+        .is_err(),
+        "cannot upgrade a pre-existing file"
+    );
+}
+
+#[test]
+fn native_prefix_read_section_checks_descriptors_at_bookends_and_keeps_every_byte_authenticated() {
+    let fixture = Fixture::new(2);
+    let owner = fixture.open();
+    let view = owner.current();
+    let output = Arc::new(Mutex::new(Vec::new()));
+    {
+        let _scope = super::super::rollover_costs::Scope::begin(Some(Arc::clone(&output)));
+        with_read_section(|| {
+            for offset in 0..1024 {
+                let mut bytes = [0; 17];
+                view.read_exact_at(offset, &mut bytes)?;
+                assert_eq!(bytes, [0x51; 17]);
+            }
+            Ok(())
+        })
+        .unwrap();
+    }
+    let costs = output.lock().unwrap()[0];
+    assert_eq!(
+        costs.metadata, 2,
+        "one immutable descriptor section: {costs:?}"
+    );
+    assert_eq!(
+        costs.cache_locks, 0,
+        "the section owns its verified cache: {costs:?}"
+    );
+    let error = with_read_section(|| {
+        let mut bytes = [0; 17];
+        view.read_exact_at(0, &mut bytes)?;
+        fixture.file.write_all_at(&[0x92], 19)?;
+        Ok(())
+    })
+    .unwrap_err();
+    assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+    assert!(view.is_failed());
+}
+
+#[test]
+fn native_prefix_candidate_capacity_check_precedes_fence_and_every_callback() {
+    let fixture = Fixture::new(2);
+    let maximum = 3 * MIN_BLOCK as u64;
+    let mut owner = VerifiedAppendOwner::open(
+        &fixture.path,
+        fixture.identity,
+        maximum,
+        || Ok(()),
+        |reader| check_bytes(reader, fixture.identity.length, 0x51),
+    )
+    .unwrap();
+    let before = owner.current();
+    assert!(owner.fits_append(1, 0));
+    assert!(owner.fits_append(MIN_BLOCK as u64, 0));
+    for (payload, reserve) in [
+        (1, MIN_BLOCK as u64),
+        (MIN_BLOCK as u64 + 1, 0),
+        (u64::MAX, 0),
+        (1, u64::MAX),
+        (0, 0),
+    ] {
+        assert!(!owner.fits_append(payload, reserve));
+        let calls = Cell::new(0);
+        let result = owner
+            .append_with_reserve(
+                &before,
+                AppendTransaction {
+                    checkpoint_epoch: before.identity.checkpoint_epoch + 1,
+                    operation_sequence: before.identity.operation_sequence,
+                    frontiers: [3; 32],
+                    payload_bytes: payload,
+                },
+                reserve,
+                || {
+                    calls.set(calls.get() + 1);
+                    Ok(())
+                },
+                |_| {
+                    calls.set(calls.get() + 1);
+                    Ok(())
+                },
+                |_| {
+                    calls.set(calls.get() + 1);
+                    Ok(())
+                },
+            )
+            .unwrap();
+        assert!(result.is_none());
+        assert_eq!(calls.get(), 0);
+        assert_eq!(owner.current().identity(), before.identity());
+        assert_eq!(
+            fixture.file.metadata().unwrap().len(),
+            before.identity().length
+        );
+        assert!(!before.is_failed());
+    }
+    let after = append(&mut owner, &[0x27]).unwrap();
+    assert_eq!(after.identity().length, maximum);
+    assert!(!after.is_failed());
+    assert!(!before.is_failed());
 }

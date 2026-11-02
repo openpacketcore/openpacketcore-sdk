@@ -158,13 +158,6 @@ impl NativeDelta<'_> {
             return Err(invalid("native roster profile activation is missing"));
         }
         match &roster {
-            RosterCommandRef::Admission(_, ProtectedRosterProfileVersion::V1) => {
-                self.initialize_roster_witness(
-                    !self.frontiers.roster_v1_namespace
-                        && self.frontiers.roster_v2_activation.is_none(),
-                )?;
-                self.frontiers.roster_v1_namespace = true;
-            }
             RosterCommandRef::TerminalV1(_) if !self.frontiers.roster_v1_namespace => {
                 return Err(invalid(
                     "native roster terminal precedes V1 namespace activation",
@@ -172,7 +165,17 @@ impl NativeDelta<'_> {
             }
             _ => {}
         }
+        let activates_v1_namespace = matches!(
+            &roster,
+            RosterCommandRef::Admission(_, ProtectedRosterProfileVersion::V1)
+        );
         let mut store = Store::for_command(self, check)?;
+        if activates_v1_namespace {
+            store.initialize_roster_witness(
+                !self.frontiers.roster_v1_namespace
+                    && self.frontiers.roster_v2_activation.is_none(),
+            )?;
+        }
         let result = match &roster {
             RosterCommandRef::Admission(q1, ProtectedRosterProfileVersion::V1) => {
                 roster_engine::admit_v1(
@@ -228,6 +231,17 @@ impl NativeDelta<'_> {
             Ok(value) => {
                 check()?;
                 let (ledger, changes, keys, revision) = store.finish_with_changes()?;
+                if self.frontiers.watch_sequence >= COUNTER_MAX
+                    && self.requires_capacity_notification(
+                        keys.keys().filter(|key| !self.has_key(key)).count(),
+                    )?
+                {
+                    return Ok(self.clock_response(
+                        now,
+                        index,
+                        StoreError::FencedTransitionStorageExhausted,
+                    ));
+                }
                 self.accept_roster_savepoint(ledger, changes, keys, revision)?;
                 value
             }
@@ -260,6 +274,15 @@ impl NativeDelta<'_> {
                 return Err(invalid("native roster evaluator storage failed"))
             }
         };
+        // A committed V1 rejection still establishes its namespace. The
+        // storage-horizon refusal above returns before this publication.
+        if activates_v1_namespace {
+            self.initialize_roster_witness(
+                !self.frontiers.roster_v1_namespace
+                    && self.frontiers.roster_v2_activation.is_none(),
+            )?;
+            self.frontiers.roster_v1_namespace = true;
+        }
         self.frontiers.sequence = sequence;
         self.frontiers.digest = digest;
         self.frontiers.logical_time = Some(now);
@@ -273,6 +296,7 @@ impl NativeDelta<'_> {
                 .filter(|sequence| *sequence <= COUNTER_MAX)
                 .ok_or_else(|| invalid("native roster watch sequence exhausted"))?;
             let notification = ReplicationEntry {
+                replay_policy: crate::ReplicationReplayPolicy::preserve(),
                 sequence,
                 tx_id: ReplicationTxId::from_request_bytes(*command.request_id.as_bytes()),
                 op,

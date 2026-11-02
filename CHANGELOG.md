@@ -104,46 +104,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   preserves plans; I/O rechecks live link and socket binding without waiting
   on the PDP mutation mutex. Recoverable-socket support remains unimplemented.
   Refs #1084.
-- `opc-session-store`: native ordinary command outcomes now use a bounded
-  committed-state retention rule instead of accumulating for the life of the
-  store. The rule stays inert below committed application sequence 65,536
-  (byte-identical behavior); once active, receipts whose committed response
-  logical time is at or before `frontiers.logical_time - 120 seconds`
-  (inclusive boundary) are retired on publication. Exact in-window retries
-  replay the original outcome; out-of-window retries receive the typed
-  `BackendOperationOutcomeUnavailable`/`CasIdempotencyOutcomeUnavailable`
-  answer and are never executed again. A retryable typed capacity refusal is
-  returned for every new binding while the resident receipt map is at or above
-  its capacity bound, including mid-delta, so new bindings cannot grow the map
-  to the 1,048,576-row `MAX_ITEMS` admission cap; refusals are effect-free,
-  binding-free and may advance the committed logical clock. The rule derives
-  only from the already-persisted committed application sequence and logical
-  time, so every voter retires identically and no new persisted field or
-  format boundary is added; generation catalog base/delta replay, full images,
-  the portable SQL projection and the prepared SQL base carry the retained
-  map. A past-million-command qualification job, voter/snapshot-install parity
-  and crash-cut coverage remain the final follow-up (#1251). Refs #1251.
-
-- `opc-session-store`: native notification rows now use bounded rolling
-  retention instead of accumulating for the life of the store. The newest
-  65,536 notifications remain resident; that 65,536 is a row-count bound, not a
-  byte budget, and the retention floor is derived only
-  from the committed `watch_sequence`, so every voter derives the same floor at
-  the same log index and the already-persisted snapshot/frontier state carries
-  it across restart with no new persisted-format field or
-  acknowledgement/delivery tracker. Row publication retires the out-of-window
-  prefix, business validation requires exactly the derived retained count and
-  raw sequences, and a watcher whose inclusive cursor is at or below the floor
-  receives the existing `ReplicationLogCursorCompacted { resume_from }` answer
-  so it resynchronises from the lowest replayable sequence; retention is a
-  bounded replay backlog, not delivery tracking. The 1,048,576-row
-  `MAX_ITEMS` cap remains a last defense instead of a lifetime stop. Durable
-  carry for the derived floor is included: generation base and delta catalogs,
-  full images, the portable SQLite snapshot projection and the prepared SQL
-  base preserve the sparse raw sequences and re-derive the identical floor on
-  replay, so close/reopen and snapshot install continue the same bounded
-  window. Million-mutation qualification and leader-to-snapshot-install parity
-  remain the final follow-up (#1250), with no new format boundary. Refs #1250.
 
 - `opc-session-net`: `PersistentSessionConsumerConfig::with_cooldown_admission`
   selects the explicit reconnect-cooldown admission policy for a persistent
@@ -291,6 +251,49 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   retaining the full 131,073-row cold reopen,
   all validators, and existing capacity, retention and deadline bounds. Refs #1307.
 
+- `opc-session-store`: complete bounded restore scans when only expired rows follow a full live-row
+  page, preserving the physical visit budget and all page-size limits.
+
+- `opc-session-store`: preserve observed record and lab-receipt expiry after
+  an injected fake-backend clock moves backward without using reader samples
+  to execute later writes. Commands sample time under the state lock, bounded
+  by earlier writer attempts and committed time; replay uses the committed entry
+  timestamp. Record changes replace their local expiry visibility, while unrelated commits keep
+  expired records and receipts hidden. Newly written zero-TTL records preserve
+  their exact boundary. Lease-only commands preserve lab restore cursors.
+
+- `opc-session-store`: carry native capacity rotations through application
+  replay and cold reloads, reject oversized fake journal batches before
+  publication, and skip expired restore rows within the source-work bound.
+
+- `opc-session-store`: align native and fake retirement at command boundaries.
+  Successful V1 fenced transitions include staged expiry cleanup; a CAS
+  conflict discards cleanup and cannot retire keys or rotate their epoch.
+
+- `opc-session-store`: rejected fake-backend writes and no-effect local batches
+  preserve committed expiry state. Successful local batches emit one replication
+  entry containing their successful write slots, and notify watchers after
+  publication. Lab transition failures retain their outcome receipt without
+  publishing unrelated cleanup.
+
+- `opc-session-store`: lab transition observations preserve committed expiry
+  and retirement state. Retained keys expose their exact fence and absent keys
+  expose the committed floor, so an uncontended acquire accepts the observed
+  fence at the same timestamp. Refs #1257.
+
+- `opc-session-store`: fake reads filter expired records without discarding
+  canonical replay state. Live replication and rebuild apply expiry at the
+  committed entry timestamp, so delayed releases, deletes, renewals and TTL
+  refreshes survive intervening follower reads. Duplicate delivery leaves
+  state unchanged, and lab restore cursors still reject expired scan views.
+  Refs #1257.
+
+- `opc-session-store`: create fresh native roots on the blocking opener pool,
+  keeping cold authentication off the asynchronous caller's stack. Queued and
+  running creation retain their connection, descriptor owner and verified
+  snapshots until ROOT writing completes, including caller cancellation after
+  SQL identity initialization. The complete initial root remains reopenable.
+
 - `opc-session-net`: preserve configured reconnect admission for the first
   prepared-request warm flight, before shared prewarm permits and DNS. `FailOver`
   immediately selects another voter when cooldown or existing setup prevents
@@ -335,40 +338,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   The reader trait retains its original method and adds a defaulted bounded
   method. (#1205)
 
-- `opc-session-store`: native key-removal business-change journal (partial
-  #1252, PR2a). `BusinessChanges` can now stage an exact-predecessor key
-  retirement as one `after=None` change with the predecessor content stamp and
-  table-summary conservation, published through the existing row machinery.
-  Removals are deduplicated and staged at most once; a candidate key created or
-  updated in the same delta is collapsed *before* the resident expiry index is
-  rebuilt and the removed key's resident expiry entry is removed with it (so the
-  next prune cannot observe a stale record/lease/released/scope entry).
-  Create-and-retire of a never-committed key is a transient with no journal row,
-  and a key with no committed predecessor is rejected. No production sweep produces
-  removals yet, there is no generation-base+delta/relocation/cold/replay/export
-  or SQLite prepared-base/full-image carry, and floor=0 behavior is unchanged.
-  PR2b (exact persisted-format carry and round-trip/relocation/parity tests),
-  PR2c/PR3 (capacity-triggered deterministic sweep, exact-bound and
-  stale-credential order matrix, >1,048,576 distinct-key/voter/snapshot
-  qualification) remain open; #1252 stays partial and must not be closed by
-  this change. Refs #1252.
-
-- `opc-session-store`: native touched-key retention foundation (partial #1252).
-  A committed-state-only fence floor `next_fence - RETAINED_KEY_FENCES` now
-  identifies protected credentials issued before a provably non-authoritative
-  key's retirement; credentials below the floor for a dead key are refused with
-  the typed `StaleFence` outcome while live records, leases, reservations and
-  scope/roster-authoritative keys keep their exact authority. A new ordinary
-  key at the fixed image capacity now fails closed with the typed deterministic
-  `KeyCapacityExhausted` outcome (counted across the whole ordered batch) and is
-  returned to the caller instead of surfacing a fatal image error. The floor is zero below the window, so fresh and below-window
-  state is byte-identical and no persisted field or fresh-install boundary is
-  added. Actual bounded key-row retirement (the capacity-triggered sweep and
-  its exact generation base+delta/relocation/cold and SQLite prepared
-  base/full-image carry), exact-bound reduced-window round-trip tests, and the
-  >1,048,576-distinct-key qualification remain open (PR2/PR3); a store still
-  cannot pass the lifetime key cap, and #1252 stays partial until they land.
-  Refs #1252.
 
 - `opc-session-store` / `opc-session-testkit`: consensus restore-scan caller
   deadlines remain retryable across logical-time fencing, worker and connection
@@ -406,20 +375,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   with bounded jitter. Recovery-only retirement after provider loss (#1298)
   and automatic unresolved-obligation discharge (#1306) remain separate work.
   Refs #1307.
-
-- `opc-session-store`: the deterministic in-memory backend no longer refuses new
-  work for the process lifetime after a fixed number of keys or lab
-  fenced-transitions. Under capacity pressure it first retires only state that
-  is provably no longer authoritative: fence floors whose key has neither a
-  live record nor a live lease, and `in_memory_lab` transition receipts past
-  `FENCED_TRANSITION_OUTCOME_RETENTION`. A retired floor raises one
-  backend-wide retired-fence high-water that observation reports and
-  allocation requires for a key without a live floor, so fence tokens never
-  regress for a re-created key; stale credentials still fail closed against
-  the exact live lease. Receipts inside their exact-answer
-  window are never evicted early; when the retained history is entirely
-  authoritative the backend keeps the typed `FencedTransitionHistoryFull`
-  failure without mutating state. Refs #1257.
 
 - `opc-proto-ngap` / `opc-sctp`: retain wiping custody of received security
   material through SCTP accumulation and growth, the last payload reference,
@@ -679,6 +634,42 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   consumers use `receive_peer_packet`, with bounded reassembly, scheduled expiry,
   and authenticated fragment-1 response replay. (#1242)
 
+- `opc-session-store`: deterministic V1/V2 creates for keys with no retained
+  history use the store's published absent-key floor. Observe before preparing
+  and re-observe after a create-time `StaleFence`. The native and memory-only
+  fake backends keep an exact epoch window of recently retired keys and accept
+  exactly the current or previous absent floor after Async recovery. Fresh-zero
+  remains valid through epoch 1 without an Async recovery boundary.
+  Rotation occurs at 32,768 retirements or earlier when dead history exhausts
+  key capacity. Every rotation strictly raises the published floor and records
+  its trigger; an absent-key preparation survives one rotation and receives a
+  no-effect `StaleFence` after two. Rotation happens only inside the committing
+  command, after all batch children.
+  Application replication entries carry required producer-selected replay policy
+  independently of mutation shape: expiry cleanup, dead-key retirement, recovery
+  floor, capacity decisions, internal capacity and bounded command framing.
+  V2 replay preserves unrelated expired rows as native does, including
+  single-effect and cached-child batches. Explicit recovery transitions carry
+  the source floor and exact cursor predecessor. Portable snapshots, conversion
+  and rebuild preserve the policy; unsupported standalone replay policies are
+  refused atomically. Native portable images identify their policy profile even
+  at genesis. Missing policy is rejected, JSON mutations use `effects`, and peers
+  require matching schemas. Release replay preserves physical lease expiry and
+  the committed guard deadline separately. Coalesced delivery preserves each
+  notification's committed cursor across recovery boundaries, and watches accept
+  inclusive recovery resume cursors. Replay cleanup and lease checks use the
+  committed entry time. Local in-memory lease operations enforce recovered
+  authority floors. SQLite transition batches state their actual command framing;
+  replay validates continuations across reopen and rebuild. The non-journal
+  in-memory batch profile retains its existing write allowance. Operation and
+  lifetime bounds remain unchanged.
+
+- `opc-session-store`: native notification and ordinary-key retirement add committed replay
+  floors to roots `OPCNR003` (Durable) and `OPCNA005` (Async). Crossing this
+  storage boundary requires a fresh installation. Native stores created by
+  earlier pre-release builds are refused with `FreshInstallationRequired` and
+  must be reinitialized; there is no in-place migration.
+
 - `opc-gtpu-dataplane`: the pinned family-tagged grouped-session ABI advances
   to schema marker `OPC-GROUP-IP-v7`. Family-tagged entries gain the versioned
   opt-in downlink inner MTU profile (version 3, the 2-byte field at
@@ -753,17 +744,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   through the shared one-second throttle and recover on a later successful
   refresh. Downstream exhaustive matches must handle the new variants.
   Refs #1246.
-
-- `opc-session-store`: `StoreError` adds `KeyProviderUnavailable`. Key-provider
-  outages from record sealing/unsealing (KMS restart, TLS failure, refused
-  connection, timeout) are now reported as this retryable variant, classified
-  like `BackendUnavailable`, instead of the coarse `Crypto` error; callers can
-  retry within their request budget. Every content-dependent key failure
-  (invalid envelope, unknown key id, authentication failure) remains collapsed
-  into `Crypto` to preserve the encryption-oracle resistance property. The wire
-  error representation maps the new variant onto its retryable
-  `BackendUnavailable` class, so no wire format changed. Downstream exhaustive
-  matches must handle the new variant. Refs #1197.
 - `opc-session-store` and `opc-session-net`: protected-roster activation now
   binds the admission capacity policy, and authenticated admissions distinguish
   ordinary and emergency work. Crossing this storage boundary requires a fresh
@@ -1840,6 +1820,34 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- `opc-session-store`: retain exact fences for recently deleted and expired
+  in-memory keys through the current and previous retirement epochs, then reclaim
+  their rows below the previous published floor, preserving live authority and rejecting
+  stale credentials through request staging, ordered replay and rebuild.
+  Expired guards for retired missing keys retain `LeaseExpired`; a tracked
+  newer owner retains `StaleFence` priority. The
+  opaque transition-receipt lifetime remains unchanged; safe receipt deletion
+  still needs a caller-bound retry epoch or expiry. The receipt part of #1257
+  remains open.
+- `opc-session-store`: retain ordinary dead keys in a committed two-epoch window.
+  Rotation strictly advances the absent-key floor; deterministic acquisition of
+  a missing key accepts exactly the current or previous floor after Async recovery.
+  Retained rows keep their exact fence, preserving live credentials and rejecting stale credentials after
+  retirement and re-creation. Native checkpoints and portable snapshots retain
+  the namespace floor. Scope child and claim history retain their separate
+  lifecycles, and pure `FencedTransitionV2` traffic does not trigger the global
+  expiry prune. Those parts of #1252 remain open.
+
+- `opc-session-store`: retain ordinary request outcomes until a caller-bound
+  retry-lifetime contract permits safe deletion. Leader-assigned proposal time
+  cannot distinguish an old retry from new work; consumer binding and operation
+  outcomes retain their existing status semantics. #1251 remains open.
+
+- `opc-session-store`: native replay retains the latest 65,536 notifications
+  instead of accumulating every notification until the lifetime item limit.
+  Checkpoints, portable snapshots and restart preserve the committed floor;
+  older cursors return `ReplicationLogCursorCompacted`. (#1250)
+
 - `opc-gtpu-dataplane`: measured End Marker and redirect-delivery timeouts now
   report redirect deltas, iteration, counters, tentative IPv6 addresses, and
   neighbour/route state, including failed diagnostic reads. Packet counts and
@@ -1855,6 +1863,55 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   local journal preflight failure by checking the exact original binding on
   the next status call. Local failures still return immediately, and retries
   cannot adopt a substituted row or restore mutation authority. (#1378)
+
+- `opc-session-store`: local and remote envelope operations report key-provider
+  outages as retryable `BackendUnavailable`; unknown keys, invalid envelopes
+  and authentication failures retain their coarse crypto errors. (#1197)
+  `opc-key` reports AEAD rejection and completed KMS denials as fieldless
+  `KeyError::OperationFailed`, keeping them separate from provider outages.
+  Local configuration errors, including invalid TCP endpoints, missing TLS
+  connectors and invalid TLS server names, are permanent operation failures.
+  Both JSON KMS adapters retain absolute Unix paths, `unix://<path>`, bare
+  `host:port` and optional `tcp://` prefixes, including IPv4 and bracketed,
+  scoped or unbracketed numeric IPv6. Resolver-supported `u16` ports with a
+  leading `+` remain accepted. Hosts containing NUL, control characters or
+  whitespace fail permanently; resolution and connection failures remain
+  retryable availability errors.
+
+- `opc-session-store`: explicitly release WAL root locks when opening fails or
+  the writer exits, so duplicated descriptors cannot block a successor after
+  the owning store has released the root. (#1366)
+
+- `opc-session-store`: bound mixed business, roster and log verification journals
+  across checkpoints and cold replay without changing the 128 MiB process cap.
+  Pre-publication pressure waits preserve consumer progress, retirement hints
+  cover mixed receipt bindings, and waits require meaningful relief with a
+  fixed total bound. Recovery validates journal chunks and selects a fully
+  audited compact base before reopening. (#1130)
+
+- `opc-session-store`: compact native Durable and Async generation files in the
+  background while ordinary delta checkpoints continue. Selected suffix frames
+  retain canonical continuity and byte comparison through ordinary authenticated
+  reads. Durable CURRENT precedes reclaim; pinned readers remain valid, and
+  bounded background relocation never gates checkpoint start. Each build attempt
+  serializes its base once and authenticates synced readback. Old-file headroom
+  is the ceiling minus the selected cut's extent, including a trigger-crossing
+  frame; it supplies designed, recoverable admission backpressure, warned at 3/4. Async
+  waits before projection/reservation and excludes guard-only time from journal
+  pressure. Overflowing candidates are discarded before append and retried only
+  with cut progress. Capacity-only recovery can select a fully validated newer
+  pending-cut base without another delta. If even that base exceeds the existing
+  ceiling, admission remains held until internal retirement frees space.
+  Installation waits before claiming its application gate during that recovery
+  and yields an unarmed claim if capacity appears during drain. Resource waits
+  retry after memory refunds, and authenticated pressure journals can drain
+  without a new cut or repeated base encoding. Cancellation does not retry in
+  I/O adapters; shutdown and cancellation wake background owners. This allows
+  committed retirement to finish; shutdown interrupts the wait without
+  selecting partial state. Admission of client deletes while live data is at
+  capacity remains an open resident-state policy decision. This improves on
+  backlog's stop at the ceiling regardless of live-data size. No format, bound,
+  deadline, acknowledgement or authentication changes. Fixes #1253.
 
 - Go operators now require Go 1.26.10 for the `crypto/x509` fix GO-2026-6809.
 
@@ -2333,7 +2390,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   snapshot export, install, and restart without accumulating the full log history.
   Native persistence uses new root and generation formats; existing native roots
   require a fresh installation and are refused with `FreshInstallationRequired`.
-  Generation-file ceilings remain until file rollover is implemented. Refs #1249.
+  File rollover (#1253) now compacts generation files before the append-history
+  ceilings. Refs #1249.
 
 - `opc-ipsec-xfrm`: publish terminal composite and single-object staged-install
   ownership together with runner completion, so a fresh plan observed at

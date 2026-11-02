@@ -5,7 +5,7 @@ use zeroize::Zeroizing;
 
 use crate::{
     errors::KeyError,
-    provider::{EncryptedPayload, KeyHandle, KeyProvider},
+    provider::{EncryptedPayload, KeyHandle, KeyProvider, AEAD_TAG_LEN},
     remote::{RemoteSealMaterialController, RemoteSealMaterialEpoch, RemoteSealProvider},
     scope::{serialize_bound_aad, EnvelopeAad, KeyId, KeyPurpose},
 };
@@ -69,7 +69,7 @@ struct KmsResponse {
 
 fn decode_hex_32(hex: &str) -> Result<Zeroizing<[u8; 32]>, KeyError> {
     if hex.len() != 64 || !hex.is_ascii() {
-        return Err(KeyError::Unavailable);
+        return Err(KeyError::OperationFailed);
     }
     let mut bytes = Zeroizing::new([0u8; 32]);
     for (i, chunk) in hex.as_bytes().as_chunks::<2>().0.iter().enumerate() {
@@ -85,7 +85,7 @@ fn decode_hex_nibble(byte: u8) -> Result<u8, KeyError> {
         b'0'..=b'9' => Ok(byte - b'0'),
         b'a'..=b'f' => Ok(byte - b'a' + 10),
         b'A'..=b'F' => Ok(byte - b'A' + 10),
-        _ => Err(KeyError::Unavailable),
+        _ => Err(KeyError::OperationFailed),
     }
 }
 
@@ -101,7 +101,7 @@ fn encode_hex(bytes: &[u8]) -> String {
 fn decode_hex_vec(hex: &str) -> Result<Vec<u8>, KeyError> {
     let (chunks, remainder) = hex.as_bytes().as_chunks::<2>();
     if !remainder.is_empty() || !hex.is_ascii() {
-        return Err(KeyError::Unavailable);
+        return Err(KeyError::OperationFailed);
     }
     let mut bytes = Vec::with_capacity(hex.len() / 2);
     for chunk in chunks {
@@ -110,6 +110,45 @@ fn decode_hex_vec(hex: &str) -> Result<Vec<u8>, KeyError> {
         bytes.push((high << 4) | low);
     }
     Ok(bytes)
+}
+
+fn tcp_endpoint_addr(endpoint: &str) -> Result<&str, KeyError> {
+    // Keep the address spelling accepted by the released adapters. In
+    // particular, converting scoped IPv6 to an (Ipv6Addr, port) tuple would
+    // discard its scope. Tokio parses a complete SocketAddr before resolving.
+    let addr = endpoint.trim_start_matches("tcp://");
+    if addr.contains("://") {
+        return Err(KeyError::OperationFailed);
+    }
+    if addr.parse::<std::net::SocketAddr>().is_ok() {
+        return Ok(addr);
+    }
+    let (host, port) = addr.rsplit_once(':').ok_or(KeyError::OperationFailed)?;
+    if host.is_empty()
+        || host
+            .chars()
+            .any(|character| character.is_whitespace() || character.is_control())
+        || port.parse::<u16>().is_err()
+        || host.contains(['[', ']', '/', '?', '#', '@'])
+    {
+        return Err(KeyError::OperationFailed);
+    }
+    if host.contains(':') {
+        // The resolver also accepts unbracketed numeric IPv6 host:port forms.
+        // A zone is resolved with the address rather than treated as a name.
+        let literal = if let Some((literal, zone)) = host.split_once('%') {
+            if zone.is_empty() {
+                return Err(KeyError::OperationFailed);
+            }
+            literal
+        } else {
+            host
+        };
+        literal
+            .parse::<std::net::Ipv6Addr>()
+            .map_err(|_| KeyError::OperationFailed)?;
+    }
+    Ok(addr)
 }
 
 pub struct KmsKeyProvider {
@@ -174,12 +213,12 @@ impl KmsKeyProvider {
                     .map_err(|_| KeyError::Unavailable)?;
                 Ok::<KmsStream, KeyError>(KmsStream::Unix(stream))
             } else {
-                let addr = self.endpoint.trim_start_matches("tcp://");
-                let connector = self.connector.as_ref().ok_or(KeyError::Unavailable)?;
+                let addr = tcp_endpoint_addr(&self.endpoint)?;
+                let connector = self.connector.as_ref().ok_or(KeyError::OperationFailed)?;
+                let domain = rustls_pki_types::ServerName::try_from(self.server_name.clone())
+                    .map_err(|_| KeyError::OperationFailed)?;
                 let stream = tokio::net::TcpStream::connect(addr)
                     .await
-                    .map_err(|_| KeyError::Unavailable)?;
-                let domain = rustls_pki_types::ServerName::try_from(self.server_name.clone())
                     .map_err(|_| KeyError::Unavailable)?;
                 let tls_stream = connector
                     .connect(domain, stream)
@@ -211,7 +250,7 @@ impl KmsKeyProvider {
             .map_err(|_| KeyError::Unavailable)?;
         let len = u32::from_be_bytes(len_buf) as usize;
         if len > Self::MAX_RESPONSE_BYTES {
-            return Err(KeyError::Unavailable);
+            return Err(KeyError::OperationFailed);
         }
 
         let mut resp_buf = Zeroizing::new(vec![0u8; len]);
@@ -220,7 +259,7 @@ impl KmsKeyProvider {
             .await
             .map_err(|_| KeyError::Unavailable)?;
         let resp: KmsResponse =
-            serde_json::from_slice(&resp_buf).map_err(|_| KeyError::Unavailable)?;
+            serde_json::from_slice(&resp_buf).map_err(|_| KeyError::OperationFailed)?;
 
         if resp.status == "success" {
             Ok(resp)
@@ -231,7 +270,7 @@ impl KmsKeyProvider {
             if msg.contains("not found") {
                 Err(KeyError::NotFound)
             } else {
-                Err(KeyError::Unavailable)
+                Err(KeyError::OperationFailed)
             }
         }
     }
@@ -254,10 +293,10 @@ impl KeyProvider for KmsKeyProvider {
             ciphertext_and_tag_hex: None,
         };
         let resp = self.call_kms(req).await?;
-        let key_id_str = resp.key_id.ok_or(KeyError::NotFound)?;
-        let key_bytes_hex = Zeroizing::new(resp.key_bytes_hex.ok_or(KeyError::NotFound)?);
+        let key_id_str = resp.key_id.ok_or(KeyError::OperationFailed)?;
+        let key_bytes_hex = Zeroizing::new(resp.key_bytes_hex.ok_or(KeyError::OperationFailed)?);
 
-        let key_id = KeyId::new(key_id_str)?;
+        let key_id = KeyId::new(key_id_str).map_err(|_| KeyError::OperationFailed)?;
         let key_bytes = decode_hex_32(&key_bytes_hex)?;
 
         let handle = KeyHandle::new(key_id, purpose, tenant.clone(), key_bytes);
@@ -275,9 +314,9 @@ impl KeyProvider for KmsKeyProvider {
             ciphertext_and_tag_hex: None,
         };
         let resp = self.call_kms(req).await?;
-        let key_bytes_hex = Zeroizing::new(resp.key_bytes_hex.ok_or(KeyError::NotFound)?);
-        let purpose_str = resp.purpose.ok_or(KeyError::NotFound)?;
-        let tenant_str = resp.tenant.ok_or(KeyError::NotFound)?;
+        let key_bytes_hex = Zeroizing::new(resp.key_bytes_hex.ok_or(KeyError::OperationFailed)?);
+        let purpose_str = resp.purpose.ok_or(KeyError::OperationFailed)?;
+        let tenant_str = resp.tenant.ok_or(KeyError::OperationFailed)?;
 
         let purpose = match purpose_str.as_str() {
             "config" => KeyPurpose::Config,
@@ -287,10 +326,9 @@ impl KeyProvider for KmsKeyProvider {
             "ipsec-sa" => KeyPurpose::IpsecSa,
             "audit" => KeyPurpose::Audit,
             "backup" => KeyPurpose::Backup,
-            _ => return Err(KeyError::Unavailable),
+            _ => return Err(KeyError::OperationFailed),
         };
-        let tenant = TenantId::new(tenant_str)
-            .map_err(|e| KeyError::invalid_metadata("tenant", e.to_string()))?;
+        let tenant = TenantId::new(tenant_str).map_err(|_| KeyError::OperationFailed)?;
         let key_bytes = decode_hex_32(&key_bytes_hex)?;
 
         let handle = KeyHandle::new(key_id.clone(), purpose, tenant, key_bytes);
@@ -308,8 +346,8 @@ impl KeyProvider for KmsKeyProvider {
             ciphertext_and_tag_hex: None,
         };
         let resp = self.call_kms(req).await?;
-        let key_id_str = resp.key_id.ok_or(KeyError::NotFound)?;
-        KeyId::new(key_id_str)
+        let key_id_str = resp.key_id.ok_or(KeyError::OperationFailed)?;
+        KeyId::new(key_id_str).map_err(|_| KeyError::OperationFailed)
     }
 }
 
@@ -378,12 +416,12 @@ impl KmsRemoteSealProvider {
                     .map_err(|_| KeyError::Unavailable)?;
                 Ok::<KmsStream, KeyError>(KmsStream::Unix(stream))
             } else {
-                let addr = self.endpoint.trim_start_matches("tcp://");
-                let connector = self.connector.as_ref().ok_or(KeyError::Unavailable)?;
+                let addr = tcp_endpoint_addr(&self.endpoint)?;
+                let connector = self.connector.as_ref().ok_or(KeyError::OperationFailed)?;
+                let domain = rustls_pki_types::ServerName::try_from(self.server_name.clone())
+                    .map_err(|_| KeyError::OperationFailed)?;
                 let stream = tokio::net::TcpStream::connect(addr)
                     .await
-                    .map_err(|_| KeyError::Unavailable)?;
-                let domain = rustls_pki_types::ServerName::try_from(self.server_name.clone())
                     .map_err(|_| KeyError::Unavailable)?;
                 let tls_stream = connector
                     .connect(domain, stream)
@@ -415,7 +453,7 @@ impl KmsRemoteSealProvider {
             .map_err(|_| KeyError::Unavailable)?;
         let len = u32::from_be_bytes(len_buf) as usize;
         if len > KmsKeyProvider::MAX_RESPONSE_BYTES {
-            return Err(KeyError::Unavailable);
+            return Err(KeyError::OperationFailed);
         }
 
         let mut resp_buf = Zeroizing::new(vec![0u8; len]);
@@ -424,7 +462,7 @@ impl KmsRemoteSealProvider {
             .await
             .map_err(|_| KeyError::Unavailable)?;
         let resp: KmsResponse =
-            serde_json::from_slice(&resp_buf).map_err(|_| KeyError::Unavailable)?;
+            serde_json::from_slice(&resp_buf).map_err(|_| KeyError::OperationFailed)?;
 
         if resp.status == "success" {
             Ok(resp)
@@ -435,7 +473,7 @@ impl KmsRemoteSealProvider {
             if msg.contains("not found") {
                 Err(KeyError::NotFound)
             } else {
-                Err(KeyError::Unavailable)
+                Err(KeyError::OperationFailed)
             }
         }
     }
@@ -460,8 +498,15 @@ impl RemoteSealProvider for KmsRemoteSealProvider {
             ciphertext_and_tag_hex: None,
         };
         let resp = self.call_kms(req).await?;
-        let ciphertext_hex = resp.ciphertext_and_tag_hex.ok_or(KeyError::Unavailable)?;
+        let ciphertext_hex = resp
+            .ciphertext_and_tag_hex
+            .ok_or(KeyError::OperationFailed)?;
         let ciphertext_and_tag = decode_hex_vec(&ciphertext_hex)?;
+        // RemoteSeal output is opaque and may include provider framing, but
+        // even an empty plaintext requires an authentication tag.
+        if ciphertext_and_tag.len() < AEAD_TAG_LEN {
+            return Err(KeyError::OperationFailed);
+        }
 
         Ok(EncryptedPayload {
             aad: bound_aad,
@@ -486,7 +531,7 @@ impl RemoteSealProvider for KmsRemoteSealProvider {
             ciphertext_and_tag_hex: Some(encode_hex(ciphertext_and_tag)),
         };
         let resp = self.call_kms(req).await?;
-        let plaintext_hex = Zeroizing::new(resp.plaintext_hex.ok_or(KeyError::Unavailable)?);
+        let plaintext_hex = Zeroizing::new(resp.plaintext_hex.ok_or(KeyError::OperationFailed)?);
         Ok(Zeroizing::new(decode_hex_vec(&plaintext_hex)?))
     }
 }
@@ -494,7 +539,7 @@ impl RemoteSealProvider for KmsRemoteSealProvider {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::provider::AES_256_GCM_SIV_KEY_LEN;
+    use crate::provider::{AES_256_GCM_SIV_KEY_LEN, AES_256_GCM_SIV_NONCE_LEN};
     use std::path::PathBuf;
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::time::Duration;
@@ -709,14 +754,14 @@ mod tests {
     fn decode_hex_32_rejects_non_ascii_without_panic() {
         let malformed = "ä".repeat(32);
 
-        assert_eq!(decode_hex_32(&malformed), Err(KeyError::Unavailable));
+        assert_eq!(decode_hex_32(&malformed), Err(KeyError::OperationFailed));
     }
 
     #[test]
     fn decode_hex_32_rejects_non_hex_ascii() {
         assert_eq!(
             decode_hex_32("zz0102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e"),
-            Err(KeyError::Unavailable)
+            Err(KeyError::OperationFailed)
         );
     }
 
@@ -752,7 +797,7 @@ mod tests {
             .await
             .expect_err("oversized KMS response must fail");
 
-        assert_eq!(err, KeyError::Unavailable);
+        assert_eq!(err, KeyError::OperationFailed);
     }
 
     #[tokio::test]
@@ -765,7 +810,7 @@ mod tests {
             .await
             .expect_err("malformed KMS JSON must fail");
 
-        assert_eq!(err, KeyError::Unavailable);
+        assert_eq!(err, KeyError::OperationFailed);
     }
 
     #[tokio::test]
@@ -789,7 +834,7 @@ mod tests {
                 .await
                 .expect_err("malformed KMS key hex must fail");
 
-            assert_eq!(err, KeyError::Unavailable);
+            assert_eq!(err, KeyError::OperationFailed);
         }
     }
 
@@ -810,7 +855,503 @@ mod tests {
             .await
             .expect_err("unknown KMS purpose must fail");
 
-        assert_eq!(err, KeyError::Unavailable);
+        assert_eq!(err, KeyError::OperationFailed);
+    }
+
+    #[tokio::test]
+    async fn kms_malformed_success_fields_are_permanent_and_redacted() {
+        let mut errors = Vec::new();
+        for (operation, fields) in [
+            ("get_active_key", &["key_id", "key_bytes_hex"][..]),
+            ("get_key_by_id", &["key_bytes_hex", "purpose", "tenant"][..]),
+            ("rotate_key", &["key_id"][..]),
+            ("seal", &["ciphertext_and_tag_hex"][..]),
+            ("unseal", &["plaintext_hex"][..]),
+        ] {
+            for field in fields {
+                let invalid = match *field {
+                    "key_id" | "tenant" => vec![None, Some(String::new())],
+                    "purpose" => vec![None, Some("unknown-sensitive-purpose".to_string())],
+                    "key_bytes_hex" => vec![
+                        None,
+                        Some("00".repeat(31)),
+                        Some("gg".repeat(32)),
+                        Some("ä".repeat(32)),
+                    ],
+                    "ciphertext_and_tag_hex" => vec![
+                        None,
+                        Some(String::new()),
+                        Some("00".into()),
+                        Some("00".repeat(AEAD_TAG_LEN - 1)),
+                        Some("0".into()),
+                        Some("gg".into()),
+                        Some("ä".into()),
+                    ],
+                    _ => vec![None, Some("0".into()), Some("gg".into()), Some("ä".into())],
+                };
+                for value in invalid {
+                    let mut response = serde_json::json!({
+                        "status": "success",
+                        "key_id": "kms-sensitive-key",
+                        "key_bytes_hex": key_hex(0x42),
+                        "purpose": "session",
+                        "tenant": "tenant-a",
+                        "ciphertext_and_tag_hex": encode_hex(b"ciphertext-canary"),
+                        "plaintext_hex": encode_hex(b"plaintext-canary"),
+                    });
+                    if let Some(value) = value {
+                        response[field] = serde_json::Value::String(value);
+                    } else {
+                        response.as_object_mut().unwrap().remove(*field);
+                    }
+                    let error = malformed_response_error(
+                        operation,
+                        MockResponse::Bytes(response.to_string().into_bytes()),
+                    )
+                    .await;
+                    errors.push((operation, *field, error));
+                }
+            }
+        }
+        assert!(
+            errors
+                .iter()
+                .all(|(_, _, error)| *error == KeyError::OperationFailed),
+            "malformed success responses must be permanent: {errors:?}"
+        );
+        for (_, _, error) in errors {
+            assert_eq!(error.to_string(), "key provider operation failed");
+            assert_eq!(format!("{error:?}"), "OperationFailed");
+        }
+    }
+
+    async fn malformed_response_error(operation: &str, response: MockResponse) -> KeyError {
+        let key_id = KeyId::new("kms-sensitive-key").expect("key ID");
+        let mock = mock_kms(response).await;
+        let local = KmsKeyProvider::new(mock.endpoint.clone(), None, Duration::from_secs(1));
+        let remote = KmsRemoteSealProvider::new(
+            mock.endpoint.clone(),
+            None,
+            Duration::from_secs(1),
+            key_id.clone(),
+        );
+        match operation {
+            "get_active_key" => local
+                .get_active_key(KeyPurpose::Session, &tenant())
+                .await
+                .expect_err("invalid active key response"),
+            "get_key_by_id" => local
+                .get_key_by_id(&key_id)
+                .await
+                .expect_err("invalid historical key response"),
+            "rotate_key" => local
+                .rotate_key(KeyPurpose::Session, &tenant())
+                .await
+                .expect_err("invalid rotation response"),
+            "seal" => remote
+                .seal(&session_aad(), b"plaintext-canary")
+                .await
+                .expect_err("invalid encrypt response"),
+            "unseal" => remote
+                .unseal(&key_id, &session_aad(), b"ciphertext-canary")
+                .await
+                .expect_err("invalid decrypt response"),
+            _ => unreachable!("fixed operation fixture"),
+        }
+    }
+
+    #[tokio::test]
+    async fn kms_malformed_response_frames_are_permanent_for_all_operations() {
+        let mut errors = Vec::new();
+        for operation in [
+            "get_active_key",
+            "get_key_by_id",
+            "rotate_key",
+            "seal",
+            "unseal",
+        ] {
+            for response in [
+                MockResponse::Bytes(br#"{"status":"success""#.to_vec()),
+                MockResponse::OversizedLength,
+            ] {
+                errors.push((
+                    operation,
+                    malformed_response_error(operation, response).await,
+                ));
+            }
+        }
+        assert!(
+            errors
+                .iter()
+                .all(|(_, error)| *error == KeyError::OperationFailed),
+            "malformed complete response frames must be permanent: {errors:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn kms_remote_seal_rejects_short_success_outputs() {
+        let mut results = Vec::new();
+        for plaintext in [b"".as_slice(), b"x".as_slice()] {
+            for length in 0..AEAD_TAG_LEN {
+                let mock = mock_kms(MockResponse::Bytes(
+                    serde_json::json!({
+                        "status": "success",
+                        "ciphertext_and_tag_hex": "00".repeat(length),
+                    })
+                    .to_string()
+                    .into_bytes(),
+                ))
+                .await;
+                let provider = KmsRemoteSealProvider::new(
+                    mock.endpoint.clone(),
+                    None,
+                    Duration::from_secs(1),
+                    KeyId::new("short-response-key").expect("key ID"),
+                );
+                let result = provider.seal(&session_aad(), plaintext).await;
+                results.push((plaintext.len(), length, result.err()));
+            }
+        }
+        assert!(
+            results
+                .iter()
+                .all(|(_, _, error)| *error == Some(KeyError::OperationFailed)),
+            "every short success output must fail permanently: {results:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn kms_remote_seal_accepts_empty_plaintext_with_valid_tag() {
+        let key_id = KeyId::new("empty-plaintext-key").expect("key ID");
+        let handle = KeyHandle::new(
+            key_id.clone(),
+            KeyPurpose::Session,
+            tenant(),
+            Zeroizing::new([0x42; AES_256_GCM_SIV_KEY_LEN]),
+        );
+        let aad = session_aad();
+        let nonce = [0x24; AES_256_GCM_SIV_NONCE_LEN];
+        let expected = handle
+            .encrypt_payload(&aad, b"", nonce)
+            .expect("seal empty payload");
+        assert_eq!(expected.ciphertext_and_tag.len(), AEAD_TAG_LEN);
+        let (mock, request_rx) = mock_kms_recording(MockResponse::Bytes(
+            serde_json::json!({
+                "status": "success",
+                "ciphertext_and_tag_hex": encode_hex(&expected.ciphertext_and_tag),
+            })
+            .to_string()
+            .into_bytes(),
+        ))
+        .await;
+        let provider =
+            KmsRemoteSealProvider::new(mock.endpoint.clone(), None, Duration::from_secs(1), key_id);
+        let sealed = provider
+            .seal(&aad, b"")
+            .await
+            .expect("valid empty-plaintext seal");
+        assert_eq!(sealed, expected);
+        assert!(handle
+            .decrypt_payload(&aad, &sealed.aad, &sealed.ciphertext_and_tag, nonce)
+            .expect("authenticate empty plaintext")
+            .is_empty());
+        assert_eq!(
+            request_rx
+                .await
+                .expect("request captured")
+                .plaintext_hex
+                .as_deref(),
+            Some("")
+        );
+    }
+
+    async fn kms_request_errors(
+        endpoint: String,
+        connector: Option<tokio_rustls::TlsConnector>,
+        server_name: &str,
+    ) -> [KeyError; 5] {
+        let key_id = KeyId::new("configuration-key").expect("key ID");
+        let local =
+            KmsKeyProvider::new(endpoint.clone(), connector.clone(), Duration::from_secs(1))
+                .with_server_name(server_name);
+        let remote =
+            KmsRemoteSealProvider::new(endpoint, connector, Duration::from_secs(1), key_id.clone())
+                .with_server_name(server_name);
+        [
+            local
+                .get_active_key(KeyPurpose::Session, &tenant())
+                .await
+                .expect_err("request must fail"),
+            local
+                .get_key_by_id(&key_id)
+                .await
+                .expect_err("request must fail"),
+            local
+                .rotate_key(KeyPurpose::Session, &tenant())
+                .await
+                .expect_err("request must fail"),
+            remote
+                .seal(&session_aad(), b"plaintext-canary")
+                .await
+                .expect_err("request must fail"),
+            remote
+                .unseal(&key_id, &session_aad(), b"ciphertext-canary")
+                .await
+                .expect_err("request must fail"),
+        ]
+    }
+
+    #[tokio::test]
+    async fn kms_missing_tls_connector_is_permanent_before_connect() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind fixture");
+        listener.set_nonblocking(true).expect("nonblocking fixture");
+        let errors = kms_request_errors(
+            format!("tcp://{}", listener.local_addr().expect("fixture address")),
+            None,
+            KmsRemoteSealProvider::DEFAULT_SERVER_NAME,
+        )
+        .await;
+        assert!(
+            errors
+                .iter()
+                .all(|error| *error == KeyError::OperationFailed),
+            "invalid configuration must fail permanently: {errors:?}"
+        );
+        assert_eq!(
+            listener
+                .accept()
+                .expect_err("no plaintext connection")
+                .kind(),
+            std::io::ErrorKind::WouldBlock
+        );
+    }
+
+    fn kms_test_tls_connector() -> tokio_rustls::TlsConnector {
+        use tokio_rustls::rustls;
+        let config = rustls::ClientConfig::builder_with_provider(std::sync::Arc::new(
+            rustls::crypto::ring::default_provider(),
+        ))
+        .with_safe_default_protocol_versions()
+        .expect("supported TLS versions")
+        .with_root_certificates(rustls::RootCertStore::empty())
+        .with_no_client_auth();
+        tokio_rustls::TlsConnector::from(std::sync::Arc::new(config))
+    }
+
+    #[test]
+    fn kms_tcp_endpoint_preserves_valid_authorities_and_rejects_uri_extras() {
+        for (endpoint, expected) in [
+            ("kms.example:443", "kms.example:443"),
+            ("tcp://kms.example:443", "kms.example:443"),
+            ("tcp://tcp://kms.example:443", "kms.example:443"),
+            ("tcp://kms.example:+443", "kms.example:+443"),
+            ("tcp://127.0.0.1:0", "127.0.0.1:0"),
+            ("tcp://127.0.0.1:65535", "127.0.0.1:65535"),
+            ("tcp://[::1]:443", "[::1]:443"),
+            ("tcp://[2001:db8::1]:443", "[2001:db8::1]:443"),
+            ("tcp://::1:443", "::1:443"),
+            ("tcp://fe80::1%2:443", "fe80::1%2:443"),
+        ] {
+            assert_eq!(tcp_endpoint_addr(endpoint), Ok(expected), "{endpoint}");
+        }
+        for endpoint in [
+            "tcp://kms.example:443/path",
+            "tcp://kms.example/path:443",
+            "tcp://user@kms.example:443",
+            "tcp://kms.example?query:443",
+            "tcp://kms.example#fragment:443",
+            "tcp://kms example:443",
+            "tcp://[not-an-ip]:443",
+            "tcp://[::1:443",
+            "tcp://::1]:443",
+            "tcp://fe80::1%:443",
+        ] {
+            assert_eq!(
+                tcp_endpoint_addr(endpoint),
+                Err(KeyError::OperationFailed),
+                "{endpoint}"
+            );
+        }
+    }
+
+    #[test]
+    fn kms_tcp_endpoint_accepts_release_address_forms() {
+        for endpoint in [
+            "kms.example:7443",
+            "tcp://kms.example:7443",
+            "127.0.0.1:7443",
+            "tcp://127.0.0.1:7443",
+            "127.0.0.1:+7443",
+            "tcp://127.0.0.1:+7443",
+            "[::1]:7443",
+            "tcp://[::1]:7443",
+            "::1:7443",
+            "tcp://::1:7443",
+        ] {
+            assert!(tcp_endpoint_addr(endpoint).is_ok(), "{endpoint}");
+        }
+    }
+
+    #[test]
+    fn kms_tcp_endpoint_accepts_scoped_ipv6_without_connecting() {
+        let addr =
+            std::net::SocketAddrV6::new("fe80::1".parse().expect("IPv6 literal"), 7443, 0, 2);
+        for endpoint in [addr.to_string(), format!("tcp://{addr}")] {
+            assert_eq!(
+                tcp_endpoint_addr(&endpoint).expect("scoped IPv6 remains valid"),
+                addr.to_string(),
+                "scope must survive validation: {endpoint}"
+            );
+        }
+    }
+
+    #[test]
+    fn kms_tcp_endpoint_rejects_control_characters_in_hosts() {
+        for control in ['\0', '\u{1}', '\u{1f}', '\u{7f}', '\u{85}'] {
+            let endpoint = format!("tcp://kms{control}.example:7443");
+            assert_eq!(
+                tcp_endpoint_addr(&endpoint),
+                Err(KeyError::OperationFailed),
+                "{endpoint:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn kms_bare_endpoint_connection_failure_remains_unavailable() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind fixture");
+        let port = listener.local_addr().expect("fixture address").port();
+        drop(listener);
+        for endpoint in [format!("127.0.0.1:{port}"), format!("localhost:{port}")] {
+            let errors = kms_request_errors(
+                endpoint.clone(),
+                Some(kms_test_tls_connector()),
+                KmsRemoteSealProvider::DEFAULT_SERVER_NAME,
+            )
+            .await;
+            assert!(
+                errors.iter().all(|error| *error == KeyError::Unavailable),
+                "valid bare endpoint {endpoint} must reach connection: {errors:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn kms_nul_host_is_permanent_before_connect() {
+        let errors = kms_request_errors(
+            "tcp://kms\0.example:7443".into(),
+            Some(kms_test_tls_connector()),
+            KmsRemoteSealProvider::DEFAULT_SERVER_NAME,
+        )
+        .await;
+        assert!(
+            errors
+                .iter()
+                .all(|error| *error == KeyError::OperationFailed),
+            "a NUL host must fail permanently for every operation: {errors:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn kms_invalid_server_name_is_permanent_before_connect() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind fixture");
+        listener.set_nonblocking(true).expect("nonblocking fixture");
+        let errors = kms_request_errors(
+            format!("tcp://{}", listener.local_addr().expect("fixture address")),
+            Some(kms_test_tls_connector()),
+            "not a dns name",
+        )
+        .await;
+        assert!(
+            errors
+                .iter()
+                .all(|error| *error == KeyError::OperationFailed),
+            "invalid configuration must fail permanently: {errors:?}"
+        );
+        assert_eq!(
+            listener
+                .accept()
+                .expect_err("validate before connecting")
+                .kind(),
+            std::io::ErrorKind::WouldBlock
+        );
+    }
+
+    #[tokio::test]
+    async fn kms_invalid_tcp_endpoint_is_permanent_before_connect() {
+        let endpoints = [
+            "tcp://127.0.0.1",
+            "tcp://127.0.0.1:",
+            "tcp://:1234",
+            "tcp://127.0.0.1:not-a-port",
+            "tcp://127.0.0.1:65536",
+            "tcp://127.0.0.1:-1",
+            "tcp://[::1]",
+            "tcp://[]:1234",
+        ];
+        let mut observed = Vec::new();
+        for endpoint in endpoints {
+            let errors = kms_request_errors(
+                endpoint.to_string(),
+                Some(kms_test_tls_connector()),
+                KmsRemoteSealProvider::DEFAULT_SERVER_NAME,
+            )
+            .await;
+            observed.push((endpoint, errors));
+        }
+        assert!(
+            observed.iter().all(|(_, errors)| errors
+                .iter()
+                .all(|error| *error == KeyError::OperationFailed)),
+            "invalid endpoint configuration must fail permanently: {observed:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn kms_unsupported_endpoint_scheme_is_permanent_before_connect() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind fixture");
+        listener.set_nonblocking(true).expect("nonblocking fixture");
+        let addr = listener.local_addr().expect("fixture address");
+        let mut observed = Vec::new();
+        for endpoint in [format!("https://{addr}"), format!("http://{addr}")] {
+            let errors = kms_request_errors(
+                endpoint.clone(),
+                Some(kms_test_tls_connector()),
+                KmsRemoteSealProvider::DEFAULT_SERVER_NAME,
+            )
+            .await;
+            observed.push((endpoint, errors));
+        }
+        assert!(
+            observed.iter().all(|(_, errors)| errors
+                .iter()
+                .all(|error| *error == KeyError::OperationFailed)),
+            "unsupported endpoint schemes must fail permanently: {observed:?}"
+        );
+        assert_eq!(
+            listener
+                .accept()
+                .expect_err("validate before connecting")
+                .kind(),
+            std::io::ErrorKind::WouldBlock
+        );
+    }
+
+    #[tokio::test]
+    async fn kms_tcp_connection_failure_remains_unavailable() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind fixture");
+        let addr = listener.local_addr().expect("fixture address");
+        drop(listener);
+        let errors = kms_request_errors(
+            format!("tcp://{addr}"),
+            Some(kms_test_tls_connector()),
+            KmsRemoteSealProvider::DEFAULT_SERVER_NAME,
+        )
+        .await;
+        assert!(
+            errors.iter().all(|error| *error == KeyError::Unavailable),
+            "valid endpoints must preserve connection failures as retryable: {errors:?}"
+        );
     }
 
     #[tokio::test]
@@ -824,6 +1365,79 @@ mod tests {
             .expect_err("KMS timeout must fail");
 
         assert_eq!(err, KeyError::Unavailable);
+    }
+
+    #[tokio::test]
+    async fn kms_completed_failure_is_not_unavailability() {
+        let key_id = KeyId::new("kms-denial-sensitive-key").expect("key id");
+        for reason in ["authentication failed", "access denied", "key revoked"] {
+            for operation in ["get_active_key", "get_key_by_id", "seal", "unseal"] {
+                let response = serde_json::json!({
+                    "status": "error",
+                    "error_message": format!("{reason}: key={} payload=secret-canary", key_id.as_str()),
+                })
+                .to_string()
+                .into_bytes();
+                let mock = mock_kms(MockResponse::Bytes(response)).await;
+                let local =
+                    KmsKeyProvider::new(mock.endpoint.clone(), None, Duration::from_secs(1));
+                let remote = KmsRemoteSealProvider::new(
+                    mock.endpoint.clone(),
+                    None,
+                    Duration::from_secs(1),
+                    key_id.clone(),
+                );
+                let error = match operation {
+                    "get_active_key" => local
+                        .get_active_key(KeyPurpose::Session, &tenant())
+                        .await
+                        .expect_err("explicit denial fails active lookup"),
+                    "get_key_by_id" => local
+                        .get_key_by_id(&key_id)
+                        .await
+                        .expect_err("explicit denial fails historical lookup"),
+                    "seal" => remote
+                        .seal(&session_aad(), b"plaintext-canary")
+                        .await
+                        .expect_err("explicit denial fails seal"),
+                    "unseal" => remote
+                        .unseal(&key_id, &session_aad(), b"ciphertext-canary")
+                        .await
+                        .expect_err("explicit denial fails unseal"),
+                    _ => unreachable!("fixed operation fixture"),
+                };
+                assert_ne!(error, KeyError::Unavailable, "{operation}: {reason}");
+                assert_eq!(error, KeyError::OperationFailed);
+                assert_eq!(error.to_string(), "key provider operation failed");
+                assert_eq!(format!("{error:?}"), "OperationFailed");
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn kms_remote_timeout_remains_unavailability() {
+        let key_id = KeyId::new("remote-timeout-key").expect("key id");
+        for unseal in [false, true] {
+            let mock = mock_kms(MockResponse::Hang(Duration::from_secs(5))).await;
+            let provider = KmsRemoteSealProvider::new(
+                mock.endpoint.clone(),
+                None,
+                Duration::from_millis(25),
+                key_id.clone(),
+            );
+            let error = if unseal {
+                provider
+                    .unseal(&key_id, &session_aad(), b"ciphertext-canary")
+                    .await
+                    .expect_err("unseal times out")
+            } else {
+                provider
+                    .seal(&session_aad(), b"plaintext-canary")
+                    .await
+                    .expect_err("seal times out")
+            };
+            assert_eq!(error, KeyError::Unavailable);
+        }
     }
 
     #[tokio::test]
@@ -977,7 +1591,8 @@ mod tests {
             .unseal(&key_id, &session_aad(), b"ciphertext-canary")
             .await
             .expect_err("revoked historical key must fail closed");
-        assert_eq!(error, KeyError::Unavailable);
+        assert_eq!(error, KeyError::OperationFailed);
+        assert_eq!(error.to_string(), "key provider operation failed");
         let rendered = format!("{error} {error:?}");
         assert!(!rendered.contains(key_id.as_str()));
         assert!(!rendered.contains("tenant-a"));

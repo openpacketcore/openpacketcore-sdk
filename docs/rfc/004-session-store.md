@@ -542,6 +542,73 @@ current recorded token.
 This prevents an old owner whose lease expired during a pause or partition from
 overwriting a newer owner after it resumes.
 
+The native backend and memory-only fake retain an exact, bounded window of
+recently retired ordinary keys. A key is dead only when it has no record, lease
+row or protected reservation and is outside the scope-key namespaces. Native
+release preserves its inactive lease row until ordinary pruning removes it.
+
+Committed retention consists of an epoch, previous and current absent-key
+floors, and the count and maximum fence retired during the current epoch.
+A dead row is tagged with its retirement epoch and remains exact through that
+epoch and the next. Re-creation clears the tag. A completed epoch rotates the
+two floors and forgets only rows older than the exact window; every forgotten
+key's last fence MUST be strictly below the previous floor. The epoch window
+MUST remain bounded, independent of lifetime key churn.
+
+The committed threshold is `N = 32,768` retirements, retaining at most `2N`
+exact dead rows. A committing command MUST also rotate below that threshold
+when retained dead history would otherwise exhaust key capacity; dead history
+MUST NOT impose a lifetime key ceiling. Committed metadata MUST record the
+latest rotation's trigger as retirement threshold or capacity. Each rotation
+MUST strictly advance the published current floor to
+`max(floor_cur + 1, retired_max + 1)`, with any Async recovery floor applied
+before this calculation, move the old current floor to the previous floor,
+advance the allocator beyond the new floor, and reset the retirement counters.
+An absent-key preparation survives one rotation and MUST receive a no-effect
+`StaleFence` after two. Capacity rotations can shorten the elapsed duration of
+that window.
+
+For deterministic V1/V2 acquisition, a retained key MUST match its exact
+recorded fence. A key with no retained row MUST match exactly either the previous
+or current absent-key floor, with the Async recovery floor applied to each.
+A value merely greater than either floor MUST NOT be accepted. Observation of
+a missing key returns the current floor after the Async floor. Both floors
+start at zero; without an Async recovery boundary, fresh-zero acquisition
+remains valid through epoch 1. Callers SHOULD observe before preparing a create
+and MUST re-observe and prepare a new request after a create-time `StaleFence`.
+The committed fence remains `expected_fence + 1`, including its record AEAD AAD
+binding. Ordinary `AcquireLease` retains its existing allocation rule.
+
+Retirement and rotation MUST be deterministic effects of a committing command,
+never of a read, a reader's clock, a snapshot, delivery grouping or an
+intermediate `Batch` child. Snapshots and restart MUST preserve both floors,
+the epoch, counters, rotation trigger and exact row tags. Fake live replay and
+rebuild MUST use the same committed entry timestamp. Local fake writer attempts
+retain their execution clock even on refusal, while reads and preflights MUST
+NOT advance it. Native and fake capacity decisions MUST travel with the
+application journal. Every entry MUST explicitly state expiry cleanup, dead-key
+retirement, recovery floor, capacity rotations, internal resident capacity and
+bounded command framing. Replay MUST apply only that policy, independently of
+the mutation tree and notification count. Ordinary writes and V1 transitions
+request cleanup; V2 and control commands preserve unrelated rows. Context changes
+without application mutations publish an empty batch. Multi-entry commands
+carry decided rotations on the first entry; explicitly identified continuations
+retain their original fence admission view while readers observe committed
+floors. An incomplete command refuses local writes, including batches whose
+write children all fail or conflict. A recovery transition MUST bind the exact
+preceding outward cursor; unrelated sequence gaps remain invalid. Each
+notification's outward coordinate is captured under the frontier in force when
+its command appends it; a coalesced apply MUST deliver preceding notifications
+before each recovery row. Stored notification rows remain in raw coordinates.
+An outward watch cursor is inclusive, including the recovery row's own cursor.
+Replay cleanup and authority checks MUST use the committed entry timestamp.
+Missing replay policy MUST be rejected. Snapshots, conversion, restore and followers MUST
+preserve and validate it.
+Rejected commands, non-mutating CAS conflicts and duplicate delivery MUST NOT
+publish retirement. Old credentials remain invalid before
+and after re-creation. Scope authority, child and claim rows retain their separate
+lifecycle predicates.
+
 ### 9.3 Lease Expiry
 
 Lease expiry alone is not correctness. It is only a liveness mechanism. Safety
@@ -1060,6 +1127,14 @@ through its existing authority before using that resume point; the error is not
 permission to discard missing history. A zero-limit request MUST NOT consult
 the compaction floor.
 
+The native backend MUST retain the latest 65,536 committed notifications and
+retire only their contiguous prefix. Its retirement floor MUST be committed
+application state derived from the notification sequence, independent of local
+time, checkpoint cadence, reader cursors or follower progress. Snapshots and
+restart MUST preserve the floor and the retained suffix. Every replica applying
+the same committed commands MUST produce the same floor. Retirement MUST NOT
+renumber entries or suppress delivery of newly committed notifications.
+
 After its linearizable barrier, `ConsensusSessionStore` MUST read one local
 applied state. It MUST NOT collect or union replication-log pages or compaction
 floors across replicas. Differing replica floors therefore yield typed local
@@ -1564,14 +1639,11 @@ replication append, or rebuild request. The consensus ALPN and legacy
 `opc-session-net/5` ALPN MUST NOT be multiplexed as equivalent authority on one
 production listener.
 
-The exact consensus contract profile MUST use transport/wire-schema revision 5,
-application revision 4, and error-set revision 6. The revision-5 transport
-profile retains the explicit forwarded consumer scope, so a peer cannot
-silently downgrade a consumer-scoped operation to an internal call; application
-revision 4 fences the former 728bc5 application-revision-3 Postcard tag-27
-`FinalizeOperatorRecoveryV2` encoding, which conflicts with the merged roster
-profile's tags 27 through 30. Error revision 6 binds that semantic boundary
-into the exact profile. Any other transport, application, or error-set revision
+The exact consensus contract profile MUST use transport/wire-schema revision 6,
+application revision 5, and error-set revision 6. The transport profile requires
+forwarding scheduling metadata and explicit consumer scope. Application journal
+entries require producer-selected replay policy, including command framing and
+recovery coordinates. Any other transport, application, or error-set revision
 MUST fail before engine dispatch.
 Operators MUST drain traffic and writers, stop every consensus member, upgrade
 the full membership together, verify exact-profile handshakes, and only then

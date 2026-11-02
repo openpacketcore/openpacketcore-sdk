@@ -9,6 +9,7 @@ use opc_types::Timestamp;
 
 fn entry(sequence: u64) -> ReplicationEntry {
     ReplicationEntry {
+        replay_policy: opc_session_store::ReplicationReplayPolicy::prune_expired(),
         sequence,
         tx_id: ReplicationTxId::new(format!("watch-{sequence}").as_str()).expect("transaction ID"),
         op: ReplicationOp::Batch { ops: Vec::new() },

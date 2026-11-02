@@ -970,7 +970,7 @@ fn discard_replication_payloads_from_response(response: Response) {
                 .for_each(discard_replication_entry_iteratively);
         }
         Response::WatchEntry(Ok(entry)) => {
-            discard_replication_entry_iteratively(entry);
+            discard_replication_entry_iteratively(*entry);
         }
         _ => {}
     }
@@ -3035,10 +3035,18 @@ async fn read_watch_stream(
         };
         match frame {
             Ok(Response::WatchEntry(Ok(entry))) => {
-                let entry = match entry.into_validated() {
-                    Ok(entry) if entry.sequence == expected_sequence => entry,
+                let entry = match (*entry).into_validated() {
+                    Ok(entry)
+                        if entry
+                            .matches_watch_cursor(expected_sequence)
+                            .unwrap_or(false) =>
+                    {
+                        entry
+                    }
                     Ok(entry) => {
-                        discard_replication_payloads_from_response(Response::WatchEntry(Ok(entry)));
+                        discard_replication_payloads_from_response(Response::watch_entry(Ok(
+                            entry,
+                        )));
                         set_watch_terminal(
                             &terminal_error,
                             StoreError::BackendUnavailable(
@@ -3057,7 +3065,8 @@ async fn read_watch_stream(
                         break;
                     }
                 };
-                let terminal_sequence = expected_sequence == u64::MAX;
+                let delivered_sequence = entry.sequence;
+                let terminal_sequence = delivered_sequence == u64::MAX;
                 match tx.try_send(Ok(entry)) {
                     Ok(()) => {}
                     Err(tokio::sync::mpsc::error::TrySendError::Closed(item)) => {
@@ -3088,7 +3097,7 @@ async fn read_watch_stream(
                 // Resume only after the item crossed the caller-visible
                 // delivery boundary. A disconnect before this point replays
                 // the item; one after it resumes at the checked successor.
-                expected_sequence = next_replication_sequence(expected_sequence)
+                expected_sequence = next_replication_sequence(delivered_sequence)
                     .map_err(|_| ProtocolError::InvalidWireValue)?;
             }
             Ok(Response::WatchEntry(Err(error))) => {
@@ -3164,7 +3173,6 @@ fn store_error_kind(err: &StoreError) -> &'static str {
         StoreError::FencedTransitionHistoryFull => "fenced_transition_history_full",
         StoreError::FencedTransitionRetentionExhausted => "fenced_transition_retention_exhausted",
         StoreError::FencedTransitionStorageExhausted => "fenced_transition_storage_exhausted",
-        StoreError::KeyCapacityExhausted => "key_capacity_exhausted",
         StoreError::FencedTransitionHistoryEpochRetired => {
             "fenced_transition_history_epoch_retired"
         }
@@ -3174,7 +3182,6 @@ fn store_error_kind(err: &StoreError) -> &'static str {
         StoreError::BackendOperationOutcomeUnavailable => "backend_operation_outcome_unavailable",
         StoreError::TopologyAuthorityRevoked => "topology_authority_revoked",
         StoreError::CapabilityNotSupported(_) => "capability_not_supported",
-        StoreError::KeyProviderUnavailable(_) => "key_provider_unavailable",
         StoreError::BackendUnavailable(_)
         | StoreError::FencedTransitionRecoveryJournalUnavailable => "backend_unavailable",
         StoreError::InvalidKey(_) => "invalid_key",
@@ -3335,6 +3342,7 @@ mod tests {
                 .expect("representable test deadline"),
         );
         ReplicationEntry {
+            replay_policy: opc_session_store::ReplicationReplayPolicy::prune_expired(),
             sequence: 1,
             tx_id: "forged-response-deadline"
                 .try_into()
@@ -3412,6 +3420,7 @@ mod tests {
 
     fn replication_entry_at_depth(depth: usize) -> ReplicationEntry {
         ReplicationEntry {
+            replay_policy: opc_session_store::ReplicationReplayPolicy::prune_expired(),
             sequence: 1,
             tx_id: "over-depth-response"
                 .try_into()
@@ -3426,6 +3435,7 @@ mod tests {
             .map(|_| opc_session_store::ReplicationOp::Batch { ops: Vec::new() })
             .collect();
         ReplicationEntry {
+            replay_policy: opc_session_store::ReplicationReplayPolicy::prune_expired(),
             sequence: 1,
             tx_id: "over-count-response"
                 .try_into()
@@ -6708,7 +6718,7 @@ mod tests {
             write_frame(&mut stream, &Response::WatchStream)
                 .await
                 .expect("write watch acknowledgement");
-            let response = serde_json::to_value(Response::WatchEntry(Ok(valid_deadline_entry())))
+            let response = serde_json::to_value(Response::watch_entry(Ok(valid_deadline_entry())))
                 .expect("serialize valid watch response");
             let response = forge_deadline_in_wire_response(response, "/WatchEntry/Ok");
             write_frame(&mut stream, &response)
@@ -6753,7 +6763,7 @@ mod tests {
                 .expect("write first watch ack");
             write_frame(
                 &mut first,
-                &Response::WatchEntry(Ok(valid_deadline_entry())),
+                &Response::watch_entry(Ok(valid_deadline_entry())),
             )
             .await
             .expect("write first watch entry");
@@ -6783,7 +6793,7 @@ mod tests {
             let mut second_entry = valid_deadline_entry();
             second_entry.sequence = 2;
             second_entry.tx_id = "watch-rotation-2".try_into().expect("valid transaction ID");
-            write_frame(&mut second, &Response::WatchEntry(Ok(second_entry)))
+            write_frame(&mut second, &Response::watch_entry(Ok(second_entry)))
                 .await
                 .expect("write replacement watch entry");
         });
@@ -6859,7 +6869,7 @@ mod tests {
                     entry.tx_id = "watch-setup-replacement"
                         .try_into()
                         .expect("valid transaction ID");
-                    write_frame(&mut stream, &Response::WatchEntry(Ok(entry)))
+                    write_frame(&mut stream, &Response::watch_entry(Ok(entry)))
                         .await
                         .expect("write replacement watch item");
                 }
@@ -6911,7 +6921,7 @@ mod tests {
             write_frame(&mut stream, &Response::WatchStream)
                 .await
                 .expect("write partial-watch ack");
-            let encoded = serde_json::to_vec(&Response::WatchEntry(Ok(valid_deadline_entry())))
+            let encoded = serde_json::to_vec(&Response::watch_entry(Ok(valid_deadline_entry())))
                 .expect("encode watch entry");
             stream
                 .write_all(
@@ -6962,7 +6972,7 @@ mod tests {
                 .expect("write replacement watch ack");
             write_frame(
                 &mut replacement,
-                &Response::WatchEntry(Ok(valid_deadline_entry())),
+                &Response::watch_entry(Ok(valid_deadline_entry())),
             )
             .await
             .expect("write complete replacement watch entry");
@@ -7143,7 +7153,7 @@ mod tests {
             let mut entry = valid_deadline_entry();
             entry.sequence = u64::MAX;
             entry.tx_id = "terminal-watch".try_into().expect("valid transaction ID");
-            write_frame(&mut stream, &Response::WatchEntry(Ok(entry)))
+            write_frame(&mut stream, &Response::watch_entry(Ok(entry)))
                 .await
                 .expect("write terminal-watch entry");
             observe_terminal_watch_connections(listener, stream).await.0
@@ -7186,7 +7196,7 @@ mod tests {
                 .expect("write permanent-watch ack");
             write_frame(
                 &mut stream,
-                &Response::WatchEntry(Err(StoreError::ReplicationWatchCatchUpRequired)),
+                &Response::watch_entry(Err(StoreError::ReplicationWatchCatchUpRequired)),
             )
             .await
             .expect("write permanent watch error");
@@ -7237,7 +7247,7 @@ mod tests {
                 entry.tx_id = format!("slow-watch-{sequence}")
                     .try_into()
                     .expect("valid transaction ID");
-                if write_frame(&mut stream, &Response::WatchEntry(Ok(entry)))
+                if write_frame(&mut stream, &Response::watch_entry(Ok(entry)))
                     .await
                     .is_err()
                 {
@@ -7305,7 +7315,7 @@ mod tests {
                 .expect("write watch acknowledgement");
             write_frame(
                 &mut stream,
-                &Response::WatchEntry(Ok(replication_entry_at_operation_limit())),
+                &Response::watch_entry(Ok(replication_entry_at_operation_limit())),
             )
             .await
             .expect("write lower watch entry");
@@ -7399,7 +7409,7 @@ mod tests {
                 .await
                 .expect("write watch acknowledgement");
 
-            let mut response = serde_json::to_value(Response::WatchEntry(Ok(
+            let mut response = serde_json::to_value(Response::watch_entry(Ok(
                 replication_entry_at_operation_limit(),
             )))
             .expect("serialize maximum-width watch response");
@@ -7550,6 +7560,7 @@ mod tests {
             .is_empty());
 
         let lightweight_entry = ReplicationEntry {
+            replay_policy: opc_session_store::ReplicationReplayPolicy::prune_expired(),
             sequence: 1,
             tx_id: "t".try_into().expect("valid transaction ID"),
             op: opc_session_store::ReplicationOp::Batch { ops: Vec::new() },

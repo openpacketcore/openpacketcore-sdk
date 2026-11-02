@@ -4,9 +4,8 @@
 
 Accepted feature contract. Correctness, performance, and consumer qualification
 are separate executed evidence; this decision does not declare their completion.
-Generation-file rollover (SDK #1253) is a separately reviewed design stage
-recorded below; it is not implemented or authorized until its owner decision
-requests are approved.
+Generation-file rollover (SDK #1253) is implemented for Durable and Async;
+its selection contract and component qualification are recorded below.
 This supersedes ADR 0021's private-only activation, SQLite application
 composition, and proposed migration scope. Its durable WAL implementation and
 regressions remain part of the SDK.
@@ -168,20 +167,128 @@ compares exact local rows when present; below P, where rows are now absent,
 it uses the existing ordering rule against the full purge LogId. At P itself,
 an equal index still requires the exact LogId.
 
-This boundary creates Durable `OPCNR002` and Async `OPCNA004` roots with distinct
-binding hash domains. `OPCNR001` and `OPCNA001` through `OPCNA003` are refused
+The current boundary creates Durable `OPCNR003` and Async `OPCNA005` roots with
+distinct binding hash domains. Durable `OPCNR001` and `OPCNR002`, and Async
+`OPCNA001` through `OPCNA004`, are refused
 with typed `PersistenceFormatMismatch`, exposed by the public store as
 `FreshInstallationRequired`. No in-place migration or silent legacy behavior
 is supported. A pre-boundary reader also refuses the new root discriminator.
 Root markers are written only at creation. Generation magic is an eight-byte
 record: the six ASCII bytes `OPCNJB` for a base or `OPCNJD` for a delta, followed
 by a vocabulary byte and an independent voter-profile byte. The current
-vocabulary is `0x06`; profile `0x00` is fixed membership and profile `0x01`
+vocabulary is `0x07`; profile `0x00` is fixed membership and profile `0x01`
 carries voter slots. Readers compare only the vocabulary level for monotonic
 format order and validate the profile separately against each context.
 Unknown levels and profiles are refused. A new root refuses older generation
-vocabularies and full-image fallbacks. Portable snapshots, the Raft wire and
-WAL operation records retain their existing formats.
+vocabularies and full-image fallbacks. Portable native snapshots carry canonical
+retention frontiers alongside their existing tables. Vocabulary 7 adds an
+optional retirement epoch to each positional key row; historical vocabularies
+keep their explicit four-field decoder. A vocabulary-7 key deletion also carries
+the fence and retirement epoch of the final dead row. This bounded witness
+survives captures that start with live authority and end after its retirement
+window. Admission checks its age and fence against both the original predecessor and
+committed window; the witness cannot claim retirement before the live predecessor's
+epoch. An untagged deletion
+without that witness is refused. The epoch fields, tags and deletion witnesses are folded
+into the still-unreleased `OPCNR003`/`OPCNA005` boundary. They cannot be written
+under an older generation discriminator. Portable snapshots preserve tags in
+`consensus_native_retired_keys`, keyed by the complete session key, with a
+canonical unsigned epoch and an epoch index. The tag namespace is required
+when epoch metadata is nondefault, including when no tags remain; an image
+without epoch history preserves the original SQL schema. Admission checks the
+schema, retained window, dead-row membership and counter bounds. The Raft wire and WAL
+operation records retain their existing formats.
+
+Fresh creation runs on the existing blocking opener pool. SQL identity has
+already been initialized when creation is queued, so caller cancellation retains
+both queued and running construction, with its owned connection, descriptor
+owner and verified snapshots, until ROOT writing completes. This preserves a
+complete initial root for reopening and keeps cold authentication off the
+asynchronous caller's stack. Ordinary namespace and fixed-state admission still
+precede exposure of the live owner.
+
+Native replay retains the latest 65,536 committed notifications. A persisted,
+monotone retirement frontier selects the retained suffix in admission,
+checkpoint capture, portable snapshots and restart. Cursors at or below it
+receive `ReplicationLogCursorCompacted` and the first retained sequence.
+Live delivery keeps all committed notifications and sequence numbers continue
+across retirement. Crossing this stored-format boundary is a fresh install.
+
+Ordinary dead-key retirement shares this pre-release format boundary. Committed
+metadata records the key epoch, previous and current absent-key floors, and the
+current epoch's retirement count and maximum fence. Successful ordinary
+commands tag unreserved keys that have neither a record nor a lease after
+pruning. A tagged row stays exact through its retirement epoch and the next;
+re-creation clears the tag. Release retains its inactive lease row until a
+later successful pruning mutation, preserving the ordinary savepoint contract.
+A per-epoch index selects the oldest retained rows at rotation. It is rebuilt
+from admitted row tags, never from a local clock.
+
+The threshold is fixed at 32,768 retirements in native and memory-only fake
+profiles. The lab's default 100,000-key resident limit accommodates the full
+65,536-row exact window; it does not require a smaller threshold. A command
+also rotates below that count when dead history would
+otherwise exhaust resident key capacity. The latest rotation's threshold or
+capacity trigger is committed alongside the epoch. Each rotation strictly
+raises the published floor to `max(floor_cur + 1, retired_max + 1)`, applying
+any Async recovery floor first, and advances the allocator beyond it. It moves
+the previous current floor to `floor_prev` and resets the current counters.
+This preserves the exact two-epoch window while allowing capacity-driven
+reclamation without a lifetime key ceiling. At most 65,536 exact dead rows
+remain retained.
+
+A missing-key observation returns the current absent-key floor after the Async
+recovery floor. Deterministic V1/V2 acquisition of an absent row accepts exactly
+the previous or current floor, each raised by Async recovery; retained rows
+still require their exact fence. Arbitrary greater values are rejected. Both
+floors initially equal zero, so fresh-zero remains accepted through epoch 1
+unless Async recovery raises the floor. Callers observe before preparation and
+re-observe after a create-time `StaleFence`. The target fence remains
+`expected_fence + 1`; credential format and record AAD binding do not change.
+An absent-key preparation survives one rotation and is rejected with a
+no-effect `StaleFence` after two rotations, including capacity-triggered ones.
+
+Rotation is a committing-command effect. It cannot occur on reads, snapshots,
+delivery batches or between `Batch` children. Forgotten keys have fences below
+the previous floor, so either accepted absent floor produces a strictly newer
+fence for a forgotten key. Live and recently retired keys retain exact answers.
+Native consensus and the memory-only fake carry capacity decisions in the
+application journal. Every entry explicitly selects expiry cleanup, dead-key
+retirement, recovery floor, capacity rotations, internal resident capacity and
+bounded command framing. The mutation tree has no implicit replay policy. Native
+ordinary writes and V1 transitions request cleanup; V2 and control commands
+preserve unrelated rows. Metadata-only commands publish an empty batch when
+replication context changes. Multi-entry commands publish decided floors on the
+first entry and retain the earlier exact fence view only for their explicitly
+identified continuations. Refused entries roll back data and replay metadata;
+local writes refuse incomplete commands. The original 256-node entry and
+256-request command bounds remain. Portable snapshots, conversion and reopen
+preserve the required policy. Portable images identify the native policy profile
+even before the first retirement, so unsupported policy cannot enter ordinary
+SQLite replay through a snapshot. Missing policy is an incompatible encoding;
+JSON mutations use `effects`, requiring matching readers.
+Native generations and portable snapshots carry both floors, epoch counters and
+row tags through delta admission, base rewriting and reopen. Scope authority
+checkpoints and child/claim history retain their separate lifecycle predicates.
+Global expiry reclamation during pure V2 traffic remains open. V2 commands
+preserve unrelated expired rows, and resident capacity can therefore be exhausted
+without an ordinary cleanup command. This replay-policy change preserves that
+native behavior and makes replicas agree with it; it does not close that item.
+
+The notification window bounds 65,536 retained replay rows, never cumulative
+notifications or live delivery. The retired-key window is also bounded without
+a cumulative key limit. Portable snapshots bound canonical retirement metadata
+to 4 KiB; six unsigned counter fields occupy 48 bytes before serialization,
+alongside the latest rotation's trigger.
+Exact retired rows and their index have a separate bounded footprint and count
+against existing key admission limits. Existing image, concurrent verification
+and journal memory limits remain unchanged.
+
+Ordinary and in-memory lab request outcomes retain their existing safe
+behavior. Their independent receipt limits are not removed here: safe deletion
+requires a caller-bound retry epoch or absolute expiry that survives retries.
+Leader-assigned proposal time cannot provide that distinction. #1251 and the
+receipt part of #1257 remain open.
 
 The root contract reserves future generation vocabularies in place. A later
 format may be appended monotonically within a file; a new state-machine
@@ -194,9 +301,11 @@ Unknown generation vocabulary returns typed `CorruptState`; an unknown image
 schema returns typed `SchemaVersionMismatch`. Read-only schema inspection
 uses pinned snapshot descriptors and immutable SQLite readers.
 Format preflight does not grant storage or consensus authority: full selected
-state, scope, membership and snapshot admission still run afterward. Later
-log-file rollover and sibling-table retirement need no second fresh-install
-boundary under this contract.
+state, scope, membership and snapshot admission still run afterward. The current
+fresh-install boundary explicitly includes notification and ordinary-key
+retirement. Generation-file rollover preserves that vocabulary and introduces
+no further boundary. Future retirement semantics require their own compatible
+committed activation or an explicitly declared format boundary.
 
 Both compatibility preflight paths and full generation admission run on
 blocking workers. Full admission includes selected-state reconstruction,
@@ -251,253 +360,132 @@ A generation file may be replaced by another file epoch carrying the same contex
 A rowless delta may preserve the same context and operation sequence. A higher
 checkpoint epoch may reselect the same logical cut in another file. Recovery
 admits the selected generation before removing one unselected next file and
-up to two previous native generation files. This namespace capacity reserves
-the rollover/install handoff; it does not itself switch generation files.
+up to two previous native generation files. This namespace capacity covers
+the rollover/install handoff.
 
 Physical row reclamation removes the accumulated-row lifetime limit. The
 1,048,576-row cap remains a last defense against an unbounded live suffix.
-File extent still grows until generation-file rollover (SDK #1253): current
-ceilings are 32 GiB Durable and 8 GiB Async. A Durable ceiling failure fences
-the writer. An Async ceiling failure latches a failed background writer; the
-next snapshot publication fails and stops the engine, within one snapshot
-interval. A restart does not make additional file space available. Stalled
-snapshot work and failed local builds are different cases; any failed local
-build still stops the engine. Build/install recovery (SDK #1254/#1243) remains
-deferred until retained-log admission (SDK #1249) exists and is qualified.
-The separate key cap is unchanged. Ordinary command receipts use a
-bounded retention rule derived only from committed state: below committed
-application sequence 65,536 every receipt is retained exactly as before, and
-once active a receipt whose committed response logical time is at or before
-`frontiers.logical_time - 120 seconds` (inclusive boundary) is retired. An
-exact retry of a retired command receives the typed outcome-unavailable answer
-(the command is never executed again); an in-window retry replays the original
-committed outcome. A capacity backstop refuses every new binding while the
-resident receipt map is at or above its capacity bound, including mid-delta, so
-new bindings cannot grow the map to the fixed image cap; refusals are retryable,
-typed, effect-free and binding-free, and may advance the committed logical clock
-(the pre-existing deterministic `clock_response` behavior). The committed application sequence and logical
-time already carried by every frontier decide the rule, so every voter retires
-identically and no new persisted field or format boundary is added; the
-portable SQL projection and prepared SQL base simply carry the retained map.
-Notification rows use a bounded rolling row-count window of the newest 65,536 entries (a
-row-count bound, not a byte budget): the retention
-floor is derived only from the committed `watch_sequence`, so every voter
-derives the same floor at the same log index and the already-persisted watch
-sequence carries it across snapshots and restart without a new format field or
-acknowledgement/delivery state. The 1,048,576-row cap remains a last defense,
-front rows are retired as the window advances, and a watcher whose inclusive
-cursor is at or below the floor receives the existing
-`ReplicationLogCursorCompacted { resume_from }` answer instructing it to
-resynchronise. Durable carry for the derived floor is part of the same change:
-generation base and delta catalogs, full images, the portable SQLite snapshot
-projection and the prepared SQL base all preserve the sparse raw sequences and
-re-derive the identical floor on replay, so a reopened store or an installed
-snapshot continues the same bounded window. The million-mutation qualification
-job and a leader-to-snapshot-install parity qualification remain the final
-follow-up; no persisted format boundary is added.
+The selected generation retains the 32 GiB Durable and 8 GiB Async per-file
+validation limits. Size-triggered rollover below replaces accumulated append
+history with a compact base before those limits are reached.
+Stalled snapshot work and failed local builds are different
+cases: a failed local build is retried under a fixed bounded attempt budget and keeps
+the engine running on the unchanged published snapshot (SDK #1254); only an
+indeterminate publication state or a store with no published snapshot at all
+stops the engine. The bounded attempt/backoff, value-free failure classification
+and duplicate-build degradation are documented in the `opc-session-store`
+README. Generation-file rollover does not change ordinary-receipt retention
+or live-state limits. The key-retirement and notification-window policies are
+specified in the retention sections above.
 
+## Generation-file rollover (SDK #1253)
 
-## Generation-file rollover design (SDK #1253, design pending owner approval)
-
-**Status: design stage only.** No rollover, compaction or durable-format change is
-implemented by this section. The generation file remains append-only and the
-declared ceilings remain in force: `MIN_BLOCK` 64 KiB with `MAX_BLOCKS`
-524,288 in `consensus/native/prefix.rs` (32 GiB Durable) and
-`MAX_GENERATION_BYTES` 8 GiB in `wal/async_persistence.rs`. At a ceiling the
-store currently stops, or, in Async, a latched failed writer makes the next
-snapshot publication fail and stops the engine. Removing the ceilings requires
-the decisions and staged implementation below; implementation is not authorized
-until the owner approves the decision requests.
+Resident row retirement alone has the following limitation:
 
 This is its own stage of the #1249 work: #1250/#1251/#1307/#1377 bound and
 reclaim resident native state, but no row retirement shrinks an append-only
 generation extent, so the lifetime stop remains.
 
-### Rollover and selection contract (owner decision 1, recommended)
+Generation rollover removes that append-history lifetime stop by reclaiming
+the file extents occupied by retired rows and prior append history.
 
-Recommended: **write a new compact base generation file and switch selection
-with one atomic selector replacement** (not rewrite-in-place). A compact base is
-materialised from the committed cut only, in a new file epoch carrying the same
-binding context; the previous file stays readable until no reader is pinned.
-Rewrite-in-place is not recommended: it cannot preserve a pinned reader, a
-crash-safe verification boundary and table-agnostic reclamation with one
-mechanism.
+Ordinary checkpoints append and select deltas while a background compactor
+builds from an immutable, already-selected cut. The unchanged trigger is
+`min(max(2 * compact_base_bytes, 64 MiB), ceiling / 2)`; ceilings remain
+32 GiB Durable and 8 GiB Async. Compaction reads the old source through the
+ordinary authenticated path, without an exclusive read section. It encodes
+one complete base per attempt, then rebases selected suffix frames by
+canonically re-encoding their physical predecessor headers and comparing
+every copied body byte against a second authenticated read. Cold reopen
+retains full existing format and continuity validation.
 
-- Reuse the existing generation magic, vocabulary and selector/epoch machinery.
-  The current vocabulary is `0x06` (fixed). If the rollover candidate reuses it,
-  the persisted profile digest is unchanged and **no fresh-install boundary is
-  introduced**; this is the recommended option and the only one that keeps a
-  rolling upgrade and existing image roots valid.
-- If implementation later needs wider counters, new index pages or a different
-  layout, a new vocabulary/root discriminator is a **durable-format decision**
-  (the existing `OPCNR002`/`OPCNA004` boundary rule applies): old roots refuse
-  the new discriminator and the store reports `FreshInstallationRequired`.
-  That decision must be explicit in the implementation review, not assumed.
-- Selection is the existing durable selector/epoch: readers resolve one selected
-  generation under the existing generation/selection invariants. The namespace
-  already reserves the rollover handoff (one unselected next file and up to two
-  previous native generation files); rollover uses that reserved capacity and
-  must not require increasing it silently.
-- The compact base must preserve the full committed contract: rows, clean/
-  dirty state, purge frontier and semantic row catalogs, membership/roster
-  contexts, snapshot selection and all carry state the base format already
-  requires. Row selection is table-agnostic: a row is omitted only when the
-  committed state and existing retention rules say it is no longer required
-  (including the #1250/#1251/#1307 retired prefixes); anything else is copied
-  exactly. #1249's physical row-reclamation contract is unchanged.
+A caught-up candidate switches at an ordinary checkpoint. Its file epoch is
+bound before preparing that checkpoint's delta; sync, no-replacement rename,
+directory sync and named-descriptor confirmation precede durable CURRENT.
+Only then may the old file be retired and unlinked. Base and suffix relocation
+run independently of checkpoint start, in units of at most 64 logical rows,
+with revision-matched publication. Existing readers keep their authenticated
+old descriptors. Only the live Durable compactor's exact owned preparation
+is exempt from ordinary selection reclaim; cold reopen still removes crash
+leftovers after full selected-state admission.
 
-### Crash-safe rollover and restart selection (owner decision 2, recommended)
+Admission does not depend on build time. Writes can exhaust the old file's
+remaining headroom: the ceiling minus the selected cut's extent. Selection
+can cross the trigger by one padded frame before scheduling the build, so the
+trigger does not guarantee half a ceiling of headroom. Exhausting this room
+causes designed, recoverable backpressure, warned at three quarters of the
+ceiling. Async checks the guard before projection and reservation; Durable
+uses its existing history_count admission wait at the file guard. Guard-only
+wait time is excluded from journal-pressure episodes. A genuine journal-memory
+stall without the file guard retains the existing #1130 fence behavior and
+all deadlines and memory bounds. Resource waiters retry their own reservation
+on each notification while the file guard remains active. The pending owner
+can detach and authenticate a pressure journal without an advanced cut or a
+new base serialization; only a genuinely advanced, changed capture may start
+a new base attempt. Cancellation is nonretryable inside I/O adapters, and
+Closing wakes owners without aborting an admissible checkpoint drain.
 
-Recommended staged state machine (all steps bounded work, one rollover in flight
-per voter):
+Every candidate frame is checked before append. Intermediate replay consumes
+only its own padded extent. A switch checks its captured delta's encoded size
+plus the maximum re-encoded physical-header growth derived from the field
+types, padded to a block boundary; it consumes that space, with no second or
+static reserve. A failed check discards only the owned candidate, leaving old
+CURRENT and the retained WAL authoritative, and restarts from a genuinely
+newer selected cut.
 
-1. Capture the committed application cut, selected snapshot cut and exact
-   context under the existing apply/admission ordering.
-2. Write the compact base into a **new, not yet selected** generation epoch:
-   stream rows under the existing bounded read/write path, write/verify the
-   root, prefix, block index and row catalogs, and fsync file data.
-3. Verify the candidate against the captured cut/context before selection:
-   prefix/root magic+vocabulary+profile, block ownership, digest, row coverage
-   and required catalogs. A failed verification keeps the current selected
-   generation and reports a typed retryable rollover failure; it never changes
-   selection.
-4. Atomically replace the durable selector/epoch to the verified candidate and
-   sync the containing directory.
-5. Keep the old generation file as a **pinned previous file** while any reader
-   captured before the selector switch is still using it; retire the old file
-   only after the last pinned reader releases it (or its existing reader
-   deadline/typed retry path resolves). Retirement is ordinary file removal by
-   the owner/garbage-collection path, not a side effect of a read.
+Capacity recovery has one limited exception: when the old file cannot append
+the next padded frame and a fresh latest-selected base plus the checked switch
+delta cannot fit, admission is already held. A background worker may build a
+complete base from a newer pending checkpoint capture. Durable validates the
+exact retained WAL cut and full native version; Async validates the captured
+resident generation/sequence and full native version. The base uses the pending
+checkpoint epoch, file_epoch e+1 and that cut's binding, with the existing
+authentication, byte comparison and descriptor/namespace checks. An ordinary
+checkpoint selects it without another switch delta, because it covers the
+complete pending cut. Old CURRENT and WAL remain authoritative until selection
+is durable. Retries require actual captured operation/applied-cut or Async
+generation progress; unchanged state is never relabeled to restart a build.
 
-Restart selection rule (recommended): the last durably selected, verified
-generation wins; an incomplete/unselected candidate is ignored and removed by
-the existing recovery sweep; a selected candidate that fails verification is a
-typed corruption/fresh-installation outcome, never a silent fallback to a
-possibly newer unselected file. A crash before selector replacement must reopen
-to the previous generation with correct committed state; a crash after selector
-replacement must reopen to the candidate with correct committed state and treat
-the previous file as pinned/retirable.
+If even that pending-cut base cannot fit, live data is at capacity. Admission
+stays held with a diagnostic, without a capacity fence or poisoned source, and
+resumes when internal retirement makes the complete base fit. Installation
+waits before claiming its application gate while this live-capacity guard is
+active, and yields an unarmed claim if capacity appears during predecessor
+drain, so already committed internal retirement remains able to complete.
+Concurrent installers retain the same exclusive handoff ownership.
+Closing interrupts that pre-ownership wait without selecting a partial base
+or manufacturing an Async closed certificate. Admission of client deletes while
+live data is at capacity remains an open resident-state policy decision.
+This is strictly more capable than backlog, which stops at the append ceiling
+regardless of live-data size. Live-data, key, receipt and notification caps,
+acknowledgement contracts and the stored generation vocabulary are unchanged.
 
-Per-step crash matrix (both modes must be tested at every cut):
+### Qualification
 
-| Crash cut | Durable reopen expectation | Async reopen expectation |
-|:---|:---|:---|
-| Before candidate file creation | Previous selected generation, full state | Previous selected generation/resident recovery |
-| Mid candidate write/append, before root/index complete | Previous generation selected; partial candidate swept | Previous generation selected; partial candidate swept |
-| Candidate complete, not yet verified | Previous generation selected; unverified candidate swept | Previous generation selected; unverified candidate swept |
-| Verified, selector not yet replaced | Previous generation selected; candidate retried or swept | Previous generation selected; candidate retried or swept |
-| Selector replaced, old file still needed by reader | Candidate selected; old file retained until reader finishes | Candidate selected; resident/read recovery uses candidate; old file retained |
-| Selector replaced and old file retired | Candidate selected; previous epoch absent; reopen correct | Candidate selected; reopen correct |
-
-Async writer-latch recovery: a failed background rollover writer must not latch
-the engine into a permanent stop and must not make the next snapshot publication
-fail merely because compaction failed. The writer retries the rollover under a
-fixed bounded attempt/backoff budget (same recoverable failure contract as the
-bounded local snapshot-build retry, SDK #1254), keeps serving from the current
-selected generation and keeps admission backpressured/typed-retryable while
-space is exhausted. Only the pre-existing engine-stopping cases remain: an
-indeterminate publication state or a store with no published snapshot at all.
-Rollover is not a publication; its failure is a typed storage-health/retryable
-signal.
-
-### Pinned-reader contract (owner decision 3, recommended)
-
-Recommended: a reader that resolved the previous generation before selection may
-complete against that pinned file until its existing operation deadline; a
-reader that arrives after selection uses the candidate. A reader whose pinned
-file was retired/withdrawn before it acquired a bounded slice receives the
-existing typed compacted/retryable answer (the same family as
-`ReplicationLogCursorCompacted`/cursor-compacted behavior) and resynchronises;
-it must never fence a healthy store, never observe a torn generation and never
-be silently served from a different cut. At most one previous generation may be
-pinned plus the reserved namespace capacity; pinned retention is bounded by the
-existing reader deadline/timeout and is visible in persistence diagnostics. A
-rollover waits for pinned readers only through their bounded deadline; it never
-blocks admission indefinitely.
-
-### Size trigger, bounds, warning and fail-closed rule (technical plan)
-
-- Trigger is **file extent/size**, not store age or time: roll over when the
-  selected file's extent reaches the compact-base target plus a bounded headroom
-  large enough for one capture/verification segment (exact constants selected in
-  implementation, subject to review; the trigger must fire well before the
-  hard `MAX_BLOCKS`/`MAX_GENERATION_BYTES` ceiling).
-- Post-rollover bound: selected compact base + one live append segment + one
-  retained previous generation (pinned) stays within a stated multiple of the
-  compact base; the regression asserts the size bound rather than quoting a
-  fixed GiB figure derived from block size.
-- Warning threshold well before the ceiling (typed persistence-health/diagnostic
-  evidence and operator warning), e.g. at a documented fraction of the hard
-  ceiling, so operators see it before any stop.
-- When rollover cannot progress (verification failures, pinned reader holding
-  the only retirement slot, insufficient disk/IO error, bounded retry budget
-  exhausted): admission stays typed-retryable/backpressured (no silent data
-  loss, no silent fence); the old selected generation remains the authority and
-  the store reports the typed compaction/fail-closed outcome. A hard ceiling
-  reached while rollover cannot progress is only the last-resort failure, after
-  warnings; it is never reached silently and never resolved by truncating live
-  state.
-
-### Test-profile and qualification plan
-
-- Reduced-ceiling deterministic regressions (Linux-only, needs-CI): a test-only
-  profile/override that shrinks the Durable and Async ceilings/blocks
-  deterministically **without changing the persisted vocabulary/profile digest**
-  (recommended: `test-control`-gated runtime ceiling override where the prefix
-  validation permits it; otherwise a test-only profile with the unchanged
-  vocabulary, decided in the implementation PR). Tests: run past the reduced
-  ceiling in each mode and keep serving; assert file size stays within the stated
-  post-rollover bound; crash at every row of the matrix above then reopen and
-  compare exact committed state; pinned reader completes or receives the typed
-  retry; restart selects correctly; voter parity (every voter produces the same
-  committed state after rollover); table-agnostic reclaim combined with
-  #1250/#1251/#1307 row retirement frees bytes through the same mechanism.
-- Linux large-file/disk qualification (needs CI/qualification): an actual
-  process/VM run on Linux test storage including clean restart, not just process
-  restart; process restart alone is not power-loss evidence. Disk-full, ENOSPC,
-  directory-sync and slow-file qualification remain required before claiming the
-  lifetime stop removed.
-- The existing #1249/retention regressions and snapshot/restart/voter-parity
-  suites remain unchanged.
-
-### Implementation split (after owner approval)
-
-- **This PR:** docs-only design/ADR + operator documentation pointer. No code,
-  no durable-format/profile change; #1253 is design-pending/owner-decision.
-- **Follow-up PR 1 (Durable):** rollover writing/verification/selection,
-  pinned-reader contract, reduced-ceiling passthrough/crash/restart/parity tests.
-- **Follow-up PR 2 (Async + qualification):** Async writer latch recovery,
-  reduced-ceiling Async tests, warning/diagnostics, large-file/disk Linux
-  qualification. The split may be adjusted by the owner; the two implementation
-  PRs must not land before decision requests 1–3 are approved.
-
-### Explicit decision requests for the owner
-
-1. Accept or reject the recommended new-compact-base + atomic-selector rollover
-   contract, and confirm that reusing the existing generation vocabulary/profile
-   digest (no fresh-install boundary) is required unless a new root/vocabulary is
-   explicitly approved as a durable-format decision.
-2. Accept or reject the recommended staged crash-safe state machine and restart
-   selection rule (last durably selected, verified generation wins; unverified/
-   incomplete candidates are swept, never selected).
-3. Accept or reject the recommended pinned-reader policy (complete within the
-   bounded timeout or receive the typed retry/compacted outcome; never fence a
-   healthy store; at most one pinned previous generation plus reserved namespace
-   capacity).
-
-Until these three are approved and this design is updated, no implementation
-work on generation rollover may change the current ceilings or the persisted
-format.
+Durable and Async component regressions drive repeated checkpoints through
+several file epochs with a smaller test-only rollover trigger; the production
+validation limits and stored vocabulary remain unchanged. They compare exact
+receipt and log state on reopen, keep a pinned reader live after the old file
+is unlinked, and preserve mutations made after capture. Fault injection covers
+twenty ordinary creation, synchronization, admission, frame-rebase, selector
+and reclamation boundaries, plus seven candidate-discard/pending-base
+boundaries in both modes. Each reopens, validates the selected state and
+completes two further rollovers. Release-only hooks also prove headroom and
+live-capacity shutdown/install handoffs without duration assertions.
+These component results do not establish power-loss, whole-process memory or
+deployment throughput qualification.
 
 ## Async writer and local observations
 
 Foreground admission applies the original validators to resident state and
 owns no per-operation disk request, disk-queue capacity permit, checkpoint
 drain, or retention I/O. Real engine/proposal admission and finite native
-memory bounds remain. Encoding, generation append/verification, file sync,
-selector replacement, and relocation work belong to one storage writer.
-At most one detached generation is being persisted per voter while later
-resident changes coalesce.
+memory bounds remain. Ordinary delta encoding, append/verification, file sync
+and selector replacement belong to one storage writer while later resident
+changes coalesce. One independent compactor may own a disjoint, unselected
+preparing file; its build and bounded post-switch relocation do not gate the
+next ordinary checkpoint. At most one ordinary capture and one compactor
+build are active per voter.
 
 The ordinary capture schedule is 250 ms; explicit drain, shutdown, and
 snapshot/install work can request an earlier capture. The schedule is not a
@@ -617,9 +605,9 @@ Async can lose acknowledged results if the live volatile quorum is lost.
 ### Completed consensus shutdown
 
 Completed-shutdown evidence was introduced with `OPCNA002`; the durable
-authority reservation followed in `OPCNA003`. Current `OPCNA004` roots retain
-both contracts and add physical log reclamation under a new binding hash
-domain. Readers without this vocabulary reject the root before participating.
+authority reservation followed in `OPCNA003`. Current `OPCNA005` roots retain
+both contracts, physical log reclamation and notification retention under a
+new binding hash domain. Readers without this vocabulary reject the root before participating.
 Old roots are refused by this binary; there is no implicit migration or
 retrospective certification.
 
@@ -672,7 +660,7 @@ acknowledgements retain their resident replication/application boundary.
 
 ### Reserved authority and replicated retirement
 
-An `OPCNA004` owner syncs its root-bound `ASYNC-AUTHORITY` reservation before
+An `OPCNA005` owner syncs its root-bound `ASYNC-AUTHORITY` reservation before
 starting volatile consensus. Its finite range bounds terms, indices and
 authority allocators independently of completed session generations. Ordinary
 operations compare resident counters against the reservation without writing
@@ -689,7 +677,7 @@ roots and retained protected authority are outside this retirement vocabulary.
 
 ### Unanimous retained-owner recovery (SDK #908)
 
-Normal Async acknowledgements remain independent of disk. An `OPCNA004` root
+Normal Async acknowledgements remain independent of disk. An `OPCNA005` root
 reserves a finite range **before** any volatile issuance. The initial ceiling
 is `2^40 - 1`; each recovery era advances by `2^40`. Eras and all reserved
 frontiers are bounded below the signed-counter limit. Exhaustion rejects work;
@@ -787,7 +775,7 @@ provider inventory reports `ProtectedAuthorityRequired`, including when its
 volatile activation was lost.
 These are availability limits, never successful fence-only recovery outcomes.
 
-This requirement also applies to newly provisioned `OPCNA004` roots;
+This requirement also applies to newly provisioned `OPCNA005` roots;
 it is independent of older deployment migration. The member provider contract fences
 one immutable admission/member binding. Issuing a larger consensus fence for
 a different admission does not advance that old provider row. A local permit

@@ -19,46 +19,105 @@ impl Wal {
         let result =
             (|| {
                 let mut state = lock_state(&self.shared)?;
-                while (state.native_install_pending || state.snapshot.is_some())
-                    && state.status == Status::Running
-                {
-                    state =
-                        self.shared.ready.wait(state).map_err(|_| {
-                            io::Error::other("native install ownership wait poisoned")
-                        })?;
-                }
-                if state.status != Status::Running {
-                    return Err(invalid_data("native install owner is fenced"));
-                }
-                owner.completed = false;
-                state.native_install_pending = true;
-                self.shared.ready.notify_all();
-                while state.native_operations != 0
-                    || state.native_basis_active
-                    || state.native_basis_ready
-                    || state.native_relocations_pending
-                    || state.native_snapshot_pending.is_some()
-                    || state.native_checkpoint_target.is_some()
-                    || state.checkpoint_requested
-                    || state
-                        .asynchronous
-                        .as_ref()
-                        .is_some_and(|progress| !progress.caught_up())
-                {
-                    if state.status != Status::Running
-                        || state
+                // Capacity can be discovered after this installer claims
+                // the gate. Until snapshot is armed, no handoff publication
+                // has begun: yield only our gate under State and let already
+                // committed retirement run before competing installers retry.
+                'ownership: loop {
+                    while (state.native_install_pending
+                        || state.snapshot.is_some()
+                        || state.native_live_capacity
+                        || (state.native_ceiling_wait && state.native_background_pending))
+                        && state.status == Status::Running
+                    {
+                        if state
                             .asynchronous
                             .as_ref()
-                            .is_some_and(|progress| progress.failure.is_some())
+                            .is_some_and(|p| p.failure.is_some())
+                        {
+                            return Err(invalid_data("native install predecessor drain failed"));
+                        }
+                        #[cfg(test)]
+                        if state.native_live_capacity && !state.native_install_pending {
+                            (self.control.hook)(Point::NativeInstallCapacityWaitStarted)?;
+                        }
+                        #[cfg(test)]
+                        (self.control.hook)(Point::NativeInstallOwnershipWaitStarted)?;
+                        state = self.shared.ready.wait(state).map_err(|_| {
+                            io::Error::other("native install ownership wait poisoned")
+                        })?;
+                    }
+                    if state.status != Status::Running {
+                        return Err(invalid_data("native install owner is fenced"));
+                    }
+                    if state
+                        .asynchronous
+                        .as_ref()
+                        .is_some_and(|p| p.failure.is_some())
                     {
                         return Err(invalid_data("native install predecessor drain failed"));
                     }
-                    state = self.shared.ready.wait(state).map_err(|_| {
-                        io::Error::other("native install predecessor wait poisoned")
-                    })?;
-                }
-                if state.status != Status::Running {
-                    return Err(invalid_data("native install owner closed during drain"));
+                    owner.completed = false;
+                    state.native_install_pending = true;
+                    self.shared.ready.notify_all();
+                    #[cfg(test)]
+                    {
+                        drop(state);
+                        (self.control.hook)(Point::NativeInstallWaitStarted)?;
+                        state = lock_state(&self.shared)?;
+                    }
+                    loop {
+                        // A ceiling checkpoint may need the paused relocation
+                        // before its next compactor can start. Yield this
+                        // unarmed gate so that its predecessor can drain.
+                        if state.native_live_capacity
+                            || (state.native_ceiling_wait && state.native_background_pending)
+                        {
+                            state.native_install_pending = false;
+                            owner.completed = true;
+                            self.shared.ready.notify_all();
+                            continue 'ownership;
+                        }
+                        if state.status != Status::Running
+                            || state
+                                .asynchronous
+                                .as_ref()
+                                .is_some_and(|p| p.failure.is_some())
+                        {
+                            // Snapshot is still unarmed, so a graceful close or
+                            // an ordinary Async persistence failure has changed
+                            // no installation authority. Preserve its owner;
+                            // unrelated poisoned/failed state remains failed.
+                            state.native_install_pending = false;
+                            owner.completed = true;
+                            self.shared.ready.notify_all();
+                            return Err(invalid_data("native install predecessor drain failed"));
+                        }
+                        // Recheck live capacity and failure even when the drain
+                        // became empty while the test/publication hook ran.
+                        // Only an unguarded, healthy owner may arm snapshot.
+                        if state.native_operations == 0
+                            && !state.native_basis_active
+                            && !state.native_basis_ready
+                            && !state.native_relocations_pending
+                            && state.native_snapshot_pending.is_none()
+                            && state.native_checkpoint_target.is_none()
+                            && !state.checkpoint_requested
+                            && state.asynchronous.as_ref().is_none_or(|p| p.caught_up())
+                        {
+                            break;
+                        }
+                        state = self.shared.ready.wait(state).map_err(|_| {
+                            io::Error::other("native install predecessor wait poisoned")
+                        })?;
+                    }
+                    if state.status != Status::Running {
+                        state.native_install_pending = false;
+                        owner.completed = true;
+                        self.shared.ready.notify_all();
+                        return Err(invalid_data("native install owner closed during drain"));
+                    }
+                    break;
                 }
                 state.snapshot = Some(Handoff {
                     candidate: Arc::clone(&installation.source.candidate),
@@ -195,6 +254,7 @@ fn advance_inner(
 ) -> io::Result<()> {
     let started = Instant::now();
     let _memory = VerificationMemory::reserve(256 * 1024)?;
+    basis.stop_optional(shared, &disk.directory, control)?;
     // Borrow the selected checkpoint throughout detached reconstruction. The
     // sole WAL writer cannot mutate it before the final predecessor check, so
     // exact identity avoids repeatedly walking its snapshot memberships. A
@@ -397,12 +457,13 @@ fn advance_inner(
         return Err(invalid_data("native install complete catalog differs"));
     }
     (control.hook)(Point::AfterNativeBasisAdmission)?;
+    let base_bytes = catalog.base_bytes();
     let mut native = catalog.into_storage(&check)?;
     let reservation = lock_state(shared)?.async_authority;
     if let Some(reservation) = reservation {
         native.check_async_reservation(reservation, &check)?;
     }
-    let mut selected = native_basis::Selected::admitted(append, &native)?;
+    let mut selected = native_basis::Selected::admitted(append, &native, base_bytes)?;
     selected.repair(&final_path, &check)?;
     native.begin_changes()?;
     installation.source.verify()?;

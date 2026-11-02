@@ -220,7 +220,7 @@ fn entry(
     }
 }
 
-fn ordinary(
+pub(super) fn ordinary(
     signed: &RosterV2PersistenceFixture,
     index: u64,
     intent: SessionMutationIntent,
@@ -233,7 +233,7 @@ fn ordinary(
     )
 }
 
-fn admission(signed: &RosterV2PersistenceFixture) -> Entry<SessionRaftTypeConfig> {
+pub(super) fn admission(signed: &RosterV2PersistenceFixture) -> Entry<SessionRaftTypeConfig> {
     let command = ConsensusRosterAdmissionCommand::new_with_provenance_and_ingress_request_id_v2(
         signed.admission.clone(),
         signed.authority.clone(),
@@ -250,7 +250,10 @@ fn admission(signed: &RosterV2PersistenceFixture) -> Entry<SessionRaftTypeConfig
     )
 }
 
-fn terminal(signed: &RosterV2PersistenceFixture, index: u64) -> Entry<SessionRaftTypeConfig> {
+pub(super) fn terminal(
+    signed: &RosterV2PersistenceFixture,
+    index: u64,
+) -> Entry<SessionRaftTypeConfig> {
     entry(
         signed,
         index,
@@ -259,7 +262,7 @@ fn terminal(signed: &RosterV2PersistenceFixture, index: u64) -> Entry<SessionRaf
     )
 }
 
-fn initialize(backend: &SqliteSessionBackend, signed: &RosterV2PersistenceFixture) {
+pub(super) fn initialize(backend: &SqliteSessionBackend, signed: &RosterV2PersistenceFixture) {
     let conn = backend.conn.blocking_lock();
     initialize_schema_with_storage_anchor_and_pending_and_bindings(
         &conn,
@@ -275,7 +278,7 @@ fn initialize(backend: &SqliteSessionBackend, signed: &RosterV2PersistenceFixtur
     .unwrap();
 }
 
-fn commit(wal: &Wal, entries: &[Entry<SessionRaftTypeConfig>]) {
+pub(super) fn commit(wal: &Wal, entries: &[Entry<SessionRaftTypeConfig>]) {
     wal.submit(append(entries)).unwrap().wait().unwrap();
     wal.submit(Operation::Committed(
         entries.last().map(|entry| entry.log_id),
@@ -337,10 +340,7 @@ fn parity(
         encode_json(&actual.responses).unwrap(),
         encode_json(&expected.responses).unwrap()
     );
-    assert_eq!(
-        encode_json(&actual.notifications).unwrap(),
-        encode_json(&expected.notifications).unwrap()
-    );
+    policy_oracle::notifications(&actual.notifications, &expected.notifications, entries);
     actual
 }
 

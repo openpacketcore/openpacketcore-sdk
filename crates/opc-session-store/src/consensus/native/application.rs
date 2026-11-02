@@ -20,8 +20,9 @@ pub(crate) struct ApplicationPublication(changes::Publication);
 
 impl NativeState {
     pub(crate) fn capture_application(&self) -> io::Result<ApplicationCapture> {
-        let memory =
-            VerificationMemory::reserve(64 * 1024 + size_of::<ApplicationCapture>() + 16 * 1024)?;
+        let memory = VerificationMemory::reserve_journal(
+            64 * 1024 + size_of::<ApplicationCapture>() + 16 * 1024,
+        )?;
         let state = self.clone_for_application()?;
         Ok(ApplicationCapture {
             state,

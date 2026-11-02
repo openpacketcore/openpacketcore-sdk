@@ -93,8 +93,8 @@ impl Removals {
             .checked_mul(RANGE_BYTES)
             .ok_or_else(|| invalid("native removal range charge overflow"))?;
         match &mut self.memory {
-            Some(memory) => memory.grow_to(bytes)?,
-            None => self.memory = Some(VerificationMemory::reserve(bytes)?),
+            Some(memory) => memory.grow_journal_to(bytes)?,
+            None => self.memory = Some(VerificationMemory::reserve_journal(bytes)?),
         }
         self.ranges.push(Range {
             epoch: id.epoch().get(),
@@ -228,11 +228,11 @@ impl DeletedRows {
             .ok_or_else(|| invalid("native deletion fingerprint reservation overflow"))?;
         let memory = match memory {
             Some(mut memory) => {
-                memory.grow_to(bytes)?;
+                memory.grow_journal_to(bytes)?;
                 memory.shrink_to(bytes)?;
                 memory
             }
-            None => VerificationMemory::reserve(bytes)?,
+            None => VerificationMemory::reserve_journal(bytes)?,
         };
         let mut rows = Vec::with_capacity(count);
         for entry in inventory.iter() {

@@ -34,21 +34,18 @@ const SESSION_ENVELOPE_ENCRYPT_FAILED_MESSAGE: &str = "session envelope encrypti
 const SESSION_ENVELOPE_DECRYPT_FAILED_MESSAGE: &str = "session envelope decryption failed";
 const SESSION_ENVELOPE_MISSING_CIPHERTEXT_MESSAGE: &str = "session envelope ciphertext is missing";
 const SESSION_ENVELOPE_INVALID_MESSAGE: &str = "session envelope is invalid";
+const SESSION_KEY_PROVIDER_UNAVAILABLE_MESSAGE: &str = "session key provider unavailable";
 
 fn invalid_session_envelope() -> StoreError {
     StoreError::Crypto(SESSION_ENVELOPE_INVALID_MESSAGE.into())
 }
 
-/// Map a key-provider failure without weakening the encryption-oracle defence.
-///
-/// Only `KeyError::Unavailable` is reported as retryable: it happens before
-/// any ciphertext or envelope content is processed, so distinguishing it
-/// reveals nothing about persisted data. Every content-dependent failure stays
-/// collapsed into the coarse [`StoreError::Crypto`].
-fn map_key_provider_error(error: KeyError, message: &'static str) -> StoreError {
+fn key_provider_error(error: KeyError, crypto_message: &'static str) -> StoreError {
     match error {
-        KeyError::Unavailable => StoreError::KeyProviderUnavailable(message.into()),
-        _ => StoreError::Crypto(message.into()),
+        KeyError::Unavailable => {
+            StoreError::BackendUnavailable(SESSION_KEY_PROVIDER_UNAVAILABLE_MESSAGE.into())
+        }
+        _ => StoreError::Crypto(crypto_message.into()),
     }
 }
 
@@ -601,11 +598,9 @@ impl EncryptedSessionPayload {
     /// The AAD binds tenant, NF kind, a keyed digest of the session key,
     /// state type, generation, fence, and `backend_namespace`, so the
     /// ciphertext only ever decrypts for exactly this record version in this
-    /// namespace. Content-dependent failures are reported as a deliberately
-    /// coarse `StoreError::Crypto` to avoid acting as an encryption oracle;
-    /// only a provider outage (`KeyError::Unavailable`, before any content is
-    /// processed) is reported as the retryable
-    /// [`StoreError::KeyProviderUnavailable`].
+    /// namespace. Provider unavailability returns retryable
+    /// [`StoreError::BackendUnavailable`]. Other failures return a deliberately
+    /// coarse [`StoreError::Crypto`] to avoid acting as an encryption oracle.
     pub async fn encrypt<P: KeyProvider + ?Sized>(
         provider: &P,
         record: &StoredSessionRecord,
@@ -614,9 +609,7 @@ impl EncryptedSessionPayload {
         let handle = provider
             .get_active_key(KeyPurpose::Session, &record.key.tenant)
             .await
-            .map_err(|error| {
-                map_key_provider_error(error, SESSION_ENVELOPE_ENCRYPT_FAILED_MESSAGE)
-            })?;
+            .map_err(|error| key_provider_error(error, SESSION_ENVELOPE_ENCRYPT_FAILED_MESSAGE))?;
         let aad = build_session_envelope_aad(record, backend_namespace, &handle)?;
         let ciphertext = encrypt_envelope_with_handle(&handle, &aad, record.payload.as_bytes())
             .map_err(|_| StoreError::Crypto(SESSION_ENVELOPE_ENCRYPT_FAILED_MESSAGE.into()))?;
@@ -632,6 +625,8 @@ impl EncryptedSessionPayload {
     /// [`Self::encrypt`], AEAD execution is delegated to `provider`; callers
     /// must keep a store on one seal mode because local and remote ciphertexts
     /// use different key custody and are not expected to decrypt across modes.
+    /// Provider unavailability returns retryable [`StoreError::BackendUnavailable`];
+    /// every other provider or envelope failure remains [`StoreError::Crypto`].
     pub async fn remote_seal<S: RemoteSealProvider + ?Sized>(
         provider: &S,
         record: &StoredSessionRecord,
@@ -641,9 +636,7 @@ impl EncryptedSessionPayload {
         let sealed = provider
             .seal(&aad, record.payload.as_bytes())
             .await
-            .map_err(|error| {
-                map_key_provider_error(error, SESSION_ENVELOPE_ENCRYPT_FAILED_MESSAGE)
-            })?;
+            .map_err(|error| key_provider_error(error, SESSION_ENVELOPE_ENCRYPT_FAILED_MESSAGE))?;
         if sealed.ciphertext_and_tag.len() < AEAD_TAG_LEN {
             return Err(StoreError::Crypto(
                 SESSION_ENVELOPE_ENCRYPT_FAILED_MESSAGE.into(),
@@ -684,9 +677,8 @@ impl EncryptedSessionPayload {
     /// (i.e. the record's own header fields), otherwise decryption fails with
     /// `StoreError::Crypto`. That failure is the integrity check: ciphertext
     /// spliced onto a different record, generation, or namespace cannot
-    /// decode. A provider outage before content is processed is the sole
-    /// exception and is reported as the retryable
-    /// [`StoreError::KeyProviderUnavailable`].
+    /// decode. Provider unavailability instead returns retryable
+    /// [`StoreError::BackendUnavailable`]; an unknown key remains a crypto error.
     pub async fn decrypt<P: KeyProvider + ?Sized>(
         &self,
         provider: &P,
@@ -720,9 +712,7 @@ impl EncryptedSessionPayload {
         let handle = provider
             .get_key_by_id(&envelope.key_id)
             .await
-            .map_err(|error| {
-                map_key_provider_error(error, SESSION_ENVELOPE_DECRYPT_FAILED_MESSAGE)
-            })?;
+            .map_err(|error| key_provider_error(error, SESSION_ENVELOPE_DECRYPT_FAILED_MESSAGE))?;
         let aad = build_session_aad(
             key,
             state_type,
@@ -740,6 +730,8 @@ impl EncryptedSessionPayload {
     /// Remote seal adds one KMS/HSM round-trip per seal operation (normally a
     /// checkpoint off the hot path) and one round-trip per unseal on failover
     /// restore, so restore latency and availability depend on the remote KMS.
+    /// Provider unavailability returns retryable [`StoreError::BackendUnavailable`];
+    /// every other provider or envelope failure remains [`StoreError::Crypto`].
     pub async fn remote_unseal<S: RemoteSealProvider + ?Sized>(
         &self,
         provider: &S,
@@ -789,7 +781,7 @@ impl EncryptedSessionPayload {
         provider
             .unseal(&envelope.key_id, &aad, &envelope.ciphertext_and_tag)
             .await
-            .map_err(|error| map_key_provider_error(error, SESSION_ENVELOPE_DECRYPT_FAILED_MESSAGE))
+            .map_err(|error| key_provider_error(error, SESSION_ENVELOPE_DECRYPT_FAILED_MESSAGE))
     }
 }
 
@@ -1102,7 +1094,10 @@ mod tests {
         )
         .await
         .expect_err("provider outage must fail");
-        assert!(matches!(error, StoreError::KeyProviderUnavailable(_)));
+        assert_eq!(
+            error,
+            StoreError::BackendUnavailable("session key provider unavailable".into())
+        );
     }
 
     #[tokio::test]
@@ -1123,7 +1118,10 @@ mod tests {
             )
             .await
             .expect_err("provider outage must fail");
-        assert!(matches!(error, StoreError::KeyProviderUnavailable(_)));
+        assert_eq!(
+            error,
+            StoreError::BackendUnavailable("session key provider unavailable".into())
+        );
     }
 
     #[tokio::test]
@@ -1136,7 +1134,10 @@ mod tests {
         )
         .await
         .expect_err("remote provider outage must fail");
-        assert!(matches!(error, StoreError::KeyProviderUnavailable(_)));
+        assert_eq!(
+            error,
+            StoreError::BackendUnavailable("session key provider unavailable".into())
+        );
 
         let remote = MemoryRemoteSealProvider::new(
             KeyId::new(PROVIDER_TEST_KEY_ID).expect("key id"),
@@ -1159,7 +1160,10 @@ mod tests {
             )
             .await
             .expect_err("remote provider outage must fail");
-        assert!(matches!(error, StoreError::KeyProviderUnavailable(_)));
+        assert_eq!(
+            error,
+            StoreError::BackendUnavailable("session key provider unavailable".into())
+        );
     }
 
     #[tokio::test]

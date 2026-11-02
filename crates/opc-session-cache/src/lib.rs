@@ -719,7 +719,6 @@ fn store_error_kind(err: &StoreError) -> &'static str {
         StoreError::FencedTransitionHistoryFull => "fenced_transition_history_full",
         StoreError::FencedTransitionRetentionExhausted => "fenced_transition_retention_exhausted",
         StoreError::FencedTransitionStorageExhausted => "fenced_transition_storage_exhausted",
-        StoreError::KeyCapacityExhausted => "key_capacity_exhausted",
         StoreError::FencedTransitionHistoryEpochRetired => {
             "fenced_transition_history_epoch_retired"
         }
@@ -730,7 +729,6 @@ fn store_error_kind(err: &StoreError) -> &'static str {
         StoreError::TopologyAuthorityRevoked => "topology_authority_revoked",
         StoreError::CapabilityNotSupported(_) => "capability_not_supported",
         StoreError::BackendUnavailable(_) => "backend_unavailable",
-        StoreError::KeyProviderUnavailable(_) => "key_provider_unavailable",
         StoreError::FencedTransitionRecoveryJournalUnavailable => {
             "fenced_transition_recovery_journal_unavailable"
         }
@@ -841,6 +839,7 @@ mod tests {
         refresh_calls: AtomicU64,
         batch_calls: AtomicU64,
         log_entries: Mutex<Vec<ReplicationEntry>>,
+        applied_entries: Mutex<Vec<ReplicationEntry>>,
         replicate_calls: AtomicU64,
         rebuild_calls: AtomicU64,
     }
@@ -907,15 +906,17 @@ mod tests {
             Ok(self.log_entries.lock().await.clone())
         }
 
-        async fn replicate_entry(&self, _entry: ReplicationEntry) -> Result<(), StoreError> {
+        async fn replicate_entry(&self, entry: ReplicationEntry) -> Result<(), StoreError> {
+            self.applied_entries.lock().await.push(entry);
             self.replicate_calls.fetch_add(1, Ordering::Relaxed);
             Ok(())
         }
 
         async fn rebuild_replication_state(
             &self,
-            _entries: Vec<ReplicationEntry>,
+            entries: Vec<ReplicationEntry>,
         ) -> Result<(), StoreError> {
+            *self.applied_entries.lock().await = entries;
             self.rebuild_calls.fetch_add(1, Ordering::Relaxed);
             Ok(())
         }
@@ -963,6 +964,7 @@ mod tests {
             refresh_calls: AtomicU64::new(0),
             batch_calls: AtomicU64::new(0),
             log_entries: Mutex::new(Vec::new()),
+            applied_entries: Mutex::new(Vec::new()),
             replicate_calls: AtomicU64::new(0),
             rebuild_calls: AtomicU64::new(0),
         })
@@ -1031,6 +1033,7 @@ mod tests {
     fn invalid_ttl_entry(sequence: u64, key: SessionKey) -> ReplicationEntry {
         let timestamp = Timestamp::now_utc();
         ReplicationEntry {
+            replay_policy: opc_session_store::ReplicationReplayPolicy::prune_expired(),
             sequence,
             tx_id: format!("invalid-ttl-{sequence}")
                 .try_into()
@@ -1092,6 +1095,7 @@ mod tests {
 
     fn over_depth_entry(sequence: u64, key: SessionKey) -> ReplicationEntry {
         ReplicationEntry {
+            replay_policy: opc_session_store::ReplicationReplayPolicy::prune_expired(),
             sequence,
             tx_id: format!("over-depth-{sequence}")
                 .try_into()
@@ -1109,6 +1113,7 @@ mod tests {
                 .map(|_| ReplicationOp::Batch { ops: Vec::new() }),
         );
         ReplicationEntry {
+            replay_policy: opc_session_store::ReplicationReplayPolicy::prune_expired(),
             sequence,
             tx_id: format!("over-count-{sequence}")
                 .try_into()
@@ -1241,6 +1246,33 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn key_retention_batch_invalidates_only_its_mutation_keys() {
+        let target = test_key();
+        let unrelated = unrelated_test_key();
+        let unrelated_record = test_record(unrelated.clone(), 1);
+        let mut rows = HashMap::from([
+            (target.clone(), test_record(target.clone(), 1)),
+            (unrelated.clone(), unrelated_record.clone()),
+        ]);
+        let op = ReplicationOp::Batch {
+            ops: vec![protected_roster_established_create_op(target.clone())],
+        };
+        op.validate_structure().unwrap();
+        SessionCache::apply_invalidation_op(&mut rows, op.clone());
+        assert!(!rows.contains_key(&target));
+        assert_eq!(rows.get(&unrelated), Some(&unrelated_record));
+        let cache = cache_without_watch(idle_scripted_backend(0));
+        *cache.cache.write().await = HashMap::from([
+            (target.clone(), test_record(target.clone(), 1)),
+            (unrelated.clone(), unrelated_record.clone()),
+        ]);
+        cache.invalidate_replication_op(&op).await;
+        let rows = cache.cache.read().await;
+        assert!(!rows.contains_key(&target));
+        assert_eq!(rows.get(&unrelated), Some(&unrelated_record));
+    }
+
+    #[tokio::test]
     async fn watch_cursor_waits_for_invalidation_before_advancing() {
         let key = test_key();
         let cache = Arc::new(RwLock::new(HashMap::from([(
@@ -1263,6 +1295,7 @@ mod tests {
             refresh_calls: AtomicU64::new(0),
             batch_calls: AtomicU64::new(0),
             log_entries: Mutex::new(Vec::new()),
+            applied_entries: Mutex::new(Vec::new()),
             replicate_calls: AtomicU64::new(0),
             rebuild_calls: AtomicU64::new(0),
         });
@@ -1282,6 +1315,7 @@ mod tests {
         backend.max_sequence.store(1, Ordering::Release);
         entry_tx
             .send(Ok(ReplicationEntry {
+                replay_policy: opc_session_store::ReplicationReplayPolicy::prune_expired(),
                 sequence: 1,
                 tx_id: "tx-1".try_into().expect("valid transaction ID"),
                 op: ReplicationOp::CompareAndSet {
@@ -1456,6 +1490,7 @@ mod tests {
 
         let error = cache
             .replicate_entry(ReplicationEntry {
+                replay_policy: opc_session_store::ReplicationReplayPolicy::prune_expired(),
                 sequence: 1,
                 tx_id: "nested-invalid-ttl"
                     .try_into()
@@ -1535,6 +1570,7 @@ mod tests {
         drop(validate_replication_page_owned(retained_entries));
 
         backend.log_entries.lock().await.push(ReplicationEntry {
+            replay_policy: opc_session_store::ReplicationReplayPolicy::prune_expired(),
             sequence: 100,
             tx_id: "wrong-range".try_into().expect("valid transaction ID"),
             op: ReplicationOp::Batch { ops: Vec::new() },
@@ -1560,6 +1596,7 @@ mod tests {
             refresh_calls: AtomicU64::new(0),
             batch_calls: AtomicU64::new(0),
             log_entries: Mutex::new(Vec::new()),
+            applied_entries: Mutex::new(Vec::new()),
             replicate_calls: AtomicU64::new(0),
             rebuild_calls: AtomicU64::new(0),
         });
@@ -1601,6 +1638,7 @@ mod tests {
             refresh_calls: AtomicU64::new(0),
             batch_calls: AtomicU64::new(0),
             log_entries: Mutex::new(Vec::new()),
+            applied_entries: Mutex::new(Vec::new()),
             replicate_calls: AtomicU64::new(0),
             rebuild_calls: AtomicU64::new(0),
         });
@@ -1666,6 +1704,7 @@ mod tests {
             refresh_calls: AtomicU64::new(0),
             batch_calls: AtomicU64::new(0),
             log_entries: Mutex::new(Vec::new()),
+            applied_entries: Mutex::new(Vec::new()),
             replicate_calls: AtomicU64::new(0),
             rebuild_calls: AtomicU64::new(0),
         });
@@ -1706,6 +1745,7 @@ mod tests {
             refresh_calls: AtomicU64::new(0),
             batch_calls: AtomicU64::new(0),
             log_entries: Mutex::new(Vec::new()),
+            applied_entries: Mutex::new(Vec::new()),
             replicate_calls: AtomicU64::new(0),
             rebuild_calls: AtomicU64::new(0),
         });
@@ -1777,6 +1817,7 @@ mod tests {
 
         let error = cache
             .replicate_entry(ReplicationEntry {
+                replay_policy: opc_session_store::ReplicationReplayPolicy::prune_expired(),
                 sequence: 0,
                 tx_id: "zero-sequence".try_into().expect("valid transaction ID"),
                 op: ReplicationOp::DeleteFenced {
@@ -1810,12 +1851,14 @@ mod tests {
         let error = cache
             .rebuild_replication_state(vec![
                 ReplicationEntry {
+                    replay_policy: opc_session_store::ReplicationReplayPolicy::prune_expired(),
                     sequence: 1,
                     tx_id: "prefix-one".try_into().expect("valid transaction ID"),
                     op: ReplicationOp::Batch { ops: Vec::new() },
                     timestamp,
                 },
                 ReplicationEntry {
+                    replay_policy: opc_session_store::ReplicationReplayPolicy::prune_expired(),
                     sequence: 3,
                     tx_id: "prefix-gap".try_into().expect("valid transaction ID"),
                     op: ReplicationOp::Batch { ops: Vec::new() },
@@ -1828,5 +1871,72 @@ mod tests {
         assert_eq!(error, StoreError::InvalidReplicationSequence);
         assert_eq!(backend.rebuild_calls.load(Ordering::Relaxed), 0);
         assert_eq!(cache.cache.read().await.get(&key), Some(&record));
+    }
+
+    #[tokio::test]
+    async fn key_retention_boundary_invalidates_only_its_mutation_keys() {
+        let target = test_key();
+        let unrelated = unrelated_test_key();
+        let unrelated_record = test_record(unrelated.clone(), 1);
+        let mut rows = HashMap::from([
+            (target.clone(), test_record(target.clone(), 1)),
+            (unrelated.clone(), unrelated_record.clone()),
+        ]);
+        let op = ReplicationOp::Batch {
+            ops: vec![protected_roster_established_create_op(target.clone())],
+        };
+        op.validate_structure().unwrap();
+        SessionCache::apply_invalidation_op(&mut rows, op.clone());
+        assert!(!rows.contains_key(&target));
+        assert_eq!(rows.get(&unrelated), Some(&unrelated_record));
+        let cache = cache_without_watch(idle_scripted_backend(0));
+        *cache.cache.write().await = HashMap::from([
+            (target.clone(), test_record(target.clone(), 1)),
+            (unrelated.clone(), unrelated_record.clone()),
+        ]);
+        cache.invalidate_replication_op(&op).await;
+        let rows = cache.cache.read().await;
+        assert!(!rows.contains_key(&target));
+        assert_eq!(rows.get(&unrelated), Some(&unrelated_record));
+    }
+    #[tokio::test]
+    async fn cache_preserves_explicit_policy_through_append_log_and_rebuild() {
+        let backend = idle_scripted_backend(0);
+        let cache = cache_without_watch(backend.clone());
+        let target = test_key();
+        let unrelated = unrelated_test_key();
+        let unrelated_record = test_record(unrelated.clone(), 1);
+        let mut policy = opc_session_store::ReplicationReplayPolicy::preserve();
+        policy.internal_key_count = 17;
+        let entry = ReplicationEntry {
+            sequence: 1,
+            tx_id: "policy-cache".try_into().unwrap(),
+            op: ReplicationOp::Batch {
+                ops: vec![protected_roster_established_create_op(target.clone())],
+            },
+            timestamp: Timestamp::now_utc(),
+            replay_policy: policy,
+        };
+        *cache.cache.write().await = HashMap::from([
+            (target.clone(), test_record(target.clone(), 1)),
+            (unrelated.clone(), unrelated_record.clone()),
+        ]);
+        cache.replicate_entry(entry.clone()).await.unwrap();
+        assert_eq!(*backend.applied_entries.lock().await, vec![entry.clone()]);
+        assert!(!cache.cache.read().await.contains_key(&target));
+        assert_eq!(
+            cache.cache.read().await.get(&unrelated),
+            Some(&unrelated_record)
+        );
+        *backend.log_entries.lock().await = vec![entry.clone()];
+        assert_eq!(
+            cache.get_replication_log(1, 1).await.unwrap(),
+            vec![entry.clone()]
+        );
+        cache
+            .rebuild_replication_state(vec![entry.clone()])
+            .await
+            .unwrap();
+        assert_eq!(*backend.applied_entries.lock().await, vec![entry]);
     }
 }

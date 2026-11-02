@@ -11,6 +11,9 @@ mod lifecycle;
 #[path = "generation_catalog_purge_tests.rs"]
 mod purge_tests;
 
+#[path = "generation_catalog_retention_tests.rs"]
+mod retention_tests;
+
 #[path = "generation_catalog_compat_tests.rs"]
 mod compat_tests;
 
@@ -543,6 +546,18 @@ fn exact(catalog: &Catalog, storage: &NativeStorage) {
     }
     assert_eq!(catalog.rows.receipts.len(), storage.business.receipts.len());
     for (id, row) in &storage.business.receipts {
+        let resolved = row.cold_range().map(|(source, range)| {
+            cold::ReceiptReadTicket::capture(&storage.business, *id, source, range)
+                .unwrap()
+                .resolve(&|| Ok(()))
+                .unwrap()
+                .copy_guarded(&storage.business)
+                .unwrap()
+        });
+        let row = resolved
+            .as_ref()
+            .map(cold::OwnedReceipt::row)
+            .unwrap_or(row);
         let mut expected = Vec::new();
         cold::write_receipt(&mut expected, *id, row, &|| Ok(())).unwrap();
         assert_eq!(row_bytes(catalog, &catalog.rows.receipts[id]), expected);

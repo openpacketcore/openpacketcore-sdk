@@ -601,6 +601,12 @@ fn standalone_transaction(conn: &Connection) -> Result<Transaction<'_>, StoreErr
     Ok(tx)
 }
 
+fn standalone_write_transaction(conn: &Connection) -> Result<Transaction<'_>, StoreError> {
+    let tx = standalone_transaction(conn)?;
+    replication::require_complete_replay_command(&tx)?;
+    Ok(tx)
+}
+
 fn operator_recovery_latch_exists(conn: &Connection) -> Result<bool, StoreError> {
     let database_path: String = conn
         .query_row(
@@ -1663,6 +1669,22 @@ impl SqliteSessionBackend {
             .map_err(|_| SessionConsensusStorageError::BackendUnavailable)?
             .ok_or(SessionConsensusStorageError::BackendUnavailable)?
             .map_err(SessionConsensusStorageError::from_validation_error)
+    }
+
+    // SQL identity initialization already committed before fresh creation is
+    // dispatched. Retain queued as well as running captures after caller
+    // cancellation, so creation finishes its ROOT rather than leaving an
+    // initialized database without its native owner. Use the same blocking
+    // pool as cold admission; no cancellation abort handle is installed here.
+    #[cfg(target_os = "linux")]
+    async fn run_native_creation_blocking<T: Send + 'static>(
+        create: impl FnOnce() -> std::io::Result<T> + Send + 'static,
+    ) -> std::io::Result<T> {
+        tokio::task::spawn_blocking(create).await.map_err(|_| {
+            std::io::Error::other(
+                crate::consensus::storage::SessionConsensusStorageError::BackendUnavailable,
+            )
+        })?
     }
 
     /// Validate the selected native root before comparing caller scope. Only
@@ -4757,7 +4779,9 @@ impl SessionBackend for SqliteSessionBackend {
             // Standalone SQLite owns its local monotonic clock and may
             // physically prune on reads. Consensus reads never mutate outside
             // an Openraft-applied command.
-            ops::prune_sync(&tx, now)?;
+            if replication::pending_replay_command_sync(&tx)?.is_none() {
+                ops::prune_sync(&tx, now)?;
+            }
             tx.commit()
                 .map_err(|e| StoreError::BackendUnavailable(e.to_string()))?;
             Ok(result)
@@ -4770,7 +4794,7 @@ impl SessionBackend for SqliteSessionBackend {
         validate_stored_record_expiry_at(&op.new_record, now)?;
         let caps = self.caps;
         self.run_store_sqlite_task(SqliteStoreWorkKind::CompareAndSet, move |conn| {
-            let tx = standalone_transaction(conn)?;
+            let tx = standalone_write_transaction(conn)?;
             let result = ops::compare_and_set_sync(&tx, &op, &caps, now)?;
             tx.commit()
                 .map_err(|_| StoreError::CasIdempotencyOutcomeUnavailable)?;
@@ -4784,7 +4808,7 @@ impl SessionBackend for SqliteSessionBackend {
         let now = self.clock.now_utc();
         let caps = self.caps;
         self.run_store_sqlite_task(SqliteStoreWorkKind::Mutation, move |conn| {
-            let tx = standalone_transaction(conn)?;
+            let tx = standalone_write_transaction(conn)?;
             ops::delete_fenced_sync(&tx, &lease, &caps, now)?;
             tx.commit()
                 .map_err(|_| StoreError::BackendOperationOutcomeUnavailable)?;
@@ -4800,7 +4824,7 @@ impl SessionBackend for SqliteSessionBackend {
         let lease = lease.clone();
         let caps = self.caps;
         self.run_store_sqlite_task(SqliteStoreWorkKind::Mutation, move |conn| {
-            let tx = standalone_transaction(conn)?;
+            let tx = standalone_write_transaction(conn)?;
             ops::refresh_ttl_sync(&tx, &lease, ttl, &caps, now)?;
             tx.commit()
                 .map_err(|_| StoreError::BackendOperationOutcomeUnavailable)?;
@@ -4845,7 +4869,7 @@ impl SessionBackend for SqliteSessionBackend {
                     }
                     SessionOp::CompareAndSet(cas) => {
                         let run_cas = || {
-                            let tx = standalone_transaction(conn)?;
+                            let tx = standalone_write_transaction(conn)?;
                             let result = ops::compare_and_set_sync(&tx, &cas, &caps, now)?;
                             tx.commit()
                                 .map_err(|_| StoreError::CasIdempotencyOutcomeUnavailable)?;
@@ -4855,7 +4879,7 @@ impl SessionBackend for SqliteSessionBackend {
                     }
                     SessionOp::DeleteFenced { lease } => {
                         let run_delete = || {
-                            let tx = standalone_transaction(conn)?;
+                            let tx = standalone_write_transaction(conn)?;
                             ops::delete_fenced_sync(&tx, &lease, &caps, now)?;
                             tx.commit()
                                 .map_err(|_| StoreError::BackendOperationOutcomeUnavailable)?;
@@ -4865,7 +4889,7 @@ impl SessionBackend for SqliteSessionBackend {
                     }
                     SessionOp::RefreshTtl { lease, ttl } => {
                         let run_refresh = || {
-                            let tx = standalone_transaction(conn)?;
+                            let tx = standalone_write_transaction(conn)?;
                             ops::refresh_ttl_sync(&tx, &lease, ttl, &caps, now)?;
                             tx.commit()
                                 .map_err(|_| StoreError::BackendOperationOutcomeUnavailable)?;
@@ -5020,13 +5044,13 @@ impl SessionBackend for SqliteSessionBackend {
 
     async fn replicate_entry(&self, entry: ReplicationEntry) -> Result<(), StoreError> {
         let entry = entry.into_validated()?;
+        replication::validate_standalone_replay_policy(&entry)?;
         replication::validate_replication_payloads(&entry.op, self.caps.max_value_bytes)?;
         let worker_entry = entry.clone();
-        let now = self.clock.now_utc();
         let caps = self.caps;
         let should_notify = self
             .run_store_sqlite_task(SqliteStoreWorkKind::Mutation, move |conn| {
-                replication::replicate_entry_sync(conn, &worker_entry, &caps, now)
+                replication::replicate_entry_sync(conn, &worker_entry, &caps)
             })
             .await?;
 
@@ -5046,6 +5070,7 @@ impl SessionBackend for SqliteSessionBackend {
     ) -> Result<(), StoreError> {
         let entries = validate_replication_prefix_owned(entries)?;
         for entry in &entries {
+            replication::validate_standalone_replay_policy(entry)?;
             replication::validate_replication_payloads(&entry.op, self.caps.max_value_bytes)?;
         }
         let caps = self.caps;
@@ -5130,7 +5155,7 @@ impl SessionLeaseManager for SqliteSessionBackend {
         checked_session_deadline(now, ttl).map_err(LeaseError::from)?;
         let key = key.clone();
         self.run_lease_sqlite_task(move |conn| {
-            let tx = standalone_transaction(conn).map_err(LeaseError::from)?;
+            let tx = standalone_write_transaction(conn).map_err(LeaseError::from)?;
             let result = lease::acquire_sync(&tx, &key, owner, ttl, now)?;
             tx.commit()
                 .map_err(|_| LeaseError::OperationOutcomeUnavailable)?;
@@ -5145,7 +5170,7 @@ impl SessionLeaseManager for SqliteSessionBackend {
         checked_session_deadline(now, ttl).map_err(LeaseError::from)?;
         let lease = lease.clone();
         self.run_lease_sqlite_task(move |conn| {
-            let tx = standalone_transaction(conn).map_err(LeaseError::from)?;
+            let tx = standalone_write_transaction(conn).map_err(LeaseError::from)?;
             let result = lease::renew_sync(&tx, &lease, ttl, now)?;
             tx.commit()
                 .map_err(|_| LeaseError::OperationOutcomeUnavailable)?;
@@ -5163,7 +5188,7 @@ impl SessionLeaseManager for SqliteSessionBackend {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .clone();
         self.run_lease_sqlite_task(move |conn| {
-            let tx = standalone_transaction(conn).map_err(LeaseError::from)?;
+            let tx = standalone_write_transaction(conn).map_err(LeaseError::from)?;
             lease::release_sync(&tx, lease, now)?;
             #[cfg(feature = "test-control")]
             if let Some(hook) = before_commit {
@@ -5217,6 +5242,7 @@ mod operation_lifetime_tests {
             time::OffsetDateTime::UNIX_EPOCH + time::Duration::seconds(60),
         );
         ReplicationEntry {
+            replay_policy: crate::ReplicationReplayPolicy::prune_expired(),
             sequence: 1,
             tx_id: "sqlite-lifetime-replication"
                 .try_into()
@@ -6404,6 +6430,7 @@ mod watcher_lifetime_tests {
 
     fn watch_entry(sequence: u64) -> ReplicationEntry {
         ReplicationEntry {
+            replay_policy: crate::ReplicationReplayPolicy::prune_expired(),
             sequence,
             tx_id: format!("sqlite-watch-{sequence}")
                 .try_into()

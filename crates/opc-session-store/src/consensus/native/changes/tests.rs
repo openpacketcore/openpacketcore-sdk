@@ -19,6 +19,9 @@ use std::time::Duration;
 #[path = "reclaim_memory.rs"]
 mod reclaim_memory;
 
+#[path = "retention_capture.rs"]
+mod retention_capture;
+
 #[test]
 fn native_frontier_captures_preserve_nested_authority_without_allocating() {
     let (mut storage, _, _) = fixture();
@@ -389,14 +392,17 @@ pub(in crate::consensus::native) fn apply(
     storage: &mut NativeStorage,
     entries: &[Entry<SessionRaftTypeConfig>],
 ) -> NativeApplied {
-    let encoded = entries
+    let encoded: Vec<_> = entries
         .iter()
         .map(|entry| serde_json::to_vec(entry).unwrap().into())
         .collect();
-    storage
-        .log
-        .project(&Operation::Append(encoded), &storage.business, None)
-        .unwrap();
+    // OpenRaft can deliver several bounded append batches in one apply call.
+    for chunk in encoded.chunks(LOG_RPC_ENTRIES) {
+        storage
+            .log
+            .project(&Operation::Append(chunk.to_vec()), &storage.business, None)
+            .unwrap();
+    }
     storage
         .log
         .project(
@@ -1057,6 +1063,7 @@ fn native_changes_coalescing_keeps_remove_reinsert_and_equal_value_revisions() {
         key: 1,
         journal_key: Some(1),
         change: RowChange {
+            key_removal: None,
             before: Some(Box::new(original.clone())),
             after: None,
             before_hash: Some(first_hash),
@@ -1070,6 +1077,7 @@ fn native_changes_coalescing_keeps_remove_reinsert_and_equal_value_revisions() {
         key: 1,
         journal_key: Some(1),
         change: RowChange {
+            key_removal: None,
             before: None,
             after: Some(Box::new(replacement.clone())),
             before_hash: None,
@@ -1475,6 +1483,7 @@ pub(in crate::consensus::native) fn transient_history_capture(
         dirty.receipts.insert(
             id,
             RowChange {
+                key_removal: None,
                 before: None,
                 after: None,
                 before_hash: None,
@@ -1599,6 +1608,7 @@ fn native_deferral_capture_rejects_transient_removals_without_witnesses() {
         dirty.receipts.insert(
             id,
             RowChange {
+                key_removal: None,
                 before: None,
                 after: None,
                 before_hash: None,
@@ -1622,301 +1632,4 @@ fn native_deferral_capture_rejects_transient_removals_without_witnesses() {
         "native deferral capture removal lacks its deletion witness",
         "deferral removals require deletion witnesses even when both endpoint images are valid"
     );
-}
-
-/// A bounded rolling notification window keeps a store alive past the old
-/// lifetime cap: the front prefix is retired from committed watch sequence
-/// alone, the retained window still validates exactly, a below-floor watcher
-/// receives the typed stale-cursor answer, and capture/detach replay accounts
-/// for the retired rows.
-#[test]
-fn native_notification_retention_keeps_a_bounded_committed_window() {
-    let _retention =
-        crate::consensus::native::retention::tests_support::override_retained_for_test(4);
-    let (mut storage, _request, mut outcome) = fixture();
-    // Fixture activation does not notify; each accepted fenced transition
-    // update appends exactly one notification.
-    for index in 2..=10_u64 {
-        let next = request(index, Some(&outcome));
-        let applied = apply(
-            &mut storage,
-            &[command(index, &next, time(index as u8), false)],
-        );
-        let Ok(SessionMutationOutcome::FencedTransition(next_outcome)) =
-            &applied.responses[0].result
-        else {
-            panic!("native retention fixture transition failed")
-        };
-        outcome = next_outcome.clone();
-    }
-    let watch = storage.business.frontiers.watch_sequence;
-    let floor = storage.business.frontiers.notification_floor();
-    assert!(watch > 4, "the fixture passes the reduced retention window");
-    assert_eq!(floor, watch - 4);
-    assert_eq!(
-        storage.business.notifications.len() as u64,
-        4,
-        "only the bounded suffix remains resident"
-    );
-    assert_eq!(
-        storage.business.notifications.front().unwrap().sequence(),
-        floor + 1,
-        "the retained window starts at the derived floor"
-    );
-    storage
-        .business
-        .validate_full_business_rows()
-        .expect("the bounded window still validates completely");
-    storage
-        .validate_image()
-        .expect("the bounded image validates");
-
-    // A watcher at or below the floor gets the existing typed stale-cursor
-    // answer, never silence and never a wrong replay.
-    match storage.business.replication_log(0, 8, &|| Ok(())) {
-        Err(StoreError::ReplicationLogCursorCompacted { resume_from }) => {
-            assert_eq!(resume_from, floor + 1);
-        }
-        other => panic!("below-floor watcher did not receive the typed cursor answer: {other:?}"),
-    }
-    let page = storage
-        .business
-        .replication_log(floor + 1, 8, &|| Ok(()))
-        .expect("the retained suffix remains replayable");
-    assert_eq!(page.len() as u64, 4);
-    for (offset, entry) in page.iter().enumerate() {
-        assert_eq!(entry.sequence, floor + 1 + offset as u64);
-    }
-
-    // Capture/detach replays the exact retained additions and retired prefix
-    // stamps, so a successor can validate the same bounded window.
-    storage.business.begin_changes().unwrap();
-    let next_request = request(11, Some(&outcome));
-    apply(&mut storage, &[command(11, &next_request, time(11), false)]);
-    let captured = storage.business.capture_changes().unwrap();
-    captured
-        .validate_captured(&|| Ok(()))
-        .expect("a bounded retention journal replays exactly");
-    assert_eq!(
-        captured.target_proof().frontiers.notification_floor(),
-        storage.business.frontiers.notification_floor(),
-        "capture target retains the committed floor"
-    );
-}
-
-/// A bounded rolling notification window is a native business property, so a
-/// full image must round-trip the retained suffix, the derived floor and the
-/// stale-cursor answer without a persisted floor field.
-#[test]
-fn native_notification_retention_survives_full_image_round_trip() {
-    let _retention =
-        crate::consensus::native::retention::tests_support::override_retained_for_test(4);
-    let (mut storage, _request, mut outcome) = fixture();
-    for index in 2..=10_u64 {
-        let next = request(index, Some(&outcome));
-        let applied = apply(
-            &mut storage,
-            &[command(index, &next, time(index as u8), false)],
-        );
-        let Ok(SessionMutationOutcome::FencedTransition(next_outcome)) =
-            &applied.responses[0].result
-        else {
-            panic!("native retention fixture transition failed")
-        };
-        outcome = next_outcome.clone();
-    }
-    let watch = storage.business.frontiers.watch_sequence;
-    let floor = storage.business.frontiers.notification_floor();
-    assert!(watch > 4);
-    let mut image = Vec::new();
-    storage.write_image(&mut image, [0xCE; 32], 17).unwrap();
-    let cold =
-        NativeStorage::read_image(&mut image.as_slice(), [0xCE; 32], 17, identity()).unwrap();
-    assert_eq!(cold.business.frontiers.watch_sequence, watch);
-    assert_eq!(cold.business.frontiers.notification_floor(), floor);
-    assert_eq!(cold.business.notifications.len() as u64, 4);
-    assert_eq!(
-        cold.business.notifications.front().unwrap().sequence(),
-        floor + 1
-    );
-    cold.business.validate_full_business_rows().unwrap();
-    cold.validate_image().unwrap();
-    match cold.business.replication_log(0, 8, &|| Ok(())) {
-        Err(StoreError::ReplicationLogCursorCompacted { resume_from }) => {
-            assert_eq!(resume_from, floor + 1);
-        }
-        other => panic!("cold below-floor watcher did not receive the typed answer: {other:?}"),
-    }
-    let page = cold
-        .business
-        .replication_log(floor + 1, 8, &|| Ok(()))
-        .unwrap();
-    assert_eq!(page.len() as u64, 4);
-    for (offset, entry) in page.iter().enumerate() {
-        assert_eq!(entry.sequence, floor + 1 + offset as u64);
-    }
-}
-
-fn receipt_request_id(entry: &Entry<SessionRaftTypeConfig>) -> SessionConsensusRequestId {
-    match &entry.payload {
-        EntryPayload::Normal(command) => command.request_id,
-        _ => panic!("receipt fixture entry is not a normal command"),
-    }
-}
-
-fn rebind_request_id(entry: &mut Entry<SessionRaftTypeConfig>, id: SessionConsensusRequestId) {
-    let EntryPayload::Normal(command) = &mut entry.payload else {
-        panic!("receipt fixture entry is not a normal command")
-    };
-    command.request_id = id;
-}
-
-fn next_apply_index(storage: &NativeStorage) -> u64 {
-    storage
-        .business
-        .applied()
-        .expect("fixture has an applied frontier")
-        .index
-        + 1
-}
-
-/// Ordinary receipts are retired outside the committed logical-time window,
-/// an exact in-window retry still replays the original outcome, and an
-/// out-of-window retry gets the typed outcome-unavailable answer without a
-/// second execution.
-#[test]
-fn native_ordinary_receipt_retention_replays_inside_window_and_answers_outside() {
-    let _retention =
-        crate::consensus::native::retention::tests_support::override_ordinary_receipt_retention_for_test(
-            1, 10,
-        );
-    let (mut storage, _, _) = fixture();
-    let index = next_apply_index(&storage);
-    let first = clock(index, time(1));
-    let first_id = receipt_request_id(&first);
-    apply(&mut storage, &[first]);
-    assert!(
-        storage.business.generic_receipts.get(&first_id).is_some(),
-        "an in-window ordinary outcome is bound"
-    );
-    let index = next_apply_index(&storage);
-    apply(&mut storage, &[clock(index, time(21))]);
-    assert!(
-        storage.business.generic_receipts.get(&first_id).is_none(),
-        "out-of-window outcome is retired"
-    );
-    assert_eq!(
-        storage.business.generic_receipts.len(),
-        1,
-        "only the newest ordinary outcome stays retained"
-    );
-    storage.business.validate_full_business_rows().unwrap();
-
-    // Out-of-window exact retry: typed outcome-unavailable, no re-execution
-    // and no sequence or logical-time advance.
-    let before = storage.business.frontiers.clone();
-    let index = next_apply_index(&storage);
-    let mut stale_retry = clock(index, time(1));
-    rebind_request_id(&mut stale_retry, first_id);
-    let replayed = apply(&mut storage, &[stale_retry]).responses.remove(0);
-    assert!(matches!(
-        replayed.result,
-        Err(StoreError::BackendOperationOutcomeUnavailable)
-    ));
-    assert_eq!(storage.business.frontiers.sequence, before.sequence);
-    assert_eq!(storage.business.frontiers.logical_time, before.logical_time);
-    assert!(storage.business.generic_receipts.get(&first_id).is_none());
-
-    // In-window exact retry: the original outcome is returned unchanged.
-    let index = next_apply_index(&storage);
-    let fresh = clock(index, time(40));
-    let fresh_id = receipt_request_id(&fresh);
-    let original = apply(&mut storage, &[fresh]).responses.remove(0);
-    let index = next_apply_index(&storage);
-    let mut in_window_retry = clock(index, time(40));
-    rebind_request_id(&mut in_window_retry, fresh_id);
-    let replayed = apply(&mut storage, &[in_window_retry]).responses.remove(0);
-    assert_eq!(
-        replayed, original,
-        "an in-window retry recovers the original committed outcome"
-    );
-    storage.validate_image().unwrap();
-}
-
-/// Below the committed activation sequence the retention rule is inert, so a
-/// receipt older than the production window is still replayed exactly as
-/// before this change.
-#[test]
-fn native_ordinary_receipt_retention_stays_inert_below_activation() {
-    let _retention =
-        crate::consensus::native::retention::tests_support::override_ordinary_receipt_retention_for_test(
-            u64::MAX, 1,
-        );
-    let (mut storage, _, _) = fixture();
-    let index = next_apply_index(&storage);
-    let first = clock(index, time(1));
-    let first_id = receipt_request_id(&first);
-    let original = apply(&mut storage, &[first]).responses.remove(0);
-    let index = next_apply_index(&storage);
-    apply(&mut storage, &[clock(index, time(200))]);
-    assert!(
-        storage.business.generic_receipts.get(&first_id).is_some(),
-        "the rule must not retire anything below its committed activation"
-    );
-    let index = next_apply_index(&storage);
-    let mut retry = clock(index, time(1));
-    rebind_request_id(&mut retry, first_id);
-    let replayed = apply(&mut storage, &[retry]).responses.remove(0);
-    assert_eq!(
-        replayed, original,
-        "below activation the exact original outcome is still replayable"
-    );
-    storage.validate_image().unwrap();
-}
-
-/// Capacity refusals must not be able to grow a single committed delta past the
-/// bounded receipt capacity. A refusal may advance the committed logical clock,
-/// which makes base receipts reclaimable at the next publication; that must
-/// never be permission to bind more receipts inside the current delta (a
-/// committed delta has no RPC cap).
-#[test]
-fn native_ordinary_receipt_capacity_refusals_cannot_grow_the_delta_past_the_bound() {
-    let _retention =
-        crate::consensus::native::retention::tests_support::override_ordinary_receipt_retention_with_capacity_for_test(
-            1, 2, 4,
-        );
-    let (mut storage, _, _) = fixture();
-    for _ in 0..4 {
-        let index = next_apply_index(&storage);
-        let applied = apply(&mut storage, &[clock(index, time(1))]);
-        assert!(matches!(
-            applied.responses[0].result,
-            Ok(SessionMutationOutcome::Unit)
-        ));
-    }
-    assert_eq!(storage.business.generic_receipts.len(), 4);
-
-    // Every command below advances past the 2-second window. The first refusal
-    // makes all four base receipts reclaimable at publication, so a
-    // reclaimability-aware backstop would disable itself for the rest of this
-    // uncapped delta and bind these receipts.
-    let base_index = next_apply_index(&storage);
-    let mut entries = Vec::new();
-    for step in 0..8_u64 {
-        entries.push(clock(base_index + step, time(20 + step as u8)));
-    }
-    let applied = apply(&mut storage, &entries);
-    for (offset, response) in applied.responses.iter().enumerate() {
-        assert!(
-            matches!(response.result, Err(StoreError::BackendUnavailable(_))),
-            "capacity refusal {offset} must stay typed, got {:?}",
-            response.result
-        );
-    }
-    assert!(
-        storage.business.generic_receipts.len() <= 4,
-        "the published receipt map must not grow past the capacity bound, got {}",
-        storage.business.generic_receipts.len()
-    );
-    storage.validate_image().unwrap();
 }

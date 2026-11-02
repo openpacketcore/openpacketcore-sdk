@@ -345,6 +345,7 @@ fn native_roster_log_maximum_admission_body_keeps_original_bounds_and_detached_s
             lease: Some(NativeLease::from_guard(&guard).unwrap()),
             fence: guard.fence().get(),
             reserved: false,
+            retired_epoch: None,
         })
         .unwrap(),
     );
