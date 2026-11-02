@@ -78,7 +78,9 @@ pub(crate) async fn backend_data_snapshot(backend: &FakeSessionBackend) -> FakeB
     data_snapshot(&state)
 }
 
+#[cfg(target_os = "linux")]
 pub(crate) type ReplayKeyIdForTest = (String, String, String, Vec<u8>);
+#[cfg(target_os = "linux")]
 pub(crate) type ReplayLeaseForTest = (
     bool,
     OwnerId,
@@ -89,6 +91,7 @@ pub(crate) type ReplayLeaseForTest = (
     Timestamp,
 );
 
+#[cfg(target_os = "linux")]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct ReplayRowForTest {
     pub(crate) fence: u64,
@@ -97,6 +100,7 @@ pub(crate) struct ReplayRowForTest {
     pub(crate) retired_epoch: Option<u64>,
 }
 
+#[cfg(target_os = "linux")]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct ReplayStateForTest {
     pub(crate) async_fence_floor: u64,
@@ -108,6 +112,7 @@ pub(crate) struct ReplayStateForTest {
     pub(crate) next_credential: u64,
 }
 
+#[cfg(target_os = "linux")]
 pub(crate) fn replay_key_id_for_test(key: &SessionKey) -> ReplayKeyIdForTest {
     (
         key.tenant.as_str().to_owned(),
@@ -117,6 +122,7 @@ pub(crate) fn replay_key_id_for_test(key: &SessionKey) -> ReplayKeyIdForTest {
     )
 }
 
+#[cfg(target_os = "linux")]
 pub(crate) async fn replay_state_for_test(backend: &FakeSessionBackend) -> ReplayStateForTest {
     let state = backend.inner.lock().await;
     ReplayStateForTest {
@@ -175,6 +181,7 @@ pub(crate) async fn replay_state_for_test(backend: &FakeSessionBackend) -> Repla
     }
 }
 
+#[cfg(target_os = "linux")]
 pub(crate) async fn pending_replay_entries_for_test(backend: &FakeSessionBackend) -> Option<u16> {
     backend
         .inner
@@ -2580,6 +2587,7 @@ mod capacity_replay;
 #[path = "command_clock_regression_tests.rs"]
 mod command_clock_regressions;
 
+#[cfg(target_os = "linux")]
 pub(crate) fn with_tracked_key_limit_for_test(
     source: &FakeSessionBackend,
     maximum: usize,
@@ -2607,6 +2615,7 @@ pub(crate) async fn canonical_record_for_test(
         .cloned()
 }
 
+#[cfg(target_os = "linux")]
 pub(crate) async fn retained_record_count_for_test(backend: &FakeSessionBackend) -> usize {
     backend.inner.lock().await.records.len()
 }
