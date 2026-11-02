@@ -1065,6 +1065,8 @@ mod tests {
     #[test]
     fn native_sql_notification_base_reader_carries_the_bounded_retention_floor() {
         static USED: AtomicUsize = AtomicUsize::new(0);
+        let _retention =
+            crate::consensus::native::retention::tests_support::override_retained_for_test(4);
         let (mut conn, context) = fixture_rows_with_retention(9, 4);
         let tx = conn.transaction().unwrap();
         let budget = Budget::new(&USED, PROCESS_VERIFICATION_BYTES);

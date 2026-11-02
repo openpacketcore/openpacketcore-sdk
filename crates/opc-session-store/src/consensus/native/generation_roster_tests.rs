@@ -205,6 +205,7 @@ fn native_key_retirement_journal_stages_exact_once_and_publishes() {
         )],
     );
     let before = storage.business.keys.len();
+    storage.business.begin_changes().unwrap();
     storage
         .business
         .apply_key_retirement(key.clone())
@@ -214,6 +215,15 @@ fn native_key_retirement_journal_stages_exact_once_and_publishes() {
         .expect("retirement journal image valid");
     assert!(storage.business.keys.get(&key).is_none());
     assert_eq!(storage.business.keys.len(), before - 1);
+    assert_eq!(
+        storage
+            .business
+            .capture_changes()
+            .unwrap()
+            .generation_counts(0)[0],
+        1,
+        "retirement publishes one exact journal endpoint"
+    );
     // A stale resident expiry entry would surface as an infrastructure failure
     // on the next prune; acquire a fresh key after the retirement to exercise it.
     let prune_trigger = journal_key(&signed, b"journal-prune-trigger");
@@ -248,56 +258,109 @@ fn native_key_retirement_journal_stages_exact_once_and_publishes() {
 
 #[test]
 fn native_key_retirement_collapses_same_delta_create_update_and_duplicates() {
+    fn apply_retirements(
+        storage: &mut NativeStorage,
+        entries: &[Entry<SessionRaftTypeConfig>],
+        removals: Vec<SessionKey>,
+    ) {
+        // Business publication must have the same retained log lineage as an
+        // ordinary apply, including when the resulting key has no endpoint.
+        if let Some(last) = entries.last() {
+            let encoded = entries
+                .iter()
+                .map(|entry| serde_json::to_vec(entry).unwrap().into())
+                .collect();
+            storage
+                .log
+                .project(&Operation::Append(encoded), &storage.business, None)
+                .unwrap();
+            storage
+                .log
+                .project(
+                    &Operation::Committed(Some(last.log_id)),
+                    &storage.business,
+                    None,
+                )
+                .unwrap();
+        }
+        let applied = storage
+            .business
+            .apply_key_retirements_in_batch(entries, removals)
+            .expect("same-delta retirement publishes");
+        assert_eq!(applied.responses.len(), entries.len());
+        for response in applied.responses {
+            assert!(matches!(
+                response.result,
+                Ok(SessionMutationOutcome::Lease(_))
+            ));
+        }
+    }
+
     let signed = crate::consensus::types::roster_v2_persistence_fixture();
     let mut storage = configured(&signed);
+    storage.business.begin_changes().unwrap();
 
     // Create-then-retire: the key never exists as an endpoint; the candidate
     // change is collapsed and the transient journal entry is dropped.
     let created = journal_key(&signed, b"journal-create-retire");
-    storage
-        .business
-        .apply_key_retirements_in_batch(
-            &[entry(
-                &signed,
-                1,
-                SessionConsensusRequestId::from_bytes([0xBB; 16]),
-                SessionMutationIntent::AcquireLease {
-                    key: created.clone(),
-                    owner: signed.authority.owner().clone(),
-                    ttl: std::time::Duration::from_secs(60),
-                },
-            )],
-            vec![created.clone()],
-        )
-        .expect("create-then-retire collapses to no endpoint");
+    apply_retirements(
+        &mut storage,
+        &[entry(
+            &signed,
+            1,
+            SessionConsensusRequestId::from_bytes([0xBB; 16]),
+            SessionMutationIntent::AcquireLease {
+                key: created.clone(),
+                owner: signed.authority.owner().clone(),
+                ttl: std::time::Duration::from_secs(60),
+            },
+        )],
+        vec![created.clone()],
+    );
     storage
         .validate_image()
         .expect("create-then-retire image valid");
     assert!(storage.business.keys.get(&created).is_none());
+    assert_eq!(
+        storage
+            .business
+            .capture_changes()
+            .unwrap()
+            .generation_counts(0)[0],
+        0,
+        "create-then-retire collapses to no journal endpoint"
+    );
 
     // Update-then-retire: an existing committed key is updated in the same
     // delta and retired; the net change removes the predecessor row.
     let updated = signed.authority.key().clone();
-    storage
-        .business
-        .apply_key_retirements_in_batch(
-            &[entry(
-                &signed,
-                2,
-                SessionConsensusRequestId::from_bytes([0xBC; 16]),
-                SessionMutationIntent::AcquireLease {
-                    key: updated.clone(),
-                    owner: signed.authority.owner().clone(),
-                    ttl: std::time::Duration::from_secs(60),
-                },
-            )],
-            vec![updated.clone()],
-        )
-        .expect("update-then-retire stages one net removal");
+    apply_retirements(
+        &mut storage,
+        &[entry(
+            &signed,
+            2,
+            SessionConsensusRequestId::from_bytes([0xBC; 16]),
+            SessionMutationIntent::AcquireLease {
+                key: updated.clone(),
+                owner: signed.authority.owner().clone(),
+                ttl: std::time::Duration::from_secs(60),
+            },
+        )],
+        vec![updated.clone()],
+    );
     storage
         .validate_image()
         .expect("update-then-retire image valid");
     assert!(storage.business.keys.get(&updated).is_none());
+    assert_eq!(
+        storage
+            .business
+            .capture_changes()
+            .unwrap()
+            .generation_counts(0)[0],
+        1,
+        "update-then-retire stages one net journal removal"
+    );
 
     // Same-delta duplicate removals are deduplicated and staged once.
     let duplicate = journal_key(&signed, b"journal-duplicate");
@@ -312,14 +375,33 @@ fn native_key_retirement_collapses_same_delta_create_update_and_duplicates() {
         },
     );
     apply(&mut storage, &[acquire]);
-    storage
-        .business
-        .apply_key_retirements_in_batch(&[], vec![duplicate.clone(), duplicate.clone()])
-        .expect("duplicate removals are staged at most once");
+    assert_eq!(
+        storage
+            .business
+            .capture_changes()
+            .unwrap()
+            .generation_counts(0)[0],
+        1,
+        "the duplicate-removal case starts from a captured key"
+    );
+    apply_retirements(
+        &mut storage,
+        &[],
+        vec![duplicate.clone(), duplicate.clone()],
+    );
     storage
         .validate_image()
         .expect("duplicate retirement image valid");
     assert!(storage.business.keys.get(&duplicate).is_none());
+    assert_eq!(
+        storage
+            .business
+            .capture_changes()
+            .unwrap()
+            .generation_counts(0)[0],
+        1,
+        "duplicate removals are journaled exactly once"
+    );
 }
 
 #[test]
@@ -364,7 +446,7 @@ fn native_key_capacity_batch_boundary_refuses_without_mutation() {
         entry(
             &signed,
             index,
-            SessionConsensusRequestId::from_bytes([0xB7; 16]),
+            SessionConsensusRequestId::from_bytes(u128::from(index).to_le_bytes()),
             SessionMutationIntent::AcquireLease {
                 key,
                 owner: owner.clone(),
@@ -372,7 +454,10 @@ fn native_key_capacity_batch_boundary_refuses_without_mutation() {
             },
         )
     };
-    let applied = apply(&mut storage, &[acquire(1, key_a), acquire(2, key_b)]);
+    let applied = apply(
+        &mut storage,
+        &[acquire(1, key_a.clone()), acquire(2, key_b.clone())],
+    );
     assert!(matches!(
         applied.responses[0].result,
         Ok(SessionMutationOutcome::Lease(_))
@@ -387,6 +472,8 @@ fn native_key_capacity_batch_boundary_refuses_without_mutation() {
         2,
         "a refused capacity admission cannot mutate the key map"
     );
+    assert!(storage.business.keys.get(&key_a).is_some());
+    assert!(storage.business.keys.get(&key_b).is_none());
 }
 
 #[test]

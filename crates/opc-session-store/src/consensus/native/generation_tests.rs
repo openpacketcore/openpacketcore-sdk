@@ -1070,27 +1070,27 @@ fn native_notification_retention_relocates_sparse_rows_after_delta_append() {
         "both delta notification additions are selected for relocation"
     );
 
-    // Replay the production ordering: the resident owner already holds the
-    // target retained window (predecessor suffix advanced by the delta), while
-    // the two additions are re-pointed at their delta-file bodies.
+    // Real apply already advanced the owner to the target retained window.
+    // Keep that window intact: publication must relocate the two resident
+    // additions itself, leaving the surviving predecessor rows unchanged.
     let predecessor_suffix: Vec<NotificationRow> = storage
         .business
         .notifications
         .iter()
-        .skip(2)
+        .take(2)
         .cloned()
         .collect();
     assert_eq!(predecessor_suffix.len(), 2);
-    for (index, row) in predecessor_suffix.into_iter().enumerate() {
-        let _ = storage.business.notifications.set(index, row);
-    }
     for (index, row) in &replacements {
         assert_eq!(
             *index as u64,
             row.sequence() - after_floor - 1,
             "relocation must use the retained-window ordinal"
         );
-        let _ = storage.business.notifications.set(*index, row.clone());
+        let current = storage.business.notifications.get(*index).unwrap();
+        assert!(current.resident().is_ok());
+        assert!(current.ptr_eq(row));
+        assert!(!current.is_selected_for_test());
     }
     let target_raw: Vec<u64> = storage
         .business
@@ -1110,6 +1110,14 @@ fn native_notification_retention_relocates_sparse_rows_after_delta_append() {
         steps += 1;
     }
     assert!(steps > 0, "the relocation batch must have published work");
+    for (index, before) in predecessor_suffix.iter().enumerate() {
+        let after = storage.business.notifications.get(index).unwrap();
+        assert!(
+            after.ptr_eq(before),
+            "surviving predecessor revision is unchanged"
+        );
+        assert_eq!(after.is_selected_for_test(), before.is_selected_for_test());
+    }
     for (index, row) in &replacements {
         let published = storage.business.notifications.get(*index).unwrap();
         assert!(

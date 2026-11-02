@@ -253,7 +253,10 @@ fn log_id(index: u64) -> LogId<SessionConsensusNodeId> {
     )
 }
 pub(in crate::consensus::native) fn time(second: u8) -> Timestamp {
-    Timestamp::from_str(&format!("2026-07-12T00:00:{second:02}Z")).unwrap()
+    Timestamp::from_str("2026-07-12T00:00:00Z")
+        .unwrap()
+        .add_seconds(i64::from(second))
+        .unwrap()
 }
 fn formation() -> Entry<SessionRaftTypeConfig> {
     Entry {
