@@ -52,6 +52,9 @@ x509-parser = { workspace = true }
 zeroize = { workspace = true }
 
 [dev-dependencies]
+rcgen = { workspace = true }
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "net", "time"] }
+tokio-rustls = { workspace = true }
 hmac = { workspace = true }
 rsa = { workspace = true, features = ["getrandom"] }
 opc-crypto = { path = "../opc-crypto", version = "0.2.0" }

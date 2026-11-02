@@ -45,7 +45,8 @@ async fn canceled_submit_still_raises_worker_commit_alarm() {
 
     let alarm = wait_for_single_active_alarm(&alarms, "config-bus.commit.failure").await;
     assert_eq!(alarm.severity, Severity::Major);
-    assert_eq!(alarm.probable_cause, ProbableCause::StorageCorruption);
+    // A failed or unresolved commit is not evidence of corrupt stored bytes.
+    assert_eq!(alarm.probable_cause, ProbableCause::ConfigApplyFailed);
     assert_alarm_details_code(&alarm, "persist_failed");
     assert!(!serde_json::to_string(&alarms.all_alarms())
         .expect("alarm history serializes")
@@ -85,7 +86,8 @@ async fn canceled_submit_append_panic_still_raises_outcome_unknown_alarm() {
 
     let alarm = wait_for_single_active_alarm(&alarms, "config-bus.commit.failure").await;
     assert_eq!(alarm.severity, Severity::Major);
-    assert_eq!(alarm.probable_cause, ProbableCause::StorageCorruption);
+    // A failed or unresolved commit is not evidence of corrupt stored bytes.
+    assert_eq!(alarm.probable_cause, ProbableCause::ConfigApplyFailed);
     assert_alarm_details_code(&alarm, "outcome_unknown");
     assert_eq!(bus.drift_state(), DriftState::RecoveryRequired);
 }
@@ -115,7 +117,8 @@ async fn datastore_append_panic_is_outcome_unknown_and_fences_recovery() {
     );
     let first_alarm = single_active_alarm(&alarms, "config-bus.commit.failure");
     assert_eq!(first_alarm.severity, Severity::Major);
-    assert_eq!(first_alarm.probable_cause, ProbableCause::StorageCorruption);
+    // An unknown outcome needs reconciliation, not a corruption verdict.
+    assert_eq!(first_alarm.probable_cause, ProbableCause::ConfigApplyFailed);
     assert_alarm_details_code(&first_alarm, "outcome_unknown");
     assert_eq!(bus.drift_state(), DriftState::RecoveryRequired);
 
@@ -134,7 +137,8 @@ async fn datastore_append_panic_is_outcome_unknown_and_fences_recovery() {
 
     let alarm = single_active_alarm(&alarms, "config-bus.commit.failure");
     assert_eq!(alarm.severity, Severity::Major);
-    assert_eq!(alarm.probable_cause, ProbableCause::StorageCorruption);
+    // A failed or unresolved commit is not evidence of corrupt stored bytes.
+    assert_eq!(alarm.probable_cause, ProbableCause::ConfigApplyFailed);
     assert_alarm_details_code(&alarm, "recovery_required");
 }
 
@@ -169,7 +173,8 @@ async fn post_append_panic_reports_outcome_unknown_and_fences_until_reconciled()
     assert_eq!(bus.drift_state(), DriftState::RecoveryRequired);
     let alarm = single_active_alarm(&alarms, "config-bus.commit.failure");
     assert_eq!(alarm.severity, Severity::Major);
-    assert_eq!(alarm.probable_cause, ProbableCause::StorageCorruption);
+    // A failed or unresolved commit is not evidence of corrupt stored bytes.
+    assert_eq!(alarm.probable_cause, ProbableCause::ConfigApplyFailed);
     assert_alarm_details_code(&alarm, "outcome_unknown");
 
     let follow_up = bus

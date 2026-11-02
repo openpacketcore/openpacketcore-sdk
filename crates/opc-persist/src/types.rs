@@ -984,7 +984,7 @@ pub(crate) fn clear_config_recovery_required(stored: &str) -> Result<Option<Stri
     metadata.recovery_required = false;
     serde_json::to_string(&metadata)
         .map(Some)
-        .map_err(|_| PersistError::corrupt_blob())
+        .map_err(|_| PersistError::inconsistent_state("config recovery marker encoding failed"))
 }
 
 pub(crate) fn validate_replay_lookup_digest(digest: &str) -> Result<(), PersistError> {

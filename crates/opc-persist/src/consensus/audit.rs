@@ -98,7 +98,7 @@ fn read_verified_sync(conn: &Connection, key: &AuditKey) -> io::Result<StoredLed
     let (encoded, mac): (Vec<u8>,Vec<u8>) = conn.query_row(
         "SELECT state_json, state_hmac FROM config_raft_management_audit WHERE singleton = 1 AND length(state_json) BETWEEN 1 AND 16777216 AND length(state_hmac) = 32",
         [], |row| Ok((row.get(0)?,row.get(1)?)),
-    ).optional().map_err(|_| invalid())?.ok_or_else(invalid)?;
+    ).optional().map_err(crate::error::sqlite_read_io_error)?.ok_or_else(invalid)?;
     let mac: [u8; 32] = mac.try_into().map_err(|_| invalid())?;
     let stored: StoredLedger = serde_json::from_slice(&encoded).map_err(|_| invalid())?;
     verify(key, STATE_DOMAIN, &stored, &mac).map_err(|_| invalid())?;
@@ -112,7 +112,7 @@ fn read_verified_sync(conn: &Connection, key: &AuditKey) -> io::Result<StoredLed
         "SELECT EXISTS(SELECT 1 FROM config_raft_identity WHERE singleton=1 AND cluster_id=?1 AND configuration_id=?2 AND configuration_epoch=?3)",
         params![identity.cluster_id().as_bytes().as_slice(),identity.configuration_id().as_bytes().as_slice(),identity.configuration_epoch().get() as i64],
         |row| row.get(0),
-    ).map_err(|_| invalid())?;
+    ).map_err(crate::error::sqlite_read_io_error)?;
     if !matches {
         return Err(invalid());
     }

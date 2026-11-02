@@ -230,7 +230,8 @@ async fn preflight_provider_and_encryption_errors_return_the_lease() {
         )
         .await
         .unwrap_err(),
-        ConfigCapacityError::EncryptionFailed
+        // This fixture reports a provider outage, not a rejected configuration.
+        ConfigCapacityError::ProviderUnavailable
     );
     assert_eq!(provider.calls(), 1);
     provider.mode = Mode::Ready;

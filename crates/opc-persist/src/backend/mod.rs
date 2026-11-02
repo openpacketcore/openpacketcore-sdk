@@ -32,6 +32,8 @@ use crate::types::{extract_tenant, AuditKey, AuditOpType, AuditRecord, CommitSou
 use opc_types::TxId;
 
 mod ops;
+#[cfg(test)]
+mod tests;
 
 /// Connection storage shared with detached workers. Field order is deliberate:
 /// rusqlite must finish closing before the final retained admission is dropped.
@@ -127,7 +129,7 @@ pub(crate) fn validate_uuid_bytes(name: &str, bytes: &[u8]) -> Result<(), Persis
 }
 
 /// Deserialize a CommitSource from a DB-stored lowercase string.
-/// Returns `PersistError::inconsistent_state()` if the value is unrecognized.
+/// Returns `PersistError::corrupt_blob()` if the stored value is unrecognized.
 pub(crate) fn deserialize_commit_source(source: &str) -> Result<CommitSource, PersistError> {
     match source {
         "gnmi" => Ok(CommitSource::Gnmi),
@@ -136,9 +138,7 @@ pub(crate) fn deserialize_commit_source(source: &str) -> Result<CommitSource, Pe
         "startup_restore" => Ok(CommitSource::StartupRestore),
         "rollback" => Ok(CommitSource::Rollback),
         "commit_confirmed_restore" => Ok(CommitSource::CommitConfirmedRestore),
-        _ => Err(PersistError::inconsistent_state(
-            "unrecognized CommitSource in config_history",
-        )),
+        _ => Err(PersistError::corrupt_blob()),
     }
 }
 
@@ -389,8 +389,12 @@ impl SqliteBackend {
         }
 
         let conn = Self::open_connection(&path, &audit_key)?;
+        #[cfg(test)]
+        let heap_pressure = tests::before_metadata_read(&conn);
         let consensus_required = crate::consensus::history::has_consensus_metadata_sync(&conn)
-            .map_err(|_| PersistError::corrupt_blob())?;
+            .map_err(crate::error::history_read_error)?;
+        #[cfg(test)]
+        drop(heap_pressure);
 
         let backend = Self {
             db_path: path,

@@ -591,6 +591,7 @@ dependencies = [
  "aes-gcm-siv",
  "async-trait",
  "hkdf",
+ "libc",
  "opc-crypto-provider",
  "opc-identity",
  "opc-tls",

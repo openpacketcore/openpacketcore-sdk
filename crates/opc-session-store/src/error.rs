@@ -253,6 +253,17 @@ pub enum StoreError {
     /// Append-only to preserve every existing serialized discriminant.
     #[error("backend unavailable: protected fenced-transition V2 recovery journal unavailable")]
     FencedTransitionRecoveryJournalUnavailable,
+    /// Retryable key-provider outage with a fixed position in this error schema.
+    /// This variant was introduced in the current unreleased version.
+    /// Record encryption and decryption return
+    /// [`StoreError::BackendUnavailable`] for provider outages and unusable
+    /// provider configuration. Retain data and back off; configuration failures
+    /// also emit a fixed operator diagnostic. Content-dependent failures remain
+    /// collapsed into [`StoreError::Crypto`].
+    ///
+    /// Append-only to preserve every existing serialized discriminant.
+    #[error("key provider unavailable: {0}")]
+    KeyProviderUnavailable(String),
 }
 
 impl StoreError {
@@ -271,6 +282,7 @@ impl StoreError {
             Self::TopologyAuthorityRevoked => "TopologyAuthorityRevoked",
             Self::CapabilityNotSupported(..) => "CapabilityNotSupported",
             Self::BackendUnavailable(..) => "BackendUnavailable",
+            Self::KeyProviderUnavailable(..) => "KeyProviderUnavailable",
             Self::InvalidKey(..) => "InvalidKey",
             Self::InvalidReplicationSequence => "InvalidReplicationSequence",
             Self::InvalidReplicationLogRange => "InvalidReplicationLogRange",
@@ -643,6 +655,7 @@ mod tests {
             StoreError::FencedTransitionStorageExhausted,
             StoreError::SessionRecordReserved,
             StoreError::FencedTransitionRecoveryJournalUnavailable,
+            StoreError::KeyProviderUnavailable("envelope encryption failed".into()),
         ] {
             let encoded = opc_consensus::encode_bounded(&appended)
                 .expect("appended StoreError postcard encoding");

@@ -205,6 +205,76 @@ impl std::fmt::Display for PersistError {
 
 impl std::error::Error for PersistError {}
 
+/// Classify a failure where SQLite reads persisted bytes. Callers performing
+/// writes or constructing local statements must retain their own write errors.
+pub(crate) fn sqlite_read_error(error: rusqlite::Error) -> PersistError {
+    match error {
+        rusqlite::Error::SqliteFailure(code, _) => match code.code {
+            rusqlite::ErrorCode::DatabaseCorrupt | rusqlite::ErrorCode::NotADatabase => {
+                PersistError::corrupt_blob()
+            }
+            rusqlite::ErrorCode::Unknown
+            | rusqlite::ErrorCode::InternalMalfunction
+            | rusqlite::ErrorCode::ApiMisuse
+            | rusqlite::ErrorCode::ParameterOutOfRange
+            | rusqlite::ErrorCode::ConstraintViolation => {
+                PersistError::inconsistent_state("config storage read invariant failed")
+            }
+            _ => PersistError::unavailable(),
+        },
+        rusqlite::Error::FromSqlConversionFailure(..)
+        | rusqlite::Error::IntegralValueOutOfRange(..)
+        | rusqlite::Error::Utf8Error(..)
+        | rusqlite::Error::InvalidColumnType(..) => PersistError::corrupt_blob(),
+        _ => PersistError::inconsistent_state("config storage read invariant failed"),
+    }
+}
+
+/// Preserve the source classification across the consensus I/O interface.
+pub(crate) fn sqlite_read_io_error(error: rusqlite::Error) -> std::io::Error {
+    persist_read_io_error(sqlite_read_error(error))
+}
+
+/// Carry an existing read classification without deriving a new verdict.
+pub(crate) fn persist_read_io_error(error: PersistError) -> std::io::Error {
+    let kind = if matches!(error.kind(), PersistErrorKind::CorruptBlob) {
+        std::io::ErrorKind::InvalidData
+    } else {
+        std::io::ErrorKind::Other
+    };
+    std::io::Error::new(kind, error)
+}
+
+/// Building the in-memory schema reference is a read prerequisite, not a read
+/// of persisted bytes. Resource failures remain retryable; a broken local
+/// reference must never be reported as rejected stored data.
+pub(crate) fn sqlite_reference_io_error(error: rusqlite::Error) -> std::io::Error {
+    let error = sqlite_read_error(error);
+    if matches!(error.kind(), PersistErrorKind::Unavailable) {
+        std::io::Error::other(error)
+    } else {
+        std::io::Error::other(PersistError::inconsistent_state(
+            "config schema reference construction failed",
+        ))
+    }
+}
+
+pub(crate) fn history_read_error(error: std::io::Error) -> PersistError {
+    if let Some(classified) = error
+        .get_ref()
+        .and_then(|cause| cause.downcast_ref::<PersistError>())
+    {
+        return classified.clone();
+    }
+    // History content/authentication checks explicitly return InvalidData.
+    // Cancellation and failed reads never establish rejected stored bytes.
+    if error.kind() == std::io::ErrorKind::InvalidData {
+        PersistError::corrupt_blob()
+    } else {
+        PersistError::unavailable()
+    }
+}
+
 impl PersistError {
     /// Construct a typed persistence error.
     pub fn new(kind: PersistErrorKind) -> Self {
@@ -352,9 +422,73 @@ impl From<std::io::Error> for PersistError {
     }
 }
 
+// SQLite can still prepare small statements from its preallocated lookaside
+// pool after lowering the global heap limit. Hold those slots until the real
+// read under test completes. This helper is used only in isolated child tests.
+#[cfg(test)]
+pub(crate) fn exhaust_sqlite_heap(conn: &rusqlite::Connection) -> Vec<rusqlite::Statement<'_>> {
+    let _ = conn.execute_batch("PRAGMA hard_heap_limit=1");
+    let mut statements = Vec::new();
+    for _ in 0..1024 {
+        match conn.prepare("SELECT 1") {
+            Ok(statement) => statements.push(statement),
+            Err(error) => {
+                assert_eq!(
+                    error.sqlite_error_code(),
+                    Some(rusqlite::ErrorCode::OutOfMemory)
+                );
+                return statements;
+            }
+        }
+    }
+    panic!("SQLite heap limit must prevent further statement allocation");
+}
+
 #[cfg(test)]
 mod tests {
-    use super::PersistError;
+    use super::{
+        history_read_error, sqlite_read_error, sqlite_read_io_error, sqlite_reference_io_error,
+        PersistError, PersistErrorKind,
+    };
+
+    #[test]
+    fn sqlite_read_classification_survives_history_io_boundary() {
+        for code in [rusqlite::ffi::SQLITE_CORRUPT, rusqlite::ffi::SQLITE_NOTADB] {
+            let error = rusqlite::Error::SqliteFailure(rusqlite::ffi::Error::new(code), None);
+            let error = history_read_error(sqlite_read_io_error(error));
+            assert!(matches!(error.kind(), PersistErrorKind::CorruptBlob));
+        }
+        for code in [
+            rusqlite::ffi::SQLITE_NOMEM,
+            rusqlite::ffi::SQLITE_BUSY,
+            rusqlite::ffi::SQLITE_IOERR,
+        ] {
+            let error = rusqlite::Error::SqliteFailure(rusqlite::ffi::Error::new(code), None);
+            let error = history_read_error(sqlite_read_io_error(error));
+            assert!(matches!(error.kind(), PersistErrorKind::Unavailable));
+        }
+        let local = sqlite_read_error(rusqlite::Error::InvalidParameterCount(2, 1));
+        let error = history_read_error(std::io::Error::other(local));
+        assert!(matches!(
+            error.kind(),
+            PersistErrorKind::InconsistentState(_)
+        ));
+        let no_memory = rusqlite::Error::SqliteFailure(
+            rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_NOMEM),
+            None,
+        );
+        let error = history_read_error(sqlite_reference_io_error(no_memory));
+        assert!(matches!(error.kind(), PersistErrorKind::Unavailable));
+        let bad_reference = rusqlite::Error::SqliteFailure(
+            rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_CORRUPT),
+            None,
+        );
+        let error = history_read_error(sqlite_reference_io_error(bad_reference));
+        assert!(matches!(
+            error.kind(),
+            PersistErrorKind::InconsistentState(_)
+        ));
+    }
 
     #[test]
     fn display_redacts_sensitive_storage_details() {

@@ -6,6 +6,273 @@ use opc_key::{KeyId, KeyPurpose, MemoryKeyProvider};
 use std::collections::BTreeMap;
 use std::str::FromStr;
 
+#[test]
+fn checkpoint_heap_outage_is_unavailable_without_changing_bytes() {
+    const CHILD: &str = "OPC_CHECKPOINT_HEAP_CHILD";
+    if let Some(directory) = std::env::var_os(CHILD) {
+        let path = Path::new(&directory).join("checkpoint.sqlite");
+        tokio::runtime::Runtime::new().unwrap().block_on(async {
+            ConsumerCheckpointStore::provision(options(&path), keys(0x51))
+                .await
+                .unwrap()
+                .shutdown()
+                .await
+                .unwrap();
+        });
+        let conn = Connection::open(&path).unwrap();
+        read_row(&conn, &options(&path)).unwrap();
+        let before = std::fs::read(&path).unwrap();
+        let wal = path.with_extension("sqlite-wal");
+        let wal_before = std::fs::read(&wal).unwrap_or_default();
+        let _pressure = crate::error::exhaust_sqlite_heap(&conn);
+        let probe = conn
+            .query_row("SELECT COUNT(*) FROM consumer_checkpoint", [], |row| {
+                row.get::<_, i64>(0)
+            })
+            .unwrap_err();
+        assert_eq!(
+            probe.sqlite_error_code(),
+            Some(rusqlite::ErrorCode::OutOfMemory)
+        );
+        let failure = read_row(&conn, &options(&path)).err().unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+        assert_eq!(std::fs::read(&wal).unwrap_or_default(), wal_before);
+        assert_eq!(failure, ConsumerCheckpointError::Unavailable);
+        return;
+    }
+    let directory = tempfile::tempdir().unwrap();
+    let child = std::process::Command::new(std::env::current_exe().unwrap())
+        .args(["--exact", "consumer_checkpoint::tests::checkpoint_heap_outage_is_unavailable_without_changing_bytes", "--test-threads=1", "--nocapture"])
+        .env(CHILD, directory.path()).output().unwrap();
+    assert!(
+        child.status.success(),
+        "{}\n{}",
+        String::from_utf8_lossy(&child.stdout),
+        String::from_utf8_lossy(&child.stderr)
+    );
+    tokio::runtime::Runtime::new().unwrap().block_on(async {
+        let mut repaired = ConsumerCheckpointStore::reopen(
+            options(&directory.path().join("checkpoint.sqlite")),
+            keys(0x51),
+        )
+        .await
+        .unwrap();
+        let (_, payload) = repaired.read_back().await.unwrap().into_parts();
+        assert!(payload.is_empty());
+        repaired.shutdown().await.unwrap();
+    });
+}
+
+#[derive(Clone, Default)]
+struct CapturedDiagnostics(Arc<Mutex<Vec<String>>>);
+impl tracing::Subscriber for CapturedDiagnostics {
+    fn enabled(&self, _: &tracing::Metadata<'_>) -> bool {
+        true
+    }
+    fn new_span(&self, _: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+        tracing::span::Id::from_u64(1)
+    }
+    fn record(&self, _: &tracing::span::Id, _: &tracing::span::Record<'_>) {}
+    fn record_follows_from(&self, _: &tracing::span::Id, _: &tracing::span::Id) {}
+    fn event(&self, event: &tracing::Event<'_>) {
+        struct Visitor(String);
+        impl tracing::field::Visit for Visitor {
+            fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+                use std::fmt::Write;
+                let _ = write!(self.0, "{field}={value:?};");
+            }
+        }
+        let mut visitor = Visitor(String::new());
+        event.record(&mut visitor);
+        self.0.lock().unwrap().push(visitor.0);
+    }
+    fn enter(&self, _: &tracing::span::Id) {}
+    fn exit(&self, _: &tracing::span::Id) {}
+}
+impl CapturedDiagnostics {
+    fn repair_reported(&self) -> bool {
+        self.0.lock().unwrap().iter().any(|report| {
+            report.contains("checkpoint key provider configuration unavailable")
+                && report.contains("retain checkpoint")
+                && report.contains("provider repair")
+        })
+    }
+    fn assert_repair_report(&self) {
+        assert!(
+            self.repair_reported(),
+            "missing operator diagnostic: {:?}",
+            self.0.lock().unwrap()
+        );
+        assert!(
+            !self
+                .0
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|report| report.contains("checkpoint-private-canary")),
+            "diagnostic must be redacted"
+        );
+    }
+}
+
+struct SwitchingProvider {
+    inner: Arc<MemoryKeyProvider>,
+    error: Mutex<Option<opc_key::KeyError>>,
+}
+#[async_trait::async_trait]
+impl KeyProvider for SwitchingProvider {
+    async fn get_active_key(
+        &self,
+        purpose: KeyPurpose,
+        tenant: &TenantId,
+    ) -> Result<opc_key::KeyHandle, opc_key::KeyError> {
+        if let Some(error) = self.error.lock().unwrap().clone() {
+            return Err(error);
+        }
+        self.inner.get_active_key(purpose, tenant).await
+    }
+    async fn get_key_by_id(&self, id: &KeyId) -> Result<opc_key::KeyHandle, opc_key::KeyError> {
+        if let Some(error) = self.error.lock().unwrap().clone() {
+            return Err(error);
+        }
+        self.inner.get_key_by_id(id).await
+    }
+    async fn rotate_key(
+        &self,
+        purpose: KeyPurpose,
+        tenant: &TenantId,
+    ) -> Result<KeyId, opc_key::KeyError> {
+        self.inner.rotate_key(purpose, tenant).await
+    }
+}
+#[tokio::test]
+async fn checkpoint_read_back_retains_rows_and_reports_provider_repair() {
+    use tracing::instrument::WithSubscriber;
+    for error in [
+        opc_key::KeyError::ProviderUnusable,
+        opc_key::KeyCustodyOperationError::CapabilityWithdrawn.into(),
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        let provider = Arc::new(SwitchingProvider {
+            inner: keys(0x51),
+            error: Mutex::new(None),
+        });
+        let mut store = ConsumerCheckpointStore::provision(
+            options(&dir.path().join("checkpoint.sqlite")),
+            provider.clone(),
+        )
+        .await
+        .unwrap();
+        let (generation, _) = store.read_back().await.unwrap().into_parts();
+        let payload = b"checkpoint-private-canary".to_vec();
+        let (generation, _) = store
+            .compare_and_set(generation, Zeroizing::new(payload.clone()))
+            .await
+            .unwrap()
+            .into_parts();
+        *provider.error.lock().unwrap() = Some(error);
+        let reports = CapturedDiagnostics::default();
+        assert_eq!(
+            store
+                .read_back()
+                .with_subscriber(reports.clone())
+                .await
+                .unwrap_err(),
+            ConsumerCheckpointError::Unavailable
+        );
+        reports.assert_repair_report();
+        *provider.error.lock().unwrap() = None;
+        let (actual, recovered) = store.read_back().await.unwrap().into_parts();
+        assert_eq!(actual, generation);
+        assert_eq!(*recovered, payload);
+        store.shutdown().await.unwrap();
+    }
+}
+#[tokio::test]
+async fn checkpoint_seal_and_provision_report_provider_repair() {
+    use tracing::instrument::WithSubscriber;
+    let dir = tempfile::tempdir().unwrap();
+    let provider = Arc::new(SwitchingProvider {
+        inner: keys(0x51),
+        error: Mutex::new(None),
+    });
+    let mut store = ConsumerCheckpointStore::provision(
+        options(&dir.path().join("checkpoint.sqlite")),
+        provider.clone(),
+    )
+    .await
+    .unwrap();
+    let (generation, _) = store.read_back().await.unwrap().into_parts();
+    *provider.error.lock().unwrap() = Some(opc_key::KeyError::ProviderUnusable);
+    let seal_reports = CapturedDiagnostics::default();
+    let seal_error = store
+        .compare_and_set(
+            generation,
+            Zeroizing::new(b"checkpoint-private-canary".to_vec()),
+        )
+        .with_subscriber(seal_reports.clone())
+        .await
+        .unwrap_err();
+    assert_eq!(seal_error, ConsumerCheckpointError::Unavailable);
+    // Record both diagnostics before asserting, so a baseline run exposes both gaps.
+    let provision_reports = CapturedDiagnostics::default();
+    let provision_error = ConsumerCheckpointStore::provision(
+        options(&dir.path().join("new.sqlite")),
+        provider.clone(),
+    )
+    .with_subscriber(provision_reports.clone())
+    .await
+    .unwrap_err();
+    // Provisioning has already prepared storage, so the public result keeps
+    // its existing indeterminate-write classification. It still needs the
+    // provider repair diagnostic from the original encryption failure.
+    assert_eq!(provision_error, ConsumerCheckpointError::Indeterminate);
+    *provider.error.lock().unwrap() = None;
+    let (actual, payload) = store.read_back().await.unwrap().into_parts();
+    assert_eq!(actual, generation);
+    assert!(payload.is_empty());
+    store.shutdown().await.unwrap();
+    assert_eq!(
+        (
+            seal_reports.repair_reported(),
+            provision_reports.repair_reported()
+        ),
+        (true, true),
+        "seal and provision both need an operator diagnostic"
+    );
+    seal_reports.assert_repair_report();
+    provision_reports.assert_repair_report();
+}
+
+#[test]
+fn checkpoint_local_encryption_failure_is_not_evidence_against_stored_data() {
+    // This no-subscriber call must not race the diagnostic-capture test at
+    // the same tracing callsite. Keep the assertion in an isolated process.
+    const CHILD: &str = "OPC_CHECKPOINT_LOCAL_FAILURE_CHILD";
+    if std::env::var_os(CHILD).is_none() {
+        let child = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "consumer_checkpoint::tests::checkpoint_local_encryption_failure_is_not_evidence_against_stored_data",
+                "--test-threads=1",
+                "--nocapture",
+            ])
+            .env(CHILD, "1")
+            .output().unwrap();
+        assert!(
+            child.status.success(),
+            "{}\n{}",
+            String::from_utf8_lossy(&child.stdout),
+            String::from_utf8_lossy(&child.stderr)
+        );
+        return;
+    }
+    assert_eq!(
+        checkpoint_decrypt_error(opc_crypto::CryptoError::EncryptionFailed),
+        ConsumerCheckpointError::Unavailable
+    );
+}
+
 fn options(path: &Path) -> ConsumerCheckpointOptions {
     let scope = ConfigConsensusIdentity::new(
         ConfigConsensusClusterId::from_bytes([0x21; 32]),
@@ -167,6 +434,54 @@ async fn checkpoint_drop_and_shutdown_hold_admission_through_sqlite_close() {
             .await
             .expect("release");
     }
+}
+
+#[tokio::test]
+async fn provider_configuration_during_checkpoint_reopen_preserves_the_row() {
+    provider_failure_during_checkpoint_reopen_preserves_the_row("unix://".into()).await;
+}
+
+#[tokio::test]
+async fn provider_outage_during_checkpoint_reopen_preserves_the_row() {
+    provider_failure_during_checkpoint_reopen_preserves_the_row(format!(
+        "/tmp/absent-kms-{}-checkpoint",
+        std::process::id()
+    ))
+    .await;
+}
+
+async fn provider_failure_during_checkpoint_reopen_preserves_the_row(endpoint: String) {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("checkpoint.sqlite");
+    let options = options(&path);
+    let working = keys(0x51);
+    let mut store = ConsumerCheckpointStore::provision(options.clone(), working.clone())
+        .await
+        .unwrap();
+    let (generation, _) = store.read_back().await.unwrap().into_parts();
+    let payload = b"retain-the-checkpoint".to_vec();
+    let (generation, _) = store
+        .compare_and_set(generation, Zeroizing::new(payload.clone()))
+        .await
+        .unwrap()
+        .into_parts();
+    store.shutdown().await.unwrap();
+    let provider = Arc::new(opc_key::KmsKeyProvider::new(
+        endpoint,
+        None,
+        Duration::from_secs(1),
+    ));
+    let error = ConsumerCheckpointStore::reopen(options.clone(), provider)
+        .await
+        .unwrap_err();
+    assert_eq!(error, ConsumerCheckpointError::Unavailable);
+    let mut restored = ConsumerCheckpointStore::reopen(options, working)
+        .await
+        .unwrap();
+    let (actual, recovered) = restored.read_back().await.unwrap().into_parts();
+    assert_eq!(actual, generation);
+    assert_eq!(*recovered, payload);
+    restored.shutdown().await.unwrap();
 }
 
 #[tokio::test]
@@ -1086,4 +1401,34 @@ fn completed_checkpoint_open_keeps_its_known_outcome_after_storage_latency() {
             store.shutdown().await.unwrap();
         }
     });
+}
+
+fn assert_checkpoint_write_diagnostic(
+    error: opc_crypto::CryptoError,
+    expected: &str,
+    forbidden: &str,
+) {
+    let diagnostics = CapturedDiagnostics::default();
+    let result =
+        tracing::subscriber::with_default(diagnostics.clone(), || checkpoint_encrypt_error(error));
+    assert_eq!(result, ConsumerCheckpointError::Unavailable);
+    let reports = diagnostics.0.lock().unwrap().join("\n");
+    assert!(reports.contains(expected), "{reports}");
+    assert!(!reports.contains(forbidden), "{reports}");
+}
+#[test]
+fn checkpoint_write_rejection_reports_provider_repair() {
+    assert_checkpoint_write_diagnostic(
+        opc_crypto::CryptoError::KeyRejected,
+        "checkpoint key provider configuration unavailable",
+        "local encryption",
+    );
+}
+#[test]
+fn checkpoint_local_write_failure_reports_local_fault() {
+    assert_checkpoint_write_diagnostic(
+        opc_crypto::CryptoError::EncryptionFailed,
+        "checkpoint local encryption failed",
+        "provider repair",
+    );
 }

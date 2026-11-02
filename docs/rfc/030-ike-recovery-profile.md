@@ -128,12 +128,12 @@ repeating an effect. Only after successfully obtaining and unsealing the fenced
 current records can their contents establish an irrecoverably uncertain outcome
 and select the typed uncertain-operation resolution and scoped terminal path.
 Do not leave an SA waiting forever for a pruned receipt. Store or key-provider
-`Unavailable`, timeout or throttling during this read/unseal is retryable
-backpressure, never evidence of missing/corrupt history or a terminal outcome.
-Preserve that distinction through the consumer wrapper until
-[#1197](https://github.com/openpacketcore/openpacketcore-sdk/issues/1197) supplies
-it through the full envelope path. Retry budgets bound attempts; their exhaustion
-does not turn provider unavailability into proof of permanent key loss.
+`Unavailable`, timeout or throttling during this read/unseal is bounded outage
+backpressure. `ProviderUnusable` and custody-state failures require a redacted
+report and backoff until repair. Neither class is missing/corrupt history or a
+terminal outcome. The envelope path carries these nonterminal outcomes; the
+coarser storage/network errors preserve nonterminal handling. Exhausted retry
+budgets never establish key loss.
 
 That last resolution is a consumer operation-state CAS plus idempotent cleanup,
 not a fabricated SDK completion token or a claim that an unrecorded operation
@@ -271,14 +271,46 @@ old encrypted WAL or snapshot bytes.
 
 Apply [#1197](https://github.com/openpacketcore/openpacketcore-sdk/issues/1197) to
 every row seal/unseal, including checkpoint creation, restore and fenced readback.
-Key-provider `Unavailable`, timeout and throttling are retryable backpressure;
-they release no uncommitted request and never select SA teardown. Until that
-classification reaches the full SDK envelope path, the consumer key-provider
-wrapper must preserve `KeyError::Unavailable` and equivalent transient outcomes
-before any generic crypto-error collapse. Do not treat retry-budget exhaustion
-as corruption. Authenticated-decryption failure, binding/public-value mismatch,
-unknown checkpoint format, provider `InvalidOutput`, or a positively missing (`NotFound`) or revoked key
-are terminal. Never infer any of those from an unavailable provider.
+Key-provider `Unavailable`, timeout and throttling are bounded retry backpressure.
+`ProviderUnusable` is also backpressure for the request and stored data, but
+requires a redacted operator configuration report and backoff until provider
+repair rather than immediate outage retries. It includes malformed endpoints,
+Unix permissions, TLS certificate/peer authentication, protocol/authentication
+alerts and invalid provider protocol responses. TLS `internal_error` (80) is an
+outage, not configuration evidence. Short-lived SVID expiry and certificate rotation
+MUST NOT turn retained ciphertext into a terminal recovery outcome.
+
+Both classes release nothing, delete nothing and never select SA teardown or a
+final cached mutation result. Preserve the exact row, ciphertext, version and
+pending replay while access is blocked. Key custody and generic envelopes
+preserve the outage/repair distinction. Storage and network boundaries may
+collapse both to a coarse unavailable error after a fixed operator diagnostic;
+they MUST preserve nonterminal handling, not claim that the full subtype survives.
+Retry-budget exhaustion is not corruption.
+
+Only positive evidence about a key or ciphertext permits terminal rejection.
+Use `KeyError::is_definitive_rejection()`: it is true only for a positively
+missing key (`NotFound`) or actual key revocation/ciphertext rejection
+(`OperationFailed`). Its exhaustive matches cover every key and custody variant;
+a new variant requires an explicit decision in the defining crate. All other
+errors retain data, including `RotationFailed`, invalid identifiers/metadata,
+and every `KeyCustodyOperationError`. Installation, identity, validation,
+capability, generic operation and provider-output failures prove no key/data
+verdict. Unknown downstream variants MUST default to nonterminal backpressure.
+
+Locally established authenticated-decryption failure, stored binding/public-value
+mismatch, unknown checkpoint format and the DH checkpoint `InvalidOutput`
+contract remain terminal. A malformed key-provider response or
+`KeyCustodyOperationError::InvalidProviderOutput` is provider failure, not that
+checkpoint verdict. Generic envelopes preserve a positive key verdict as
+`CryptoError::KeyRejected`; a local encryption failure does not reject stored
+bytes. Repair alone must permit recovery of the unchanged retained row.
+
+The JSON KMS `error` status is not a verdict by itself. Only exact structured
+`reason` values `key_not_found`, `key_revoked`, or `ciphertext_rejected` (the last
+only on `decrypt`) authorize a provider verdict. Missing/unknown reasons and
+free-form `error_message` text retain data as specified in RFC 003 §9.3.
+
 
 Peer KE validation is a separate protocol boundary. `InvalidPeerPublicKey`,
 `MalformedKeyExchange` and `KeyAgreementFailed` terminate the exchange and are
@@ -451,7 +483,7 @@ alone never selects terminal closure of healthy forwarding.
 | Failure class | Automatic action |
 | --- | --- |
 | Store unavailable/acknowledgement lost | Keep the exact pending CAS and installed healthy forwarding. Apply the outbound-witness empty/cached-response rule; resolve by exact retry/fenced readback. No guessed success, new mutation effect or voluntary SA reset. |
-| Key-provider unavailable, timeout or throttling | [#1197](https://github.com/openpacketcore/openpacketcore-sdk/issues/1197): retryable backpressure during any row seal/unseal, checkpoint creation/restore or fenced read. Preserve transient classification through the consumer wrapper until the full envelope path carries it. No uncommitted release, missing/corrupt classification or SA teardown; exhausted retry attempts do not prove key loss. |
+| Key-provider outage, unusable configuration or custody state | Outages use bounded backoff; configuration/custody failures emit a redacted report and wait for repair. All preserve the exact row and pending replay through seal/unseal, checkpoint restore and fenced read. Coarse storage/network errors remain nonterminal. No uncommitted release, corruption classification, final cached mutation result or SA teardown; exhausted attempts do not prove key loss. |
 | DH custody module or capability state | `CapabilityWithdrawn`, `NotInstalled`, `KeyGenerationFailed`, `Unavailable`, entropy failure, unsupported/unadmitted algorithms, timeouts and throttling are backpressure: retain the SA and pending checkpoint; a rekey that cannot be checkpointed waits. `IdentityChanged` and `ValidationChanged` also stop process admission and raise an alarm, without tearing down individual SAs. Only `InvalidCheckpoint`, `CheckpointPublicValueMismatch` or provider `InvalidOutput` are terminal at this boundary; revoked or positively missing keys follow the envelope rule. |
 | Invalid peer KE | `InvalidPeerPublicKey`, `MalformedKeyExchange` and `KeyAgreementFailed` fail the exchange, never backpressure. An authenticated request commits `INVALID_SYNTAX` before reply release and IKE closure. A bad response commits checkpoint removal and Child SA Delete intent, or IKE SA closure for an IKE rekey. Resume cleanup after restart; never install derived keys or a successor epoch. |
 | Retryable canonical refusal | `Unavailable`, `LifecycleBlocked`, `CapabilityActive` and `NotCommitted`: retain attempts/cache/identity; retry only after the known cause clears. Join an existing owner rather than constructing duplicates. A terminal lifecycle routes to cleanup, not endless retry. |
@@ -463,7 +495,7 @@ alone never selects terminal closure of healthy forwarding.
 | In-process runtime loss | Stop/join its executor, retain epoch ownership fencing and take exact readback before replacement. Cache bytes may be lost while release history survives; `AlreadyReleased` must reach the bounded remedy, not lifetime waiting. |
 | Reconcile failure | Classify row/key-provider failures before calling SDK reconcile. `ReconcileUnavailable` retains the quiescent runtime/cache/witness for provider retry. Other existing reconcile failures revoke the epoch; they do not subsume a transient row-unseal failure. Readback never manufactures effects from an unrecognized record. |
 | Authenticated unsupported shape | Report `UnsupportedShape`, retain exact cause, and commit an IKE Delete through the independent send window once pending local work resolves. Unauthenticated packets cannot select this path. |
-| Terminal envelope/checkpoint failure | Authenticated-decryption failure, binding/public-value mismatch, unknown checkpoint format, provider `InvalidOutput` or a positively `NotFound`/revoked key: refuse the epoch and perform scoped terminal cleanup. Remove any checkpoint in the terminal CAS. Under [#1197](https://github.com/openpacketcore/openpacketcore-sdk/issues/1197), unavailable/timeout/throttled reads are never these outcomes. |
+| Terminal envelope/checkpoint failure | Authenticated-decryption failure, binding/public-value mismatch, unknown checkpoint format, provider `InvalidOutput` or a positively `NotFound`/revoked key: refuse the epoch and perform scoped terminal cleanup. Remove any checkpoint in the terminal CAS. Unavailable, unusable, unclassified and custody-state provider failures are never these outcomes; use the shared positive-verdict predicate. |
 | Confirmed incomplete recovery history | A successfully unsealed but incomplete record cannot authorize recovery. Resolve its operation through the scoped terminal CAS, removing its checkpoint. Distinguish that evidence from an unavailable store or key provider; a newer-looking partial record alone is not recovery evidence. |
 
 No attach ceiling, per-empty receipt row, whole-worker reset or manual recovery
@@ -603,6 +635,7 @@ production SDK code.
 | `outage_keeps_peer_dpd_alive`: `lifecycle::outage_keeps_peer_dpd_alive_and_replays_a_cached_nonempty_response`, plus admission refusals | An outage beyond the peer timeout still permits empty and applicable cached nonempty replies with zero writes/ordinary IV/entropy; revocation stops them. | SDK `src/recovery.rs::request_disposition`: replace `ready_for_cached_response` with `ready` in the cached branch. Separate focused mutations cover the shared witness guard. |
 | `lost_prefix_then_nonempty`: `lifecycle::lost_prefix_then_nonempty_commits_the_repaired_floor` | Lost/reordered empty prefix, cached replay, a fresh nonempty result and MAX exhaustion preserve the peer's independent windows. | `driver::Runtime::restore`: omit enabling empty reconstruction. |
 | `cache_loss_refusal_and_shape_exit`: `remedy_tests::canonical_cache_loss_and_attempt_exhaustion_reach_sync_or_committed_delete` and SKF/cleanup tests | Actual cache loss and three invalid-output charges reach the bounded sync/Delete remedy; authenticated SKF is distinct from noise, and positive trust failure permits only scoped cleanup. | `remedy::canonical_failure`: make `AlreadyReleased`/`AttemptsExhausted` wait forever. |
+| `provider_error_verdicts`: `provider_configuration_tests` | Every key/custody variant and live KMS channel/reply failure crosses actual recovery/cleanup with unchanged ciphertext/version, no new crypto effect or packet release, and recovery after repair. Outage retry and repair-wait policies are distinct. Positive missing/revoked-key controls still clean up. | `envelope::classify_key_error`: treat a false shared verdict predicate as integrity failure; classify KMS diagnostic text as key loss. |
 | `nat_mapping_and_initial_contact`: `endpoint_tests`, `contact_tests` | Only committed fresh evidence changes routes; genuine challenge responses bind source and request; authenticated cleanup survives later traffic, excludes other identities/namespaces/new SA and refuses reincarnated victims. | `endpoint::Runtime::endpoint_empty`: accept replay as fresh; `contact::Authenticated::plan`: ignore identity; `contact::cleanup`: ignore birth or require final AUTH to remain in the ordinary cache. |
 | `mode_and_effect_authority`: `effect_tests::mode_and_effect_authority_requires_current_committed_outcome_once`, `codec_tests` | Current committed outcomes apply once; candidate/stale/closed outcomes and incomplete records refuse. | `effects::Effects::apply_fenced`: bypass the idempotency entry; `codec::ProfileCodec::decode`: default an omitted mode. |
 

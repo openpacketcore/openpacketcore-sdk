@@ -6,7 +6,7 @@ use tracing::debug;
 
 use opc_types::{ConfigVersion, SchemaDigest, Timestamp, TxId};
 
-use crate::error::PersistError;
+use crate::error::{history_read_error, sqlite_read_error, PersistError};
 use crate::preflight::PersistCapabilities;
 use crate::types::{
     AlarmAuditEventRecord, AuditKey, AuditOpType, AuditRecord, CommitRecord, CommitSource,
@@ -98,13 +98,13 @@ impl ConfigStore for SqliteBackend {
                 .prepare(
                     "SELECT tx_id FROM config_history WHERE version > ?1 ORDER BY version ASC LIMIT ?2",
                 )
-                .map_err(|error| PersistError::sqlite(error.to_string()))?;
+                .map_err(sqlite_read_error)?;
             let rows = statement
                 .query_map(params![version, limit], |row| row.get::<_, Vec<u8>>(0))
-                .map_err(|error| PersistError::sqlite(error.to_string()))?;
+                .map_err(sqlite_read_error)?;
             let mut records = Vec::new();
             for row in rows {
-                let tx_id = row.map_err(|error| PersistError::sqlite(error.to_string()))?;
+                let tx_id = row.map_err(sqlite_read_error)?;
                 let record = Self::load_by_tx_id_bytes(conn, &tx_id, audit_key)?
                     .ok_or_else(|| {
                         PersistError::inconsistent_state(
@@ -193,7 +193,7 @@ impl ConfigStore for SqliteBackend {
                         |row| row.get(0),
                     )
                     .optional()
-                    .map_err(|error| PersistError::sqlite(error.to_string()))?;
+                    .map_err(sqlite_read_error)?;
                 tx_id
                     .map(|tx_id| {
                         Self::load_by_tx_id_bytes(conn, &tx_id, audit_key)
@@ -285,7 +285,7 @@ impl ConfigStore for SqliteBackend {
                     |row| row.get(0),
                 )
                 .optional()
-                .map_err(|error| PersistError::sqlite(error.to_string()))?;
+                .map_err(sqlite_read_error)?;
             let Some(principal) = principal else {
                 return Err(PersistError::rollback_not_found());
             };
@@ -341,7 +341,7 @@ impl ConfigStore for SqliteBackend {
                     |row| row.get(0),
                 )
                 .optional()
-                .map_err(|e| PersistError::sqlite(e.to_string()))?;
+                .map_err(sqlite_read_error)?;
             let Some(principal) = principal else {
                 return Err(PersistError::rollback_not_found());
             };
@@ -405,7 +405,9 @@ impl ConfigStore for SqliteBackend {
                     params![&tx_id_bytes],
                     |row| row.get(0),
                 )
-                .map_err(|e| PersistError::sqlite(e.to_string()))?;
+                .optional()
+                .map_err(sqlite_read_error)?
+                .ok_or_else(PersistError::rollback_not_found)?;
             let rows = tx
                 .execute(
                     "UPDATE config_history SET rollback_point = 1 WHERE tx_id = ?1",
@@ -493,25 +495,35 @@ impl SqliteBackend {
             self,
             crate::consensus::DEFAULT_CONFIG_CONSENSUS_OPERATION_TIMEOUT,
             move |conn, cancellation| {
-                let tx = conn.unchecked_transaction().map_err(|_| {
-                    std::io::Error::other("config history read transaction unavailable")
-                })?;
+                let tx = match conn.unchecked_transaction() {
+                    Ok(tx) => tx,
+                    Err(error) => return Ok(Err(sqlite_read_error(error))),
+                };
                 let result = crate::consensus::history::validate_access_sync(
                     &tx,
                     audit_key.as_ref(),
                     required.load(std::sync::atomic::Ordering::Acquire),
                     cancellation,
                 )
-                .map_err(|_| PersistError::corrupt_blob())
+                .map_err(history_read_error)
                 .and_then(|()| read(&tx, audit_key.as_ref()));
-                tx.commit().map_err(|_| {
-                    std::io::Error::other("config history read transaction unavailable")
-                })?;
-                Ok(result)
+                let completion = tx.commit().map_err(sqlite_read_error);
+                // A later transaction-completion error cannot erase evidence
+                // already established by the read itself.
+                Ok(match result {
+                    Err(error) => Err(error),
+                    Ok(value) => completion.map(|()| value),
+                })
             },
         )
         .await
-        .map_err(|_| PersistError::unavailable())?
+        .map_err(|error| {
+            if error.kind() == std::io::ErrorKind::InvalidData {
+                PersistError::inconsistent_state("config history worker failed")
+            } else {
+                PersistError::unavailable()
+            }
+        })?
     }
 
     /// Reject direct local mutation after the atomic Openraft authority claim.
@@ -528,7 +540,7 @@ impl SqliteBackend {
             .config_consensus_history_required
             .load(std::sync::atomic::Ordering::Acquire)
             || crate::consensus::history::has_consensus_metadata_sync(conn)
-                .map_err(|_| PersistError::unavailable())?
+                .map_err(history_read_error)?
         {
             return Err(PersistError::inconsistent_state(
                 "direct config mutation is disabled after Openraft authority claim",
@@ -557,8 +569,7 @@ impl SqliteBackend {
         conn: &rusqlite::Connection,
         audit_key: &AuditKey,
     ) -> Result<Option<StoredConfig>, PersistError> {
-        crate::consensus::history::validate_sync(conn, audit_key)
-            .map_err(|_| PersistError::corrupt_blob())?;
+        crate::consensus::history::validate_sync(conn, audit_key).map_err(history_read_error)?;
         // Find the highest version (absolute latest)
         let tx_id_bytes: Option<Vec<u8>> = conn
             .query_row(
@@ -571,7 +582,7 @@ impl SqliteBackend {
                 |row| row.get(0),
             )
             .optional()
-            .map_err(|e| PersistError::sqlite(e.to_string()))?;
+            .map_err(sqlite_read_error)?;
 
         let Some(tx_id_bytes) = tx_id_bytes else {
             return Ok(None);
@@ -584,8 +595,7 @@ impl SqliteBackend {
         conn: &rusqlite::Connection,
         audit_key: &AuditKey,
     ) -> Result<Option<StoredConfig>, PersistError> {
-        crate::consensus::history::validate_sync(conn, audit_key)
-            .map_err(|_| PersistError::corrupt_blob())?;
+        crate::consensus::history::validate_sync(conn, audit_key).map_err(history_read_error)?;
         let first_fenced: Option<(Vec<u8>, Option<Vec<u8>>)> = conn
             .query_row(
                 r#"SELECT tx_id, parent_tx_id
@@ -601,7 +611,7 @@ impl SqliteBackend {
                 |row| Ok((row.get(0)?, row.get(1)?)),
             )
             .optional()
-            .map_err(|error| PersistError::sqlite(error.to_string()))?;
+            .map_err(sqlite_read_error)?;
         let Some((fenced_tx_id, parent_tx_id)) = first_fenced else {
             return Self::load_latest_impl(conn, audit_key);
         };
@@ -650,7 +660,7 @@ impl SqliteBackend {
                         |row| row.get(0),
                     )
                     .optional()
-                    .map_err(|e| PersistError::sqlite(e.to_string()))?;
+                    .map_err(sqlite_read_error)?;
                 parent_bytes
             }
             RollbackTarget::ByTxId(tx_id) => Some(tx_id.as_uuid().as_bytes().to_vec()),
@@ -661,7 +671,7 @@ impl SqliteBackend {
                     |row| row.get::<_, Vec<u8>>(0),
                 )
                 .optional()
-                .map_err(|e| PersistError::sqlite(e.to_string()))?,
+                .map_err(sqlite_read_error)?,
             RollbackTarget::ByLabel(label) => conn
                 .query_row(
                     "SELECT tx_id FROM rollback_labels WHERE label = ?1",
@@ -669,7 +679,7 @@ impl SqliteBackend {
                     |row| row.get::<_, Vec<u8>>(0),
                 )
                 .optional()
-                .map_err(|e| PersistError::sqlite(e.to_string()))?,
+                .map_err(sqlite_read_error)?,
         };
 
         let Some(bytes) = tx_id_bytes else {
@@ -684,7 +694,7 @@ impl SqliteBackend {
                 |_| Ok(true),
             )
             .optional()
-            .map_err(|e| PersistError::sqlite(e.to_string()))?
+            .map_err(sqlite_read_error)?
             .unwrap_or(false);
         if is_pending {
             return Err(PersistError::rollback_not_found());
@@ -842,7 +852,7 @@ impl SqliteBackend {
                 |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?)),
             )
             .optional()
-            .map_err(|error| PersistError::sqlite(error.to_string()))?;
+            .map_err(sqlite_read_error)?;
         match (&latest, record.parent_tx_id) {
             (None, None) => {}
             (Some((latest_tx_id, latest_version, _, _, _)), Some(parent_tx_id))
@@ -887,7 +897,9 @@ impl SqliteBackend {
                         [&pending_tx_id],
                         |row| row.get(0),
                     )
-                    .map_err(|error| PersistError::sqlite(error.to_string()))?;
+                    .optional()
+                    .map_err(sqlite_read_error)?
+                    .ok_or_else(PersistError::corrupt_blob)?;
                 let now = Timestamp::now_utc().to_string();
                 let rows = tx
                     .execute(
@@ -927,7 +939,7 @@ impl SqliteBackend {
                     [&digest],
                     |row| row.get(0),
                 )
-                .map_err(|error| PersistError::sqlite(error.to_string()))?;
+                .map_err(sqlite_read_error)?;
             if duplicate {
                 return Err(PersistError::constraint_violation(
                     "config replay lookup digest is not unique",
@@ -996,7 +1008,7 @@ impl SqliteBackend {
         ) {
             Ok(v) => v,
             Err(rusqlite::Error::QueryReturnedNoRows) => return Ok(None),
-            Err(e) => return Err(PersistError::sqlite(e.to_string())),
+            Err(error) => return Err(sqlite_read_error(error)),
         };
 
         let parent_tx_id_out = crate::consensus::history::original_parent_sync(
@@ -1006,7 +1018,7 @@ impl SqliteBackend {
             version,
             parent_tx_id_out,
         )
-        .map_err(|_| PersistError::corrupt_blob())?;
+        .map_err(history_read_error)?;
 
         // Fail closed: validate fixed-size fields
         if tx_id_out.len() != 16 {
@@ -1016,9 +1028,7 @@ impl SqliteBackend {
             return Err(PersistError::corrupt_blob());
         }
         if audit_count < 0 {
-            return Err(PersistError::inconsistent_state(
-                "negative audit_count in config_history",
-            ));
+            return Err(PersistError::corrupt_blob());
         }
         let audit_count =
             usize::try_from(audit_count).map_err(|_| PersistError::audit_chain_broken())?;
@@ -1030,8 +1040,8 @@ impl SqliteBackend {
             .expect("audit_terminal_hash length validated above");
 
         // Fail closed: validate timestamp
-        let committed_at = Timestamp::from_str(&committed_at_str)
-            .map_err(|_| PersistError::inconsistent_state("corrupt timestamp in config_history"))?;
+        let committed_at =
+            Timestamp::from_str(&committed_at_str).map_err(|_| PersistError::corrupt_blob())?;
 
         // Fail closed: validate CommitSource
         let source = deserialize_commit_source(&source_str)?;
@@ -1047,24 +1057,18 @@ impl SqliteBackend {
 
         // Fail closed: validate version is non-negative and fits in u64
         let version = if version < 0 {
-            return Err(PersistError::inconsistent_state(
-                "negative version in config_history",
-            ));
+            return Err(PersistError::corrupt_blob());
         } else {
             ConfigVersion::new(version as u64)
         };
 
         // Fail closed: confirmed_deadline must be parseable if present
         let mut confirmed_deadline = match confirmed_deadline_str {
-            Some(s) => Some(Timestamp::from_str(&s).map_err(|_| {
-                PersistError::inconsistent_state("corrupt confirmed_deadline in config_history")
-            })?),
+            Some(s) => Some(Timestamp::from_str(&s).map_err(|_| PersistError::corrupt_blob())?),
             None => None,
         };
         let confirmed_at = match confirmed_at {
-            Some(s) => Some(Timestamp::from_str(&s).map_err(|_| {
-                PersistError::inconsistent_state("corrupt confirmed_at in config_history")
-            })?),
+            Some(s) => Some(Timestamp::from_str(&s).map_err(|_| PersistError::corrupt_blob())?),
             None => None,
         };
         if confirmed_at.is_some() {
@@ -1104,44 +1108,21 @@ impl SqliteBackend {
                 ORDER BY sequence ASC
                 "#,
             )
-            .map_err(|e| PersistError::sqlite(e.to_string()))?;
+            .map_err(sqlite_read_error)?;
 
-        let mut rows = stmt
-            .query([tx_id_bytes])
-            .map_err(|e| PersistError::sqlite(e.to_string()))?;
+        let mut rows = stmt.query([tx_id_bytes]).map_err(sqlite_read_error)?;
 
         let mut audit = Vec::new();
-        while let Some(row) = rows
-            .next()
-            .map_err(|e| PersistError::sqlite(e.to_string()))?
-        {
-            let tx_id_bytes: Vec<u8> = row
-                .get(0)
-                .map_err(|e| PersistError::sqlite(e.to_string()))?;
-            let sequence: u32 = row
-                .get(1)
-                .map_err(|e| PersistError::sqlite(e.to_string()))?;
-            let yang_path: String = row
-                .get(2)
-                .map_err(|e| PersistError::sqlite(e.to_string()))?;
-            let op_type: String = row
-                .get(3)
-                .map_err(|e| PersistError::sqlite(e.to_string()))?;
-            let previous_value: Option<String> = row
-                .get(4)
-                .map_err(|e| PersistError::sqlite(e.to_string()))?;
-            let new_value: Option<String> = row
-                .get(5)
-                .map_err(|e| PersistError::sqlite(e.to_string()))?;
-            let redaction_applied: i32 = row
-                .get(6)
-                .map_err(|e| PersistError::sqlite(e.to_string()))?;
-            let previous_hash: Vec<u8> = row
-                .get(7)
-                .map_err(|e| PersistError::sqlite(e.to_string()))?;
-            let entry_hmac: Vec<u8> = row
-                .get(8)
-                .map_err(|e| PersistError::sqlite(e.to_string()))?;
+        while let Some(row) = rows.next().map_err(sqlite_read_error)? {
+            let tx_id_bytes: Vec<u8> = row.get(0).map_err(sqlite_read_error)?;
+            let sequence: u32 = row.get(1).map_err(sqlite_read_error)?;
+            let yang_path: String = row.get(2).map_err(sqlite_read_error)?;
+            let op_type: String = row.get(3).map_err(sqlite_read_error)?;
+            let previous_value: Option<String> = row.get(4).map_err(sqlite_read_error)?;
+            let new_value: Option<String> = row.get(5).map_err(sqlite_read_error)?;
+            let redaction_applied: i32 = row.get(6).map_err(sqlite_read_error)?;
+            let previous_hash: Vec<u8> = row.get(7).map_err(sqlite_read_error)?;
+            let entry_hmac: Vec<u8> = row.get(8).map_err(sqlite_read_error)?;
 
             // Fail closed on corrupt fixed-size hash fields
             if previous_hash.len() != 32 {

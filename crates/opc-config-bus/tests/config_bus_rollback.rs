@@ -11,6 +11,77 @@ use opc_types::{ConfigVersion, SchemaDigest};
 mod config_bus_common;
 use config_bus_common::*;
 
+#[tokio::test]
+async fn rollback_alarm_preserves_positive_data_evidence_before_error_collapse() {
+    struct Failure(StoreError);
+    #[async_trait::async_trait]
+    impl ManagedDatastore<TestConfig> for Failure {
+        async fn load_latest(&self) -> Result<Option<StoredConfig<TestConfig>>, StoreError> {
+            Ok(None)
+        }
+        async fn load_rollback(
+            &self,
+            _: RollbackTarget,
+        ) -> Result<StoredConfig<TestConfig>, StoreError> {
+            Err(self.0.clone())
+        }
+        async fn load_by_idempotency_key(
+            &self,
+            _: &IdempotencyKey,
+        ) -> Result<Option<StoredConfig<TestConfig>>, StoreError> {
+            Ok(None)
+        }
+        async fn clear_recovery_required(&self, _: opc_types::TxId) -> Result<(), StoreError> {
+            Ok(())
+        }
+    }
+    let mut failures = Vec::new();
+    for (error, cause) in [
+        (
+            StoreError::crypto("rejected envelope"),
+            ProbableCause::StorageCorruption,
+        ),
+        (
+            StoreError::unavailable("provider unavailable"),
+            ProbableCause::ConfigApplyFailed,
+        ),
+        (
+            StoreError::internal("internal failure"),
+            ProbableCause::ConfigApplyFailed,
+        ),
+    ] {
+        let alarms = SharedAlarmManager::default();
+        let bus = ConfigBus::new_with_alarm_manager_dev_only(
+            TestConfig::new("initial"),
+            Arc::new(Failure(error.clone())),
+            alarms.clone(),
+        )
+        .await
+        .unwrap();
+        let result = bus
+            .submit(CommitRequest::rollback(
+                RequestId::new(),
+                principal(),
+                TransportType::Internal,
+                RequestSource::Northbound,
+                RollbackTarget::Label("rollback".into()),
+                vec![changed_path()],
+                Instant::now() + Duration::from_secs(1),
+            ))
+            .await
+            .unwrap_err();
+        assert_eq!(result.code, CommitErrorCode::RollbackUnavailable);
+        let alarm = single_active_alarm(&alarms, "config-bus.commit.failure");
+        if alarm.probable_cause != cause {
+            failures.push((error.code, alarm.probable_cause, cause));
+        }
+    }
+    assert!(
+        failures.is_empty(),
+        "rollback lost data verdict evidence: {failures:?}"
+    );
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn rollback_failures_are_redacted_for_clients() {
     let secret = "dsn=postgres://user:secret@db/internal";

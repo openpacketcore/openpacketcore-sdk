@@ -17,9 +17,11 @@ use crate::{
 /// memory. Callers still build the same [`EnvelopeAad`] used by the local
 /// [`crate::KeyProvider`] path, and implementations must bind the exact bytes
 /// from [`serialize_bound_aad`] into the remote encrypt/decrypt request.
-/// Reserve [`KeyError::Unavailable`] for availability failures. Authentication
-/// or other content-dependent rejection must remain a separate coarse error,
-/// such as [`KeyError::OperationFailed`], so callers can retry only outages.
+/// Reserve [`KeyError::Unavailable`] for outages and [`KeyError::ProviderUnusable`]
+/// for endpoint, TLS/peer authentication, protocol or configuration failures.
+/// Neither authorizes deleting data or releasing an uncommitted result. Callers
+/// back off and report unusable configuration to operators. Only positive
+/// key revocation or ciphertext rejection uses [`KeyError::OperationFailed`].
 #[async_trait]
 pub trait RemoteSealProvider: Send + Sync {
     /// Seal inside the KMS/HSM; the key never enters app memory.
@@ -91,7 +93,7 @@ impl RemoteSealMaterialController {
         &self,
         active_key_id: KeyId,
     ) -> Result<RemoteSealMaterialEpoch, KeyError> {
-        let mut state = self.inner.lock().map_err(|_| KeyError::OperationFailed)?;
+        let mut state = self.inner.lock().map_err(|_| KeyError::ProviderUnusable)?;
         if state.active_key_id == active_key_id {
             return Ok(state.epoch);
         }
@@ -110,14 +112,14 @@ impl RemoteSealMaterialController {
         self.inner
             .lock()
             .map(|state| state.epoch)
-            .map_err(|_| KeyError::OperationFailed)
+            .map_err(|_| KeyError::ProviderUnusable)
     }
 
     pub(crate) fn active_selection(&self) -> Result<(RemoteSealMaterialEpoch, KeyId), KeyError> {
         self.inner
             .lock()
             .map(|state| (state.epoch, state.active_key_id.clone()))
-            .map_err(|_| KeyError::OperationFailed)
+            .map_err(|_| KeyError::ProviderUnusable)
     }
 }
 
@@ -206,7 +208,7 @@ impl RemoteSealProvider for MemoryRemoteSealProvider {
             .await?;
         handle
             .encrypt_payload(aad, plaintext, self.nonce)
-            .map_err(|_| KeyError::OperationFailed)
+            .map_err(local_seal_error)
     }
 
     async fn unseal(
@@ -232,12 +234,17 @@ impl RemoteSealProvider for MemoryRemoteSealProvider {
     }
 }
 
+// Keep the local failure conversion independently testable.
+fn local_seal_error(_: crate::errors::CryptoOperationError) -> KeyError {
+    KeyError::ProviderUnusable
+}
+
 #[cfg(test)]
 mod material_tests {
     use super::*;
 
     #[test]
-    fn poisoned_material_is_a_redacted_permanent_failure() {
+    fn poisoned_material_is_a_redacted_provider_configuration_failure() {
         let key_id = KeyId::new("poison-sensitive-key").expect("key ID");
         let controller = RemoteSealMaterialController::new(key_id.clone());
         let poisoner = controller.clone();
@@ -253,17 +260,13 @@ mod material_tests {
             controller.epoch().unwrap_err(),
             controller.active_selection().unwrap_err(),
         ];
-        assert_eq!(
-            errors,
-            [
-                KeyError::OperationFailed,
-                KeyError::OperationFailed,
-                KeyError::OperationFailed
-            ]
-        );
+        // Poisoned provider state says nothing about a request or ciphertext.
+        assert!(errors
+            .iter()
+            .all(|error| *error == KeyError::ProviderUnusable));
         for error in errors {
-            assert_eq!(error.to_string(), "key provider operation failed");
-            assert_eq!(format!("{error:?}"), "OperationFailed");
+            assert_eq!(error.to_string(), "key provider unusable as configured");
+            assert_eq!(format!("{error:?}"), "ProviderUnusable");
         }
         assert!(!format!("{controller:?}").contains(key_id.as_str()));
     }
@@ -319,5 +322,11 @@ mod material_tests {
             controller.active_selection().expect("active selection"),
             (RemoteSealMaterialEpoch(u64::MAX), old_key)
         );
+    }
+    #[test]
+    fn local_remote_seal_failure_is_not_a_key_verdict() {
+        let error = local_seal_error(crate::errors::CryptoOperationError::EncryptionFailed);
+        assert_eq!(error, KeyError::ProviderUnusable);
+        assert!(!error.is_definitive_rejection());
     }
 }

@@ -58,8 +58,9 @@ pub enum StoreErrorCode {
     /// The requested record (rollback target, transaction, or idempotency
     /// key) does not exist; rollback commits map this to `RollbackNotFound`.
     NotFound,
-    /// The backend is temporarily unable to serve the request (for example a
-    /// rollback target that is still pending confirmation); retryable.
+    /// The backend or key provider cannot currently serve the request. Retain
+    /// data and back off within the existing budget; provider configuration
+    /// failures require operator repair. This is not a corruption verdict.
     Unavailable,
     /// The backend may have durably applied a write but lost the authoritative
     /// acknowledgement. The caller must resolve the result by reading with
@@ -68,8 +69,9 @@ pub enum StoreErrorCode {
     /// Store invariant violation or serialization failure (duplicate tx id or
     /// version, envelope encode failure); not retryable without intervention.
     Internal,
-    /// AEAD encryption/decryption or plaintext-digest verification failed;
-    /// the record is treated as tampered and the operation fails closed.
+    /// Stored envelope decryption, binding or plaintext-digest verification
+    /// failed; the record is rejected. Failure to encrypt a new write is
+    /// `Unavailable`, not evidence against existing stored data.
     Crypto,
     /// The stored schema digest does not match the digest recomputed from the
     /// decoded payload; the record is refused for publication.
@@ -724,9 +726,9 @@ impl<C: OpcConfig> SealedConfig<C> {
     ) -> Result<opc_crypto::AuthenticatedEnvelopeClaim, StoreError> {
         self.fresh_envelope
             .as_ref()
-            .ok_or_else(|| StoreError::crypto("config envelope lacks fresh encryption evidence"))?
+            .ok_or_else(|| StoreError::internal("config envelope lacks fresh encryption evidence"))?
             .claim()
-            .map_err(|_| StoreError::crypto("config envelope evidence was already consumed"))
+            .map_err(|_| StoreError::internal("config envelope evidence was already consumed"))
     }
 
     /// Wraps an unencrypted payload from a record written before envelope

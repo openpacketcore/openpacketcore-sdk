@@ -11,7 +11,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Instant;
 use tokio::sync::{mpsc, mpsc::error::TrySendError, oneshot};
 
-use opc_alarm::{ProbableCause, Severity, SharedAlarmManager};
+use opc_alarm::{Severity, SharedAlarmManager};
 use opc_config_model::{
     ApplyPlan, CommitError, CommitErrorCode, CommitMode, CommitRequest, CommitResult, CommitStatus,
     CommittedConfigRevision, ConfigError, ConfigImpactClassifier, ConfigOperation, OpcConfig,
@@ -21,8 +21,8 @@ use opc_config_model::{
 use opc_types::{redact, ConfigVersion, Timestamp, TxId};
 
 use crate::alarms::{
-    apply_commit_alarm_outcome, raise_commit_error, raise_config_error_alarm,
-    CONFIG_BUS_COMMIT_FAILURE_ALARM_TYPE,
+    apply_commit_alarm_outcome, raise_commit_error, raise_commit_store_error,
+    raise_config_error_alarm, store_failure_cause, CONFIG_BUS_COMMIT_FAILURE_ALARM_TYPE,
 };
 use crate::authorizer::{ConfigAuthorizer, DenyAllAuthorizer};
 use crate::datastore::{CommittedRevisionSource, ManagedDatastore};
@@ -672,6 +672,7 @@ async fn worker_loop<C: OpcConfig>(
 
                 let has_pending = pending_fire_at.is_some();
 
+                let mut store_failure = None;
                 let processed = AssertUnwindSafe(process_commit(
                     submission.request,
                     Arc::clone(&snapshot),
@@ -684,6 +685,7 @@ async fn worker_loop<C: OpcConfig>(
                     authority.as_ref(),
                     has_pending,
                     &mut submission.required_audit,
+                    &mut store_failure,
                 ))
                 .catch_unwind()
                 .await
@@ -713,13 +715,17 @@ async fn worker_loop<C: OpcConfig>(
 
                 if result.is_ok() {
                     if let Some(reason) = recovery.reason() {
-                        raise_commit_error(
-                            &alarm_manager,
-                            &CommitError::recovery_required(reason),
-                        );
+                        let error = CommitError::recovery_required(reason);
+                        if let Some(store_code) = store_failure {
+                            raise_commit_store_error(&alarm_manager, &error, store_code);
+                        } else {
+                            raise_commit_error(&alarm_manager, &error);
+                        }
                     } else {
                         apply_commit_alarm_outcome(&alarm_manager, &result);
                     }
+                } else if let (Err(error), Some(store_code)) = (&result, store_failure) {
+                    raise_commit_store_error(&alarm_manager, error, store_code);
                 } else {
                     apply_commit_alarm_outcome(&alarm_manager, &result);
                 }
@@ -866,18 +872,19 @@ async fn worker_loop<C: OpcConfig>(
                             "rollback_failed",
                             "rollback_failed",
                             Severity::Major,
-                            ProbableCause::StorageCorruption,
+                            store_failure_cause(err.code),
                         );
                     }
                     Ok(marker_clear_error) => {
                         crate::metrics::record_rollback_success();
-                        if marker_clear_error.is_some() {
+                        if let Some(error) = marker_clear_error {
                             recovery.fence(RECOVERY_RECONCILIATION_FAILED_MESSAGE);
-                            raise_commit_error(
+                            raise_commit_store_error(
                                 &alarm_manager,
                                 &CommitError::recovery_required(
                                     RECOVERY_RECONCILIATION_FAILED_MESSAGE,
                                 ),
+                                error.code,
                             );
                         }
                     }
@@ -899,6 +906,7 @@ async fn process_commit<C: OpcConfig>(
     authority: &Mutex<Option<Arc<dyn crate::ConfigAuthorityPort>>>,
     has_pending: bool,
     required_audit: &mut Option<crate::required_audit::RequiredAuditSubmission>,
+    store_failure: &mut Option<StoreErrorCode>,
 ) -> Result<ProcessedCommit, CommitError> {
     if let Some(reason) = recovery.reason() {
         let can_attempt_durable_replay = request.idempotency_key.is_some()
@@ -1008,7 +1016,15 @@ async fn process_commit<C: OpcConfig>(
                     .await
                     .map_err(|err| {
                         log_store_error("load_by_idempotency_key failed", request.request_id, &err);
-                        CommitError::state_machine_fault(IDEMPOTENCY_LOOKUP_FAILED_MESSAGE)
+                        record_store_failure(store_failure, err.code);
+                        CommitError::new(
+                            if err.code == StoreErrorCode::Unavailable {
+                                CommitErrorCode::PersistFailed
+                            } else {
+                                CommitErrorCode::StateMachineFault
+                            },
+                            IDEMPOTENCY_LOOKUP_FAILED_MESSAGE,
+                        )
                     })?
                 {
                     if request_matches_stored_fingerprint(&request, &existing)? {
@@ -1047,8 +1063,16 @@ async fn process_commit<C: OpcConfig>(
             if store
                 .retained_history_floor()
                 .await
-                .map_err(|_| {
-                    CommitError::state_machine_fault("config history authority is unavailable")
+                .map_err(|err| {
+                    record_store_failure(store_failure, err.code);
+                    CommitError::new(
+                        if err.code == StoreErrorCode::Unavailable {
+                            CommitErrorCode::PersistFailed
+                        } else {
+                            CommitErrorCode::StateMachineFault
+                        },
+                        "config history authority is unavailable",
+                    )
                 })?
                 .is_some()
                 && request.base_version != current.version
@@ -1082,6 +1106,7 @@ async fn process_commit<C: OpcConfig>(
                 store,
                 Arc::clone(&previous),
                 has_pending,
+                store_failure,
             )
             .await?;
             let (candidate, deltas, changed_paths) = compute_deltas_and_changed_paths(
@@ -1210,6 +1235,7 @@ async fn process_commit<C: OpcConfig>(
                 }
                 Ok(Err(err)) => {
                     log_store_error("append_commit failed", request.request_id, &err);
+                    record_store_failure(store_failure, err.code);
                     if err.code == StoreErrorCode::OutcomeUnknown {
                         recovery.fence(OUTCOME_UNKNOWN_MESSAGE);
                         return Err(CommitError::outcome_unknown(OUTCOME_UNKNOWN_MESSAGE));
@@ -1235,6 +1261,7 @@ async fn process_commit<C: OpcConfig>(
                         }
                         Ok(None) => {}
                         Err(lookup_error) => {
+                            record_store_failure(store_failure, lookup_error.code);
                             log_store_error(
                                 "post-append reconciliation lookup failed",
                                 request.request_id,
@@ -1268,6 +1295,7 @@ async fn process_commit<C: OpcConfig>(
                 Ok(Ok(())) => {}
                 Ok(Err(err)) => {
                     log_store_error("clear_recovery_required failed", request.request_id, &err);
+                    record_store_failure(store_failure, err.code);
                     recovery.fence(RECOVERY_RECONCILIATION_FAILED_MESSAGE);
                 }
                 Err(panic_payload) => {
@@ -1522,6 +1550,16 @@ async fn authorize_request<C: OpcConfig>(
         .authorize(&auth_ctx)
         .await
         .map_err(|_auth_err| CommitError::authorization_denied("authorization denied"))
+}
+
+// Preserve evidence already established by a storage read. A later outage
+// changes the operation's outcome, but cannot undo that earlier classification.
+fn record_store_failure(failure: &mut Option<StoreErrorCode>, code: StoreErrorCode) {
+    if !failure.is_some_and(|existing| {
+        store_failure_cause(existing) == opc_alarm::ProbableCause::StorageCorruption
+    }) {
+        *failure = Some(code);
+    }
 }
 
 async fn load_reconciliation_record<C: OpcConfig>(

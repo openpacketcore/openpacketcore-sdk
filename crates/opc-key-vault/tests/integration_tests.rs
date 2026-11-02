@@ -316,6 +316,76 @@ async fn success_round_trip() {
 }
 
 #[tokio::test]
+async fn vault_unusable_replies_are_nonterminal_and_not_retried() {
+    let mut failures = Vec::new();
+    for (status, body) in [
+        (401, r#"{"errors":["authentication failed"]}"#.to_string()),
+        (403, r#"{"errors":["access denied"]}"#.to_string()),
+        (404, r#"{"errors":["route not found"]}"#.to_string()),
+        (200, "not-json".into()),
+        (
+            200,
+            r#"{"data":{"plaintext":"%%%","ciphertext":"vault:v1:bad"}}"#.into(),
+        ),
+        (
+            200,
+            format!(
+                r#"{{"data":{{"plaintext":"{}","ciphertext":"wrong-prefix"}}}}"#,
+                BASE64.encode([1u8; 32])
+            ),
+        ),
+    ] {
+        let mock = MockVault::new(Arc::new(Mutex::new(vec![MockResponse { status, body }]))).await;
+        let error = mock_provider(&mock, "token-canary")
+            .get_active_key(KeyPurpose::Config, &tenant())
+            .await
+            .unwrap_err();
+        let requests = mock.request_paths().await.len();
+        if error != KeyError::ProviderUnusable || requests != 1 {
+            failures.push((status, error, requests));
+        }
+    }
+    assert!(
+        failures.is_empty(),
+        "configuration faults were retried or misclassified: {failures:?}"
+    );
+}
+
+#[tokio::test]
+async fn vault_untrusted_tls_is_configuration_without_fast_retries() {
+    use tokio_rustls::rustls;
+    let generated = rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
+    let key = rustls::pki_types::PrivatePkcs8KeyDer::from(generated.signing_key.serialize_der());
+    let config = rustls::ServerConfig::builder_with_provider(Arc::new(
+        rustls::crypto::ring::default_provider(),
+    ))
+    .with_safe_default_protocol_versions()
+    .unwrap()
+    .with_no_client_auth()
+    .with_single_cert(vec![generated.cert.der().clone()], key.into())
+    .unwrap();
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = url::Url::parse(&format!("https://{}/", listener.local_addr().unwrap())).unwrap();
+    let server = tokio::spawn(async move {
+        let acceptor = tokio_rustls::TlsAcceptor::from(Arc::new(config));
+        let mut attempts = 0;
+        while let Ok(Ok((stream, _))) =
+            tokio::time::timeout(std::time::Duration::from_millis(300), listener.accept()).await
+        {
+            attempts += 1;
+            assert!(acceptor.accept(stream).await.is_err());
+        }
+        attempts
+    });
+    let error = VaultKeyProvider::new(url, "token-canary".into(), "transit".into())
+        .get_active_key(KeyPurpose::Config, &tenant())
+        .await
+        .unwrap_err();
+    let attempts = server.await.unwrap();
+    assert_eq!((error, attempts), (KeyError::ProviderUnusable, 1));
+}
+
+#[tokio::test]
 async fn auth_failure_403() {
     let responses = Arc::new(Mutex::new(vec![MockResponse {
         status: 403,
@@ -330,7 +400,7 @@ async fn auth_failure_403() {
         .await
         .expect_err("should fail");
 
-    assert_eq!(err, KeyError::Unavailable);
+    assert_eq!(err, KeyError::ProviderUnusable);
 }
 
 #[tokio::test]
@@ -348,7 +418,7 @@ async fn plain_http_requires_explicit_opt_in() {
         .await
         .expect_err("plain HTTP should fail before sending the token");
 
-    assert_eq!(err, KeyError::Unavailable);
+    assert_eq!(err, KeyError::ProviderUnusable);
     assert!(mock.request_paths().await.is_empty());
 }
 
@@ -413,7 +483,7 @@ async fn malformed_json_response() {
         .await
         .expect_err("should fail");
 
-    assert_eq!(err, KeyError::Unavailable);
+    assert_eq!(err, KeyError::ProviderUnusable);
 }
 
 /// `get_key_by_id` must recover the SAME material the active key was issued
@@ -510,7 +580,7 @@ async fn rotate_key_rotates_and_returns_fresh_id() {
 }
 
 #[tokio::test]
-async fn rotate_key_failure_maps_to_rotation_failed() {
+async fn rotate_key_failure_preserves_outage() {
     let responses = Arc::new(Mutex::new(vec![MockResponse {
         status: 500,
         body: r#"{"errors":["rotation denied"]}"#.into(),
@@ -523,7 +593,7 @@ async fn rotate_key_failure_maps_to_rotation_failed() {
         .rotate_key(KeyPurpose::Session, &tenant())
         .await
         .expect_err("should fail");
-    assert_eq!(err, KeyError::RotationFailed);
+    assert_eq!(err, KeyError::Unavailable);
 }
 
 /// Full envelope round trip through `opc-crypto`, exercising the realistic
@@ -577,4 +647,102 @@ async fn golden_envelope_round_trip() {
     let paths = mock.request_paths().await;
     assert!(paths[0].contains("/datakey/plaintext/"));
     assert!(paths[1].contains("/decrypt/"));
+}
+
+#[tokio::test]
+async fn vault_tls_internal_error_uses_bounded_outage_retries() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = url::Url::parse(&format!("https://{}/", listener.local_addr().unwrap())).unwrap();
+    let server = tokio::spawn(async move {
+        let mut attempts = 0;
+        while let Ok(Ok((mut stream, _))) =
+            tokio::time::timeout(std::time::Duration::from_millis(300), listener.accept()).await
+        {
+            attempts += 1;
+            let mut hello = [0; 4096];
+            assert!(stream.read(&mut hello).await.unwrap() > 0);
+            // TLS fatal internal_error (80), unrelated to peer authentication.
+            stream.write_all(&[21, 3, 3, 0, 2, 2, 80]).await.unwrap();
+            stream.shutdown().await.unwrap();
+        }
+        attempts
+    });
+    let error = VaultKeyProvider::new(url, "token-canary".into(), "transit".into())
+        .get_active_key(KeyPurpose::Config, &tenant())
+        .await
+        .unwrap_err();
+    assert_eq!((error, server.await.unwrap()), (KeyError::Unavailable, 3));
+}
+
+#[tokio::test]
+async fn vault_truncated_reply_is_an_outage_with_bounded_retries() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = url::Url::parse(&format!("http://{}/", listener.local_addr().unwrap())).unwrap();
+    let server = tokio::spawn(async move {
+        let mut attempts = 0;
+        while let Ok(Ok((mut stream, _))) =
+            tokio::time::timeout(std::time::Duration::from_secs(1), listener.accept()).await
+        {
+            attempts += 1;
+            let mut request = [0; 4096];
+            assert!(stream.read(&mut request).await.unwrap() > 0);
+            stream.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 1000\r\nConnection: close\r\n\r\n{\"data\":").await.unwrap();
+            stream.shutdown().await.unwrap();
+        }
+        attempts
+    });
+    let error = VaultKeyProvider::new(url, "token".into(), "transit".into())
+        .dangerous_allow_insecure_http()
+        .get_active_key(KeyPurpose::Config, &tenant())
+        .await
+        .unwrap_err();
+    assert_eq!((error, server.await.unwrap()), (KeyError::Unavailable, 3));
+}
+#[tokio::test]
+async fn vault_rotation_preserves_outage_and_repair_classes() {
+    for (status, expected, count) in [
+        (401, KeyError::ProviderUnusable, 1),
+        (503, KeyError::Unavailable, 3),
+    ] {
+        let mock = MockVault::new(Arc::new(Mutex::new(
+            (0..3)
+                .map(|_| MockResponse {
+                    status,
+                    body: "{}".into(),
+                })
+                .collect(),
+        )))
+        .await;
+        let error = mock_provider(&mock, "token")
+            .rotate_key(KeyPurpose::Session, &tenant())
+            .await
+            .unwrap_err();
+        assert_eq!(error, expected);
+        assert_eq!(mock.request_paths().await.len(), count);
+    }
+}
+
+#[tokio::test]
+async fn vault_rotation_does_not_replay_applied_truncated_reply() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = url::Url::parse(&format!("http://{}/", listener.local_addr().unwrap())).unwrap();
+    let server = tokio::spawn(async move {
+        let mut attempts = 0;
+        while let Ok(Ok((mut stream, _))) =
+            tokio::time::timeout(std::time::Duration::from_secs(1), listener.accept()).await
+        {
+            attempts += 1;
+            let mut request = [0; 4096];
+            assert!(stream.read(&mut request).await.unwrap() > 0);
+            stream.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 1000\r\nConnection: close\r\n\r\n{\"data\":").await.unwrap();
+            stream.shutdown().await.unwrap();
+        }
+        attempts
+    });
+    let error = VaultKeyProvider::new(url, "token".into(), "transit".into())
+        .dangerous_allow_insecure_http()
+        .rotate_key(KeyPurpose::Config, &tenant())
+        .await
+        .unwrap_err();
+    assert_eq!((error, server.await.unwrap()), (KeyError::Unavailable, 1));
 }

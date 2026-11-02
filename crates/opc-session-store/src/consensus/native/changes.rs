@@ -332,7 +332,9 @@ struct RowChange<T: RowValue> {
     after: Option<Box<SharedRow<T>>>,
     before_hash: Option<RowStamp>,
     after_hash: Option<RowStamp>,
-    key_removal: Option<retention::KeyRemoval>,
+    // An absent witness costs one pointer even in a full transient receipt
+    // journal; scratch_size prepays every possible witness box before staging.
+    key_removal: Option<Box<retention::KeyRemoval>>,
 }
 
 impl<T: RowValue> RowChange<T> {
@@ -406,7 +408,7 @@ fn staged_optional<K: Clone + Eq + Hash + Serialize, T: resident::RowFingerprint
                 after: after.map(Box::new),
                 before_hash,
                 after_hash,
-                key_removal,
+                key_removal: key_removal.map(Box::new),
             },
         });
     }
@@ -420,7 +422,8 @@ fn scratch_size<K, T: RowValue>(count: usize) -> io::Result<usize> {
         .checked_mul(
             size_of::<StagedRow<K, T>>()
                 + 4 * (size_of::<(K, RowChange<T>)>() + 1)
-                + 2 * (size_of::<SharedRow<T>>() + std::mem::align_of::<SharedRow<T>>()),
+                + 2 * (size_of::<SharedRow<T>>() + std::mem::align_of::<SharedRow<T>>())
+                + size_of::<retention::KeyRemoval>(),
         )
         .and_then(|bytes| bytes.checked_add(64))
         .ok_or_else(|| invalid("native change reservation overflow"))
@@ -659,6 +662,8 @@ impl BusinessChanges {
                     .validate_key_removal(key, None)?;
                 change
                     .key_removal
+                    .as_deref()
+                    .copied()
                     .ok_or_else(|| invalid("native captured key retirement witness absent"))?
                     .validate(
                         change.before.as_deref().map(|row| row.fence),

@@ -5,6 +5,132 @@ use crate::{
 };
 use std::collections::{BTreeMap, BTreeSet};
 
+// Retained schema admission is implemented only for the Linux runtime.
+#[cfg(target_os = "linux")]
+#[test]
+fn retained_heap_outage_is_unavailable_without_changing_bytes() {
+    const CHILD: &str = "OPC_RETAINED_HEAP_CHILD";
+    if let Some(directory) = std::env::var_os(CHILD) {
+        let path = Path::new(&directory).join("retained.sqlite");
+        let backend = open_authority_sync(
+            options(&path),
+            key(),
+            OpenIntent::NewAuthority,
+            &Arc::new(work()),
+        )
+        .unwrap();
+        let conn = backend.conn().try_lock_owned().unwrap();
+        let record: Vec<u8> = conn
+            .query_row(
+                "SELECT record FROM consensus_retained_binding WHERE singleton=1",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let record = record.try_into().unwrap();
+        validate_connection(&conn, &options(&path), &record, &key(), &Arc::new(work())).unwrap();
+        let before = std::fs::read(&path).unwrap();
+        let wal = path.with_extension("sqlite-wal");
+        let wal_before = std::fs::read(&wal).unwrap_or_default();
+        let _pressure = crate::error::exhaust_sqlite_heap(&conn);
+        let probe = conn
+            .query_row(
+                "SELECT COUNT(*) FROM consensus_retained_binding",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap_err();
+        assert_eq!(
+            probe.sqlite_error_code(),
+            Some(rusqlite::ErrorCode::OutOfMemory)
+        );
+        let failure =
+            validate_connection(&conn, &options(&path), &record, &key(), &Arc::new(work()))
+                .unwrap_err();
+        let schema_failure = crate::consensus::validate_retained_schema(
+            &conn,
+            options(&path).binding.topology(),
+            &key(),
+            work().deadline,
+        )
+        .unwrap_err();
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+        assert_eq!(std::fs::read(&wal).unwrap_or_default(), wal_before);
+        assert_eq!(
+            (
+                failure,
+                matches!(
+                    &schema_failure,
+                    crate::consensus::ConfigConsensusStorageError::BackendUnavailable
+                )
+            ),
+            (RetainedConfigError::Unavailable, true),
+            "{schema_failure:?}"
+        );
+        return;
+    }
+    let directory = tempfile::tempdir().unwrap();
+    let child = std::process::Command::new(std::env::current_exe().unwrap())
+        .args([
+            "--exact",
+            "retained::tests::retained_heap_outage_is_unavailable_without_changing_bytes",
+            "--test-threads=1",
+            "--nocapture",
+        ])
+        .env(CHILD, directory.path())
+        .output()
+        .unwrap();
+    assert!(
+        child.status.success(),
+        "{}\n{}",
+        String::from_utf8_lossy(&child.stdout),
+        String::from_utf8_lossy(&child.stderr)
+    );
+    open_authority_sync(
+        options(&directory.path().join("retained.sqlite")),
+        key(),
+        OpenIntent::Reopen,
+        &Arc::new(work()),
+    )
+    .expect("unchanged retained storage reopens after outage repair");
+}
+
+// Retained schema admission is implemented only for the Linux runtime.
+#[cfg(target_os = "linux")]
+#[test]
+fn retained_missing_binding_schema_is_rejected() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("retained.sqlite");
+    let backend = open_authority_sync(
+        options(&path),
+        key(),
+        OpenIntent::NewAuthority,
+        &Arc::new(work()),
+    )
+    .unwrap();
+    let conn = backend.conn().try_lock_owned().unwrap();
+    let record: Vec<u8> = conn
+        .query_row(
+            "SELECT record FROM consensus_retained_binding WHERE singleton=1",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    let record = record.try_into().unwrap();
+    conn.execute_batch("DROP TABLE consensus_retained_binding")
+        .unwrap();
+    let before = std::fs::read(&path).unwrap();
+    let wal = path.with_extension("sqlite-wal");
+    let wal_before = std::fs::read(&wal).unwrap_or_default();
+    assert_eq!(
+        validate_connection(&conn, &options(&path), &record, &key(), &Arc::new(work()))
+            .unwrap_err(),
+        RetainedConfigError::Rejected,
+    );
+    assert_eq!(before, std::fs::read(&path).unwrap());
+    assert_eq!(wal_before, std::fs::read(&wal).unwrap_or_default());
+}
+
 pub(super) fn options(path: &Path) -> RetainedConfigOptions {
     let node = ConfigConsensusNodeId::new(1).expect("node");
     let topology = ConfigConsensusTopology::try_new(

@@ -101,8 +101,8 @@ async fn qualification_restore_scan_diagnostics_identify_store_variants_without_
             true,
         ),
         (
-            "BackendUnavailable",
-            StoreError::BackendUnavailable("synthetic-provider-secret".into()),
+            "KeyProviderUnavailable",
+            StoreError::KeyProviderUnavailable("synthetic-provider-secret".into()),
             true,
         ),
     ];

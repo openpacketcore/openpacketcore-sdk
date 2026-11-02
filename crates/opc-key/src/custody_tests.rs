@@ -22,6 +22,22 @@ use crate::{
     KeyCustodyOperationError, KeyError, KeyId, RemoteSealProvider, SessionAad,
 };
 
+#[test]
+fn custody_mapper_preserves_positive_verdicts_and_retains_unknown_failures() {
+    assert_eq!(
+        super::map_provider_error(KeyError::OperationFailed),
+        KeyError::OperationFailed
+    );
+    for error in [
+        KeyError::RotationFailed,
+        KeyError::InvalidKeyId {
+            message: "wrong provider".into(),
+        },
+    ] {
+        assert_eq!(super::map_provider_error(error), KeyError::ProviderUnusable);
+    }
+}
+
 const KEY_MATERIAL_CANARY: &str = "provider-owned-key-material-canary";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -511,6 +527,20 @@ async fn provider_outputs_are_bounded_canonical_and_context_exact() {
 }
 
 #[tokio::test]
+async fn provider_configuration_survives_the_custody_error_boundary() {
+    use crate::KeyProvider;
+    let provider =
+        crate::KmsKeyProvider::new("unix://".into(), None, std::time::Duration::from_secs(1));
+    let error = provider
+        .get_key_by_id(&KeyId::new("configuration-boundary").unwrap())
+        .await
+        .unwrap_err();
+    let mapped = super::map_provider_error(error);
+    assert_eq!(mapped.to_string(), "key provider unusable as configured");
+    assert_eq!(format!("{mapped:?}"), "ProviderUnusable");
+}
+
+#[tokio::test]
 async fn provider_errors_preserve_only_safe_public_classifications() {
     let required = key_custody_required_capabilities();
     let module = Arc::new(CountingCustodyModule::new(required));
@@ -544,7 +574,9 @@ async fn provider_errors_preserve_only_safe_public_classifications() {
     let error = unseal_with_slot(&slot, &module.key_id, &aad, b"ciphertext")
         .await
         .expect_err("contextual provider errors must collapse");
-    assert_custody_error(error, KeyCustodyOperationError::ProviderOperationFailed);
+    assert_eq!(error, KeyError::ProviderUnusable);
+    assert_eq!(error.to_string(), "key provider unusable as configured");
+    assert!(!format!("{error:?} {error}").contains(KEY_MATERIAL_CANARY));
 
     module.set_mode(ProviderMode::Valid);
     assert_eq!(

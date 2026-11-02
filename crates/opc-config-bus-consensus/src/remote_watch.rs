@@ -1731,6 +1731,8 @@ mod tests {
     #[derive(Default)]
     struct AppliedStoreProbe {
         compacted_before: std::sync::atomic::AtomicU64,
+        next_read_failure: std::sync::Mutex<Option<StoreError>>,
+        read_calls: AtomicUsize,
         active_waits: AtomicUsize,
         max_active_waits: AtomicUsize,
         wait_calls: AtomicUsize,
@@ -1817,6 +1819,12 @@ mod tests {
             after: ConfigVersion,
             limit: usize,
         ) -> Result<Vec<StoredConfig<C>>, StoreError> {
+            if let Some(probe) = &self.probe {
+                probe.read_calls.fetch_add(1, Ordering::SeqCst);
+                if let Some(error) = probe.next_read_failure.lock().unwrap().take() {
+                    return Err(error);
+                }
+            }
             if self.compacted
                 || self.probe.as_ref().is_some_and(|probe| {
                     after.get() < probe.compacted_before.load(Ordering::SeqCst)
@@ -2812,6 +2820,41 @@ mod tests {
         drop(tail);
         handle.shutdown().await;
         consensus.shutdown().await.expect("reap consensus engine");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn follower_watch_retries_read_outage_but_stops_on_rejected_bytes() {
+        for rejected in [false, true] {
+            let probe = Arc::new(AppliedStoreProbe::default());
+            let (bus, _, tx_ids) = seeded_shadow_with_probe(&["v1"], Some(probe.clone())).await;
+            let tls = TestTls::new(71);
+            let identity = scope(71);
+            let (handle, address) = start_server(bus, &tls, identity).await;
+            let remote = tls.remote(identity, address);
+            probe.read_calls.store(0, Ordering::SeqCst);
+            *probe.next_read_failure.lock().unwrap() = Some(if rejected {
+                StoreError::crypto("stored bytes rejected")
+            } else {
+                StoreError::unavailable("storage read unavailable")
+            });
+            let result = tokio::time::timeout(
+                Duration::from_secs(5),
+                remote.watch_committed(ConfigVersion::INITIAL),
+            )
+            .await
+            .expect("bounded follower retry");
+            if rejected {
+                assert_eq!(result.err(), Some(ConfigWatchError::Integrity));
+                assert_eq!(probe.read_calls.load(Ordering::SeqCst), 1);
+            } else {
+                let mut stream = result.expect("outage must retry without a new subscription");
+                let entry = stream.next().await.unwrap().unwrap();
+                assert_eq!(entry.tx_id, tx_ids[0]);
+                assert_eq!(entry.version, ConfigVersion::new(1));
+                assert_eq!(probe.read_calls.load(Ordering::SeqCst), 2);
+            }
+            handle.shutdown().await;
+        }
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

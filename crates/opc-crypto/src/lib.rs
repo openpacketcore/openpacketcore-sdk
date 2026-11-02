@@ -330,10 +330,71 @@ impl CryptoEnvelopeV1 {
 pub enum CryptoError {
     #[error("invalid envelope encoding")]
     InvalidEnvelope,
+    /// Local encryption failed; this is not evidence against stored data.
     #[error("envelope encryption failed")]
     EncryptionFailed,
+    /// A provider positively established a missing/revoked key or rejected
+    /// ciphertext through `KeyError::is_definitive_rejection`.
+    #[error("key or ciphertext rejected")]
+    KeyRejected,
     #[error("envelope decryption failed")]
     DecryptionFailed,
+    /// Provider outage; preserve pending data and use bounded backoff.
+    #[error("key provider unavailable")]
+    ProviderUnavailable,
+    /// Provider configuration/channel failure; preserve data, back off and
+    /// report to operators. This does not indicate rejected ciphertext.
+    #[error("key provider unusable as configured")]
+    ProviderUnusable,
+}
+
+/// Origin of a failed encryption of new data. None establishes corruption of
+/// stored data. This closed set keeps write-side consumers exhaustive even
+/// though [`CryptoError`] can acquire new variants.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EncryptionFailureKind {
+    /// A local encryption or envelope-construction invariant failed.
+    Local,
+    /// The key provider could not serve the request.
+    ProviderUnavailable,
+    /// Provider configuration or key selection needs repair.
+    ProviderUnusable,
+}
+
+impl CryptoError {
+    /// Classify an error from encrypting a new value, before any stored-data
+    /// rejection boundary. New error variants must choose their origin here.
+    pub const fn encryption_failure_kind(&self) -> EncryptionFailureKind {
+        match self {
+            Self::EncryptionFailed | Self::InvalidEnvelope | Self::DecryptionFailed => {
+                EncryptionFailureKind::Local
+            }
+            Self::ProviderUnavailable => EncryptionFailureKind::ProviderUnavailable,
+            Self::ProviderUnusable | Self::KeyRejected => EncryptionFailureKind::ProviderUnusable,
+        }
+    }
+
+    /// Positive evidence against the envelope or its key. Other failures must
+    /// retain stored data; an encryption failure alone is not such evidence.
+    /// A successful provider handle whose tenant, purpose or key ID contradicts
+    /// the row is a binding mismatch and remains definitive, as are failures
+    /// of the stored binding checked before provider lookup.
+    pub const fn is_definitive_rejection(&self) -> bool {
+        match self {
+            Self::InvalidEnvelope | Self::DecryptionFailed | Self::KeyRejected => true,
+            Self::EncryptionFailed | Self::ProviderUnavailable | Self::ProviderUnusable => false,
+        }
+    }
+}
+
+fn provider_error(error: opc_key::KeyError) -> CryptoError {
+    if error.is_definitive_rejection() {
+        return CryptoError::KeyRejected;
+    }
+    match error {
+        opc_key::KeyError::Unavailable => CryptoError::ProviderUnavailable,
+        _ => CryptoError::ProviderUnusable,
+    }
 }
 
 pub async fn encrypt_envelope<P: KeyProvider + ?Sized>(
@@ -372,7 +433,7 @@ pub async fn encrypt_envelope_with_nonce<P: KeyProvider + ?Sized>(
     let handle = provider
         .get_active_key(aad.purpose(), aad.tenant())
         .await
-        .map_err(|_| CryptoError::EncryptionFailed)?;
+        .map_err(provider_error)?;
     encrypt_envelope_with_handle_and_nonce(&handle, aad, plaintext, nonce)
 }
 
@@ -464,10 +525,17 @@ pub async fn decrypt_envelope<P: KeyProvider + ?Sized>(
 ) -> Result<Zeroizing<Vec<u8>>, CryptoError> {
     let envelope =
         CryptoEnvelopeV1::decode(envelope_bytes).map_err(|_| CryptoError::DecryptionFailed)?;
+    // The header and its stored AAD must agree before an unavailable or
+    // differently configured provider can obscure positive local damage.
+    let bound =
+        opc_key::serialize_bound_aad(expected_aad, &envelope.key_id).map_err(provider_error)?;
+    if bound != envelope.aad {
+        return Err(CryptoError::DecryptionFailed);
+    }
     let handle = provider
         .get_key_by_id(&envelope.key_id)
         .await
-        .map_err(|_| CryptoError::DecryptionFailed)?;
+        .map_err(provider_error)?;
 
     decrypt_decoded_envelope_with_handle(&handle, expected_aad, &envelope)
 }
@@ -571,6 +639,183 @@ mod tests {
             out.push(HEX[(byte & 0x0f) as usize] as char);
         }
         out
+    }
+
+    struct VerdictProvider(opc_key::KeyError);
+    #[async_trait::async_trait]
+    impl KeyProvider for VerdictProvider {
+        async fn get_active_key(
+            &self,
+            _: KeyPurpose,
+            _: &TenantId,
+        ) -> Result<KeyHandle, opc_key::KeyError> {
+            Err(self.0.clone())
+        }
+        async fn get_key_by_id(&self, _: &KeyId) -> Result<KeyHandle, opc_key::KeyError> {
+            Err(self.0.clone())
+        }
+        async fn rotate_key(
+            &self,
+            _: KeyPurpose,
+            _: &TenantId,
+        ) -> Result<KeyId, opc_key::KeyError> {
+            Err(self.0.clone())
+        }
+    }
+    #[tokio::test]
+    async fn positive_key_verdicts_are_distinct_from_local_encryption_failure() {
+        let working = provider_with_active_key(KeyPurpose::Config, "verdict-key", 0x41);
+        let aad = config_aad();
+        let plaintext = b"{}";
+        let envelope = encrypt_envelope(&working, &aad, plaintext).await.unwrap();
+        let mut failures = Vec::new();
+        for error in [
+            opc_key::KeyError::NotFound,
+            opc_key::KeyError::OperationFailed,
+        ] {
+            let provider = VerdictProvider(error.clone());
+            let actual = [
+                encrypt_envelope(&provider, &aad, plaintext)
+                    .await
+                    .unwrap_err()
+                    .to_string(),
+                decrypt_envelope(&provider, &aad, &envelope)
+                    .await
+                    .unwrap_err()
+                    .to_string(),
+                encrypt_bounded_config_envelope(&provider, &aad, plaintext)
+                    .await
+                    .unwrap_err()
+                    .to_string(),
+            ];
+            if actual
+                .iter()
+                .any(|value| value != "key or ciphertext rejected")
+            {
+                failures.push((error, actual));
+            }
+        }
+        assert!(
+            failures.is_empty(),
+            "positive key verdicts lost their provenance: {failures:?}"
+        );
+    }
+
+    struct UnreadyProvider;
+    #[async_trait::async_trait]
+    impl KeyProvider for UnreadyProvider {
+        async fn get_active_key(
+            &self,
+            _: KeyPurpose,
+            _: &TenantId,
+        ) -> Result<KeyHandle, opc_key::KeyError> {
+            Err(opc_key::KeyCustodyOperationError::CapabilityWithdrawn.into())
+        }
+        async fn get_key_by_id(&self, _: &KeyId) -> Result<KeyHandle, opc_key::KeyError> {
+            Err(opc_key::KeyCustodyOperationError::CapabilityWithdrawn.into())
+        }
+        async fn rotate_key(
+            &self,
+            _: KeyPurpose,
+            _: &TenantId,
+        ) -> Result<KeyId, opc_key::KeyError> {
+            Err(opc_key::KeyCustodyOperationError::CapabilityWithdrawn.into())
+        }
+    }
+    #[tokio::test]
+    async fn custody_unready_is_nonterminal_through_all_envelope_apis() {
+        let working = provider_with_active_key(KeyPurpose::Config, "custody-key", 0x41);
+        let aad = config_aad();
+        let plaintext = br#"{"hostname":"amf-01"}"#;
+        let envelope = encrypt_envelope(&working, &aad, plaintext).await.unwrap();
+        let errors = [
+            encrypt_envelope(&UnreadyProvider, &aad, plaintext)
+                .await
+                .unwrap_err()
+                .to_string(),
+            decrypt_envelope(&UnreadyProvider, &aad, &envelope)
+                .await
+                .unwrap_err()
+                .to_string(),
+            encrypt_bounded_config_envelope(&UnreadyProvider, &aad, plaintext)
+                .await
+                .unwrap_err()
+                .to_string(),
+        ];
+        assert!(
+            errors
+                .iter()
+                .all(|error| error == "key provider unusable as configured"),
+            "custody state became rejection: {errors:?}"
+        );
+        assert_eq!(
+            decrypt_envelope(&working, &aad, &envelope)
+                .await
+                .unwrap()
+                .as_slice(),
+            plaintext
+        );
+    }
+
+    #[tokio::test]
+    async fn provider_configuration_survives_generic_envelope_operations() {
+        let working = provider_with_active_key(KeyPurpose::Config, "configuration-key", 0x41);
+        let aad = config_aad();
+        let plaintext = br#"{"hostname":"amf-01"}"#;
+        let envelope = encrypt_envelope(&working, &aad, plaintext).await.unwrap();
+        let provider =
+            opc_key::KmsKeyProvider::new("unix://".into(), None, std::time::Duration::from_secs(1));
+        let decrypt = decrypt_envelope(&provider, &aad, &envelope)
+            .await
+            .unwrap_err();
+        assert_eq!(decrypt.to_string(), "key provider unusable as configured");
+        let encrypt = encrypt_envelope(&provider, &aad, plaintext)
+            .await
+            .unwrap_err();
+        assert_eq!(encrypt.to_string(), "key provider unusable as configured");
+        assert_eq!(
+            decrypt_envelope(&working, &aad, &envelope)
+                .await
+                .unwrap()
+                .as_slice(),
+            plaintext
+        );
+    }
+
+    #[tokio::test]
+    async fn provider_configuration_survives_bounded_config_encryption() {
+        let provider =
+            opc_key::KmsKeyProvider::new("unix://".into(), None, std::time::Duration::from_secs(1));
+        let error =
+            encrypt_bounded_config_envelope(&provider, &config_aad(), br#"{"hostname":"amf-01"}"#)
+                .await
+                .unwrap_err();
+        assert_eq!(error.to_string(), "key provider unusable as configured");
+    }
+
+    #[tokio::test]
+    async fn provider_outage_survives_generic_and_bounded_envelope_operations() {
+        let working = provider_with_active_key(KeyPurpose::Config, "outage-key", 0x41);
+        let aad = config_aad();
+        let plaintext = br#"{"hostname":"amf-01"}"#;
+        let envelope = encrypt_envelope(&working, &aad, plaintext).await.unwrap();
+        let provider = opc_key::KmsKeyProvider::new(
+            format!("/tmp/absent-kms-{}-outage", std::process::id()),
+            None,
+            std::time::Duration::from_secs(1),
+        );
+        let decrypt = decrypt_envelope(&provider, &aad, &envelope)
+            .await
+            .unwrap_err();
+        assert_eq!(decrypt.to_string(), "key provider unavailable");
+        let encrypt = encrypt_envelope(&provider, &aad, plaintext)
+            .await
+            .unwrap_err();
+        assert_eq!(encrypt.to_string(), "key provider unavailable");
+        let bounded = encrypt_bounded_config_envelope(&provider, &aad, plaintext)
+            .await
+            .unwrap_err();
+        assert_eq!(bounded.to_string(), "key provider unavailable");
     }
 
     #[tokio::test]
@@ -700,10 +945,17 @@ mod tests {
             .await
             .expect_err("unknown key should fail");
 
+        let missing_key_err = decrypt_envelope(&MemoryKeyProvider::new(), &aad, &encoded)
+            .await
+            .expect_err("missing provider key must fail closed");
         for err in [wrong_aad_err, wrong_key_err, corrupt_err, unknown_key_err] {
             assert_eq!(err, CryptoError::DecryptionFailed);
             assert_eq!(err.to_string(), "envelope decryption failed");
+            assert!(err.is_definitive_rejection());
         }
+        assert_eq!(missing_key_err, CryptoError::KeyRejected);
+        assert_eq!(missing_key_err.to_string(), "key or ciphertext rejected");
+        assert!(missing_key_err.is_definitive_rejection());
     }
 
     #[tokio::test]
@@ -838,5 +1090,29 @@ mod tests {
             .await
             .expect("decrypt");
         assert_eq!(round_trip.as_slice(), plaintext);
+    }
+    #[tokio::test]
+    async fn damaged_key_binding_is_rejected_before_provider_lookup() {
+        let provider = provider_with_active_key(KeyPurpose::Config, "original-key", 7);
+        let aad = config_aad();
+        let bytes = encrypt_envelope(&provider, &aad, b"retained")
+            .await
+            .unwrap();
+        let mut envelope = CryptoEnvelopeV1::decode(&bytes).unwrap();
+        envelope.key_id = KeyId::new("damaged-key").unwrap();
+        let unavailable =
+            opc_key::KmsKeyProvider::new("unix://".into(), None, std::time::Duration::from_secs(1));
+        let error = decrypt_envelope(&unavailable, &aad, &envelope.encode().unwrap())
+            .await
+            .unwrap_err();
+        assert_eq!(error, CryptoError::DecryptionFailed);
+        assert!(error.is_definitive_rejection());
+        // Intact binding under a wrong deployment still retains the row.
+        assert_eq!(
+            decrypt_envelope(&unavailable, &aad, &bytes)
+                .await
+                .unwrap_err(),
+            CryptoError::ProviderUnusable
+        );
     }
 }

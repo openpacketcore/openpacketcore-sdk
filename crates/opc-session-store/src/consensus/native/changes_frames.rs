@@ -233,6 +233,8 @@ impl BusinessChanges {
                     writer,
                     &change
                         .key_removal
+                        .as_deref()
+                        .copied()
                         .ok_or_else(|| invalid("native key retirement witness absent"))?,
                 )?;
             }
@@ -330,6 +332,8 @@ impl BusinessChanges {
                     reader,
                     &change
                         .key_removal
+                        .as_deref()
+                        .copied()
                         .ok_or_else(|| invalid("native key retirement witness absent"))?,
                 )?;
             }

@@ -17,6 +17,7 @@ categories = ["cryptography", "network-programming"]
 aes-gcm-siv = { workspace = true }
 async-trait = { workspace = true }
 hkdf = { workspace = true }
+libc = "0.2"
 opc-crypto-provider = { path = "../opc-crypto-provider", version = "0.2.0" }
 opc-types = { path = "../opc-types", version = "0.2.0" }
 serde = { workspace = true, features = ["derive"] }
@@ -26,13 +27,14 @@ rand = { workspace = true }
 subtle = { workspace = true }
 thiserror = { workspace = true }
 zeroize = { workspace = true }
-tokio = { workspace = true, features = ["sync", "net", "time"] }
+tokio = { workspace = true, features = ["sync", "net", "time", "fs"] }
 tokio-rustls = { workspace = true }
 rustls-pki-types = { workspace = true }
 opc-tls = { path = "../opc-tls", version = "0.2.0" }
 opc-identity = { path = "../opc-identity", version = "0.2.0" }
 
 [dev-dependencies]
+rcgen = { workspace = true }
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
 
 [lints]
