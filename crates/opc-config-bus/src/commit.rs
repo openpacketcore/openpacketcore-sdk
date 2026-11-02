@@ -1016,7 +1016,7 @@ async fn process_commit<C: OpcConfig>(
                     .await
                     .map_err(|err| {
                         log_store_error("load_by_idempotency_key failed", request.request_id, &err);
-                        *store_failure = Some(err.code);
+                        record_store_failure(store_failure, err.code);
                         CommitError::new(
                             if err.code == StoreErrorCode::Unavailable {
                                 CommitErrorCode::PersistFailed
@@ -1064,7 +1064,7 @@ async fn process_commit<C: OpcConfig>(
                 .retained_history_floor()
                 .await
                 .map_err(|err| {
-                    *store_failure = Some(err.code);
+                    record_store_failure(store_failure, err.code);
                     CommitError::new(
                         if err.code == StoreErrorCode::Unavailable {
                             CommitErrorCode::PersistFailed
@@ -1235,7 +1235,7 @@ async fn process_commit<C: OpcConfig>(
                 }
                 Ok(Err(err)) => {
                     log_store_error("append_commit failed", request.request_id, &err);
-                    *store_failure = Some(err.code);
+                    record_store_failure(store_failure, err.code);
                     if err.code == StoreErrorCode::OutcomeUnknown {
                         recovery.fence(OUTCOME_UNKNOWN_MESSAGE);
                         return Err(CommitError::outcome_unknown(OUTCOME_UNKNOWN_MESSAGE));
@@ -1261,7 +1261,7 @@ async fn process_commit<C: OpcConfig>(
                         }
                         Ok(None) => {}
                         Err(lookup_error) => {
-                            *store_failure = Some(lookup_error.code);
+                            record_store_failure(store_failure, lookup_error.code);
                             log_store_error(
                                 "post-append reconciliation lookup failed",
                                 request.request_id,
@@ -1295,7 +1295,7 @@ async fn process_commit<C: OpcConfig>(
                 Ok(Ok(())) => {}
                 Ok(Err(err)) => {
                     log_store_error("clear_recovery_required failed", request.request_id, &err);
-                    *store_failure = Some(err.code);
+                    record_store_failure(store_failure, err.code);
                     recovery.fence(RECOVERY_RECONCILIATION_FAILED_MESSAGE);
                 }
                 Err(panic_payload) => {
@@ -1550,6 +1550,16 @@ async fn authorize_request<C: OpcConfig>(
         .authorize(&auth_ctx)
         .await
         .map_err(|_auth_err| CommitError::authorization_denied("authorization denied"))
+}
+
+// Preserve evidence already established by a storage read. A later outage
+// changes the operation's outcome, but cannot undo that earlier classification.
+fn record_store_failure(failure: &mut Option<StoreErrorCode>, code: StoreErrorCode) {
+    if !failure.is_some_and(|existing| {
+        store_failure_cause(existing) == opc_alarm::ProbableCause::StorageCorruption
+    }) {
+        *failure = Some(code);
+    }
 }
 
 async fn load_reconciliation_record<C: OpcConfig>(

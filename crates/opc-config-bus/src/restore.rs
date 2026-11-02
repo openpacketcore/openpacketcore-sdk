@@ -642,9 +642,14 @@ impl<C: OpcConfig> ConfigBus<C> {
                                     "failed to append startup rollback commit",
                                     &err,
                                 );
+                                let code = if err.code == StoreErrorCode::NotFound {
+                                    StoreErrorCode::RestoreRecoveryRequired
+                                } else {
+                                    err.code
+                                };
                                 preserve_startup_error(
                                     &alarm_manager,
-                                    StoreError::new(err.code, RESTORE_RECOVERY_REQUIRED_MESSAGE),
+                                    StoreError::new(code, RESTORE_RECOVERY_REQUIRED_MESSAGE),
                                 )
                             })?;
 
@@ -657,9 +662,14 @@ impl<C: OpcConfig> ConfigBus<C> {
                                     "failed to clear recovery required on startup rollback commit",
                                     &err,
                                 );
+                                let code = if err.code == StoreErrorCode::NotFound {
+                                    StoreErrorCode::RestoreRecoveryRequired
+                                } else {
+                                    err.code
+                                };
                                 preserve_startup_error(
                                     &alarm_manager,
-                                    StoreError::new(err.code, RESTORE_RECOVERY_REQUIRED_MESSAGE),
+                                    StoreError::new(code, RESTORE_RECOVERY_REQUIRED_MESSAGE),
                                 )
                             })?;
 

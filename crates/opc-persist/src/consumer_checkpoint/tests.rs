@@ -246,6 +246,27 @@ async fn checkpoint_seal_and_provision_report_provider_repair() {
 
 #[test]
 fn checkpoint_local_encryption_failure_is_not_evidence_against_stored_data() {
+    // This no-subscriber call must not race the diagnostic-capture test at
+    // the same tracing callsite. Keep the assertion in an isolated process.
+    const CHILD: &str = "OPC_CHECKPOINT_LOCAL_FAILURE_CHILD";
+    if std::env::var_os(CHILD).is_none() {
+        let child = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "consumer_checkpoint::tests::checkpoint_local_encryption_failure_is_not_evidence_against_stored_data",
+                "--test-threads=1",
+                "--nocapture",
+            ])
+            .env(CHILD, "1")
+            .output().unwrap();
+        assert!(
+            child.status.success(),
+            "{}\n{}",
+            String::from_utf8_lossy(&child.stdout),
+            String::from_utf8_lossy(&child.stderr)
+        );
+        return;
+    }
     assert_eq!(
         checkpoint_decrypt_error(opc_crypto::CryptoError::EncryptionFailed),
         ConsumerCheckpointError::Unavailable

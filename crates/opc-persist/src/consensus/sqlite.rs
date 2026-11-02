@@ -3399,7 +3399,9 @@ pub(crate) fn apply_entries_cancellable_sync(
                                 && (audit_keys.is_some()
                                     || super::audit::read_sync(&tx, audit_key, identity)?.is_some())
                             {
-                                Err(ConfigMutationFailure::InvalidInput)
+                                // An unaudited command conflicts with the admitted
+                                // policy; no stored bytes have been rejected.
+                                Err(ConfigMutationFailure::Conflict)
                             } else {
                                 execute_intent_sync(
                                     &tx,

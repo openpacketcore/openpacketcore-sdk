@@ -796,7 +796,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   longer become generic encryption/decryption rejection. Positive provider
   verdicts use `KeyRejected`; local `EncryptionFailed` alone does not establish
   rejected stored data. Callers use `CryptoError::is_definitive_rejection()`;
-  both enums remain non-exhaustive. Refs #1197.
+  both enums remain non-exhaustive. `EncryptionFailureKind` and
+  `CryptoError::encryption_failure_kind()` expose the exhaustive classification
+  used for encryption diagnostics. Refs #1197.
 - `opc-session-store`: the new unreleased `KeyProviderUnavailable` variant keeps
   its serialized position. Non-verdict key/custody failures and malformed remote
   sealing responses return `BackendUnavailable`; positive key/data rejection
@@ -814,8 +816,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   stored data damage. Coarse state-machine, recovery and startup task failures
   use `ConfigApplyFailed`. Runtime append, reconciliation and recovery-marker
   cleanup retain the source store code. Rejected stored JSON and metadata retain
-  `Crypto`; missing startup rollback parents retain Critical severity with
-  `ConfigApplyFailed`. Alarm severity and recovery fencing remain intact.
+  `Crypto`; missing startup rollback parents, append targets, and marker-clear
+  targets retain Critical severity with `ConfigApplyFailed`. A later read outage
+  does not replace stored-data evidence from an earlier append failure. Alarm
+  severity and recovery fencing remain intact.
   Refs #1197.
 - `opc-persist`: checkpoint reopen/read-back provider failures change from
   `Rejected` to `Unavailable`, preserving the checkpoint. Sealing and provisioning
@@ -823,7 +827,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   retains its existing `Indeterminate` outcome. Config-history reads distinguish
   rejected bytes (including SQLite corruption) from read outages at the storage
   boundary, preserving the first read failure across transaction completion.
-  Local invariants and write failures do not establish stored-data corruption.
+  Missing mandatory authority rows remain corruption; missing live tables are
+  permanent invariant failures rather than retryable outages. Plain commits
+  refused by an initialized required-audit policy report a local conflict;
+  existing persisted rejection classes retain their meanings.
   Refs #1197.
 - `opc-key-vault`: configuration/authentication, malformed-response and TLS
   verification failures use `ProviderUnusable` and avoid transient retries.

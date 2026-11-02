@@ -213,7 +213,8 @@ pub(crate) fn sqlite_read_error(error: rusqlite::Error) -> PersistError {
             rusqlite::ErrorCode::DatabaseCorrupt | rusqlite::ErrorCode::NotADatabase => {
                 PersistError::corrupt_blob()
             }
-            rusqlite::ErrorCode::InternalMalfunction
+            rusqlite::ErrorCode::Unknown
+            | rusqlite::ErrorCode::InternalMalfunction
             | rusqlite::ErrorCode::ApiMisuse
             | rusqlite::ErrorCode::ParameterOutOfRange
             | rusqlite::ErrorCode::ConstraintViolation => {

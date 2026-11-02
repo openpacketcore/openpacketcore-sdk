@@ -405,7 +405,7 @@ impl ConfigStore for SqliteBackend {
                     params![&tx_id_bytes],
                     |row| row.get(0),
                 )
-                .map_err(|e| PersistError::sqlite(e.to_string()))?;
+                .map_err(sqlite_read_error)?;
             let rows = tx
                 .execute(
                     "UPDATE config_history SET rollback_point = 1 WHERE tx_id = ?1",
@@ -937,7 +937,7 @@ impl SqliteBackend {
                     [&digest],
                     |row| row.get(0),
                 )
-                .map_err(|error| PersistError::sqlite(error.to_string()))?;
+                .map_err(sqlite_read_error)?;
             if duplicate {
                 return Err(PersistError::constraint_violation(
                     "config replay lookup digest is not unique",
