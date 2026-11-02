@@ -99,6 +99,13 @@ impl ReadNotification<'_> {
 }
 
 impl NativeNotification {
+    pub(in crate::consensus::native) fn selected_range(&self) -> Option<&SelectedRange> {
+        match &self.body {
+            Body::Resident(_) => None,
+            Body::Selected(row) => Some(&row.range),
+        }
+    }
+
     #[cfg(any(test, feature = "test-control"))]
     pub(super) fn is_selected_for_test(&self) -> bool {
         matches!(self.body, Body::Selected(_))

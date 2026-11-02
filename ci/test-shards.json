@@ -508,6 +508,20 @@
       ]
     },
     {
+      "module": "consensus::native::generation::catalog::tests::retention_tests",
+      "shard": "native-log-14",
+      "tests": [
+        "native_notification_retention_passes_original_lifetime_limit_and_reopens"
+      ]
+    },
+    {
+      "module": "consensus::native::generation::catalog::tests::retention_tests",
+      "shard": "native-log-15",
+      "tests": [
+        "native_key_retention_passes_original_lifetime_limit_and_reopens"
+      ]
+    },
+    {
       "module": "authenticated_consumer_fixture::v2_facade_tests::read_deadline_tests::realtime_tests",
       "shard": "heavy-0",
       "tests": [

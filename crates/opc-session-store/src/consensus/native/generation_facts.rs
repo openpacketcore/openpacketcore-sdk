@@ -4,6 +4,7 @@
 //! only the complete catalog reader can bind them to an admitted prefix.
 
 use super::*;
+use crate::consensus::native::resident::RowFingerprint;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub(in crate::consensus::native) struct KeyId {
@@ -37,6 +38,7 @@ pub(in crate::consensus::native) struct Row<T> {
 pub(in crate::consensus::native) struct Key {
     pub(in crate::consensus::native) format: Format,
     pub(in crate::consensus::native) fence: u64,
+    pub(in crate::consensus::native) retired_epoch: Option<u64>,
     pub(in crate::consensus::native) credential: Option<u64>,
     pub(in crate::consensus::native) commitment: [u8; 32],
     pub(in crate::consensus::native) reserved: bool,
@@ -81,6 +83,7 @@ impl Key {
         Ok(Self {
             format,
             fence: row.fence,
+            retired_epoch: row.retired_epoch,
             credential: row.lease.as_ref().map(|lease| lease.credential_id),
             commitment: crate::fenced_mutation_roster::session_key_commitment(key),
             reserved: row.reserved,
@@ -218,12 +221,12 @@ impl Receipt {
         row: &NativeReceipt,
     ) -> io::Result<Row<Self>> {
         Ok(Row {
-            content: changes::fingerprint(1, &id, row)?,
+            content: row.row_fingerprint(1, &id)?,
             facts: Self {
                 ordinal: row.ordinal,
                 payload_digest: row.payload_digest,
                 retained_until: row.retained_until,
-                response: row.response.as_deref().map(Response::of).transpose()?,
+                response: row.response_facts()?,
                 lease_deferred: row.lease_deferred(),
             },
         })

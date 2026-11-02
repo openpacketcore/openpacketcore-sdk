@@ -55,6 +55,10 @@ impl SelectedBytes {
 }
 
 impl SelectedRange {
+    pub(in crate::consensus::native) fn descriptor(&self) -> (&prefix::VerifiedPrefix, u64, u32) {
+        (&self.source, self.offset, self.length)
+    }
+
     // An ordering hint only; reads still use this exact admitted prefix view.
     pub(super) fn cold_read_order(&self) -> (usize, u64) {
         (self.source.source_order(), self.offset)

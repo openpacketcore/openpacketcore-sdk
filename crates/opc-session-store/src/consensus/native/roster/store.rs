@@ -101,6 +101,24 @@ impl<'s, 'a> Store<'s, 'a> {
         Ok((self.ledger, self.changes, self.keys, self.restore_revision))
     }
 
+    /// Initialize only the command's private savepoint until admission succeeds.
+    pub(in crate::consensus::native) fn initialize_roster_witness(
+        &mut self,
+        fresh: bool,
+    ) -> io::Result<()> {
+        if let Some(witness) = self.ledger.witness {
+            return witness
+                .validate()
+                .map_err(|_| invalid("native roster witness is invalid"));
+        }
+        if !fresh || !self.ledger.rows.is_empty() || !self.ledger.partitions.is_empty() {
+            return Err(invalid("native activated roster witness is missing"));
+        }
+        let mut edit = Edit::new(&self.ledger, 0, 0)?;
+        edit.witness = Some(GlobalChargeWitness::empty());
+        self.accept(edit)
+    }
+
     fn accept(&mut self, edit: Edit) -> io::Result<()> {
         if !Arc::ptr_eq(self.changes.target(), self.ledger.certificate()?) {
             return Err(invalid("native roster savepoint lost its current journal"));

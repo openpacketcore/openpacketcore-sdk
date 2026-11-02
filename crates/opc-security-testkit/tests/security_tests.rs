@@ -268,7 +268,7 @@ async fn test_kms_key_provider_behavior() {
         .unwrap_err();
     assert_eq!(err2, opc_key::KeyError::Unavailable);
 
-    // 6. Simulated error case
+    // 6. Completed KMS denial is a permanent operation failure.
     fake_kms.set_behavior(KmsBehavior {
         delay: None,
         unavailable: false,
@@ -279,7 +279,7 @@ async fn test_kms_key_provider_behavior() {
         .get_active_key(KeyPurpose::Config, &tenant())
         .await
         .unwrap_err();
-    assert_eq!(err3, opc_key::KeyError::Unavailable);
+    assert_eq!(err3, opc_key::KeyError::OperationFailed);
 
     // 7. Not found case
     fake_kms.set_behavior(KmsBehavior::default());
@@ -310,23 +310,32 @@ async fn test_kms_active_key_without_backing_key_returns_not_found() {
 }
 
 #[tokio::test]
-async fn test_kms_fault_responses_return_unavailable() {
+async fn test_kms_fault_responses_distinguish_outages_from_permanent_failures() {
     let cases = [
-        KmsBehavior {
-            truncated_response: true,
-            ..KmsBehavior::default()
-        },
-        KmsBehavior {
-            oversized_response: true,
-            ..KmsBehavior::default()
-        },
-        KmsBehavior {
-            malformed_key_hex: true,
-            ..KmsBehavior::default()
-        },
+        (
+            KmsBehavior {
+                truncated_response: true,
+                ..KmsBehavior::default()
+            },
+            opc_key::KeyError::Unavailable,
+        ),
+        (
+            KmsBehavior {
+                oversized_response: true,
+                ..KmsBehavior::default()
+            },
+            opc_key::KeyError::OperationFailed,
+        ),
+        (
+            KmsBehavior {
+                malformed_key_hex: true,
+                ..KmsBehavior::default()
+            },
+            opc_key::KeyError::OperationFailed,
+        ),
     ];
 
-    for (idx, behavior) in cases.into_iter().enumerate() {
+    for (idx, (behavior, expected)) in cases.into_iter().enumerate() {
         let socket_path = short_unix_socket_path(&format!("kms-fault-{idx}"));
         let fake_kms = FakeKms::new_unix(&socket_path, behavior).await.unwrap();
         fake_kms.insert_key("config-active-1", "config", "tenant-a", [0x44u8; 32]);
@@ -342,7 +351,7 @@ async fn test_kms_fault_responses_return_unavailable() {
             .get_active_key(KeyPurpose::Config, &tenant())
             .await
             .unwrap_err();
-        assert_eq!(err, opc_key::KeyError::Unavailable);
+        assert_eq!(err, expected, "fault case {idx}");
     }
 }
 
@@ -364,5 +373,5 @@ async fn test_kms_tcp_without_tls_fails_closed() {
         .get_active_key(KeyPurpose::Config, &tenant())
         .await
         .unwrap_err();
-    assert_eq!(err, opc_key::KeyError::Unavailable);
+    assert_eq!(err, opc_key::KeyError::OperationFailed);
 }

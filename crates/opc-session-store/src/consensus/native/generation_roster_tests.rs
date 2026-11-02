@@ -47,6 +47,7 @@ fn configured(signed: &RosterV2PersistenceFixture) -> NativeStorage {
             lease: Some(NativeLease::from_guard(&guard).unwrap()),
             fence: authority.fence().get(),
             reserved: false,
+            retired_epoch: None,
         })
         .unwrap(),
     );
@@ -165,315 +166,6 @@ fn roster_durable_bindings(storage: &NativeStorage) -> usize {
         .expect("signed roster cycle witness")
         .roster_counters()
         .durable_epoch_bindings()
-}
-
-fn journal_key(signed: &RosterV2PersistenceFixture, stable: &'static [u8]) -> SessionKey {
-    let mut key = signed.authority.key().clone();
-    key.stable_id = bytes::Bytes::from_static(stable)
-        .try_into()
-        .expect("stable ID");
-    key
-}
-
-#[test]
-fn native_key_retirement_journal_stages_exact_once_and_publishes() {
-    let signed = crate::consensus::types::roster_v2_persistence_fixture();
-    let mut storage = configured(&signed);
-    let key = journal_key(&signed, b"journal-retire");
-    let acquire = entry(
-        &signed,
-        1,
-        SessionConsensusRequestId::from_bytes([0xB8; 16]),
-        SessionMutationIntent::AcquireLease {
-            key: key.clone(),
-            owner: signed.authority.owner().clone(),
-            ttl: std::time::Duration::from_secs(60),
-        },
-    );
-    let applied = apply(&mut storage, &[acquire]);
-    let lease = match &applied.responses[0].result {
-        Ok(SessionMutationOutcome::Lease(lease)) => lease.clone(),
-        other => panic!("acquire must succeed before retirement: {other:?}"),
-    };
-    apply(
-        &mut storage,
-        &[entry(
-            &signed,
-            2,
-            SessionConsensusRequestId::from_bytes([0xB9; 16]),
-            SessionMutationIntent::ReleaseLease(lease),
-        )],
-    );
-    let before = storage.business.keys.len();
-    storage.business.begin_changes().unwrap();
-    storage
-        .business
-        .apply_key_retirement(key.clone())
-        .expect("exact committed predecessor is staged and published");
-    storage
-        .validate_image()
-        .expect("retirement journal image valid");
-    assert!(storage.business.keys.get(&key).is_none());
-    assert_eq!(storage.business.keys.len(), before - 1);
-    assert_eq!(
-        storage
-            .business
-            .capture_changes()
-            .unwrap()
-            .generation_counts(0)[0],
-        1,
-        "retirement publishes one exact journal endpoint"
-    );
-    // A stale resident expiry entry would surface as an infrastructure failure
-    // on the next prune; acquire a fresh key after the retirement to exercise it.
-    let prune_trigger = journal_key(&signed, b"journal-prune-trigger");
-    let prune_applied = apply(
-        &mut storage,
-        &[entry(
-            &signed,
-            3,
-            SessionConsensusRequestId::from_bytes([0xBA; 16]),
-            SessionMutationIntent::AcquireLease {
-                key: prune_trigger,
-                owner: signed.authority.owner().clone(),
-                ttl: std::time::Duration::from_secs(60),
-            },
-        )],
-    );
-    assert!(matches!(
-        prune_applied.responses[0].result,
-        Ok(SessionMutationOutcome::Lease(_))
-    ));
-    // The removal journal is exact once: a second retirement of the same key has
-    // no committed predecessor and must fail closed without mutation.
-    let error = match storage.business.apply_key_retirement(key.clone()) {
-        Err(error) => error,
-        Ok(_) => panic!("a retired key has no committed predecessor"),
-    };
-    assert!(error
-        .to_string()
-        .contains("native key removal has no exact predecessor"));
-    assert!(storage.business.keys.get(&key).is_none());
-}
-
-#[test]
-fn native_key_retirement_collapses_same_delta_create_update_and_duplicates() {
-    fn apply_retirements(
-        storage: &mut NativeStorage,
-        entries: &[Entry<SessionRaftTypeConfig>],
-        removals: Vec<SessionKey>,
-    ) {
-        // Business publication must have the same retained log lineage as an
-        // ordinary apply, including when the resulting key has no endpoint.
-        if let Some(last) = entries.last() {
-            let encoded = entries
-                .iter()
-                .map(|entry| serde_json::to_vec(entry).unwrap().into())
-                .collect();
-            storage
-                .log
-                .project(&Operation::Append(encoded), &storage.business, None)
-                .unwrap();
-            storage
-                .log
-                .project(
-                    &Operation::Committed(Some(last.log_id)),
-                    &storage.business,
-                    None,
-                )
-                .unwrap();
-        }
-        let applied = storage
-            .business
-            .apply_key_retirements_in_batch(entries, removals)
-            .expect("same-delta retirement publishes");
-        assert_eq!(applied.responses.len(), entries.len());
-        for response in applied.responses {
-            assert!(matches!(
-                response.result,
-                Ok(SessionMutationOutcome::Lease(_))
-            ));
-        }
-    }
-
-    let signed = crate::consensus::types::roster_v2_persistence_fixture();
-    let mut storage = configured(&signed);
-    storage.business.begin_changes().unwrap();
-
-    // Create-then-retire: the key never exists as an endpoint; the candidate
-    // change is collapsed and the transient journal entry is dropped.
-    let created = journal_key(&signed, b"journal-create-retire");
-    apply_retirements(
-        &mut storage,
-        &[entry(
-            &signed,
-            1,
-            SessionConsensusRequestId::from_bytes([0xBB; 16]),
-            SessionMutationIntent::AcquireLease {
-                key: created.clone(),
-                owner: signed.authority.owner().clone(),
-                ttl: std::time::Duration::from_secs(60),
-            },
-        )],
-        vec![created.clone()],
-    );
-    storage
-        .validate_image()
-        .expect("create-then-retire image valid");
-    assert!(storage.business.keys.get(&created).is_none());
-    assert_eq!(
-        storage
-            .business
-            .capture_changes()
-            .unwrap()
-            .generation_counts(0)[0],
-        0,
-        "create-then-retire collapses to no journal endpoint"
-    );
-
-    // Update-then-retire: an existing committed key is updated in the same
-    // delta and retired; the net change removes the predecessor row.
-    let updated = signed.authority.key().clone();
-    apply_retirements(
-        &mut storage,
-        &[entry(
-            &signed,
-            2,
-            SessionConsensusRequestId::from_bytes([0xBC; 16]),
-            SessionMutationIntent::AcquireLease {
-                key: updated.clone(),
-                owner: signed.authority.owner().clone(),
-                ttl: std::time::Duration::from_secs(60),
-            },
-        )],
-        vec![updated.clone()],
-    );
-    storage
-        .validate_image()
-        .expect("update-then-retire image valid");
-    assert!(storage.business.keys.get(&updated).is_none());
-    assert_eq!(
-        storage
-            .business
-            .capture_changes()
-            .unwrap()
-            .generation_counts(0)[0],
-        1,
-        "update-then-retire stages one net journal removal"
-    );
-
-    // Same-delta duplicate removals are deduplicated and staged once.
-    let duplicate = journal_key(&signed, b"journal-duplicate");
-    let acquire = entry(
-        &signed,
-        3,
-        SessionConsensusRequestId::from_bytes([0xBD; 16]),
-        SessionMutationIntent::AcquireLease {
-            key: duplicate.clone(),
-            owner: signed.authority.owner().clone(),
-            ttl: std::time::Duration::from_secs(60),
-        },
-    );
-    apply(&mut storage, &[acquire]);
-    assert_eq!(
-        storage
-            .business
-            .capture_changes()
-            .unwrap()
-            .generation_counts(0)[0],
-        1,
-        "the duplicate-removal case starts from a captured key"
-    );
-    apply_retirements(
-        &mut storage,
-        &[],
-        vec![duplicate.clone(), duplicate.clone()],
-    );
-    storage
-        .validate_image()
-        .expect("duplicate retirement image valid");
-    assert!(storage.business.keys.get(&duplicate).is_none());
-    assert_eq!(
-        storage
-            .business
-            .capture_changes()
-            .unwrap()
-            .generation_counts(0)[0],
-        1,
-        "duplicate removals are journaled exactly once"
-    );
-}
-
-#[test]
-fn native_key_retirement_without_exact_predecessor_is_rejected() {
-    let signed = crate::consensus::types::roster_v2_persistence_fixture();
-    let mut storage = configured(&signed);
-    let unknown = journal_key(&signed, b"journal-absent");
-    let before = storage.business.keys.len();
-    let error = match storage.business.apply_key_retirement(unknown) {
-        Err(error) => error,
-        Ok(_) => panic!("an absent predecessor cannot be retired"),
-    };
-    assert!(error
-        .to_string()
-        .contains("native key removal has no exact predecessor"));
-    assert_eq!(storage.business.keys.len(), before);
-}
-
-#[test]
-fn native_key_capacity_batch_boundary_refuses_without_mutation() {
-    let signed = crate::consensus::types::roster_v2_persistence_fixture();
-    let mut storage = configured(&signed);
-    // One existing committed key from the fixture; allow exactly one more.
-    let _limit =
-        crate::consensus::native::retention::tests_support::KeyCapacityLimitOverride::new(2);
-    let owner = signed.authority.owner().clone();
-    let key_a = {
-        let mut key = signed.authority.key().clone();
-        key.stable_id = bytes::Bytes::from_static(b"key-capacity-a")
-            .try_into()
-            .expect("stable ID");
-        key
-    };
-    let key_b = {
-        let mut key = signed.authority.key().clone();
-        key.stable_id = bytes::Bytes::from_static(b"key-capacity-b")
-            .try_into()
-            .expect("stable ID");
-        key
-    };
-    let acquire = |index: u64, key: crate::model::SessionKey| {
-        entry(
-            &signed,
-            index,
-            SessionConsensusRequestId::from_bytes(u128::from(index).to_le_bytes()),
-            SessionMutationIntent::AcquireLease {
-                key,
-                owner: owner.clone(),
-                ttl: std::time::Duration::from_secs(60),
-            },
-        )
-    };
-    let applied = apply(
-        &mut storage,
-        &[acquire(1, key_a.clone()), acquire(2, key_b.clone())],
-    );
-    assert!(matches!(
-        applied.responses[0].result,
-        Ok(SessionMutationOutcome::Lease(_))
-    ));
-    assert_eq!(
-        applied.responses[1].result,
-        Err(StoreError::KeyCapacityExhausted),
-        "the second batch key must hit the typed deterministic capacity refusal"
-    );
-    assert_eq!(
-        storage.business.keys.len(),
-        2,
-        "a refused capacity admission cannot mutate the key map"
-    );
-    assert!(storage.business.keys.get(&key_a).is_some());
-    assert!(storage.business.keys.get(&key_b).is_none());
 }
 
 #[test]
@@ -698,7 +390,7 @@ fn native_roster_generation_signed_v1_v2_reopen_and_compacted_base_match_sql() {
                 sql_rows(&storage, &path, &signed);
             }
             let (compacted, base) = Files::new(&storage);
-            assert_eq!(&compacted.bytes()[..8], b"OPCNJB\x06\x00");
+            assert_eq!(&compacted.bytes()[..8], b"OPCNJB\x07\x00");
             exact_rosters(&base.into_storage(&|| Ok(())).unwrap(), &storage);
             let replay = entry(
                 &signed,
@@ -2025,4 +1717,204 @@ fn native_roster_completed_history_storage_smoke() {
 fn native_roster_completed_history_exceeds_old_capacity_and_cold_reopens() {
     // Literal historical boundary: never lower it using an environment knob.
     capacity_history_progress_and_reopen(131_073);
+}
+
+#[test]
+fn roster_capacity_and_horizon_refusal_preserve_namespace_frontier() {
+    for v1 in [false, true] {
+        for head in [COUNTER_MAX - 1, COUNTER_MAX] {
+            let signed = crate::consensus::types::roster_v2_persistence_fixture();
+            let mut storage = configured(&signed);
+            if v1 {
+                apply(&mut storage, &[q1(&signed, 1), q2(&signed, 2)]);
+            }
+            let start = storage.business.frontiers.applied.unwrap().index + 1;
+            let activated = entry(
+                &signed,
+                start,
+                SessionConsensusRequestId::from_bytes([0x71; 16]),
+                SessionMutationIntent::ActivateFencedTransitionCapability {
+                    schema_version: crate::fenced_transition::FENCED_TRANSITION_SCHEMA_V1,
+                    scope_identity: signed.identity,
+                    voter_set_digest: protected_roster_profile_voter_set_digest(
+                        signed.identity,
+                        &storage.business.members,
+                    ),
+                },
+            );
+            apply(&mut storage, &[activated]);
+            let mut key = signed.authority.key().clone();
+            key.stable_id = bytes::Bytes::from_static(b"roster-retired-capacity")
+                .try_into()
+                .unwrap();
+            let acquired = apply(
+                &mut storage,
+                &[entry(
+                    &signed,
+                    start + 1,
+                    SessionConsensusRequestId::from_bytes([0x72; 16]),
+                    SessionMutationIntent::AcquireLease {
+                        key,
+                        owner: crate::OwnerId::new("roster-capacity").unwrap(),
+                        ttl: std::time::Duration::from_secs(60),
+                    },
+                )],
+            );
+            let Ok(SessionMutationOutcome::Lease(lease)) = &acquired.responses[0].result else {
+                panic!("acquire")
+            };
+            let mut cleanup_key = signed.authority.key().clone();
+            cleanup_key.stable_id = bytes::Bytes::from_static(b"roster-cleanup-capacity")
+                .try_into()
+                .unwrap();
+            let release = entry(
+                &signed,
+                start + 2,
+                SessionConsensusRequestId::from_bytes([0x73; 16]),
+                SessionMutationIntent::ReleaseLease(lease.clone()),
+            );
+            let cleanup = entry(
+                &signed,
+                start + 3,
+                SessionConsensusRequestId::from_bytes([0x74; 16]),
+                SessionMutationIntent::AcquireLease {
+                    key: cleanup_key,
+                    owner: crate::OwnerId::new("roster-cleanup").unwrap(),
+                    ttl: std::time::Duration::from_secs(60),
+                },
+            );
+            assert!(apply(&mut storage, &[release, cleanup])
+                .responses
+                .iter()
+                .all(|row| row.result.is_ok()));
+            let probe = if v1 {
+                let admission = roster::carrier::tests::signed_v1_command_with_mutation(
+                    &signed,
+                    EstablishedMutation::no_op(),
+                );
+                entry(
+                    &signed,
+                    start + 4,
+                    admission.request_id().unwrap(),
+                    SessionMutationIntent::RosterAdmission(Box::new(admission)),
+                )
+            } else {
+                q1(&signed, start + 4)
+            };
+            let trial = storage.business.prepare(&[probe]).unwrap();
+            eprintln!(
+                "roster_fixture v1={v1} head={head} result={:?}",
+                trial.responses[0].result
+            );
+            assert!(matches!(
+                trial.responses[0].result,
+                Ok(SessionMutationOutcome::RosterAdmission(
+                    ConsensusRosterAdmissionOutcome::Admitted { .. }
+                ) | SessionMutationOutcome::RosterAdmissionV2(
+                    ConsensusRosterAdmissionOutcome::Admitted { .. }
+                ))
+            ));
+            drop(trial);
+            let original = storage
+                .business
+                .replication_log(1, 16, &|| Ok(()))
+                .unwrap()
+                .pop()
+                .unwrap();
+            storage.business.notifications.clear();
+            let window = retention::NOTIFICATION_WINDOW as u64;
+            for sequence in head - window + 1..=head {
+                storage.business.notifications.push_back(
+                    NotificationRow::new(NativeNotification::new(ReplicationEntry {
+                        sequence,
+                        ..original.clone()
+                    }))
+                    .unwrap(),
+                );
+            }
+            storage.business.frontiers.watch_sequence = head;
+            storage.business.frontiers.retention.watch_retired_through = head - window;
+            storage.business.admit_business().unwrap();
+            storage.log.admit(&storage.business).unwrap();
+            storage.validate_image().unwrap();
+            let before_namespace = storage.business.frontiers.roster_v1_namespace;
+            let roster_scope =
+                roster::fixed_scope(storage.business.identity, &storage.business.members);
+            let before_roster = storage
+                .business
+                .roster
+                .rows
+                .iter()
+                .map(|(binding, row)| {
+                    (
+                        *binding,
+                        row.hydrate_detached(&signed.root, &roster_scope, &|| Ok(()))
+                            .unwrap()
+                            .canonical()
+                            .to_vec(),
+                    )
+                })
+                .collect::<Vec<_>>();
+            let before_keys = storage
+                .business
+                .keys
+                .iter()
+                .map(|(key, row)| (key.clone(), postcard::to_allocvec(&**row).unwrap()))
+                .collect::<Vec<_>>();
+            let before_retention = storage.business.frontiers.retention;
+            let command = if v1 {
+                let admission = roster::carrier::tests::signed_v1_command_with_mutation(
+                    &signed,
+                    EstablishedMutation::no_op(),
+                );
+                entry(
+                    &signed,
+                    start + 4,
+                    admission.request_id().unwrap(),
+                    SessionMutationIntent::RosterAdmission(Box::new(admission)),
+                )
+            } else {
+                q1(&signed, start + 4)
+            };
+            let maximum = storage.business.keys.len() - 1;
+            let applied = retention::with_key_capacity_limit_for_test(maximum, || {
+                apply(&mut storage, &[command])
+            });
+            if head == COUNTER_MAX {
+                assert_eq!(
+                    applied.responses[0].result,
+                    Err(StoreError::FencedTransitionStorageExhausted)
+                );
+                assert!(applied.notifications.is_empty());
+                assert_eq!(
+                    storage.business.frontiers.roster_v1_namespace, before_namespace,
+                    "refusal cannot activate a namespace"
+                );
+                assert!(storage.business.frontiers.retention == before_retention);
+                assert_eq!(storage.business.roster.rows.len(), before_roster.len());
+                for (binding, bytes) in before_roster {
+                    assert_eq!(
+                        storage.business.roster.rows[&binding]
+                            .hydrate_detached(&signed.root, &roster_scope, &|| Ok(()))
+                            .unwrap()
+                            .canonical(),
+                        bytes
+                    );
+                }
+                assert_eq!(storage.business.keys.len(), before_keys.len());
+                for (key, bytes) in before_keys {
+                    assert_eq!(
+                        postcard::to_allocvec(&**storage.business.keys.get(&key).unwrap()).unwrap(),
+                        bytes
+                    );
+                }
+            } else {
+                assert!(applied.responses[0].result.is_ok());
+                assert_eq!(applied.notifications.len(), 1);
+                assert_eq!(applied.notifications[0].sequence, COUNTER_MAX);
+                assert_eq!(storage.business.frontiers.retention.keys.epoch, 2);
+            }
+            storage.validate_image().unwrap();
+        }
+    }
 }

@@ -618,7 +618,7 @@
     {
       "test": "rust:crates/opc-gtpu-dataplane::test=ebpf_gtpu_privileged::ebpf_gtpu_downlink_oversized_dont_fragment_is_fragmented_inside_the_tunnel",
       "kind": "assertions-decreased",
-      "reason": "Restore main’s successful live default-limit update instead of the erroneous InvalidLimits expectation. The static count loses unwrap_err(), while assert_eq!(setter_result, Ok(())) and all packet, rate-limit, ESP, silence and deadline assertions remain. The per-destination lifetime test independently enforces RFC 6864 section 4.3 across replacements, and the native scenario passes with the restored contract.",
+      "reason": "Restore main\u2019s successful live default-limit update instead of the erroneous InvalidLimits expectation. The static count loses unwrap_err(), while assert_eq!(setter_result, Ok(())) and all packet, rate-limit, ESP, silence and deadline assertions remain. The per-destination lifetime test independently enforces RFC 6864 section 4.3 across replacements, and the native scenario passes with the restored contract.",
       "issue": 1018,
       "replacements": [
         "rust:crates/opc-gtpu-dataplane::lib=lib::reassembly::tests::rate_budget_retention_preserves_lifetime_bound_across_limit_replacement"
@@ -1599,6 +1599,553 @@
       "kind": "fixture-setup-changed",
       "reason": "Issue #1160 makes a wall-clock restore deadline retryable availability, while true fixed-work exhaustion remains terminal. Replace only the stale expected Err(RestoreScanWorkBudgetExceeded) in the wall-deadline branch with exact Err(BackendUnavailable(\"session restore scan deadline exceeded\")). Retain the original 100 ms absolute deadline, active-cancellation branch, detached-State assertion, worker-reservation retention and retirement checks, later authoritative read, barrier and shutdown. Fixed-work exhaustion expectations are unchanged.",
       "issue": 1160
+    },
+    {
+      "test": "rust:crates/opc-security-testkit::test=security_tests::test_kms_fault_responses_return_unavailable",
+      "kind": "removed",
+      "renamed_to": "rust:crates/opc-security-testkit::test=security_tests::test_kms_fault_responses_distinguish_outages_from_permanent_failures",
+      "reason": "Rename the fault classification matrix for RFC 003 section 9.3. The truncated frame still requires Unavailable; oversized frames and malformed key hex require OperationFailed. All three fixtures and exact error assertions remain.",
+      "issue": 1197
+    },
+    {
+      "test": "rust:crates/opc-session-store::lib=lib::sqlite::consensus::tests::native::basis::rollover::background::native_rollover_install_claim_before_capacity_detection_yields_for_retirement",
+      "kind": "fixture-setup-changed",
+      "reason": "Rename the opt-in pre-fix hang-escape environment marker by behaviour. The same diagnostic-only ten-second escape and all recovery, shutdown, retirement, ownership and cold-reopen assertions remain; normal execution still uses ordered hooks without that escape.",
+      "issue": 1253
+    },
+    {
+      "test": "rust:crates/opc-session-store::lib=lib::sqlite::consensus::tests::native::basis::rollover::background::native_rollover_live_capacity_install_leaves_a_retirement_progress_path",
+      "kind": "fixture-setup-changed",
+      "reason": "Rename the opt-in pre-fix hang-escape environment marker by behaviour. The same diagnostic-only ten-second escape and all recovery, shutdown, retirement, ownership and cold-reopen assertions remain; normal execution still uses ordered hooks without that escape.",
+      "issue": 1253
+    },
+    {
+      "test": "rust:crates/opc-session-store::lib=lib::sqlite::consensus::tests::native::basis::rollover::concurrency::native_rollover_compactor_queue_poison_notifies_even_with_owner_parked",
+      "kind": "fixture-setup-changed",
+      "reason": "Rename the subprocess recursion and I/O-case environment markers by behaviour. Every existing Durable/Async and applicable I/O, install or shutdown child case still runs. Each parent now requires the exact named child and a one-test success summary as well as successful exit; no case, bound, deadline or assertion is removed.",
+      "issue": 1253
+    },
+    {
+      "test": "rust:crates/opc-session-store::lib=lib::sqlite::consensus::tests::native::basis::rollover::concurrency::native_rollover_guarded_resource_wait_obeys_the_shutdown_stop",
+      "kind": "fixture-setup-changed",
+      "reason": "Rename the subprocess recursion and I/O-case environment markers by behaviour. Every existing Durable/Async and applicable I/O, install or shutdown child case still runs. Each parent now requires the exact named child and a one-test success summary as well as successful exit; no case, bound, deadline or assertion is removed.",
+      "issue": 1253
+    },
+    {
+      "test": "rust:crates/opc-session-store::lib=lib::sqlite::consensus::tests::native::basis::rollover::concurrency::native_rollover_guarded_resource_wait_rechecks_relief_before_the_file_guard_clears",
+      "kind": "fixture-setup-changed",
+      "reason": "Rename the subprocess recursion and I/O-case environment markers by behaviour. Every existing Durable/Async and applicable I/O, install or shutdown child case still runs. Each parent now requires the exact named child and a one-test success summary as well as successful exit; no case, bound, deadline or assertion is removed.",
+      "issue": 1253
+    },
+    {
+      "test": "rust:crates/opc-session-store::lib=lib::sqlite::consensus::tests::native::basis::rollover::concurrency::native_rollover_installers_during_capacity_restart_preserve_ownership_and_close",
+      "kind": "fixture-setup-changed",
+      "reason": "Rename the subprocess recursion and I/O-case environment markers by behaviour. Every existing Durable/Async and applicable I/O, install or shutdown child case still runs. Each parent now requires the exact named child and a one-test success summary as well as successful exit; no case, bound, deadline or assertion is removed.",
+      "issue": 1253
+    },
+    {
+      "test": "rust:crates/opc-session-store::lib=lib::sqlite::consensus::tests::native::basis::rollover::concurrency::native_rollover_live_capacity_at_journal_stop_drains_and_retires_once",
+      "kind": "fixture-setup-changed",
+      "reason": "Rename the subprocess recursion and I/O-case environment markers by behaviour. Every existing Durable/Async and applicable I/O, install or shutdown child case still runs. Each parent now requires the exact named child and a one-test success summary as well as successful exit; no case, bound, deadline or assertion is removed.",
+      "issue": 1253
+    },
+    {
+      "test": "rust:crates/opc-session-store::lib=lib::sqlite::consensus::tests::native::basis::rollover::concurrency::native_rollover_pending_pressure_drains_without_token_advance_or_serialization",
+      "kind": "fixture-setup-changed",
+      "reason": "Rename the subprocess recursion and I/O-case environment markers by behaviour. Every existing Durable/Async and applicable I/O, install or shutdown child case still runs. Each parent now requires the exact named child and a one-test success summary as well as successful exit; no case, bound, deadline or assertion is removed.",
+      "issue": 1253
+    },
+    {
+      "test": "rust:crates/opc-session-store::lib=lib::sqlite::consensus::tests::native::basis::rollover::concurrency::native_rollover_pending_pressure_flushes_an_already_admitted_durable_cut",
+      "kind": "fixture-setup-changed",
+      "reason": "Rename the subprocess recursion and I/O-case environment markers by behaviour. Every existing Durable/Async and applicable I/O, install or shutdown child case still runs. Each parent now requires the exact named child and a one-test success summary as well as successful exit; no case, bound, deadline or assertion is removed.",
+      "issue": 1253
+    },
+    {
+      "test": "rust:crates/opc-session-store::lib=lib::sqlite::consensus::tests::native::basis::rollover::concurrency::native_rollover_rebase_abort_inside_guard_wait_restarts_and_completes_once",
+      "kind": "fixture-setup-changed",
+      "reason": "Rename the subprocess recursion and I/O-case environment markers by behaviour. Every existing Durable/Async and applicable I/O, install or shutdown child case still runs. Each parent now requires the exact named child and a one-test success summary as well as successful exit; no case, bound, deadline or assertion is removed.",
+      "issue": 1253
+    },
+    {
+      "test": "rust:crates/opc-session-store::lib=lib::sqlite::consensus::tests::native::basis::rollover::concurrency::native_rollover_shutdown_and_install_cancel_inside_real_io_adapters",
+      "kind": "fixture-setup-changed",
+      "reason": "Rename the subprocess recursion and I/O-case environment markers by behaviour. Every existing Durable/Async and applicable I/O, install or shutdown child case still runs. Each parent now requires the exact named child and a one-test success summary as well as successful exit; no case, bound, deadline or assertion is removed.",
+      "issue": 1253
+    },
+    {
+      "test": "rust:crates/opc-session-store::lib=lib::sqlite::consensus::tests::native::basis::rollover::background::native_rollover_ceiling_wait_wakes_for_shutdown_and_install",
+      "kind": "fixture-setup-changed",
+      "reason": "Align the install case with the unarmed-claim contract: instead of requiring Async interruption while the unarmed installer and builder are parked, require the waiting admission cut to stay unchanged, then release the predecessor and handoff and require all nine operations to complete once without an error. The suspended Async shutdown case still requires Interrupted before releasing the builder. Every source-health, journal-timer exclusion, installed applied-cut and cold-reopen assertion remains, with unchanged limits and deadlines.",
+      "issue": 1253
+    },
+    {
+      "test": "rust:crates/opc-session-store::lib=lib::consensus::native::changes::tests::native_notification_retention_keeps_a_bounded_committed_window",
+      "kind": "removed",
+      "issue": 1250,
+      "reason": "Replace implicit derived-floor retention and its fixtures with an explicit committed frontier under the declared pre-release fresh-install boundary. Real publication, current-position relocation, generation reopen and portable sealed snapshot install validate the retained window and stale-cursor result.",
+      "replacements": [
+        "rust:crates/opc-session-store::lib=lib::consensus::native::ordinary_retention_tests::native_notification_retention_bounds_committed_replay_and_rejects_stale_cursor",
+        "rust:crates/opc-session-store::lib=lib::consensus::native::generation::catalog::tests::retention_tests::native_notification_retention_survives_checkpoint_reopen_and_base_rewrite",
+        "rust:crates/opc-session-store::lib=lib::sqlite::consensus::tests::native::retention::native_notification_retention_portable_snapshot_roundtrip_and_install"
+      ]
+    },
+    {
+      "test": "rust:crates/opc-session-store::lib=lib::consensus::native::changes::tests::native_notification_retention_survives_full_image_round_trip",
+      "kind": "removed",
+      "issue": 1250,
+      "reason": "Replace implicit derived-floor retention and its fixtures with an explicit committed frontier under the declared pre-release fresh-install boundary. Real publication, current-position relocation, generation reopen and portable sealed snapshot install validate the retained window and stale-cursor result.",
+      "replacements": [
+        "rust:crates/opc-session-store::lib=lib::consensus::native::ordinary_retention_tests::native_notification_retention_bounds_committed_replay_and_rejects_stale_cursor",
+        "rust:crates/opc-session-store::lib=lib::consensus::native::generation::catalog::tests::retention_tests::native_notification_retention_survives_checkpoint_reopen_and_base_rewrite",
+        "rust:crates/opc-session-store::lib=lib::sqlite::consensus::tests::native::retention::native_notification_retention_portable_snapshot_roundtrip_and_install",
+        "rust:crates/opc-session-store::lib=lib::consensus::native::ordinary_retention_tests::native_notification_retention_survives_full_image_round_trip"
+      ]
+    },
+    {
+      "test": "rust:crates/opc-session-store::lib=lib::consensus::native::changes::tests::native_ordinary_receipt_capacity_refusals_cannot_grow_the_delta_past_the_bound",
+      "kind": "removed",
+      "issue": 1251,
+      "reason": "Remove the rejected ordinary-receipt deletion and admission policy. Retain existing request outcomes unchanged: a leader-assigned proposal timestamp cannot exclude a retried identity. Receipt retirement remains open until a caller-bound retry epoch or expiry exists.",
+      "behavior_deleted": true,
+      "deleting_change": "revert(session-store): preserve ordinary request outcomes across retries"
+    },
+    {
+      "test": "rust:crates/opc-session-store::lib=lib::consensus::native::changes::tests::native_ordinary_receipt_retention_replays_inside_window_and_answers_outside",
+      "kind": "removed",
+      "issue": 1251,
+      "reason": "Remove the rejected ordinary-receipt deletion and admission policy. Retain existing request outcomes unchanged: a leader-assigned proposal timestamp cannot exclude a retried identity. Receipt retirement remains open until a caller-bound retry epoch or expiry exists.",
+      "behavior_deleted": true,
+      "deleting_change": "revert(session-store): preserve ordinary request outcomes across retries"
+    },
+    {
+      "test": "rust:crates/opc-session-store::lib=lib::consensus::native::changes::tests::native_ordinary_receipt_retention_stays_inert_below_activation",
+      "kind": "removed",
+      "issue": 1251,
+      "reason": "Remove the rejected ordinary-receipt deletion and admission policy. Retain existing request outcomes unchanged: a leader-assigned proposal timestamp cannot exclude a retried identity. Receipt retirement remains open until a caller-bound retry epoch or expiry exists.",
+      "behavior_deleted": true,
+      "deleting_change": "revert(session-store): preserve ordinary request outcomes across retries"
+    },
+    {
+      "test": "rust:crates/opc-session-store::lib=lib::consensus::native::generation::catalog::tests::roster_tests::native_key_capacity_batch_boundary_refuses_without_mutation",
+      "kind": "removed",
+      "issue": 1252,
+      "reason": "Remove the rejected derived-key-floor and KeyCapacityExhausted policy. The replacement retires dead ordinary keys behind a committed absent-key fence and proves continued admission and exact batch-independent state instead of a permanent capacity refusal.",
+      "replacements": [
+        "rust:crates/opc-session-store::lib=lib::consensus::native::key_retention_tests::native_key_retention_retires_dead_keys_without_reviving_stale_credentials",
+        "rust:crates/opc-session-store::lib=lib::consensus::native::key_retention_tests::native_key_retention_is_independent_of_delivery_batches",
+        "rust:crates/opc-session-store::lib=lib::consensus::native::generation::catalog::tests::retention_tests::native_key_retention_survives_delta_reopen_and_base_rewrite"
+      ]
+    },
+    {
+      "test": "rust:crates/opc-session-store::lib=lib::consensus::native::generation::catalog::tests::roster_tests::native_key_retirement_collapses_same_delta_create_update_and_duplicates",
+      "kind": "removed",
+      "issue": 1252,
+      "reason": "Replace the unused manual key-removal foundation and derived floor with real ordinary-command retirement, exact tracked journal endpoints, generation and portable snapshot carry, and batch-independent stale-credential protection.",
+      "replacements": [
+        "rust:crates/opc-session-store::lib=lib::consensus::native::key_retention_tests::native_key_retention_retires_dead_keys_without_reviving_stale_credentials",
+        "rust:crates/opc-session-store::lib=lib::consensus::native::key_retention_tests::native_key_retention_is_independent_of_delivery_batches",
+        "rust:crates/opc-session-store::lib=lib::consensus::native::generation::catalog::tests::retention_tests::native_key_retention_survives_delta_reopen_and_base_rewrite",
+        "rust:crates/opc-session-store::lib=lib::consensus::native::changes::tests::retention_capture::native_key_retirement_capture_records_exact_predecessors_and_eliminates_transients"
+      ]
+    },
+    {
+      "test": "rust:crates/opc-session-store::lib=lib::consensus::native::generation::catalog::tests::roster_tests::native_key_retirement_journal_stages_exact_once_and_publishes",
+      "kind": "removed",
+      "issue": 1252,
+      "reason": "Replace the unused manual key-removal foundation and derived floor with real ordinary-command retirement, exact tracked journal endpoints, generation and portable snapshot carry, and batch-independent stale-credential protection.",
+      "replacements": [
+        "rust:crates/opc-session-store::lib=lib::consensus::native::key_retention_tests::native_key_retention_retires_dead_keys_without_reviving_stale_credentials",
+        "rust:crates/opc-session-store::lib=lib::consensus::native::key_retention_tests::native_key_retention_is_independent_of_delivery_batches",
+        "rust:crates/opc-session-store::lib=lib::consensus::native::generation::catalog::tests::retention_tests::native_key_retention_survives_delta_reopen_and_base_rewrite",
+        "rust:crates/opc-session-store::lib=lib::consensus::native::changes::tests::retention_capture::native_key_retirement_capture_records_exact_predecessors_and_eliminates_transients"
+      ]
+    },
+    {
+      "test": "rust:crates/opc-session-store::lib=lib::consensus::native::generation::catalog::tests::roster_tests::native_key_retirement_without_exact_predecessor_is_rejected",
+      "kind": "removed",
+      "issue": 1252,
+      "reason": "Replace the unused manual key-removal foundation and derived floor with real ordinary-command retirement, exact tracked journal endpoints, generation and portable snapshot carry, and batch-independent stale-credential protection.",
+      "replacements": [
+        "rust:crates/opc-session-store::lib=lib::consensus::native::key_retention_tests::native_key_retention_retires_dead_keys_without_reviving_stale_credentials",
+        "rust:crates/opc-session-store::lib=lib::consensus::native::key_retention_tests::native_key_retention_is_independent_of_delivery_batches",
+        "rust:crates/opc-session-store::lib=lib::consensus::native::generation::catalog::tests::retention_tests::native_key_retention_survives_delta_reopen_and_base_rewrite",
+        "rust:crates/opc-session-store::lib=lib::consensus::native::changes::tests::retention_capture::native_key_retirement_capture_records_exact_predecessors_and_eliminates_transients"
+      ]
+    },
+    {
+      "test": "rust:crates/opc-session-store::lib=lib::consensus::native::generation::tests::native_notification_retention_relocates_sparse_rows_after_delta_append",
+      "kind": "removed",
+      "issue": 1250,
+      "reason": "Replace implicit derived-floor retention and its fixtures with an explicit committed frontier under the declared pre-release fresh-install boundary. Real publication, current-position relocation, generation reopen and portable sealed snapshot install validate the retained window and stale-cursor result.",
+      "replacements": [
+        "rust:crates/opc-session-store::lib=lib::consensus::native::ordinary_retention_tests::native_notification_retention_bounds_committed_replay_and_rejects_stale_cursor",
+        "rust:crates/opc-session-store::lib=lib::consensus::native::generation::catalog::tests::retention_tests::native_notification_retention_survives_checkpoint_reopen_and_base_rewrite",
+        "rust:crates/opc-session-store::lib=lib::sqlite::consensus::tests::native::retention::native_notification_retention_portable_snapshot_roundtrip_and_install",
+        "rust:crates/opc-session-store::lib=lib::consensus::native::generation::catalog::tests::retention_tests::native_notification_retention_relocation_tracks_sequence_after_concurrent_pruning"
+      ]
+    },
+    {
+      "test": "rust:crates/opc-session-store::lib=lib::consensus::native::generation::tests::native_notification_retention_survives_generation_base_delta_and_reopen",
+      "kind": "removed",
+      "issue": 1250,
+      "reason": "Replace implicit derived-floor retention and its fixtures with an explicit committed frontier under the declared pre-release fresh-install boundary. Real publication, current-position relocation, generation reopen and portable sealed snapshot install validate the retained window and stale-cursor result.",
+      "replacements": [
+        "rust:crates/opc-session-store::lib=lib::consensus::native::ordinary_retention_tests::native_notification_retention_bounds_committed_replay_and_rejects_stale_cursor",
+        "rust:crates/opc-session-store::lib=lib::consensus::native::generation::catalog::tests::retention_tests::native_notification_retention_survives_checkpoint_reopen_and_base_rewrite",
+        "rust:crates/opc-session-store::lib=lib::sqlite::consensus::tests::native::retention::native_notification_retention_portable_snapshot_roundtrip_and_install",
+        "rust:crates/opc-session-store::lib=lib::consensus::native::generation::catalog::tests::retention_tests::native_notification_retention_compact_base_relocates_the_selected_sparse_window"
+      ]
+    },
+    {
+      "test": "rust:crates/opc-session-store::lib=lib::consensus::native::generation::tests::native_ordinary_receipt_retention_survives_generation_and_image_round_trips",
+      "kind": "removed",
+      "issue": 1251,
+      "reason": "Remove the rejected ordinary-receipt deletion and admission policy. Retain existing request outcomes unchanged: a leader-assigned proposal timestamp cannot exclude a retried identity. Receipt retirement remains open until a caller-bound retry epoch or expiry exists.",
+      "behavior_deleted": true,
+      "deleting_change": "revert(session-store): preserve ordinary request outcomes across retries"
+    },
+    {
+      "test": "rust:crates/opc-session-store::lib=lib::consensus::native::ordinary::key_retention_tests::batch_capacity_decision_counts_the_delta_overlay",
+      "kind": "removed",
+      "issue": 1252,
+      "reason": "Remove the rejected derived-key-floor and KeyCapacityExhausted policy. The replacement retires dead ordinary keys behind a committed absent-key fence and proves continued admission and exact batch-independent state instead of a permanent capacity refusal.",
+      "replacements": [
+        "rust:crates/opc-session-store::lib=lib::consensus::native::key_retention_tests::native_key_retention_retires_dead_keys_without_reviving_stale_credentials",
+        "rust:crates/opc-session-store::lib=lib::consensus::native::key_retention_tests::native_key_retention_is_independent_of_delivery_batches",
+        "rust:crates/opc-session-store::lib=lib::consensus::native::generation::catalog::tests::retention_tests::native_key_retention_survives_delta_reopen_and_base_rewrite"
+      ]
+    },
+    {
+      "test": "rust:crates/opc-session-store::lib=lib::consensus::native::ordinary::key_retention_tests::capacity_refusal_is_a_deterministic_result_not_an_infrastructure_fault",
+      "kind": "removed",
+      "issue": 1252,
+      "reason": "Remove the rejected derived-key-floor and KeyCapacityExhausted policy. The replacement retires dead ordinary keys behind a committed absent-key fence and proves continued admission and exact batch-independent state instead of a permanent capacity refusal.",
+      "replacements": [
+        "rust:crates/opc-session-store::lib=lib::consensus::native::key_retention_tests::native_key_retention_retires_dead_keys_without_reviving_stale_credentials",
+        "rust:crates/opc-session-store::lib=lib::consensus::native::key_retention_tests::native_key_retention_is_independent_of_delivery_batches",
+        "rust:crates/opc-session-store::lib=lib::consensus::native::generation::catalog::tests::retention_tests::native_key_retention_survives_delta_reopen_and_base_rewrite"
+      ]
+    },
+    {
+      "test": "rust:crates/opc-session-store::lib=lib::consensus::native::retention::tests::key_retirement_floor_is_derived_and_keeps_floor_zero_byte_identical",
+      "kind": "removed",
+      "issue": 1252,
+      "reason": "Replace the unused manual key-removal foundation and derived floor with real ordinary-command retirement, exact tracked journal endpoints, generation and portable snapshot carry, and batch-independent stale-credential protection.",
+      "replacements": [
+        "rust:crates/opc-session-store::lib=lib::consensus::native::key_retention_tests::native_key_retention_retires_dead_keys_without_reviving_stale_credentials",
+        "rust:crates/opc-session-store::lib=lib::consensus::native::key_retention_tests::native_key_retention_is_independent_of_delivery_batches",
+        "rust:crates/opc-session-store::lib=lib::consensus::native::generation::catalog::tests::retention_tests::native_key_retention_survives_delta_reopen_and_base_rewrite",
+        "rust:crates/opc-session-store::lib=lib::consensus::native::changes::tests::retention_capture::native_key_retirement_capture_records_exact_predecessors_and_eliminates_transients"
+      ]
+    },
+    {
+      "test": "rust:crates/opc-session-store::lib=lib::consensus::native::retention::tests::prefix_retention_derives_a_committed_floor",
+      "kind": "removed",
+      "issue": 1250,
+      "reason": "Replace implicit derived-floor retention and its fixtures with an explicit committed frontier under the declared pre-release fresh-install boundary. Real publication, current-position relocation, generation reopen and portable sealed snapshot install validate the retained window and stale-cursor result.",
+      "replacements": [
+        "rust:crates/opc-session-store::lib=lib::consensus::native::ordinary_retention_tests::native_notification_retention_bounds_committed_replay_and_rejects_stale_cursor",
+        "rust:crates/opc-session-store::lib=lib::consensus::native::generation::catalog::tests::retention_tests::native_notification_retention_survives_checkpoint_reopen_and_base_rewrite",
+        "rust:crates/opc-session-store::lib=lib::sqlite::consensus::tests::native::retention::native_notification_retention_portable_snapshot_roundtrip_and_install"
+      ]
+    },
+    {
+      "test": "rust:crates/opc-session-store::lib=lib::consensus::native::retention::tests::prefix_retention_validates_retained_counts_and_retirement",
+      "kind": "removed",
+      "issue": 1250,
+      "reason": "Replace implicit derived-floor retention and its fixtures with an explicit committed frontier under the declared pre-release fresh-install boundary. Real publication, current-position relocation, generation reopen and portable sealed snapshot install validate the retained window and stale-cursor result.",
+      "replacements": [
+        "rust:crates/opc-session-store::lib=lib::consensus::native::ordinary_retention_tests::native_notification_retention_bounds_committed_replay_and_rejects_stale_cursor",
+        "rust:crates/opc-session-store::lib=lib::consensus::native::generation::catalog::tests::retention_tests::native_notification_retention_survives_checkpoint_reopen_and_base_rewrite",
+        "rust:crates/opc-session-store::lib=lib::sqlite::consensus::tests::native::retention::native_notification_retention_portable_snapshot_roundtrip_and_install"
+      ]
+    },
+    {
+      "test": "rust:crates/opc-session-store::lib=lib::fake::lab::tests::lab_bounds_created_and_deleted_keys_past_one_hundred_thousand",
+      "kind": "removed",
+      "issue": 1257,
+      "reason": "Replace capacity-triggered dead-key pruning and fresh-request retry accommodations with eager deterministic pruning, a strictly higher absent-key fence, allocator reconciliation and exact replay/rebuild coverage.",
+      "replacements": [
+        "rust:crates/opc-session-store::lib=lib::fake::tests::fake_key_retention_retires_dead_keys_without_reviving_stale_credentials",
+        "rust:crates/opc-session-store::lib=lib::fake::tests::fake_key_retention_replays_and_rebuilds_the_same_absent_floor",
+        "rust:crates/opc-session-store::lib=lib::fake::lab::tests::fake_key_retention_stages_lab_requests_with_the_absent_floor"
+      ]
+    },
+    {
+      "test": "rust:crates/opc-session-store::lib=lib::fake::lab::tests::lab_bounds_receipts_past_sixty_five_thousand_fenced_transitions",
+      "kind": "removed",
+      "issue": 1257,
+      "reason": "Remove the rejected lab receipt-deletion policy. Opaque caller-selected identities cannot safely be treated as unknown after deletion; keep the existing retained receipt and typed expiry behavior until a caller-bound exclusion rule exists.",
+      "behavior_deleted": true,
+      "deleting_change": "revert(session-store): preserve lab receipts and replace lazy key retirement"
+    },
+    {
+      "test": "rust:crates/opc-session-store::lib=lib::fake::lab::tests::lab_key_capacity_refusal_mutates_nothing_and_is_retryable",
+      "kind": "removed",
+      "issue": 1257,
+      "reason": "Replace capacity-triggered maintenance with eager pruning at observation and top-level operation boundaries. Eligible expired-state maintenance may precede a later business rejection; live authority, staged batch rollback, stale-guard rejection and deterministic replay remain required. The existing batch rollback proof is retained.",
+      "replacements": [
+        "rust:crates/opc-session-store::lib=lib::fake::tests::fake_key_retention_retires_dead_keys_without_reviving_stale_credentials",
+        "rust:crates/opc-session-store::lib=lib::fake::tests::fake_key_retention_replays_and_rebuilds_the_same_absent_floor",
+        "rust:crates/opc-session-store::lib=lib::fake::lab::tests::fake_key_retention_stages_lab_requests_with_the_absent_floor"
+      ]
+    },
+    {
+      "test": "rust:crates/opc-session-store::lib=lib::fake::lab::tests::lab_retires_only_elapsed_receipts_at_capacity_and_keeps_typed_expiry",
+      "kind": "removed",
+      "issue": 1257,
+      "reason": "Remove the rejected lab receipt-deletion policy. Opaque caller-selected identities cannot safely be treated as unknown after deletion; keep the existing retained receipt and typed expiry behavior until a caller-bound exclusion rule exists.",
+      "behavior_deleted": true,
+      "deleting_change": "revert(session-store): preserve lab receipts and replace lazy key retirement"
+    },
+    {
+      "test": "rust:crates/opc-session-store::lib=lib::fake::lab::tests::replicated_stale_delete_cannot_remove_a_newer_record_after_floor_retirement",
+      "kind": "removed",
+      "issue": 1257,
+      "reason": "Replace capacity-triggered dead-key pruning and fresh-request retry accommodations with eager deterministic pruning, a strictly higher absent-key fence, allocator reconciliation and exact replay/rebuild coverage.",
+      "replacements": [
+        "rust:crates/opc-session-store::lib=lib::fake::tests::fake_key_retention_retires_dead_keys_without_reviving_stale_credentials",
+        "rust:crates/opc-session-store::lib=lib::fake::tests::fake_key_retention_replays_and_rebuilds_the_same_absent_floor",
+        "rust:crates/opc-session-store::lib=lib::fake::lab::tests::fake_key_retention_stages_lab_requests_with_the_absent_floor"
+      ]
+    },
+    {
+      "test": "rust:crates/opc-session-store::lib=lib::fake::lab::tests::retired_floor_high_water_keeps_recreated_key_fences_monotone_and_log_rebuildable",
+      "kind": "removed",
+      "issue": 1257,
+      "reason": "Replace capacity-triggered dead-key pruning and fresh-request retry accommodations with eager deterministic pruning, a strictly higher absent-key fence, allocator reconciliation and exact replay/rebuild coverage.",
+      "replacements": [
+        "rust:crates/opc-session-store::lib=lib::fake::tests::fake_key_retention_retires_dead_keys_without_reviving_stale_credentials",
+        "rust:crates/opc-session-store::lib=lib::fake::tests::fake_key_retention_replays_and_rebuilds_the_same_absent_floor",
+        "rust:crates/opc-session-store::lib=lib::fake::lab::tests::fake_key_retention_stages_lab_requests_with_the_absent_floor"
+      ]
+    },
+    {
+      "test": "rust:crates/opc-session-store::lib=lib::fake::tests::dead_key_fences_are_retired_under_capacity_and_stale_guards_stay_refused",
+      "kind": "removed",
+      "issue": 1257,
+      "reason": "Replace capacity-triggered dead-key pruning and fresh-request retry accommodations with eager deterministic pruning, a strictly higher absent-key fence, allocator reconciliation and exact replay/rebuild coverage.",
+      "replacements": [
+        "rust:crates/opc-session-store::lib=lib::fake::tests::fake_key_retention_retires_dead_keys_without_reviving_stale_credentials",
+        "rust:crates/opc-session-store::lib=lib::fake::tests::fake_key_retention_replays_and_rebuilds_the_same_absent_floor",
+        "rust:crates/opc-session-store::lib=lib::fake::lab::tests::fake_key_retention_stages_lab_requests_with_the_absent_floor"
+      ]
+    },
+    {
+      "test": "rust:crates/opc-session-store::lib=lib::fake::tests::expired_record_and_lease_retire_their_key_floor_at_capacity",
+      "kind": "removed",
+      "issue": 1257,
+      "reason": "Replace capacity-triggered dead-key pruning and fresh-request retry accommodations with eager deterministic pruning, a strictly higher absent-key fence, allocator reconciliation and exact replay/rebuild coverage.",
+      "replacements": [
+        "rust:crates/opc-session-store::lib=lib::fake::tests::fake_key_retention_retires_dead_keys_without_reviving_stale_credentials",
+        "rust:crates/opc-session-store::lib=lib::fake::tests::fake_key_retention_replays_and_rebuilds_the_same_absent_floor",
+        "rust:crates/opc-session-store::lib=lib::fake::lab::tests::fake_key_retention_stages_lab_requests_with_the_absent_floor"
+      ]
+    },
+    {
+      "test": "rust:crates/opc-session-store::lib=lib::consensus::native::generation::decode::tests::native_generation_cold_key_preflight_matches_complete_postcard_and_original_payload_bound",
+      "kind": "fixture-setup-changed",
+      "issue": 1252,
+      "reason": "The declared epoch-retirement format keeps recently dead rows exact. Reject deletion at the zero floor and after real ordinary-command retirement while its exact window remains active; admit the isolated deletion codec only under an explicit post-window previous floor. Cold catalog admission independently verifies the final dead-row retirement witness, its predecessor epoch and committed epoch counts (ADR 0022). Preserve the full postcard serializer comparison, exact payload limit, invalid-fence, truncation and trailing-byte checks."
+    },
+    {
+      "test": "rust:crates/opc-session-store::lib=lib::consensus::store::async_persistence::tests::bootstrap::async_persistence_public_root_interruption_never_reseeds_or_admits",
+      "kind": "fixture-setup-changed",
+      "issue": 1250,
+      "reason": "Fresh native creation now dispatches to the existing blocking opener pool before the original ROOT publication cuts. Require the dispatch hook followed by the exact original cut prefix; retain all eight injected durable cut cases and every typed refusal, no-admission, namespace, selection and reopen assertion."
+    },
+    {
+      "test": "rust:crates/opc-session-net::lib=lib::consumer::tests::cooldown_failover::cooldown_failover_attempt_spans_have_only_fixed_fields_across_lost_replies",
+      "kind": "fixture-setup-changed",
+      "issue": 1250,
+      "reason": "Order first registration of the real attempt callsite on an unobserved joined thread, then retain both observed and unobserved tracing dispatchers so the process-wide interest cache represents both contexts. Preserve the original paused-clock failover and lost-reply scenarios and every exact field, transmission, successor and business assertion."
+    },
+    {
+      "test": "rust:crates/opc-session-store::lib=lib::fake::tests::expired_retired_lease_mutations_preserve_the_expiry_answer",
+      "kind": "fixture-setup-changed",
+      "issue": 1257,
+      "reason": "Commit expiry cleanup through an ordinary acquire/release before observation. The exact epoch window in RFC 004 \u00a79.2 retains the exact expired key fence instead of immediately raising the absent floor. Preserve every LeaseExpired refusal and complete before/after state equality; reads and delayed replay retain their separate non-mutating regressions."
+    },
+    {
+      "test": "rust:crates/opc-session-store::lib=lib::fake::lab::tests::fake_key_retention_stages_lab_requests_with_the_absent_floor",
+      "kind": "fixture-setup-changed",
+      "issue": 1257,
+      "reason": "The exact retirement window in RFC 004 \u00a79.2 preserves the retained key fence through expiry. Replace immediate absent-floor advancement with equality to that exact fence. Retain observation without publication, stale-request refusal, first-attempt acquisition and exact replay checks; separate expiry-to-acquire regressions still prohibit intervening maintenance or retries."
+    },
+    {
+      "test": "rust:crates/opc-session-store::lib=lib::consensus::native::key_retention_tests::native_key_retention_retires_dead_keys_without_reviving_stale_credentials",
+      "kind": "fixture-setup-changed",
+      "issue": 1252,
+      "reason": "The epoch-retirement contract in RFC 004 \u00a79.2 retains an exact recently dead row instead of immediately deleting it and raising the absent floor. Assert the exact two-row count and unchanged retired fence; preserve every stale-credential refusal, increasing recreation fence and live-authority check."
+    },
+    {
+      "test": "rust:crates/opc-session-store::lib=lib::consensus::native::generation::catalog::tests::retention_tests::native_key_retention_survives_delta_reopen_and_base_rewrite",
+      "kind": "fixture-setup-changed",
+      "issue": 1252,
+      "reason": "The epoch-retirement contract in RFC 004 \u00a79.2 keeps the dead row exact in the initial epoch. Require both rows, the exact old fence, epoch tag zero, one retirement and floor zero after delivery, delta reopening and base rewriting. Preserve captured-state, replica equality and stale-credential checks."
+    },
+    {
+      "test": "rust:crates/opc-session-store::lib=lib::consensus::native::generation::catalog::tests::retention_tests::native_key_retention_passes_original_lifetime_limit_and_reopens",
+      "kind": "fixture-setup-changed",
+      "issue": 1252,
+      "reason": "Preserve all 1,048,577 distinct creations, 32,768-operation checkpoint spans, 16,384-entry deliveries and full catalog reopening. Replace immediate-deletion counts with the exact committed two-epoch count at every boundary. Check every dropped retained fence against floor_prev, the 2N bound, prepared-create success after one rotation, no-effect StaleFence after two, exact recent-key recreation and fresh authority after re-observing a forgotten key."
+    },
+    {
+      "test": "rust:crates/opc-session-store::lib=lib::fake::tests::fake_key_retention_retires_dead_keys_without_reviving_stale_credentials",
+      "kind": "fixture-setup-changed",
+      "issue": 1257,
+      "reason": "The exact retirement window in RFC 004 \u00a79.2 retains the released key fence alongside live authority. Assert two retained rows and exact equality instead of immediate deletion and an increased absent floor. Preserve every stale-credential refusal, newer recreation fence and live-lease check."
+    },
+    {
+      "test": "rust:crates/opc-session-store::lib=lib::fake::tests::fake_key_retention_passes_original_distinct_key_limit",
+      "kind": "fixture-setup-changed",
+      "issue": 1257,
+      "reason": "Preserve all 100,001 distinct acquire/create/delete/release cycles. Assert the exact two-epoch dead-row formula, epoch and retirement counters, 2N bound and the current inactive lease pending the next committing cleanup. Preserve record emptiness, bounded replay history, no lab receipts, forgotten-key observation, stale authority refusal and live authority."
+    },
+    {
+      "test": "rust:crates/opc-session-store::lib=lib::fake::tests::fake_key_retention_replays_and_rebuilds_the_same_absent_floor",
+      "kind": "fixture-setup-changed",
+      "issue": 1257,
+      "reason": "The current released lease remains inactive until the next committing command, matching native pruning. Require two exact resident rows at the final cut instead of immediate removal. Preserve the full ten-key stream, capacity-driven rotation, complete source/replay/rebuild equality and old/live authority checks."
+    },
+    {
+      "test": "rust:crates/opc-session-store::lib=lib::fake::tests::fake_key_retention_reclaims_imported_delete_floors",
+      "kind": "fixture-setup-changed",
+      "issue": 1257,
+      "reason": "A replicated delete cannot create authority for an unknown key. Keep all three distinct key/fence inputs, each at the still-next sequence after the preceding rejection, and require StaleFence with an identical state snapshot, no retained rows, zero absent floor and untouched allocator. The previous acceptance expectation contradicted the explicit retired/forgotten-authority rule; successful create/delete/release churn remains covered by the full 100,001-key proof and source/replay/rebuild test."
+    },
+    {
+      "test": "rust:crates/opc-session-store::lib=lib::fake::tests::late_capacity_failure_after_dead_child_rolls_back_batch_and_preserves_watcher",
+      "kind": "fixture-setup-changed",
+      "issue": 1257,
+      "reason": "Use valid acquire/release children to leave the first key without a record or active authority, followed by an acquire for a second key at the one-key limit. Unknown-key deletes are now correctly refused before capacity checks. Preserve the late capacity error, complete rollback, no watcher output, successful reuse of the unconsumed sequence and exactly one watcher notification. Add an explicit inactive-lease and unchanged-epoch check; this still detects cleanup or rotation between Batch children."
+    },
+    {
+      "test": "rust:crates/opc-session-store::lib=lib::fake::tests::late_capacity_failure_rolls_back_batch_and_preserves_watcher",
+      "kind": "fixture-setup-changed",
+      "issue": 1257,
+      "reason": "Replace unknown-key deletes with valid lease acquisitions so the second child still reaches resident-capacity refusal after staging a live first child. Preserve the exact late capacity error, whole-state rollback, absent watcher events, reuse of the unconsumed sequence and single successful notification. The separate dead-first-child case retains its inactive-lease scenario."
+    },
+    {
+      "test": "rust:crates/opc-session-store::lib=lib::fake::tests::failed_rebuild_preserves_every_internal_state_dimension",
+      "kind": "fixture-setup-changed",
+      "issue": 1257,
+      "reason": "Give the replacement stream valid lease authority before its final refresh of a missing record. The first entry changes staged lease/fence/allocator state; the final entry acquires its own lease then fails with the original NotFound. Preserve the two-entry rebuild, original exact error, full state-snapshot equality and watcher silence; do not allow an earlier StaleFence to replace the late failure."
+    },
+    {
+      "test": "rust:crates/opc-session-store::lib=lib::fake::tests::staging_preserves_and_advances_nonzero_compaction_state",
+      "kind": "fixture-setup-changed",
+      "issue": 1257,
+      "reason": "Use authorized acquisitions for the first, second and third replication entries, and acquire authority before the deliberately missing-record refresh. Preserve both late NotFound failures in append and rebuild, every complete-state equality, duplicate idempotency, watcher assertion, and exact compaction sequence/log contents before and after a successful append. Unknown-key delete authority is now explicitly refused in its own three-case regression."
+    },
+    {
+      "test": "rust:crates/opc-session-store::lib=lib::consensus::native::changes::tests::retention_capture::native_key_retirement_capture_records_exact_predecessors_and_eliminates_transients",
+      "kind": "fixture-setup-changed",
+      "issue": 1252,
+      "reason": "The exact epoch window in RFC 004 \u00a79.2 requires rotation before a dead row disappears. Preserve both retained/absent predecessors and batched/separate delivery, all predecessor pointer/hash, removal, transient elimination and captured-proof assertions. Add a real final acquire that exercises the production capacity finalizer at a two-row resident limit, with unchanged N; account exactly for that additional live row and assert its captured creation. Earlier commands fit the same resident limit, so rotation belongs to the final command regardless of delivery grouping."
+    },
+    {
+      "test": "rust:crates/opc-session-store::lib=lib::consensus::native::v1::tests::native_v1_full_image_four_preserves_tombstones_and_explicit_legacy_readers",
+      "kind": "fixture-setup-changed",
+      "issue": 1252,
+      "reason": "The epoch-tagged positional row requires the new full-image discriminator 06. Keep explicit version-4 coverage through its own four-field writer and run tombstone/replay/context checks for both 04 and 06; retain all legacy 01/02/03 reader and mislabeled-context refusal cases."
+    },
+    {
+      "test": "rust:crates/opc-session-store::lib=lib::consensus::native::voter_slot_tests::native_slot_intent_cannot_be_missing_displaced_or_smuggled_into_an_old_format",
+      "kind": "fixture-setup-changed",
+      "issue": 1252,
+      "reason": "The epoch-tagged slot profile uses full-image discriminator 07. Exercise both explicit legacy 05 and current 07 writers, and reject each when mislabeled as either fixed-membership 04 or 06. Keep every missing/displaced intent and truncate/engine-fence assertion."
+    },
+    {
+      "test": "rust:crates/opc-session-store::lib=lib::consensus::storage::tests::native_reopen_formats::native_unknown_frontier_public_reopen_refuses_before_backend_or_snapshot_writes",
+      "kind": "fixture-setup-changed",
+      "issue": 1252,
+      "reason": "Update the fixture current-generation header from vocabulary 6 to epoch vocabulary 7 specified by ADR 0022. Preserve the unknown-field mutation, both persistence modes, both expected identities, exact corruption refusal, byte-for-byte no-write proof and restored-file successful reopen."
+    },
+    {
+      "test": "rust:crates/opc-session-store::lib=lib::consensus::storage::tests::native_reopen_formats::native_future_generation_public_reopen_refuses_before_backend_or_snapshot_writes",
+      "kind": "fixture-setup-changed",
+      "issue": 1252,
+      "reason": "The epoch format in ADR 0022 makes vocabulary 7 current, so the unknown future fixture is vocabulary 8. Preserve both persistence modes, both identity cases, the exact corruption result, all no-write assertions and successful reopen after restoring the original bytes."
+    },
+    {
+      "test": "rust:crates/opc-session-store::lib=lib::sqlite::consensus::tests::native::ordinary::native_ordinary_pruning_savepoint_and_same_apply_index_match_sql",
+      "kind": "fixture-setup-changed",
+      "reason": "RFC 004 section 9.2 requires non-mutating native CAS conflicts to preserve canonical expiry state. Keep complete response parity and compare every notification effect, identity, sequence and timestamp while independently checking the explicit native and SQLite replay policies. Preserve the SQL row-count, revision and watch assertions and every other physical table. Separately require exact native pre-conflict records and restore revision, physical convergence after the next successful write, same-delivery expiry-index checks, cold reopening and cold admission cleanup.",
+      "issue": 1252
+    },
+    {
+      "test": "rust:crates/opc-session-store::lib=lib::consensus::native::ordinary_retention_tests::native_notification_retention_survives_full_image_round_trip",
+      "kind": "fixture-setup-changed",
+      "issue": 1250,
+      "reason": "Execute the complete notification-window round trip in a checked same-test child process so unrelated parallel fixtures cannot consume its process-wide verification budget. Preserve all 65,536 retained entries, exact retired frontier, full-image validation, stale-cursor refusal and ordered replay through 128-entry pages. The parent requires a successful child exit and exactly one passing, non-ignored test; all production memory caps and assertions remain unchanged."
+    },
+    {
+      "test": "rust:crates/opc-session-store::lib=lib::fake::lab::tests::restore_expiry_tests::lab_restore_expired_rows_still_consume_the_scan_work_budget",
+      "kind": "fixture-setup-changed",
+      "issue": 1252,
+      "reason": "Expired records are absent from the live restore source and must not exhaust the 4,096 live-row allowance. Both 4,096 and 4,097 expired-only fixtures now require a complete empty page under the separate 2,000,000 physical-visit bound. Preserve public page validation, zero scope exclusions, absent continuation and exact unchanged canonical records. Live-row, metadata, payload and retained-page limits remain unchanged."
+    },
+    {
+      "test": "rust:crates/opc-session-store::lib=lib::consensus::native::key_retention_tests::native_new_internal_capacity_requires_a_journal_position_even_without_key_pressure",
+      "kind": "fixture-setup-changed",
+      "issue": 1252,
+      "reason": "Required replay policy accounts for new internal resident rows before any capacity rotation. An insertion therefore needs a context entry even below pressure and must refuse an exhausted watch counter before publication. Rename the former no-entry control to assert atomic refusal, exact original resident rows and unchanged retention. Preserve the complete retained notification window, signed counter horizon and original production limits."
+    },
+    {
+      "test": "rust:crates/opc-session-store::lib=lib::backend::key_retention_replication_tests::key_retention_boundary_record_transform_preserves_all_command_metadata",
+      "kind": "fixture-setup-changed",
+      "issue": 1252,
+      "reason": "Replace separate assertions about metadata embedded in an operation variant with equality of the complete required entry policy. That equality covers every former capacity, continuation, floor and pruning value plus retirement, command identity, recovery and internal capacity. Preserve effect count, exact transformed record and all non-payload record fields."
+    },
+    {
+      "test": "rust:crates/opc-session-store::test=replication_structure_bounds::key_retention_batch_preserves_replication_shape_bounds_and_encoding",
+      "kind": "fixture-setup-changed",
+      "issue": 1252,
+      "reason": "Move replay metadata from removed operation variants into the required entry field. Zero rotations and empty metadata-only batches are valid; policy cannot nest inside an operation tree. Preserve exact node and depth limits and their one-past-limit refusals, round-trip every legal rotation count, and reject malformed scalar policy values."
+    },
+    {
+      "test": "rust:crates/opc-session-store::test=replication_structure_bounds::key_retention_boundary_keeps_original_tree_bounds_and_bounded_continuations",
+      "kind": "fixture-setup-changed",
+      "issue": 1252,
+      "reason": "Use the single entry policy instead of operation-specific boundary containers. Exercise exact first and continuation counts, refuse repeated capacity decisions on continuations, preserve typed round trips and require every policy field. The shared entry shape test retains exact depth and node limits; separate encoding checks prove both missing-policy refusal and refusal by earlier readers."
+    },
+    {
+      "test": "rust:crates/opc-session-net::lib=lib::protocol::tests::key_retention_batches_round_trip_with_bounded_flat_wire_nodes",
+      "kind": "fixture-setup-changed",
+      "issue": 1252,
+      "reason": "Carry capacity policy beside the bounded flat mutation nodes. Retain the exact maximum node count, complete typed round trip and illegal capacity refusals. Zero rotations are now an explicit valid policy; nested policy containers no longer exist in the mutation vocabulary. Required-field and continuation negatives cover the new entry form."
+    },
+    {
+      "test": "rust:crates/opc-session-store::lib=lib::consensus::native::async_recovery::tests::native_async_boundary_watch_does_not_relabel_predecessor_effects",
+      "kind": "fixture-setup-changed",
+      "issue": 1252,
+      "reason": "Required recovery metadata occupies the first outward position after the new floor. Require that exact empty-effect entry and its complete recovery policy, keep the predecessor entry byte-for-byte unchanged, and require the following real acquisition at the next position. Preserve strict ordered page and watch-frontier checks."
+    },
+    {
+      "test": "rust:crates/opc-session-store::lib=lib::consensus::native::replay_policy_parity_tests::explicit_policy_watch_rebuild_and_application_restore_round_trip",
+      "kind": "fixture-setup-changed",
+      "issue": 1252,
+      "reason": "Run the complete watch, rebuild and restore fixture in a checked same-test child so unrelated parallel fixtures cannot consume its process-wide verification reservation. Preserve every data, policy, cursor, retained-state and restore assertion and the original memory cap. The parent requires successful exit and the exact one-test, non-ignored success summary."
+    },
+    {
+      "test": "rust:crates/opc-session-store::lib=lib::consensus::store::sequential_wal_sdk_tests::scope_authority::scope_authority_four_thousand_successions_keep_native_checkpoint_and_snapshots_bounded",
+      "kind": "fixture-setup-changed",
+      "issue": 1252,
+      "reason": "The first profile activation publishes one internal row; initial scope admission adds the authority checkpoint and empty child ledger. Require exactly two empty-effect contexts with complete preservation policies and internal counts one and three at both succession checkpoints. Keep zero session rows, the fixed checkpoint-size limit, one activation receipt, all four thousand successions, snapshot bounds and durable reopen checks."
+    },
+    {
+      "test": "rust:crates/opc-session-store::lib=lib::sqlite::consensus::tests::native::roster::export::install_base::native_roster_install_base_preserves_complete_cold_predecessor_and_exact_raft_pointers",
+      "kind": "fixture-setup-changed",
+      "issue": 1252,
+      "reason": "Account for the required canonical native profile at default frontiers. Independently derive both producer policies from the committed command history captured before log purge and compare complete effects and journal columns before comparing every original schema object and carrier. Preserve exact retained Raft pointers, votes, membership, unapplied suffixes, cold reopen and portable export checks."
+    },
+    {
+      "test": "rust:crates/opc-session-store::lib=lib::sqlite::consensus::tests::native::roster::export::install_base::native_roster_install_base_unapplied_copy_rejects_wrong_root_and_rolls_back_cancellation",
+      "kind": "fixture-setup-changed",
+      "issue": 1252,
+      "reason": "Include the validated default native profile when comparing empty and unapplied converted images. Preserve equality for every original schema object and column, exact unapplied Raft positions, wrong-root refusal, cancellation rollback and unchanged source bytes. Native-to-native comparisons remain exact."
     }
   ]
 }

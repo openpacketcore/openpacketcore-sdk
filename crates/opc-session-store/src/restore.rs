@@ -74,7 +74,7 @@ pub const RESTORE_SCAN_MAX_PAGE_RETAINED_BYTES: usize = 8 * 1024 * 1024;
 /// counted only if their record is admitted to the retained page.
 pub const RESTORE_SCAN_MAX_EXAMINED_METADATA_BYTES: usize = 8 * 1024 * 1024;
 
-/// Maximum SQLite virtual-machine instructions spent on one restore page.
+/// Maximum SQLite VM instructions, or native/lab source-row visits, per page.
 pub const RESTORE_SCAN_MAX_SQLITE_VM_STEPS: usize = 2_000_000;
 
 /// Maximum wall-clock milliseconds spent inside one SQLite restore query.

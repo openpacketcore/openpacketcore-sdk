@@ -199,17 +199,17 @@ for the full signed history and cold reconstruction. Stage timings separate
 admission, terminalization, batch persistence and cold reconstruction. The
 ordinary three-roster smoke test uses the same path.
 
-The full-bound native log and receipt-history reclamation proofs also use
+The full-bound native log, receipt-history and retention proofs also use
 `CARGO_PROFILE_TEST_OPT_LEVEL=1`, with debug assertions and overflow checks
 enabled. Each proof has a dedicated parallel core shard (`native-log-0` through
-`native-log-13`) and egress shard (`4` through `17`).
+`native-log-15`) and egress shard (`4` through `20`).
 Both plans preserve their package and feature selection and precheck the exact
 enabled names in the execution profile. The default three-cycle regressions
 retain the ordinary test profile. All entry counts, persistence operations,
 assertions and test deadlines remain unchanged. Core proof jobs have 90-minute
 budgets. The egress leader proof on shard 4 has a 120-minute budget; the Durable
-and Async proofs on shards 5 and 6 and the receipt-history proofs on shards
-7 through 17 have 75 minutes, including compilation.
+and Async proofs on shards 5 and 6 and the receipt-history and retention proofs
+on shards 7 through 19 have 75 minutes, including compilation.
 See the [CI layout](ci/README.md) for the hosted sizing evidence and the ordinary
 library partition.
 

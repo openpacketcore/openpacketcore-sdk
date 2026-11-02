@@ -1,7 +1,7 @@
 //! Ordinary commands preserve the established savepoint contract: deterministic
 //! rejection discards the whole business effect, including global expiry
 //! pruning, while binding the response and advancing the application clock.
-//! A successful CAS conflict commits pruning and emits no watch event.
+//! A CAS conflict discards pruning and emits no watch event.
 
 use super::*;
 use crate::backend::{CompareAndSet, CompareAndSetResult, ReplicationOp};
@@ -15,7 +15,56 @@ struct Transaction<'a, 'state> {
     now: Timestamp,
 }
 
+pub(super) struct KeyEffects {
+    frontiers: NativeFrontiers,
+    keys: HashMap<SessionKey, NativeKeyState>,
+    expiry: expiry::ExpiryIndex,
+    removed: Vec<(SessionKey, retention::KeyRemoval)>,
+}
+
+impl KeyEffects {
+    pub(super) fn publish(self, delta: &mut NativeDelta<'_>) {
+        delta.frontiers = self.frontiers;
+        delta.expiry = self.expiry;
+        for (key, witness) in self.removed {
+            delta.keys.remove(&key);
+            delta.key_removals.insert(key, witness);
+        }
+        for key in self.keys.keys() {
+            delta.key_removals.remove(key);
+        }
+        delta.keys.extend(self.keys);
+    }
+}
+
 impl NativeDelta<'_> {
+    pub(super) fn staged_v1(
+        &self,
+        request: &crate::FencedTransitionRequest,
+        now: Timestamp,
+    ) -> Result<(business::BusinessEffect, KeyEffects), StoreError> {
+        let mut transaction = Transaction {
+            base: self,
+            frontiers: self.frontiers.clone(),
+            keys: HashMap::new(),
+            expiry: self.expiry.clone(),
+            now,
+        };
+        transaction.prune()?;
+        let effect = business::transition_v1(
+            request,
+            &transaction.key(request.lease().key()),
+            self.has_key(request.lease().key()),
+            &transaction.frontiers,
+            now,
+        )?;
+        transaction.set_key(effect.key.clone(), effect.value.clone());
+        transaction.frontiers.next_fence = effect.next_fence;
+        transaction.frontiers.next_credential = effect.next_credential;
+        transaction.revision()?;
+        Ok((effect, transaction.finish()?))
+    }
+
     pub(super) fn ordinary(
         &mut self,
         command: &SessionConsensusCommand,
@@ -49,40 +98,6 @@ impl NativeDelta<'_> {
                 self.response(index, Err(StoreError::CasIdempotencyConflict))
             });
         }
-        // Bounded ordinary-receipt retention. The rule activates only from a
-        // committed application sequence far beyond every below-bound fixture,
-        // so a store that never approaches the old cap keeps the original
-        // behavior byte-identically. Once active, a command whose committed
-        // submission time is outside the retained logical-time window cannot
-        // be an in-window retry: its exact outcome was retired, so answer with
-        // a typed outcome-unavailable result instead of executing it again.
-        let retention = super::retention::ordinary_receipt_retention();
-        if retention.active(self.frontiers.sequence)
-            && retention.retry_outside_retention(command.logical_time, now)
-        {
-            let error = if matches!(intent, SessionMutationIntent::CompareAndSet(_)) {
-                StoreError::CasIdempotencyOutcomeUnavailable
-            } else {
-                StoreError::BackendOperationOutcomeUnavailable
-            };
-            return Ok(self.clock_response(now, index, error));
-        }
-        // Last-resort retention capacity. The bound is enforced on every apply
-        // while the rule is active, including mid-delta: refuse whenever the
-        // resident map is at or above the bound, even when expired rows are
-        // reclaimable at the next publication. Reclamation happens only at
-        // publication, so "reclaimable exists" is not permission to grow the
-        // current delta; a committed delta has no RPC cap and a window-crossing
-        // batch must not bypass the bound. Refuse before evaluating the command
-        // (no effect, no binding) with a retryable typed answer; the next
-        // publication's committed-clock retirement reclaims the window.
-        if retention.active(self.frontiers.sequence) && self.receipt_count_at_capacity(retention)? {
-            return Ok(self.clock_response(
-                now,
-                index,
-                StoreError::BackendUnavailable("native ordinary receipt retention capacity".into()),
-            ));
-        }
         let sequence = self
             .frontiers
             .sequence
@@ -104,14 +119,20 @@ impl NativeDelta<'_> {
         } else {
             Err(StoreError::TopologyAuthorityRevoked)
         };
+        let executed = executed.and_then(|(outcome, replication)| {
+            if matches!(
+                outcome,
+                SessionMutationOutcome::CompareAndSet(CompareAndSetResult::Conflict { .. })
+            ) {
+                Ok((outcome, replication, None))
+            } else {
+                transaction
+                    .finish()
+                    .map(|effects| (outcome, replication, Some(effects)))
+            }
+        });
         let (result, replication) = match executed {
-            Ok((outcome, replication)) => {
-                let Transaction {
-                    frontiers,
-                    keys,
-                    expiry,
-                    ..
-                } = transaction;
+            Ok((outcome, replication, effects)) => {
                 if matches!(
                     intent,
                     SessionMutationIntent::ActivateProtectedRosterProfileV2 { .. }
@@ -121,9 +142,9 @@ impl NativeDelta<'_> {
                             && self.frontiers.roster_v2_activation.is_none(),
                     )?;
                 }
-                self.frontiers = frontiers;
-                self.expiry = expiry;
-                self.keys.extend(keys);
+                if let Some(effects) = effects {
+                    effects.publish(self);
+                }
                 (Ok(outcome), replication)
             }
             Err(error) if business::deterministic(&error) => (Err(error), None),
@@ -140,6 +161,7 @@ impl NativeDelta<'_> {
                 .filter(|next| *next <= COUNTER_MAX)
                 .ok_or_else(|| invalid("native ordinary watch sequence exhausted"))?;
             let notification = ReplicationEntry {
+                replay_policy: crate::ReplicationReplayPolicy::prune_and_retire(),
                 sequence,
                 tx_id: ReplicationTxId::from_request_bytes(*command.request_id.as_bytes()),
                 op,
@@ -162,122 +184,83 @@ impl NativeDelta<'_> {
         self.compact_one_v1(now)?;
         Ok(response)
     }
-
-    /// Whether the resident ordinary-receipt collections have reached the
-    /// bounded admission capacity. This deliberately does not consult
-    /// expiration: retired rows leave the map only at publication, and a
-    /// committed delta has no RPC cap, so a batch must not be able to grow past
-    /// the bound by observing reclaimable-but-not-yet-reclaimed base rows.
-    fn receipt_count_at_capacity(
-        &self,
-        retention: super::retention::OrdinaryReceiptRetention,
-    ) -> io::Result<bool> {
-        let resident = self
-            .base
-            .generic_receipts
-            .len()
-            .checked_add(self.generic_receipts.len())
-            .ok_or_else(|| invalid("native ordinary receipt count overflow"))?;
-        Ok(resident >= retention.capacity())
-    }
-}
-
-/// Whether admitting a new key would exceed the committed image capacity.
-///
-/// Counts the committed map, keys published earlier in the same batch
-/// (`delta_new`) and new keys in the current transaction, so a batch cannot
-/// pass the cap one command at a time.
-fn key_capacity_decision(
-    committed: usize,
-    delta_new: usize,
-    transaction_new: usize,
-    limit: usize,
-) -> bool {
-    committed
-        .saturating_add(delta_new)
-        .saturating_add(transaction_new)
-        >= limit
 }
 
 impl Transaction<'_, '_> {
-    /// Committed protected-credential floor derived from `next_fence`.
-    fn key_retirement_floor(&self) -> u64 {
-        retention::key_retirement_floor(self.frontiers.next_fence)
+    fn finish(mut self) -> Result<KeyEffects, StoreError> {
+        let removed = self.retire_dead_keys()?;
+        Ok(KeyEffects {
+            frontiers: self.frontiers,
+            keys: self.keys,
+            expiry: self.expiry,
+            removed,
+        })
     }
 
-    /// A key is provably non-authoritative only when no live record, live lease,
-    /// explicit reservation or roster reference names it. Scope checkpoint rows
-    /// and reserved keys stay authoritative regardless of age.
-    fn key_is_provably_non_authoritative(key: &SessionKey, row: &NativeKeyState) -> bool {
-        !crate::scope_storage::is_scope_record_key(key)
-            && row.record.is_none()
-            && row.lease.is_none()
-            && !row.reserved
-    }
-
-    /// Refuse a credential issued before a logically retired key's floor.
-    ///
-    /// The foundation does not yet remove retired key rows, so the check is
-    /// applied only when the key state is provably non-authoritative; a live
-    /// older lease keeps its exact authority. Once PR2 wires row retirement, the
-    /// same floor is the typed refusal for a missing retired entry.
-    fn retired_credential_floor_refusal(
-        &self,
-        key: &SessionKey,
-        row: &NativeKeyState,
-        fence: crate::FenceToken,
-    ) -> Result<(), StoreError> {
-        if Self::key_is_provably_non_authoritative(key, row)
-            && fence.get() < self.key_retirement_floor()
-        {
-            return Err(StoreError::StaleFence);
-        }
-        Ok(())
-    }
-
-    /// Capacity-triggered retirement decision.
-    ///
-    /// The foundation cannot remove key rows yet, so a new key at the fixed
-    /// `MAX_ITEMS` cap fails closed with a typed outcome instead of surfacing a
-    /// fatal image error. PR2 replaces this decision with the bounded sweep.
-    fn key_capacity_exhausted(&self, key: &SessionKey) -> bool {
-        if self.base.base.keys.get(key).is_some()
-            || self.base.keys.contains_key(key)
-            || self.keys.contains_key(key)
-        {
-            return false;
-        }
-        let committed = self.base.base.keys.len();
-        // New keys already published by an earlier command in this ordered
-        // batch (the NativeDelta overlay), plus new keys in this transaction.
-        let delta_new = self
-            .base
+    // Finalize each successful committed command, not each delivery batch:
+    // follower packaging must never change the namespace fence.
+    // Preserve lease rows until ordinary pruning removes them, including the
+    // inactive row deliberately retained by a successful release.
+    fn retire_dead_keys(&mut self) -> Result<Vec<(SessionKey, retention::KeyRemoval)>, StoreError> {
+        let mut retired: Vec<_> = self
             .keys
-            .keys()
-            .filter(|candidate| self.base.base.keys.get(*candidate).is_none())
-            .count();
-        let transaction_new = self
-            .keys
-            .keys()
-            .filter(|candidate| {
-                self.base.base.keys.get(*candidate).is_none()
-                    && !self.base.keys.contains_key(*candidate)
+            .iter()
+            .filter(|(key, row)| {
+                row.record.is_none()
+                    && row.lease.is_none()
+                    && !row.reserved
+                    && row.retired_epoch.is_none()
+                    && !crate::scope_storage::is_scope_record_key(key)
             })
-            .count();
-        key_capacity_decision(
-            committed,
-            delta_new,
-            transaction_new,
-            Self::key_capacity_limit(),
-        )
-    }
-
-    fn key_capacity_limit() -> usize {
-        #[cfg(test)]
-        if let Some(limit) = retention::tests_support::key_capacity_limit_override() {
-            return limit;
+            .map(|(key, _)| expiry::OrderedKey(Arc::new(key.clone())))
+            .collect();
+        retired.sort_unstable();
+        let mut removed = Vec::new();
+        for key in retired {
+            let key = key.0.as_ref();
+            let before = self.keys.get(key).cloned().ok_or_else(unavailable)?;
+            let mut row = before.clone();
+            row.retired_epoch = Some(self.frontiers.retention.keys.epoch);
+            self.frontiers.retention.keys.retired_max =
+                self.frontiers.retention.keys.retired_max.max(row.fence);
+            self.frontiers.retention.keys.retired_count = self
+                .frontiers
+                .retention
+                .keys
+                .retired_count
+                .checked_add(1)
+                .ok_or_else(unavailable)?;
+            self.expiry.replace(key, Some(&before), Some(&row));
+            self.keys.insert(key.clone(), row);
+            if self.frontiers.retention.keys.retired_count
+                == crate::key_retention::RETIRED_KEYS_PER_EPOCH
+            {
+                let through = self
+                    .frontiers
+                    .rotate_keys(crate::key_retention::RotationReason::Threshold)?;
+                if let Some(through) = through {
+                    while let Some(key) = self.expiry.oldest_retired_through(through) {
+                        let before = self
+                            .keys
+                            .get(&key)
+                            .cloned()
+                            .unwrap_or_else(|| self.base.physical_key(&key));
+                        self.frontiers
+                            .retention
+                            .validate_key_removal(&key, Some(&before))
+                            .map_err(|_| unavailable())?;
+                        self.expiry.replace(&key, Some(&before), None);
+                        self.keys.remove(&key);
+                        removed.push((
+                            key.clone(),
+                            retention::KeyRemoval::new(&key, &before, self.frontiers.retention)
+                                .map_err(|_| unavailable())?,
+                        ));
+                    }
+                }
+            }
         }
-        validation::MAX_ITEMS
+        Ok(removed)
     }
 
     fn key(&self, key: &SessionKey) -> NativeKeyState {
@@ -287,13 +270,18 @@ impl Transaction<'_, '_> {
             .unwrap_or_else(|| self.base.key(key))
     }
 
-    fn set_key(&mut self, key: SessionKey, row: NativeKeyState) {
+    fn set_key(&mut self, key: SessionKey, mut row: NativeKeyState) {
+        if row.record.is_some() || row.lease.is_some() || row.reserved {
+            row.retired_epoch = None;
+        }
         let before = self
             .keys
             .get(&key)
             .cloned()
             .unwrap_or_else(|| self.base.physical_key(&key));
-        self.expiry.replace(&key, Some(&before), Some(&row));
+        let exists = self.keys.contains_key(&key) || self.base.has_key(&key);
+        self.expiry
+            .replace(&key, exists.then_some(&before), Some(&row));
         self.keys.insert(key, row);
     }
 
@@ -353,11 +341,6 @@ impl Transaction<'_, '_> {
         if guard.expires_at() <= self.now {
             return Err(StoreError::LeaseExpired);
         }
-        // A mutation requires the exact live lease entry, so a credential for a
-        // logically retired (or absent/replaced) lease is already refused
-        // below. The derived floor is enforced on the read/release path in
-        // `lease_guard` and will also cover absent retired rows when bounded key
-        // retirement lands; mutating paths need no duplicate floor check.
         let row = self.key(guard.key());
         if !row.lease.as_ref().is_some_and(|lease| lease.matches(guard))
             || guard.fence().get() < row.fence
@@ -369,7 +352,6 @@ impl Transaction<'_, '_> {
 
     fn lease_guard(&self, guard: &LeaseGuard) -> Result<NativeKeyState, StoreError> {
         let row = self.key(guard.key());
-        self.retired_credential_floor_refusal(guard.key(), &row, guard.fence())?;
         let Some(lease) = &row.lease else {
             return Err(if guard.fence().get() <= row.fence {
                 StoreError::StaleFence
@@ -409,6 +391,16 @@ impl Transaction<'_, '_> {
                 let record = crate::scope_storage::ScopeRow::Activation((**certificate).clone())
                     .to_record()
                     .map_err(|_| unavailable())?;
+                if self.frontiers.watch_sequence >= COUNTER_MAX
+                    && self
+                        .base
+                        .requires_capacity_notification(usize::from(
+                            !self.base.has_key(&record.key),
+                        ))
+                        .map_err(|_| unavailable())?
+                {
+                    return Err(StoreError::FencedTransitionStorageExhausted);
+                }
                 self.set_key(
                     record.key.clone(),
                     NativeKeyState {
@@ -468,9 +460,6 @@ impl Transaction<'_, '_> {
                 }
                 let expires_at = checked_session_deadline(self.now, *ttl)?;
                 self.prune()?;
-                if self.key_capacity_exhausted(key) {
-                    return Err(StoreError::KeyCapacityExhausted);
-                }
                 let mut row = self.key(key);
                 if row.lease.as_ref().is_some_and(|lease| {
                     lease.active && lease.owner != *owner && lease.guard_expires_at > self.now
@@ -682,34 +671,5 @@ impl Transaction<'_, '_> {
                 new_record: op.new_record.clone(),
             }),
         ))
-    }
-}
-#[cfg(test)]
-mod key_retention_tests {
-    use super::*;
-
-    #[test]
-    fn batch_capacity_decision_counts_the_delta_overlay() {
-        // One committed key away from a ten-key cap: a transaction-local new
-        // key, an earlier-batch overlay key, or their combination must refuse.
-        assert!(!key_capacity_decision(9, 0, 0, 10));
-        assert!(key_capacity_decision(9, 1, 0, 10));
-        assert!(key_capacity_decision(9, 0, 1, 10));
-        assert!(key_capacity_decision(10, 0, 0, 10));
-        // max-1 + two new keys across a batch must not admit both.
-        assert!(key_capacity_decision(9, 1, 1, 10));
-        // An existing key never adds capacity pressure.
-        assert!(!key_capacity_decision(9, 0, 0, 10));
-    }
-
-    #[test]
-    fn capacity_refusal_is_a_deterministic_result_not_an_infrastructure_fault() {
-        assert!(business::deterministic(&StoreError::KeyCapacityExhausted));
-        assert!(
-            !business::deterministic(&StoreError::BackendUnavailable(
-                "genuine native infrastructure fault".into()
-            )),
-            "capacity typing must not mask infrastructure faults"
-        );
     }
 }

@@ -22,7 +22,7 @@ pub(crate) fn preflight_format(
             hash: Sha256::new(),
         };
         let mut format = Format::read(&mut reader, true)?;
-        if format.vocabulary < Format::V6.vocabulary {
+        if format.vocabulary < Format::V7.vocabulary {
             return Err(invalid("native generation discriminator differs"));
         }
         let loaded = header::base(&mut reader, format)?;
@@ -120,18 +120,36 @@ fn skip_bytes(
     maximum: usize,
     check: &impl Fn() -> io::Result<()>,
 ) -> io::Result<()> {
+    skip_bytes_with_key_marker(reader, maximum, false, check).map(|_| ())
+}
+
+fn skip_bytes_with_key_marker(
+    reader: &mut Cursor<'_>,
+    maximum: usize,
+    inspect_key: bool,
+    check: &impl Fn() -> io::Result<()>,
+) -> io::Result<bool> {
     let mut remaining = u32::from_le_bytes(reader.scalar()?) as usize;
     if remaining > maximum || remaining as u64 > reader.maximum - reader.position {
         return Err(invalid("native generation input extent exceeds bound"));
     }
     let mut bytes = Zeroizing::new([0; 8192]);
+    let mut present = None;
     while remaining != 0 {
         check()?;
         let count = remaining.min(bytes.len());
         reader.read_exact(&mut bytes[..count])?;
+        if inspect_key && present.is_none() {
+            present = Some(decode::key_row_present(&bytes[..count])?);
+        }
         remaining -= count;
     }
-    check()
+    check()?;
+    if inspect_key {
+        present.ok_or_else(|| invalid("native generation key row is empty"))
+    } else {
+        Ok(false)
+    }
 }
 
 fn optional_bytes(
@@ -165,7 +183,13 @@ fn skip_rows(
             check()?;
             expect(reader, &[tag as u8])?;
             match tag {
-                0 | 2 => {
+                0 => {
+                    reader.before()?;
+                    if !skip_bytes_with_key_marker(reader, MAX_ITEM, true, check)? {
+                        skip_bytes(reader, 20, check)?;
+                    }
+                }
+                2 => {
                     reader.before()?;
                     skip_bytes(reader, MAX_ITEM, check)?;
                 }

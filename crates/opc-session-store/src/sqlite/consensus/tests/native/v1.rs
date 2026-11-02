@@ -86,11 +86,7 @@ fn physical(wal: &Wal, oracle: &SqliteSessionBackend) {
         "consensus_fenced_transition_receipts",
         "consensus_fenced_transition_activation",
     ] {
-        assert_eq!(
-            super::ordinary::rows(&exported, table),
-            super::ordinary::rows(&conn, table),
-            "complete physical V1 parity: {table}"
-        );
+        policy_oracle::table(&exported, &conn, table);
     }
     validate_fenced_transition_receipt_storage_bounds_sync(&exported).unwrap();
     validate_fenced_transition_activation_certificate_sync(&exported, identity(), false).unwrap();

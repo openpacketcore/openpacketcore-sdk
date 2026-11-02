@@ -130,7 +130,7 @@ fn append_request(start: u64, end: u64) -> AppendEntriesRequest<SessionRaftTypeC
     }
 }
 
-fn generation_bytes(directory: &FixedRawReadStoreFixture) -> u64 {
+fn generation_lengths(directory: &FixedRawReadStoreFixture) -> Vec<u64> {
     std::fs::read_dir(directory.path().join("retained-bound.sqlite.native-wal"))
         .unwrap()
         .map(|entry| entry.unwrap())
@@ -141,7 +141,31 @@ fn generation_bytes(directory: &FixedRawReadStoreFixture) -> u64 {
                 .is_some_and(|extension| extension == "native")
         })
         .map(|entry| entry.metadata().unwrap().len())
-        .sum()
+        .collect()
+}
+
+fn generation_bytes(directory: &FixedRawReadStoreFixture) -> u64 {
+    generation_lengths(directory).into_iter().sum()
+}
+
+fn assert_generation_disk_bound(directory: &FixedRawReadStoreFixture) {
+    let lengths = generation_lengths(directory);
+    assert_eq!(
+        lengths.len(),
+        1,
+        "drain retires every superseded generation file"
+    );
+    let bytes: u64 = lengths.iter().sum();
+    // These blank-entry fixtures retain only 1,024 rows. Their compact base
+    // remains below the ordinary 64 MiB rollover floor, without a test limit.
+    assert!(
+        bytes <= 64 * 1024 * 1024,
+        "purged history must not accumulate in generation files: {bytes} bytes"
+    );
+    eprintln!(
+        "NATIVE_LOG_BOUND drained_generation_bytes={bytes} files={}",
+        lengths.len()
+    );
 }
 
 fn assert_reclaimed_committed_coverage(wal: &Wal, end: u64, keep: u64) {
@@ -263,7 +287,7 @@ async fn bounded_cycles(mode: SessionPersistenceMode, cycles: u64) {
     let extent = generation_bytes(&directory);
     assert!(
         extent > initial_bytes,
-        "append-only generation growth is measured separately from retained rows"
+        "generation storage is measured separately from retained rows"
     );
     eprintln!(
         "NATIVE_LOG_BOUND file_bytes_before={initial_bytes} file_bytes_after={extent} growth={}",
@@ -275,6 +299,7 @@ async fn bounded_cycles(mode: SessionPersistenceMode, cycles: u64) {
     wal.shutdown_after_consensus().unwrap();
     drop(wal);
     drop(backend);
+    assert_generation_disk_bound(&directory);
 
     let (backend, raft, wal, _) = open_engine(&directory, mode).await;
     let inventory = wal.native_log_inventory_for_test().unwrap();
@@ -319,6 +344,7 @@ async fn bounded_cycles(mode: SessionPersistenceMode, cycles: u64) {
     wal.shutdown_after_consensus().unwrap();
     drop(wal);
     drop(backend);
+    assert_generation_disk_bound(&directory);
     eprintln!("NATIVE_LOG_BOUND complete appended={} snapshots={snapshots} continued_appends=1 elapsed_s={:.3}",
         total + 1, started.elapsed().as_secs_f64());
 }

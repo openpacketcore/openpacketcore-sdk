@@ -202,7 +202,7 @@ impl Edit {
                 })
                 .and_then(|bytes| bytes.checked_add(4 * size_of::<Certificate>() + 1024))
                 .ok_or_else(|| invalid("native roster change allocation overflow"))?;
-        let memory = Arc::new(VerificationMemory::reserve(bytes)?);
+        let memory = Arc::new(VerificationMemory::reserve_journal(bytes)?);
         Ok(Self {
             ledger: ledger.clone(),
             tables: base.tables,
@@ -370,6 +370,7 @@ impl Edit {
             target,
             rows: self.row_changes.into_iter().collect(),
             partitions: self.partition_changes.into_iter().collect(),
+            retained_bytes: self.memory.reserved_bytes(),
             memory: vec![self.memory],
         };
         journal.validate(&|| Ok(()))?;
@@ -385,6 +386,7 @@ pub(in crate::consensus::native) struct Journal {
     pub(in crate::consensus::native) rows: HashMap<RequestBindingKey, Change<Row>>,
     pub(in crate::consensus::native) partitions: HashMap<ProductionFloorKey, Change<Partition>>,
     memory: Vec<Arc<VerificationMemory>>,
+    retained_bytes: usize,
 }
 
 impl Journal {
@@ -399,7 +401,12 @@ impl Journal {
             rows: HashMap::new(),
             partitions: HashMap::new(),
             memory: Vec::new(),
+            retained_bytes: 0,
         }
+    }
+
+    pub(in crate::consensus::native) fn retained_bytes(&self) -> usize {
+        self.retained_bytes
     }
 
     pub(in crate::consensus::native) fn starts_at(&self, base: &Arc<Certificate>) -> bool {
@@ -621,6 +628,7 @@ impl PreparedAppend<'_> {
         merge(&mut journal.rows, next.rows);
         merge(&mut journal.partitions, next.partitions);
         journal.target = next.target;
+        journal.retained_bytes += next.retained_bytes;
         journal.memory.extend(next.memory);
     }
 }

@@ -25,6 +25,22 @@ const MAX_INDEX_BYTES: usize = 16 * 1024 * 1024;
 const DIGEST_BYTES: usize = 32;
 const MAX_BLOCKS: usize = MAX_INDEX_BYTES / DIGEST_BYTES;
 pub(crate) const PROCESS_VERIFICATION_BYTES: usize = 128 * 1024 * 1024;
+// Live and captured journals leave checkpoint workspace free. Retirement
+// admission separately preserves the existing optional consumer allowance.
+// These are scheduling allowances; the process cap is unchanged.
+pub(crate) const JOURNAL_HEADROOM_BYTES: usize = PROCESS_VERIFICATION_BYTES / 8;
+
+#[derive(Debug)]
+struct JournalPressure {
+    requested: usize,
+}
+impl std::fmt::Display for JournalPressure {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("portable snapshot verification memory limit reached")
+    }
+}
+impl std::error::Error for JournalPressure {}
+
 static VERIFICATION_BYTES: AtomicUsize = AtomicUsize::new(0);
 #[cfg(any(test, feature = "test-control"))]
 static VERIFICATION_PEAK: AtomicUsize = AtomicUsize::new(0);
@@ -81,7 +97,7 @@ pub(crate) struct JournalPageMemory {
 
 impl JournalPageMemory {
     pub(crate) fn reserve(bytes: usize) -> io::Result<Self> {
-        Self::reserve_with(&JOURNAL_PAGES, bytes, VerificationMemory::reserve)
+        Self::reserve_with(&JOURNAL_PAGES, bytes, VerificationMemory::reserve_journal)
     }
 
     fn reserve_with(
@@ -152,6 +168,33 @@ impl VerificationMemory {
 
     pub(crate) fn used_bytes() -> usize {
         VERIFICATION_BYTES.load(Ordering::Acquire)
+    }
+
+    /// Only allocation pressure before publication may be retried. A malformed
+    /// row, failed verification or unrelated I/O error never carries this type.
+    pub(crate) fn journal_pressure(error: &io::Error) -> Option<usize> {
+        error
+            .get_ref()?
+            .downcast_ref::<JournalPressure>()
+            .map(|pressure| pressure.requested)
+    }
+
+    pub(crate) fn reserve_journal(bytes: usize) -> io::Result<Self> {
+        Self::reserve_from(
+            &VERIFICATION_BYTES,
+            bytes,
+            PROCESS_VERIFICATION_BYTES - JOURNAL_HEADROOM_BYTES,
+        )
+    }
+
+    /// Charge an underestimated journal before allocating its exact buffer.
+    pub(crate) fn grow_journal_to(&mut self, bytes: usize) -> io::Result<()> {
+        if let Some(extra) = bytes.checked_sub(self.bytes) {
+            let mut additional = Self::reserve_journal(extra)?;
+            self.bytes = bytes;
+            additional.bytes = 0;
+        }
+        Ok(())
     }
 
     pub(crate) fn reserved_bytes(&self) -> usize {
@@ -235,17 +278,6 @@ impl VerificationMemory {
         Ok(())
     }
 
-    /// Charge an underestimated inventory before allocating its exact buffer.
-    pub(crate) fn grow_to(&mut self, bytes: usize) -> io::Result<()> {
-        if let Some(extra) = bytes.checked_sub(self.bytes) {
-            let mut additional =
-                Self::reserve_from(self.counter, extra, PROCESS_VERIFICATION_BYTES)?;
-            self.bytes = bytes;
-            additional.bytes = 0; // Move the new charge without refunding it.
-        }
-        Ok(())
-    }
-
     #[cfg(test)]
     pub(crate) fn reserve_for_test(
         counter: &'static AtomicUsize,
@@ -268,9 +300,11 @@ impl VerificationMemory {
                     limit,
                     std::panic::Location::caller(),
                 );
-                return Err(io::Error::other(
-                    "portable snapshot verification memory limit reached",
-                ));
+                return Err(if std::ptr::eq(counter, &VERIFICATION_BYTES) {
+                    io::Error::other(JournalPressure { requested: bytes })
+                } else {
+                    io::Error::other("portable snapshot verification memory limit reached")
+                });
             };
             match counter.compare_exchange_weak(used, next, Ordering::AcqRel, Ordering::Acquire) {
                 Ok(_) => {

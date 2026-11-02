@@ -40,11 +40,27 @@ TESTS = (
     "consensus::native::generation::catalog::tests::lease_deferral_tests::"
     "native_catalog_lease_deferral_retirement_rejects_false_deletion_witnesses",
     ROSTER_HISTORY_TEST,
+    "consensus::native::generation::catalog::tests::retention_tests::"
+    "native_notification_retention_passes_original_lifetime_limit_and_reopens",
+    "consensus::native::generation::catalog::tests::retention_tests::"
+    "native_key_retention_passes_original_lifetime_limit_and_reopens",
 )
 
 # One expensive proof per hosted runner. Keep these separate from the ordinary
 # matrices: their compilation alone exceeded the old heavy/egress headroom.
-CORE_SHARDS = (*(f"native-log-{index}" for index in range(len(TESTS) - 1)), ROSTER_HISTORY_SHARD)
+def core_shards() -> tuple[str, ...]:
+    shards = []
+    log_index = 0
+    for name in TESTS:
+        if name == ROSTER_HISTORY_TEST:
+            shards.append(ROSTER_HISTORY_SHARD)
+        else:
+            shards.append(f"native-log-{log_index}")
+            log_index += 1
+    return tuple(shards)
+
+
+CORE_SHARDS = core_shards()
 EGRESS_SHARDS = tuple(range(4, 4 + len(TESTS)))
 
 

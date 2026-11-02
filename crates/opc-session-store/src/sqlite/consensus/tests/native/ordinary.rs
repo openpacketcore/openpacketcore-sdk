@@ -68,11 +68,7 @@ fn physical_parity(wal: &Wal, oracle: &SqliteSessionBackend) {
         "session_replication_log",
         "consensus_log",
     ] {
-        assert_eq!(
-            rows(&exported, table),
-            rows(&conn, table),
-            "complete physical parity for {table}"
-        );
+        policy_oracle::table(&exported, &conn, table);
     }
     validate_lease_state_sync(&exported).unwrap();
     assert_eq!(wal.native_sql_fallback_count().unwrap(), 0);
@@ -463,6 +459,7 @@ fn native_ordinary_pruning_savepoint_and_same_apply_index_match_sql() {
     fixture.parity(&[fenced_transition_v2_batch_entry(2, expired, now(2))]);
     physical_parity(&fixture.wal, &fixture.oracle);
     let before = rows(&fixture.oracle.conn.blocking_lock(), "restore_scan_state");
+    let before_records = rows(&fixture.oracle.conn.blocking_lock(), "session_records");
     let forged = crate::LeaseGuard::new(
         guard.key().clone(),
         guard.owner().clone(),
@@ -483,7 +480,13 @@ fn native_ordinary_pruning_savepoint_and_same_apply_index_match_sql() {
         rows(&fixture.oracle.conn.blocking_lock(), "restore_scan_state"),
         before
     );
-    let conflict = step(&fixture, command(4, cas(&guard, Some(99), 2), now(6)));
+    // Native conflicts preserve canonical expiry state under RFC 004 section 9.2.
+    // The SQL reference still commits its historical sweep on an Ok conflict;
+    // outcomes and notifications agree, and the next successful write converges.
+    let conflict = fixture
+        .parity(&[command(4, cas(&guard, Some(99), 2), now(6))])
+        .responses
+        .remove(0);
     assert!(
         matches!(conflict.result,Ok(SessionMutationOutcome::CompareAndSet(CompareAndSetResult::Conflict { current:Some(value) })) if value.generation.get() == 1)
     );
@@ -501,6 +504,35 @@ fn native_ordinary_pruning_savepoint_and_same_apply_index_match_sql() {
         3,
         "CAS conflict adds no notification"
     );
+    let exported = fixture.wal.native_export_snapshot().unwrap();
+    assert_eq!(
+        rows(&exported, "session_records"),
+        before_records,
+        "native CAS conflict publishes no expiry cleanup"
+    );
+    assert_eq!(
+        rows(&exported, "restore_scan_state"),
+        before,
+        "native CAS conflict preserves the restore revision"
+    );
+    for table in [
+        "leases",
+        "key_fences",
+        "lease_globals",
+        "consensus_machine",
+        "consensus_applied",
+        "consensus_committed",
+        "consensus_membership",
+        "consensus_request_outcomes",
+        "session_replication_log",
+        "consensus_log",
+    ] {
+        policy_oracle::table(&exported, &conn, table);
+    }
+    validate_lease_state_sync(&exported).unwrap();
+    assert_eq!(fixture.wal.native_sql_fallback_count().unwrap(), 0);
+    super::roster::export::import::rootless_roundtrip(&conn);
+    drop(exported);
     drop(conn);
     // A single committed delivery exercises the delta's updated expiry index
     // before the publication proof is rebuilt from its coalesced after-images.

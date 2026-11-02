@@ -36,7 +36,7 @@ duplicate execution. Live inventories reject missing, ignored or ambiguous names
 The tests retain their four Tokio workers, all assertions and ten-second bounds.
 Successful runs print elapsed time and decode/audit counts for hosted validation.
 
-The full-bound native log and receipt-history proofs listed in
+The full-bound native log, receipt-history and retention proofs listed in
 [`native_log_bound.py`](native_log_bound.py) each have a dedicated parallel runner:
 
 | Proof | Core shard | Egress shard | Test optimization |
@@ -56,12 +56,19 @@ The full-bound native log and receipt-history proofs listed in
 | Catalog separate checkpoints | `native-log-12` | `16` | O1 |
 | Catalog rejection of false deletion witnesses | `native-log-13` | `17` | O1 |
 | Completed-roster history and cold reopen | `roster-history` | `18` | O3 |
+| Notification retirement beyond the original lifetime limit and reopen | `native-log-14` | `19` | O1 |
+| Dead-key retirement beyond the original lifetime limit and reopen | `native-log-15` | `20` | O1 |
 
 Each runs in its own serial test process, with debug assertions and
 overflow checks enabled, preserving the original package/feature selection.
 Live prechecks resolve the exact enabled name in that profile. All original
 entry counts, persistence operations and assertions remain intact; the default
 three-cycle regressions stay in the ordinary library partition.
+
+The notification and dead-key retention proofs each cross 1,048,576 committed
+operations and reopen the catalog. They use the same O1 isolation and existing
+90-minute core and 75-minute egress budgets. The smaller retention regressions
+remain in the ordinary library partition.
 
 Core log proof runners retain their 90-minute job budget. The egress leader proof
 on shard 4 has 120 minutes; the Durable and Async proofs on shards 5 and 6 retain

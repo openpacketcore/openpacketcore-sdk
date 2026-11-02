@@ -96,7 +96,7 @@ pub(super) fn admit(
     wal: &Wal,
     state: &mut State,
     operation: &Operation,
-    mut completion: Completion,
+    completion: &mut Completion,
 ) -> io::Result<()> {
     let sequence = state
         .sequence
@@ -134,7 +134,10 @@ pub(super) fn write_loop(
     control: &IoControl,
 ) -> io::Result<()> {
     let mut next_capture = Instant::now() + CAPTURE_INTERVAL;
-    loop {
+    'writer: loop {
+        basis.poll_pending(shared, disk, binding, limits, control)?;
+        basis.poll_background(shared, disk, control)?;
+        basis.poll_compactor(shared, disk, binding, control)?;
         if basis.has_relocations() {
             basis.relocate_step(shared, disk, control)?;
             continue;
@@ -142,6 +145,31 @@ pub(super) fn write_loop(
         let mut state = lock_state(shared)?;
         loop {
             ensure_readable(&state)?;
+            if basis.pending_active() {
+                if basis.pending_actionable(&state, disk) {
+                    drop(state);
+                    continue 'writer;
+                }
+                #[cfg(test)]
+                (control.hook)(Point::NativePendingIdle)?;
+                state = shared
+                    .ready
+                    .wait(state)
+                    .map_err(|_| io::Error::other("asynchronous pending-capacity wait poisoned"))?;
+                continue;
+            }
+            if basis.background_actionable(&state) {
+                // The last relocation unit may unblock a requested next
+                // compactor even when no new admission dirties the store.
+                drop(state);
+                continue 'writer;
+            }
+            if state.native_rollover_ready || basis.compactor_restart_ready() {
+                drop(state);
+                basis.poll_compactor(shared, disk, binding, control)?;
+                state = lock_state(shared)?;
+                continue;
+            }
             let progress = state
                 .asynchronous
                 .as_ref()
@@ -245,7 +273,12 @@ pub(super) fn write_loop(
             applied: native.business.applied(),
         };
         anchor.async_cut = Some(cut);
+        let journal_bytes = native.changed_verification_bytes() as u64;
         let (changes, snapshot_selection) = native.take_checkpoint_changes(candidate.clone())?;
+        let mut full = native.capture_snapshot()?;
+        if let Some(selection) = &snapshot_selection {
+            full.select_checkpoint_snapshot(selection)?;
+        }
         state
             .asynchronous
             .as_mut()
@@ -253,6 +286,11 @@ pub(super) fn write_loop(
             .captured = Some(generation);
         state.native_basis_active = true;
         state.checkpoint_requested = false;
+        state.checkpoint_costs.ordinary_journal_captured_bytes += journal_bytes;
+        state.checkpoint_costs.ordinary_journal_capture_maximum = state
+            .checkpoint_costs
+            .ordinary_journal_capture_maximum
+            .max(journal_bytes);
         let capture_time = capture_started.elapsed();
         state.checkpoint_costs.native_capture += capture_time;
         state.checkpoint_costs.native_owner_maximum = state
@@ -266,10 +304,41 @@ pub(super) fn write_loop(
         let started = Instant::now();
         next_capture = started + CAPTURE_INTERVAL;
         let result = (|| {
-            let relocations = basis.append_async(changes, &mut anchor, binding, limits, control)?;
+            let appended = basis.append_async(
+                native_basis::AsyncCapture {
+                    changes,
+                    full,
+                    snapshot: candidate,
+                    selection: snapshot_selection,
+                },
+                &mut anchor,
+                disk,
+                binding,
+                limits,
+                control,
+                shared,
+            )?;
+            let native_basis::AsyncAppend::Selected {
+                rows,
+                snapshot,
+                selection,
+            } = appended
+            else {
+                let native_basis::AsyncAppend::Capacity(request) = appended else {
+                    unreachable!()
+                };
+                basis.begin_pending(request, shared, disk, control)?;
+                return Ok(None);
+            };
             checkpoint::select(&disk.directory, &anchor, control)?;
-            Ok::<_, io::Error>(relocations)
+            if basis.retire_previous() {
+                checkpoint::reclaim_covered(disk, &anchor, control, binding.async_recovery_format)?;
+            }
+            Ok::<_, io::Error>(Some((rows, snapshot, selection)))
         })();
+        if matches!(result, Ok(None)) {
+            continue;
+        }
         let mut state = lock_state(shared)?;
         ensure_readable(&state)?;
         if state.checkpoint_epoch != old_epoch
@@ -284,8 +353,9 @@ pub(super) fn write_loop(
             ));
         }
         state.native_basis_active = false;
+        let selected_cut = result.is_ok();
         match result {
-            Ok(relocations) => {
+            Ok(Some((relocations, candidate, snapshot_selection))) => {
                 if let Some(selection) = snapshot_selection {
                     state
                         .native
@@ -324,10 +394,15 @@ pub(super) fn write_loop(
                 state.checkpoint_costs.maximum = state.checkpoint_costs.maximum.max(elapsed);
                 state.checkpoint_costs.native_basis_count += 1;
                 state.checkpoint_costs.native_basis_bytes += anchor.basis_bytes;
+                basis.record_generation_size(&mut state, binding.persistence, control)?;
                 disk.anchor = Some(anchor);
                 basis.begin_async_relocations(relocations)?;
             }
+            Ok(None) => unreachable!(),
             Err(error) => {
+                if native_basis::pending::is_stopped(&error) {
+                    return Err(error);
+                }
                 let failure =
                     SessionStorageFailure::from_io(SessionStorageFailureStage::Persistence, &error);
                 let progress = state
@@ -337,6 +412,11 @@ pub(super) fn write_loop(
                 progress.captured = None;
                 progress.failure = Some(failure);
                 state.checkpoint_costs.failures += 1;
+                state.native_ceiling_wait = false;
+                state.native_live_capacity = false;
+                state.native_pending_journal_pressure = false;
+                #[cfg(test)]
+                (control.hook)(Point::NativeAsyncPersistenceFailed)?;
                 // Resident authority survives an ordinary I/O failure while
                 // its finite native allocation permits progress. Corruption
                 // still fences the original owner immediately.
@@ -348,5 +428,9 @@ pub(super) fn write_loop(
         }
         shared.async_progress.send_replace(());
         shared.ready.notify_all();
+        drop(state);
+        if selected_cut {
+            basis.after_async_selection(shared, disk, binding, control)?;
+        }
     }
 }

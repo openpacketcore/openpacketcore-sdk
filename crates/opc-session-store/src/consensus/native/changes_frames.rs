@@ -90,9 +90,25 @@ pub(in crate::consensus::native) fn ordinary_payload(
 pub(in crate::consensus::native) fn notification_payload(
     row: &ReplicationEntry,
 ) -> io::Result<usize> {
-    let ReplicationOp::Batch { ops } = &row.op else {
-        return ordinary_notification_payload(&row.op);
+    row.validate()
+        .map_err(|_| invalid("native application entry invalid"))?;
+    notification_payload_op(&row.op)
+}
+
+pub(in crate::consensus::native) fn notification_payload_op(
+    op: &ReplicationOp,
+) -> io::Result<usize> {
+    let ops = match op {
+        ReplicationOp::Batch { ops } => ops,
+
+        op => return ordinary_notification_payload(op),
     };
+    if ops.is_empty() {
+        return Ok(0);
+    }
+    if let [op] = ops.as_slice() {
+        return ordinary_notification_payload(op);
+    }
     if ops.len() != 2
         || !matches!(
             &ops[0],
@@ -212,6 +228,14 @@ impl BusinessChanges {
             writer.write_all(&[0])?;
             frame::write_before(writer, change.before_hash.map(|stamp| stamp.content))?;
             frame::write_binary(writer, &(key, change.after.as_deref()))?;
+            if change.after.is_none() {
+                frame::write_binary(
+                    writer,
+                    &change
+                        .key_removal
+                        .ok_or_else(|| invalid("native key retirement witness absent"))?,
+                )?;
+            }
         }
         let defers_live_leases = self
             .target
@@ -301,6 +325,14 @@ impl BusinessChanges {
                     &(key, change.after.as_deref()),
                 )
             })?;
+            if change.after.is_none() {
+                frame::verify_binary::<retention::KeyRemoval>(
+                    reader,
+                    &change
+                        .key_removal
+                        .ok_or_else(|| invalid("native key retirement witness absent"))?,
+                )?;
+            }
         }
         let defers_live_leases = self
             .target

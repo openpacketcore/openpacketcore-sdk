@@ -28,6 +28,10 @@ pub struct EncryptedPayload {
 }
 
 /// Key-provider contract from RFC 003.
+///
+/// Reserve [`KeyError::Unavailable`] for provider availability failures.
+/// Missing keys and completed request rejections must remain distinct from
+/// retryable outages; provider-specific context must not escape in errors.
 #[async_trait]
 pub trait KeyProvider: Send + Sync {
     async fn get_active_key(

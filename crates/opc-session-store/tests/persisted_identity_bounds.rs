@@ -203,6 +203,7 @@ fn stored_record(
 
 fn nested_delete_entry(sequence: u64, session_key: SessionKey, owner: OwnerId) -> ReplicationEntry {
     ReplicationEntry {
+        replay_policy: opc_session_store::ReplicationReplayPolicy::prune_expired(),
         sequence,
         tx_id: format!("persistence-test-tx-{sequence}")
             .try_into()

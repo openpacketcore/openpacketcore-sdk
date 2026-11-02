@@ -102,11 +102,7 @@ fn native_snapshot_export_reuses_insert_preparations_and_preserves_exact_rows() 
         "session_replication_log",
         "consensus_log",
     ] {
-        assert_eq!(
-            rows(&conn, table),
-            rows(&oracle, table),
-            "exact table {table}"
-        );
+        policy_oracle::table(&conn, &oracle, table);
     }
     let row_counts: [usize; 3] = [
         "consensus_log",
@@ -246,16 +242,21 @@ fn native_portable_snapshot_fits_without_discarded_raft_log_pages() {
     let finalized = finalize_native_snapshot_database_sync(conn, pin, authority(), &cut).unwrap();
     assert!(finalized.file().metadata().unwrap().len() <= page_limit as u64 * page_size);
     let conn = open_pinned_snapshot_database(&finalized).unwrap();
-    assert_portable_tables_equal(&conn, &reference_conn);
+    assert_portable_tables_equal(&conn, &reference_conn, &fixture.oracle.conn.blocking_lock());
     fixture.wal.shutdown().unwrap();
 }
 
-fn assert_portable_tables_equal(actual: &Connection, expected: &Connection) {
+fn assert_portable_tables_equal(actual: &Connection, expected: &Connection, source: &Connection) {
     let tables = |conn: &Connection| {
         conn.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%' ORDER BY name").unwrap()
         .query_map([], |row| row.get::<_, String>(0)).unwrap().collect::<rusqlite::Result<Vec<_>>>().unwrap()
     };
-    assert_eq!(tables(actual), tables(expected));
+    let mut expected_tables = tables(expected);
+    assert!(native_retention::read(actual).unwrap().unwrap() == Default::default());
+    assert!(native_retention::read(expected).unwrap().is_none());
+    expected_tables.push("consensus_native_retention".into());
+    expected_tables.sort();
+    assert_eq!(tables(actual), expected_tables);
     for table in tables(expected) {
         if table == "restore_scan_state" {
             let state = |conn: &Connection| {
@@ -280,11 +281,7 @@ fn assert_portable_tables_equal(actual: &Connection, expected: &Connection) {
                 "each finalization rotates its restore incarnation"
             );
         } else {
-            assert_eq!(
-                rows(actual, &table),
-                rows(expected, &table),
-                "portable table {table}"
-            );
+            policy_oracle::table_with_source(actual, expected, &table, source);
         }
     }
 }
@@ -323,7 +320,11 @@ fn native_portable_snapshot_finalization_preserves_cold_rows_cut_and_cleanup() {
     let finalized =
         finalize_native_snapshot_database_sync(exported, pin, authority(), &cut).unwrap();
     let conn = open_pinned_snapshot_database(&finalized).unwrap();
-    assert_portable_tables_equal(&conn, &open_pinned_snapshot_database(&reference).unwrap());
+    assert_portable_tables_equal(
+        &conn,
+        &open_pinned_snapshot_database(&reference).unwrap(),
+        &fixture.oracle.conn.blocking_lock(),
+    );
     validate_native_snapshot_export_sync(&conn, &finalized, authority(), &cut).unwrap();
     drop(conn);
     drop(finalized);
@@ -456,11 +457,7 @@ fn native_snapshot_file_export_preserves_every_sql_column_and_captured_cut() {
     let tables = oracle.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%' ORDER BY name").unwrap()
         .query_map([], |row| row.get::<_, String>(0)).unwrap().collect::<rusqlite::Result<Vec<_>>>().unwrap();
     for table in tables {
-        assert_eq!(
-            rows(&exported, &table),
-            rows(&oracle, &table),
-            "complete original table {table}"
-        );
+        policy_oracle::table(&exported, &oracle, &table);
     }
     assert_eq!(
         snapshot_applied_membership_sync(&oracle, identity()).unwrap(),

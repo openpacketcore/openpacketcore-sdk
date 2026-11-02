@@ -31,13 +31,22 @@ mod restore;
 #[path = "generation_sqlite.rs"]
 mod sqlite;
 use restore::BaseRestore;
+#[path = "generation_rebase.rs"]
+mod rebase;
 #[path = "generation_relocation.rs"]
 mod relocation;
+#[path = "generation_replay.rs"]
+mod replay;
+#[path = "generation_rollover.rs"]
+mod rollover;
+#[cfg(test)]
+pub(crate) use rebase::rebase_frame;
+pub(crate) use rebase::{try_rebase_frame, FrameMapping};
 pub(crate) use relocation::Relocations;
 pub(in crate::consensus::native) use relocation::{PositionedReader, RelocationBuilder};
 #[path = "generation_facts.rs"]
 pub(super) mod facts;
-pub(crate) use base::{BaseParameters, PreparedBase};
+pub(crate) use base::{BaseParameters, PreparedBase, StreamingBase};
 pub(crate) use catalog::preflight_format;
 pub(crate) use catalog::{Catalog, CatalogScope};
 pub(crate) use sqlite::SqlitePreparedBase;
@@ -45,8 +54,8 @@ pub(crate) use sqlite::SqlitePreparedBase;
 // Six-byte frame family, one vocabulary byte, one independent profile byte.
 // Profile 0 is fixed membership; profile 1 carries voter slots. Future
 // vocabularies retain this layout and compare only the vocabulary byte.
-const MAGIC: &[u8; 8] = b"OPCNJD\x06\x00";
-const SLOT_MAGIC: &[u8; 8] = b"OPCNJD\x06\x01";
+const MAGIC: &[u8; 8] = b"OPCNJD\x07\x00";
+const SLOT_MAGIC: &[u8; 8] = b"OPCNJD\x07\x01";
 const V4_MAGIC: &[u8; 8] = b"OPCNJD04";
 const V5_MAGIC: &[u8; 8] = b"OPCNJD05";
 const V3_MAGIC: &[u8; 8] = b"OPCNJD03";
@@ -90,12 +99,19 @@ impl Format {
         profile: VoterProfile::Slots,
     };
 
+    const V7: Self = Self {
+        vocabulary: 7,
+        profile: VoterProfile::Fixed,
+    };
+    const V7_SLOTS: Self = Self {
+        vocabulary: 7,
+        profile: VoterProfile::Slots,
+    };
+
     fn read(reader: &mut dyn Read, base: bool) -> io::Result<Self> {
         let mut magic = [0; 8];
         reader.read_exact(&mut magic)?;
-        if &magic[..6] == if base { b"OPCNJB" } else { b"OPCNJD" }
-            && magic[6] == Self::V6.vocabulary
-        {
+        if &magic[..6] == if base { b"OPCNJB" } else { b"OPCNJD" } && matches!(magic[6], 6 | 7) {
             let profile = match magic[7] {
                 0 => VoterProfile::Fixed,
                 1 => VoterProfile::Slots,
@@ -136,6 +152,14 @@ impl Format {
     }
 
     fn validate_context(self, context: &Context) -> io::Result<()> {
+        if self.vocabulary < Self::V7.vocabulary
+            && context.business.frontiers.retention.keys
+                != crate::key_retention::KeyRetention::default()
+        {
+            return Err(invalid(
+                "native key retirement requires epoch generation vocabulary",
+            ));
+        }
         if self.has_voter_slots() != context.business.frontiers.voter_slots.is_some()
             || (!self.has_voter_slots() && context.log.slot_intent.is_some())
         {
@@ -309,6 +333,19 @@ pub(crate) struct Version {
 }
 
 impl Version {
+    pub(crate) fn require_capture(
+        changes: &NativeChanges,
+        full: &NativeStorage,
+        check: &impl Fn() -> io::Result<()>,
+    ) -> io::Result<()> {
+        changes.validate(check)?;
+        let target = Self {
+            business: Arc::clone(changes.business.target_proof()),
+            log: changes.log.generation_target(),
+        };
+        target.require_current(full)
+    }
+
     pub(crate) fn capture(storage: &NativeStorage) -> io::Result<Self> {
         let (business, log) = storage.log.generation_versions(&storage.business)?;
         Ok(Self { business, log })
@@ -494,6 +531,63 @@ impl PreparedDelta {
         self.target.clone()
     }
 
+    /// Only the physical predecessor and cut binding change when this captured
+    /// delta moves to a replacement file. JSON byte arrays have at most 3
+    /// decimal digits per u8; u64/usize fields have at most their type maximum's
+    /// decimal width. Serialize those type maxima to bound the replacement
+    /// fields, subtract their current widths, and cap growth by MAX_HEADER.
+    /// Logical contexts/counts/epoch/sequence and the entire body stay fixed.
+    /// This bounds this capture, not resident payloads by journal metadata.
+    pub(crate) fn switch_payload_bound(&self) -> io::Result<u64> {
+        let widest = Previous {
+            binding: [u8::MAX; 32],
+            file_epoch: u64::MAX,
+            checkpoint_epoch: u64::MAX,
+            operation_sequence: u64::MAX,
+            frontiers: [u8::MAX; 32],
+            length: u64::MAX,
+            block_bytes: usize::MAX,
+            digest: [u8::MAX; 32],
+        };
+        let maximum_previous = serde_json::to_vec(&widest)
+            .map_err(|_| invalid("native switch predecessor cannot encode"))?
+            .len();
+        let actual_previous = serde_json::to_vec(&self.header.previous)
+            .map_err(|_| invalid("native switch predecessor cannot encode"))?
+            .len();
+        let maximum_cut = serde_json::to_vec(&[u8::MAX; 32])
+            .map_err(|_| invalid("native switch cut cannot encode"))?
+            .len();
+        let actual_cut = serde_json::to_vec(&self.header.cut_binding)
+            .map_err(|_| invalid("native switch cut cannot encode"))?
+            .len();
+        let actual_header = serde_json::to_vec(&self.header)
+            .map_err(|_| invalid("native switch header cannot encode"))?
+            .len();
+        let growth = maximum_previous.saturating_sub(actual_previous)
+            + maximum_cut.saturating_sub(actual_cut);
+        self.payload_bytes
+            .checked_add(growth.min(MAX_HEADER.saturating_sub(actual_header)) as u64)
+            .ok_or_else(|| invalid("native switch extent overflow"))
+    }
+
+    /// The switch consumes its bounded slot; no second reserve remains. The
+    /// scheduling check precedes relocation allocation and the append fence.
+    pub(crate) fn append_switch(
+        &self,
+        owner: &mut VerifiedAppendOwner,
+        check: &impl Fn() -> io::Result<()>,
+    ) -> io::Result<Option<(Arc<VerifiedPrefix>, Relocations)>> {
+        if !owner.fits_append(self.switch_payload_bound()?, 0) {
+            return Ok(None);
+        }
+        self.append_with_relocations(owner, check).map(Some)
+    }
+
+    pub(crate) fn into_capture(self) -> NativeChanges {
+        self.capture
+    }
+
     fn write_payload(
         &self,
         writer: &mut dyn Write,
@@ -665,7 +759,6 @@ impl PreparedDelta {
             self.header.after.business.frontiers.applied,
             &self.header.after.business.members,
             self.capture.business.target_proof().roster_root(),
-            self.header.after.business.frontiers.notification_floor(),
             check,
         )?;
         Ok((source, relocations))

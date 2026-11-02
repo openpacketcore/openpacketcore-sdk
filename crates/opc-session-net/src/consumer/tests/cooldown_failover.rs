@@ -1024,9 +1024,21 @@ async fn cooldown_failover_attempt_spans_have_only_fixed_fields_across_lost_repl
             }
         }
     }
+    let (unobserved, _material) = stateless_test_client(SessionReauthenticationControl::new());
+    let voter = unobserved.voter.clone();
     let attempts = Arc::new(StdMutex::new(BTreeMap::<u64, Captured>::new()));
+    // Register both contexts: a sole scoped dispatcher lets first registration
+    // on another thread cache that thread's lack of interest for this callsite.
+    let _unobserved_dispatch = tracing::Dispatch::new(tracing::subscriber::NoSubscriber::new());
     let subscriber = tracing_subscriber::registry().with(Attempts(attempts.clone()));
     let _default = tracing::subscriber::set_default(subscriber);
+    // Order first registration on a thread without this local subscriber.
+    // Other concurrently running consumer tests can reach the same callsite.
+    std::thread::spawn(move || {
+        assert!(super::super::consumer_attempt_span("registration_probe", &voter).is_disabled());
+    })
+    .join()
+    .expect("unobserved first registration");
     prepared_success_and_possible_write_receipt_only().await;
     let attempts = attempts.lock().unwrap();
     let expected: BTreeSet<String> = [

@@ -340,6 +340,207 @@ fn cancellation_runtime() -> tokio::runtime::Runtime {
         .unwrap()
 }
 
+async fn responsive_fresh_open(mode: SessionPersistenceMode) {
+    use crate::sqlite::consensus::wal::Point;
+
+    let directory = FixedRawReadStoreFixture::new();
+    let backend = SqliteSessionBackend::open(directory.path().join(DATABASE)).unwrap();
+    let runtime_thread = std::thread::current().id();
+    let (entered, started) = tokio::sync::oneshot::channel();
+    let entered = Mutex::new(Some(entered));
+    let (release, wait) = mpsc::channel();
+    let wait = Mutex::new(wait);
+    let admitted = Arc::new(AtomicBool::new(false));
+    let seen = Arc::clone(&admitted);
+    backend
+        .native_owner
+        .as_ref()
+        .unwrap()
+        .set_io_hook_for_test(Arc::new(move |point| {
+            if point == Point::AfterNativeBasisAdmission {
+                assert_ne!(
+                    std::thread::current().id(),
+                    runtime_thread,
+                    "fresh {mode:?} admission must leave the runtime thread"
+                );
+                assert!(!seen.swap(true, Ordering::SeqCst));
+                entered.lock().unwrap().take().unwrap().send(()).unwrap();
+                wait.lock()
+                    .unwrap()
+                    .recv_timeout(Duration::from_secs(30))
+                    .map_err(|_| std::io::Error::other("fresh admission release timed out"))?;
+            }
+            Ok(())
+        }));
+    let progressed = Arc::new(AtomicBool::new(false));
+    let progress = Arc::clone(&progressed);
+    let observer = tokio::spawn(async move {
+        started.await.unwrap();
+        tokio::task::yield_now().await;
+        progress.store(true, Ordering::SeqCst);
+        release.send(()).unwrap();
+    });
+    let (log, mut machine, opened_identity) =
+        open_ordinary(&backend, &directory, mode).await.unwrap();
+    observer.await.unwrap();
+    assert!(admitted.load(Ordering::SeqCst));
+    assert!(progressed.load(Ordering::SeqCst));
+    assert_eq!(opened_identity, identity(1));
+    assert_eq!(machine.applied_state().await.unwrap().0, None);
+    assert!(!root_selection(&directory).is_empty());
+    close_ordinary(log, machine);
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn native_fresh_durable_open_keeps_runtime_responsive() {
+    responsive_fresh_open(SessionPersistenceMode::Durable).await;
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn native_fresh_async_open_keeps_runtime_responsive() {
+    responsive_fresh_open(SessionPersistenceMode::Async).await;
+}
+
+fn cancelled_fresh_open(mode: SessionPersistenceMode) {
+    use crate::sqlite::consensus::wal::Point;
+
+    cancellation_runtime().block_on(async {
+        let directory = FixedRawReadStoreFixture::new();
+        let backend = SqliteSessionBackend::open(directory.path().join(DATABASE)).unwrap();
+        let owner = backend.native_owner.as_ref().unwrap();
+        let runtime_thread = std::thread::current().id();
+        let (entered, started) = tokio::sync::oneshot::channel();
+        let entered = Mutex::new(Some(entered));
+        let (release, wait) = mpsc::channel();
+        let wait = Mutex::new(wait);
+        owner.set_io_hook_for_test(Arc::new(move |point| {
+            if point == Point::AfterNativeBasisAdmission {
+                assert_ne!(
+                    std::thread::current().id(),
+                    runtime_thread,
+                    "fresh {mode:?} creation must stay on its owned worker"
+                );
+                entered.lock().unwrap().take().unwrap().send(()).unwrap();
+                wait.lock()
+                    .unwrap()
+                    .recv_timeout(Duration::from_secs(30))
+                    .unwrap();
+            }
+            Ok(())
+        }));
+        let mut opening = Box::pin(open_ordinary(&backend, &directory, mode));
+        tokio::select! {
+            _ = &mut opening => panic!("fresh opener finished before its worker was released"),
+            _ = started => {},
+        }
+        drop(opening);
+        let mut connection = Box::pin(backend.lock_connection_for_test());
+        assert!(std::future::poll_fn(|cx| {
+            std::task::Poll::Ready(connection.as_mut().poll(cx))
+        })
+        .await
+        .is_pending());
+        drop(connection);
+        release.send(()).unwrap();
+        // The runtime has exactly one blocking worker. This barrier follows
+        // completion and destruction of the cancelled creation's captures.
+        tokio::task::spawn_blocking(|| ()).await.unwrap();
+        assert_eq!(Arc::strong_count(owner), 1);
+        assert!(owner.current().is_err());
+        assert!(!root_selection(&directory).is_empty());
+        owner.set_io_hook_for_test(Arc::new(|_| Ok(())));
+        let (log, mut machine, opened_identity) =
+            open_ordinary(&backend, &directory, mode).await.unwrap();
+        assert_eq!(opened_identity, identity(1));
+        assert_eq!(machine.applied_state().await.unwrap().0, None);
+        close_ordinary(log, machine);
+    });
+}
+
+#[test]
+fn native_fresh_durable_cancellation_retains_creation_owners() {
+    cancelled_fresh_open(SessionPersistenceMode::Durable);
+}
+
+#[test]
+fn native_fresh_async_cancellation_retains_creation_owners() {
+    cancelled_fresh_open(SessionPersistenceMode::Async);
+}
+
+fn cancelled_queued_creation(mode: SessionPersistenceMode) {
+    use crate::sqlite::consensus::wal::{owner::RootPointForTest, Point};
+
+    cancellation_runtime().block_on(async {
+        let directory = FixedRawReadStoreFixture::new();
+        let backend = SqliteSessionBackend::open(directory.path().join(DATABASE)).unwrap();
+        let owner = backend.native_owner.as_ref().unwrap();
+        let (entered, dispatched) = tokio::sync::oneshot::channel();
+        let entered = Mutex::new(Some(entered));
+        let (release, wait) = mpsc::channel();
+        let wait = Mutex::new(Some(wait));
+        owner.set_root_hook_for_test(Arc::new(move |point| {
+            if point == RootPointForTest::BeforeCreationDispatch {
+                let wait = wait.lock().unwrap().take().unwrap();
+                let (started, blocked) = mpsc::channel();
+                let _blocker = tokio::task::spawn_blocking(move || {
+                    started.send(()).unwrap();
+                    wait.recv_timeout(Duration::from_secs(30)).unwrap();
+                });
+                // Occupy the sole blocking worker before creation can queue.
+                blocked.recv_timeout(Duration::from_secs(30)).unwrap();
+                entered.lock().unwrap().take().unwrap().send(()).unwrap();
+            }
+            Ok(())
+        }));
+        let admitted = Arc::new(AtomicBool::new(false));
+        let seen = Arc::clone(&admitted);
+        owner.set_io_hook_for_test(Arc::new(move |point| {
+            if point == Point::AfterNativeBasisAdmission {
+                assert!(!seen.swap(true, Ordering::SeqCst));
+            }
+            Ok(())
+        }));
+        let mut opening = Box::pin(open_ordinary(&backend, &directory, mode));
+        tokio::select! {
+            _ = &mut opening => panic!("fresh creation completed behind an occupied worker"),
+            _ = dispatched => {},
+        }
+        assert!(!admitted.load(Ordering::SeqCst));
+        drop(opening);
+        let mut connection = Box::pin(backend.lock_connection_for_test());
+        assert!(std::future::poll_fn(|cx| {
+            std::task::Poll::Ready(connection.as_mut().poll(cx))
+        })
+        .await
+        .is_pending());
+        drop(connection);
+        assert!(Arc::strong_count(owner) > 1);
+        release.send(()).unwrap();
+        tokio::task::spawn_blocking(|| ()).await.unwrap();
+        assert!(admitted.load(Ordering::SeqCst));
+        assert_eq!(Arc::strong_count(owner), 1);
+        assert!(owner.current().is_err());
+        assert!(!root_selection(&directory).is_empty());
+        owner.set_root_hook_for_test(Arc::new(|_| Ok(())));
+        owner.set_io_hook_for_test(Arc::new(|_| Ok(())));
+        let (log, mut machine, opened_identity) =
+            open_ordinary(&backend, &directory, mode).await.unwrap();
+        assert_eq!(opened_identity, identity(1));
+        assert_eq!(machine.applied_state().await.unwrap().0, None);
+        close_ordinary(log, machine);
+    });
+}
+
+#[test]
+fn native_fresh_durable_queued_cancellation_completes_root_creation() {
+    cancelled_queued_creation(SessionPersistenceMode::Durable);
+}
+
+#[test]
+fn native_fresh_async_queued_cancellation_completes_root_creation() {
+    cancelled_queued_creation(SessionPersistenceMode::Async);
+}
+
 #[test]
 fn native_full_open_cancels_running_admission_and_releases_owners() {
     use crate::sqlite::consensus::wal::Point;

@@ -123,6 +123,11 @@ fn native_root_old_formats_require_fresh_installation_without_mutating_selection
             SessionPersistenceMode::Durable,
         ),
         (
+            b"OPCNR002",
+            b"opc-session-native-wal-v2".as_slice(),
+            SessionPersistenceMode::Durable,
+        ),
+        (
             b"OPCNA001",
             b"opc-session-native-async-v1".as_slice(),
             SessionPersistenceMode::Async,
@@ -135,6 +140,11 @@ fn native_root_old_formats_require_fresh_installation_without_mutating_selection
         (
             b"OPCNA003",
             b"opc-session-native-async-v3".as_slice(),
+            SessionPersistenceMode::Async,
+        ),
+        (
+            b"OPCNA004",
+            b"opc-session-native-async-v4".as_slice(),
             SessionPersistenceMode::Async,
         ),
     ] {

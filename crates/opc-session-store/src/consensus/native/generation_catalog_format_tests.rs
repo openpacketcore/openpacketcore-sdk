@@ -1,6 +1,117 @@
 use super::*;
 
 #[test]
+fn native_epoch_admission_rejects_more_tagged_rows_than_committed_retirements() {
+    let (mut storage, _, request) = fixture();
+    storage.business.frontiers.retention.keys.retired_count = 3;
+    storage.business.frontiers.retention.keys.retired_max = 1;
+    for number in 0u64..3 {
+        let mut key = request.lease().key().clone();
+        key.stable_id = bytes::Bytes::copy_from_slice(&number.to_be_bytes())
+            .try_into()
+            .unwrap();
+        storage.business.keys.insert(
+            key,
+            SharedRow::new(NativeKeyState {
+                fence: 1,
+                retired_epoch: Some(0),
+                ..NativeKeyState::default()
+            })
+            .unwrap(),
+        );
+    }
+    storage.business.admit_business().unwrap();
+    let (files, catalog) = Files::new(&storage);
+    let mut wire = Wire::<BaseHeader>::read(&files.bytes());
+    wire.header
+        .context
+        .business
+        .frontiers
+        .retention
+        .keys
+        .retired_count = 2;
+    let forged = wire.encode(base::MAGIC, Vec::new());
+    assert_eq!(
+        reject(
+            &forged,
+            rebound(&forged, catalog.identity(), &wire.header.context),
+            &storage,
+            CUT
+        ),
+        "native catalog key retirement counts differ"
+    );
+}
+
+#[test]
+fn native_epoch_admission_checks_unchanged_tags_after_rotation() {
+    let (mut storage, _, request) = fixture();
+    storage.business.frontiers.retention.keys.retired_count = 1;
+    storage.business.frontiers.retention.keys.retired_max = 1;
+    let mut key = request.lease().key().clone();
+    key.stable_id = bytes::Bytes::from_static(b"unchanged-retirement-tag")
+        .try_into()
+        .unwrap();
+    storage.business.keys.insert(
+        key,
+        SharedRow::new(NativeKeyState {
+            fence: 1,
+            retired_epoch: Some(0),
+            ..NativeKeyState::default()
+        })
+        .unwrap(),
+    );
+    storage.business.admit_business().unwrap();
+    let (files, _) = Files::new(&storage);
+    storage.begin_changes().unwrap();
+    let prepared = files.prepare(&mut storage, 19);
+    let mut delta = Vec::new();
+    prepared.write_payload(&mut delta, &|| Ok(())).unwrap();
+    let mut wire = Wire::<Header>::read(&delta);
+    assert_eq!(wire.header.changed, [0; 5]);
+    let identity = PrefixIdentity {
+        checkpoint_epoch: wire.header.checkpoint_epoch,
+        operation_sequence: wire.header.operation_sequence,
+        ..files.owner.current().identity()
+    };
+    for epoch in [1, 2] {
+        wire.header.after.business.frontiers.retention.keys = crate::key_retention::KeyRetention {
+            epoch,
+            floor_prev: if epoch == 1 { 0 } else { 2 },
+            floor_cur: epoch + 1,
+            retired_max: 0,
+            retired_count: 0,
+            last_rotation: Some(crate::key_retention::RotationReason::Threshold),
+        };
+        wire.header.after.business.frontiers.next_fence = epoch + 2;
+        let encoded = wire.encode(MAGIC, files.bytes());
+        let expected = rebound(&encoded, identity, &wire.header.after);
+        if epoch == 1 {
+            let path = files._directory.path().join("previous-epoch.native");
+            std::fs::write(&path, &encoded).unwrap();
+            Catalog::open(
+                &path,
+                expected,
+                MAXIMUM,
+                CatalogScope {
+                    identity: storage.business.identity,
+                    members: &storage.business.members,
+                    roster_root: None,
+                },
+                wire.header.cut_binding,
+                &|| Ok(()),
+            )
+            .unwrap();
+            assert_eq!(std::fs::read(path).unwrap(), encoded);
+        } else {
+            assert_eq!(
+                reject(&encoded, expected, &storage, wire.header.cut_binding),
+                "native catalog key retirement counts differ"
+            );
+        }
+    }
+}
+
+#[test]
 fn native_preflight_requires_roster_counts() {
     let (mut storage, _, _) = fixture();
     let (files, _) = Files::new(&storage);
@@ -207,7 +318,7 @@ fn native_generation_magic_separates_vocabulary_from_voter_profile() {
         (false, MAGIC, SLOT_MAGIC),
     ] {
         assert_eq!(&fixed[..7], &slots[..7]);
-        assert_eq!((fixed[6], fixed[7], slots[7]), (6, 0, 1));
+        assert_eq!((fixed[6], fixed[7], slots[7]), (7, 0, 1));
         let fixed_format = Format::read(&mut &fixed[..], base_frame).unwrap();
         let slot_format = Format::read(&mut &slots[..], base_frame).unwrap();
         assert!(!fixed_format.has_voter_slots());
@@ -218,20 +329,20 @@ fn native_generation_magic_separates_vocabulary_from_voter_profile() {
             for profile in [VoterProfile::Fixed, VoterProfile::Slots] {
                 previous
                     .validate_successor(Format {
-                        vocabulary: 6,
+                        vocabulary: 7,
                         profile,
                     })
                     .unwrap();
                 previous
                     .validate_successor(Format {
-                        vocabulary: 7,
+                        vocabulary: 8,
                         profile,
                     })
                     .unwrap();
                 assert_eq!(
                     previous
                         .validate_successor(Format {
-                            vocabulary: 5,
+                            vocabulary: 6,
                             profile
                         })
                         .unwrap_err()
@@ -242,7 +353,7 @@ fn native_generation_magic_separates_vocabulary_from_voter_profile() {
         }
         for original in [fixed, slots] {
             let mut future = *original;
-            future[6] = 7;
+            future[6] = 8;
             assert_eq!(
                 Format::read(&mut &future[..], base_frame)
                     .err()
@@ -292,7 +403,8 @@ fn native_format_preflight_refuses_old_and_unknown_base_discriminators_without_w
         base::V3_MAGIC,
         base::V4_MAGIC,
         base::V5_MAGIC,
-        b"OPCNJB\x07\x00",
+        b"OPCNJB\x06\x00",
+        b"OPCNJB\x08\x00",
         b"OPCNAT01",
         b"OPCNAT02",
     ] {
@@ -311,13 +423,29 @@ fn native_format_preflight_refuses_old_and_unknown_base_discriminators_without_w
     }
     // The explicit historical reader remains testable, but its result cannot
     // satisfy a current native root's vocabulary boundary.
-    let mut legacy = original.clone();
-    legacy[..8].copy_from_slice(base::V4_MAGIC);
+    let prepared = PreparedBase::prepare(
+        &storage,
+        BaseParameters {
+            binding: ROOT,
+            file_epoch: 4,
+            checkpoint_epoch: 11,
+            operation_sequence: 18,
+            cut_binding: CUT,
+            block_bytes: BLOCK,
+            maximum: MAXIMUM,
+        },
+        &|| Ok(()),
+    )
+    .unwrap()
+    .format_for_test(Format::V4, MAXIMUM, &|| Ok(()))
+    .unwrap();
+    let mut legacy = Vec::new();
+    let legacy_identity = prepared.write_to(&mut legacy, &|| Ok(())).unwrap();
     let path = files._directory.path().join("historical.native");
     std::fs::write(&path, &legacy).unwrap();
     let (_, legacy) = Catalog::open(
         &path,
-        rebound(&legacy, catalog.identity(), &catalog.rows.context),
+        legacy_identity,
         MAXIMUM,
         CatalogScope {
             identity: storage.business.identity,
@@ -357,7 +485,7 @@ fn native_format_preflight_reads_delta_discriminators_and_preserves_format_order
     )
     .unwrap();
     for (magic, message) in [
-        (b"OPCNJD\x07\x00", "native generation discriminator differs"),
+        (b"OPCNJD\x08\x00", "native generation discriminator differs"),
         (V4_MAGIC, "native generation delta format regressed"),
     ] {
         let bytes = wire.encode(magic, files.bytes());

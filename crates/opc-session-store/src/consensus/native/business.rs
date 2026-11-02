@@ -19,6 +19,7 @@ pub(super) struct BusinessEffect {
 pub(super) fn transition(
     request: &FencedTransitionV2Request,
     current: &NativeKeyState,
+    retained: bool,
     frontiers: &NativeFrontiers,
     logical_time: Timestamp,
 ) -> Result<BusinessEffect, StoreError> {
@@ -27,6 +28,7 @@ pub(super) fn transition(
         request.lease(),
         request.mutation(),
         current,
+        retained,
         frontiers,
         logical_time,
     )?;
@@ -41,6 +43,7 @@ pub(super) fn transition(
 pub(super) fn transition_v1(
     request: &crate::FencedTransitionRequest,
     current: &NativeKeyState,
+    retained: bool,
     frontiers: &NativeFrontiers,
     logical_time: Timestamp,
 ) -> Result<BusinessEffect, StoreError> {
@@ -49,6 +52,7 @@ pub(super) fn transition_v1(
         request.lease(),
         request.mutation(),
         current,
+        retained,
         frontiers,
         logical_time,
     )?;
@@ -64,6 +68,7 @@ fn transition_parts(
     lease: &FencedTransitionLease,
     mutation: &FencedTransitionMutation,
     current: &NativeKeyState,
+    retained: bool,
     frontiers: &NativeFrontiers,
     logical_time: Timestamp,
 ) -> Result<BusinessEffect, StoreError> {
@@ -73,7 +78,15 @@ fn transition_parts(
     }
     match lease {
         FencedTransitionLease::Acquire { expected_fence, .. } => {
-            if current.fence != expected_fence.get() {
+            let accepted = if retained || crate::scope_storage::is_scope_record_key(lease.key()) {
+                current.fence == expected_fence.get()
+            } else {
+                frontiers
+                    .retention
+                    .keys
+                    .accepts_absent_fence(expected_fence.get(), frontiers.async_fence_floor())
+            };
+            if !accepted {
                 return Err(StoreError::StaleFence);
             }
         }
@@ -189,6 +202,7 @@ fn transition_parts(
         }
     };
     let mut value = current.clone();
+    value.retired_epoch = None;
     value.fence = guard.fence().get();
     value.lease = Some(NativeLease::from_guard(&guard)?);
     let (generation, mutation, replication) = match mutation {
@@ -278,6 +292,5 @@ pub(super) fn deterministic(error: &StoreError) -> bool {
             | StoreError::PayloadTooLarge { .. }
             | StoreError::FencedTransitionRequestExpired
             | StoreError::FencedTransitionStorageExhausted
-            | StoreError::KeyCapacityExhausted
     )
 }

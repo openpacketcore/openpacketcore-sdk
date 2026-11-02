@@ -629,7 +629,7 @@ where
                 reason = "frame_too_large",
                 "watch response exceeded the negotiated frame limit"
             );
-            let fallback = Response::WatchEntry(Err(StoreError::BackendUnavailable(
+            let fallback = Response::watch_entry(Err(StoreError::BackendUnavailable(
                 WATCH_RESPONSE_LIMIT_MESSAGE.to_string(),
             )));
             write_post_auth_response_until(
@@ -653,7 +653,7 @@ where
 
 fn discard_watch_response_iteratively(response: Response) {
     if let Response::WatchEntry(Ok(entry)) = response {
-        discard_replication_entries_iteratively(vec![entry]);
+        discard_replication_entries_iteratively(vec![*entry]);
     }
 }
 
@@ -663,7 +663,7 @@ fn discard_response_iteratively(response: Response) {
             discard_replication_entries_iteratively(entries);
         }
         Response::WatchEntry(Ok(entry)) => {
-            discard_replication_entries_iteratively(vec![entry]);
+            discard_replication_entries_iteratively(vec![*entry]);
         }
         response => drop(response),
     }
@@ -3630,10 +3630,15 @@ where
                             check_response_write_control(deadline, &cancellation)?;
                             let (item, close_after) = match item {
                                 Ok(entry) => match entry.into_validated() {
-                                    Ok(entry) if entry.sequence == expected_sequence => {
-                                        let terminal = expected_sequence == u64::MAX;
+                                    Ok(entry)
+                                        if entry
+                                            .matches_watch_cursor(expected_sequence)
+                                            .unwrap_or(false) =>
+                                    {
+                                        let terminal = entry.sequence == u64::MAX;
                                         if !terminal {
-                                            expected_sequence = expected_sequence
+                                            expected_sequence = entry
+                                                .sequence
                                                 .checked_add(1)
                                                 .ok_or(ProtocolError::InvalidWireValue)?;
                                         }
@@ -3650,7 +3655,7 @@ where
                             check_response_write_control(deadline, &cancellation)?;
                             let terminate = write_watch_response_until(
                                 writer,
-                                Response::WatchEntry(item),
+                                Response::watch_entry(item),
                                 effective_response_frame_size,
                                 deadline,
                                 &cancellation,
@@ -3665,7 +3670,7 @@ where
                         let deadline = response_write_deadline(idle_timeout)?;
                         let terminate = write_watch_response_until(
                             writer,
-                            Response::WatchEntry(Err(e)),
+                            Response::watch_entry(Err(e)),
                             effective_response_frame_size,
                             deadline,
                             &cancellation,
@@ -4644,6 +4649,7 @@ mod tests {
         let key = record.key.clone();
         let timestamp = opc_types::Timestamp::now_utc();
         ReplicationEntry {
+            replay_policy: opc_session_store::ReplicationReplayPolicy::prune_expired(),
             sequence,
             tx_id: format!("log-{sequence}")
                 .try_into()
@@ -5355,7 +5361,7 @@ mod tests {
 
         let terminate = write_watch_response(
             &mut writer,
-            Response::WatchEntry(Ok(replication_log_entry(1, 8192))),
+            Response::watch_entry(Ok(replication_log_entry(1, 8192))),
             budget,
             std::time::Duration::from_secs(1),
             &TEST_SERVER_NOT_CANCELLED,
@@ -5381,7 +5387,8 @@ mod tests {
                 ops: vec![operation],
             };
         }
-        let response = Response::WatchEntry(Ok(ReplicationEntry {
+        let response = Response::watch_entry(Ok(ReplicationEntry {
+            replay_policy: opc_session_store::ReplicationReplayPolicy::prune_expired(),
             sequence: 1,
             tx_id: "malformed-watch-tree"
                 .try_into()
@@ -5530,6 +5537,7 @@ mod tests {
     fn very_wide_malformed_log_and_watch_outputs_are_disposed_iteratively() {
         fn wide_entry(sequence: u64) -> ReplicationEntry {
             ReplicationEntry {
+                replay_policy: opc_session_store::ReplicationReplayPolicy::prune_expired(),
                 sequence,
                 tx_id: format!("wide-{sequence}")
                     .try_into()
@@ -5544,7 +5552,7 @@ mod tests {
         }
 
         discard_response_iteratively(Response::GetReplicationLog(Ok(vec![wide_entry(1)])));
-        discard_watch_response_iteratively(Response::WatchEntry(Ok(wide_entry(2))));
+        discard_watch_response_iteratively(Response::watch_entry(Ok(wide_entry(2))));
     }
 
     #[tokio::test]

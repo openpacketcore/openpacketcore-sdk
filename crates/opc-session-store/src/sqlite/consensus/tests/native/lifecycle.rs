@@ -32,11 +32,7 @@ fn history_parity(wal: &Wal, oracle: &SqliteSessionBackend) {
         "consensus_request_outcomes",
         "session_replication_log",
     ] {
-        assert_eq!(
-            super::ordinary::rows(&exported, table),
-            super::ordinary::rows(&conn, table),
-            "complete maintenance table {table}"
-        );
+        policy_oracle::table(&exported, &conn, table);
     }
     validate_fenced_transition_v2_receipts_sync(&exported, identity()).unwrap();
     assert_eq!(wal.native_sql_fallback_count().unwrap(), 0);
@@ -176,10 +172,7 @@ fn direct_parity(
         encode_json(&actual.responses).unwrap(),
         encode_json(&expected.responses).unwrap()
     );
-    assert_eq!(
-        encode_json(&actual.notifications).unwrap(),
-        encode_json(&expected.notifications).unwrap()
-    );
+    policy_oracle::notifications(&actual.notifications, &expected.notifications, entries);
     assert_eq!(
         storage.business.history_state().unwrap(),
         read_fenced_transition_v2_history_state_sync(&conn, identity()).unwrap()
@@ -351,11 +344,7 @@ fn native_history_partial_reclaim_matches_sql_exact_cursor_and_snapshot_columns(
             "consensus_request_outcomes",
             "session_replication_log",
         ] {
-            assert_eq!(
-                super::ordinary::rows(&output, table),
-                super::ordinary::rows(&conn, table),
-                "exact reclaim state at index {index}, table {table}"
-            );
+            policy_oracle::table(&output, &conn, table);
         }
         validate_fenced_transition_v2_receipts_sync(&output, identity()).unwrap();
         super::roster::export::import::rootless_roundtrip(&conn);

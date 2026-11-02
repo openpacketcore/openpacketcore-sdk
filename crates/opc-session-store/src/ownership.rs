@@ -991,7 +991,6 @@ fn map_store_error(error: StoreError) -> FencedOwnershipError {
         }
         StoreError::CapabilityNotSupported(_) => FencedOwnershipError::CapabilityNotSupported,
         StoreError::BackendUnavailable(_)
-        | StoreError::KeyProviderUnavailable(_)
         | StoreError::FencedTransitionRecoveryJournalUnavailable => {
             FencedOwnershipError::BackendUnavailable
         }

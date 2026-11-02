@@ -29,13 +29,14 @@ separate reservation, released after their allocations are destroyed, including
 on errors and unwind. Retained reservations follow the journal into a detached
 checkpoint and are released only with its last owner.
 
-The durable owner requests a checkpoint at 8 MiB of live business-journal
-reservations. A reclaim candidate is the number of receipts that the shared
+The durable owner requests a checkpoint at 8 MiB of live business, roster and
+log journal reservations. A reclaim candidate is the number of receipts that the shared
 lifecycle planner will actually remove, multiplied by the 72-byte before-row
 record (one pointer and two 32-byte fingerprints). Rotations, stale expectations
 and no-ops reserve zero deletion bytes. The former 2 MiB estimate slack is
-removed. If other commands in a mixed delivery change the expected inventory,
-its owner reserves the shortfall before allocating the exact vector.
+removed. Mixed deliveries reserve one maximum reclaim batch per maintenance
+command, so new receipt bindings cannot bypass proactive admission. Exact
+evaluation still reserves the complete vector before allocating it.
 
 The scheduling allowances derive from the unchanged 128 MiB cap:
 
@@ -61,14 +62,15 @@ normal retry/status handling. Preflight does not request a checkpoint while a
 snapshot is installing. Committed apply waits without retaining State, an
 operation permit, captured roots or a candidate. Its inactivity bound is one
 shared durable-consensus operation budget, currently 10 seconds. Progress means
-a new low in the admission shortfall (`max(used + candidate - 80 MiB, 0)`) or
-live-journal size during that pressure episode. A checkpoint or capture counts
+at least 64 KiB of relief in the admission shortfall
+(`max(used + candidate - 80 MiB, 0)`) or live-journal size during that episode. A checkpoint or capture counts
 only when it provides such relief; completion alone does not renew the bound.
 The lowest observed values are retained, so temporary checkpoint allocations
 growing and shrinking cannot keep renewing an otherwise stalled wait. A
 successful reservation ends the episode; if detached preparation later retries
 against a stale predecessor, a new pressure wait gets a fresh budget.
-There is no separate total-wait deadline while new lows keep renewing the bound.
+The entire pressure episode has a thirty-second bound even when meaningful
+relief keeps renewing the inactivity window.
 A single checkpoint or relocation drain exceeding 10 seconds without observable
 relief can still fence a healthy voter on very slow storage. Readiness observed
 at the deadline gets a fresh atomic reservation attempt. Persistent pressure
@@ -103,26 +105,38 @@ validates and appends the entire recovered journal. Coalesced live delivery stil
 has one atomic publication; a smaller regression compares full business digests,
 applied and committed positions between straight apply and replay.
 
-**Mixed-load limit:** consumer writes can keep growing business, log and roster
-journals while a checkpoint is slow. The existing WAL request/byte limits bound
-stored input, not its verification expansion; the 8/24 MiB business thresholds
-do not stop consumers or account for every log/roster allocation. Consequently,
-there is no general under-half-cap bound for an arbitrary mixed suffix or for
-multiple stores/images in one process. Such loads can exhaust verification
-memory during publication/checkpointing or repeatedly fail cold replay. This
-exposure predates the retirement fix. Compact deletion accounting reduces it,
-and bounded admission makes retirement pressure observable, but a general
-consumer/recovery budget requires a separate change. The retirement-only bound
-above must not be read as that broader guarantee.
+**Mixed-load admission and recovery:** business, log and roster journals keep
+all original reservations when captured. Allocation-derived admission leaves
+16 MiB of checkpoint workspace for their growth and optional journal-page
+construction. Retirement retains its stricter 80 MiB line so ordinary consumer
+work can continue. A pre-publication allocation failure destroys the candidate,
+releases the operation permit, requests a useful checkpoint and waits under the
+same minimum-relief and total-time bounds. This retry is restricted to the
+private allocation-pressure error; corrupt rows, failed verification and panics
+still fence through the existing path.
 
-The scalar planner also does not evaluate receipt bindings from consumer
-commands in a mixed delivery. For example, two new bindings followed by a
-maintenance entry expecting those two bindings can make the pre-delivery hint
-zero even though evaluation removes 1,024 receipts. A lagging follower then
-uses the exact fail-closed reservation instead of proactive throttling for that
-entry. Modeling arbitrary bindings here would duplicate business validation;
-this remains part of the mixed-write budgeting follow-up. A regression checks
-the full deletion charge and complete-state parity for this case.
+Cold recovery validates complete journal chunks at 24 MiB, or sooner when the
+actual process counter reaches 64 MiB, and then releases their allocations.
+Every WAL operation and committed replay cohort is still audited. After the
+complete audit, strict-source admission and full image validation, recovery
+writes and admits one compact base before starting the writer. Installed
+snapshot authority remains attached. No file repair or selection occurs between
+cohorts; an interruption restarts from the original durable cut.
+
+Mixed bindings followed by maintenance use the maximum deletion candidate for
+each maintenance command. The exact evaluator still checks every expectation
+and reserves the actual allocation, preserving atomic delivery and deterministic
+outcomes. Component tests cover both normal and void bindings.
+
+`native_journal_pressure_mixed_captured_and_live_crash_reopens` holds a checkpoint
+while consumer, roster and retirement changes fill its successor journal, exits
+with both owners live, then checks the complete reopened business digest,
+consumer progress and bounded shutdown. The large cold-replay case retains
+65,536 new receipts plus signed roster and maintenance commands, observes chunk
+rebasing, checks real fill/replay counter peaks, selects the rebuilt base and
+reopens it again. The original maximum retirement-only suffix retains its
+18–21 MiB journal and below-64 MiB replay requirements. These component cases
+do not establish a whole-process RSS or deployment latency guarantee.
 
 ## Void-profile interaction
 
@@ -370,9 +384,9 @@ ID/body retry and status semantics.
 Shutdown signals pressure waits before joining consensus/storage owners. A
 cancelled wait does not fence or clear the WAL queue: accepted WAL work follows
 the existing drain path, and the unapplied committed entry replays on reopen.
-Persistent pressure with no new low in admission shortfall or live-journal size
-for the ten-second inactivity bound fences storage instead of leaving it
-silently parked. Checkpoint completion alone cannot renew that bound. A single
+Persistent pressure without 64 KiB of admission or journal relief for ten
+seconds, or lasting thirty seconds in total, fences storage instead of leaving
+it silently parked. Checkpoint completion alone cannot renew that bound. A single
 checkpoint or relocation drain longer than ten seconds without observable
 relief can still fence a healthy voter on very slow storage. A successful
 reservation resets the wait; shutdown and planner errors do not fence.

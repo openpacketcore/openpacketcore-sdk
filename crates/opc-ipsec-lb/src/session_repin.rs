@@ -3987,10 +3987,6 @@ fn map_store_error(error: StoreError) -> IpsecLbError {
             "session_repin.key",
             "session re-pin journal key was rejected",
         ),
-        StoreError::KeyCapacityExhausted => IpsecLbError::invalid_config(
-            "session_repin.capacity",
-            "native key capacity exhausted; bounded key retention is required",
-        ),
         StoreError::CasIdempotencyConflict => IpsecLbError::invalid_config(
             "session_repin.idempotency",
             "session re-pin journal mutation identity was reused",
@@ -4033,7 +4029,6 @@ fn map_store_error(error: StoreError) -> IpsecLbError {
         ),
         StoreError::CapabilityNotSupported(_) => IpsecLbError::Unsupported,
         StoreError::BackendUnavailable(_)
-        | StoreError::KeyProviderUnavailable(_)
         | StoreError::ReplicationWatchCatchUpRequired
         | StoreError::FencedTransitionRecoveryJournalUnavailable => IpsecLbError::io(
             "session_repin_journal",

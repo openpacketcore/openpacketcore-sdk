@@ -972,6 +972,10 @@ class LibraryGroupPlanTests(unittest.TestCase):
         "native_catalog_lease_deferral_retirement_separate_checkpoints",
         "consensus::native::generation::catalog::tests::lease_deferral_tests::"
         "native_catalog_lease_deferral_retirement_rejects_false_deletion_witnesses",
+        "consensus::native::generation::catalog::tests::retention_tests::"
+        "native_notification_retention_passes_original_lifetime_limit_and_reopens",
+        "consensus::native::generation::catalog::tests::retention_tests::"
+        "native_key_retention_passes_original_lifetime_limit_and_reopens",
     )
 
     def setUp(self) -> None:

@@ -299,6 +299,7 @@ impl<'a> SqlitePreparedBase<'a> {
                     digest,
                     logical_time,
                     watch_sequence,
+                    retention: metadata.retention,
                     next_fence: global("next_fence")?,
                     next_credential: global("next_credential_id")?,
                     restore_revision: tx
@@ -535,6 +536,7 @@ impl<'a> SqlitePreparedBase<'a> {
             // without acquiring a lease or protected-roster reservation.
             reserved: !crate::scope_storage::is_scope_record_key(key)
                 && source::reserved(&self.tx, key)?,
+            retired_epoch: sql::native_retired::read(&self.tx, key)?,
         };
         validation::validate_key(key, &row, &context.business.frontiers)?;
         account(

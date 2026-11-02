@@ -285,9 +285,22 @@ async fn scope_authority_four_thousand_successions_keep_native_checkpoint_and_sn
                         .unwrap();
                     assert_eq!(
                         (counts.0, counts.2, counts.3),
-                        (1, 0, 0),
-                        "one checkpoint, no session rows or watches"
+                        (1, 0, 2),
+                        "one checkpoint, no session rows and two fixed replay contexts"
                     );
+                    let contexts = wal.with_native_read(|state| {
+                        Ok(state.replication_log(1, 8, &|| Ok(())))
+                    }).unwrap().unwrap();
+                    assert_eq!(contexts.len(), 2);
+                    // Activation owns one internal row. Initial admission
+                    // adds the authority checkpoint and its empty child ledger.
+                    for (index, entry) in contexts.iter().enumerate() {
+                        let mut expected = crate::ReplicationReplayPolicy::preserve();
+                        expected.internal_key_count = [1, 3][index];
+                        assert_eq!(entry.replay_policy, expected);
+                        assert_eq!(entry.sequence, (index + 1) as u64);
+                        assert!(matches!(&entry.op, crate::ReplicationOp::Batch { ops } if ops.is_empty()));
+                    }
                     assert!(
                         counts.1 < 9216,
                         "fixed encoded checkpoint plus bounded response metadata"

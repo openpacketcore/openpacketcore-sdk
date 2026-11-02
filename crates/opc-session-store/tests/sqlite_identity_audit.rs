@@ -88,6 +88,7 @@ fn replication_entry(sequence: u64, owner: &str) -> ReplicationEntry {
             .expect("valid stable ID"),
     };
     ReplicationEntry {
+        replay_policy: opc_session_store::ReplicationReplayPolicy::prune_expired(),
         sequence,
         tx_id: format!("tx-{sequence}")
             .try_into()
@@ -424,6 +425,7 @@ fn replication_cas_expiry_audit_is_bound_to_entry_timestamp() {
             .expect("plus one"),
     );
     let entry = ReplicationEntry {
+        replay_policy: opc_session_store::ReplicationReplayPolicy::prune_expired(),
         sequence: 1,
         tx_id: "expiry-audit-tx".try_into().expect("transaction ID"),
         timestamp,

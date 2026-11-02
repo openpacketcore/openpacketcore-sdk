@@ -11,6 +11,7 @@ mod checked;
 pub(crate) use checked::{Scope, ValidatedSource};
 
 pub(crate) struct Metadata {
+    pub(crate) retention: crate::consensus::native::retention::Retention,
     pub(crate) machine: (u64, SessionConsensusEntryDigest, Option<Timestamp>, u64),
     pub(crate) v1: Option<(SessionConsensusIdentity, [u8; 32])>,
     pub(crate) v2: Option<(SessionConsensusIdentity, [u8; 32], [u8; 32])>,
@@ -55,6 +56,8 @@ pub(crate) fn reserve_input(
         "consensus_identity",
         "consensus_voter_slots",
         "consensus_async_recovery",
+        "consensus_native_retention",
+        "consensus_native_retired_keys",
         "consensus_membership_scope",
         "consensus_membership_history",
         "consensus_membership_terminal_history",
@@ -226,9 +229,21 @@ fn validate_reserved(
     }) && protected_roster_recovery_layout_sync(conn)
         .map_err(|_| invalid_data("native snapshot roster layout invalid"))?
         == ProtectedRosterRecoveryLayout::Activated;
+    let machine = read_machine_sync(conn, identity)?;
+    let retention = native_retention::read(conn)?.unwrap_or_default();
+    let next_fence = conn
+        .query_row(
+            "SELECT val FROM lease_globals WHERE key='next_fence'",
+            [],
+            |row| row.get::<_, u64>(0),
+        )
+        .map_err(db_error)?;
+    retention.validate(machine.3, next_fence)?;
+    native_retired::validate(conn, retention.keys, check)?;
     Ok(Metadata {
+        retention,
         async_recovery: async_recovery::read(conn)?,
-        machine: read_machine_sync(conn, identity)?,
+        machine,
         v1,
         history: if v2.is_some() {
             Some(read_fenced_transition_v2_history_state_sync(

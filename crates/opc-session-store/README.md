@@ -696,7 +696,7 @@ process. Three and five fixed voters are supported; membership, storage roots,
 configuration epoch, persistence mode and application Recovery authority stay
 unchanged.
 
-New Async roots use format `OPCNA004`. Before the first volatile operation,
+New Async roots use format `OPCNA005`. Before the first volatile operation,
 the owner syncs a separate, exact-root-bound authority reservation. Its finite
 range bounds votes, log positions, lease fences, credentials and business
 frontiers independently of the session-generation writer. Ordinary operations
@@ -802,19 +802,116 @@ permitted; handoff does not terminate sessions or release their fences. No
 operator action or node cleanup is required for the restart. Abrupt loss keeps
 ordinary elections and the existing cold-recovery rules.
 
-Native roots use `OPCNR002` (Durable) and `OPCNA004` (Async). Earlier native
+The WAL root lock is explicitly unlocked when its opening owner is dropped or
+the writer finishes shutdown. A duplicated or inherited descriptor cannot keep
+the released root locked. A live owner continues to exclude other openers, and
+closing an old descriptor cannot release a successor's lock.
+
+Native roots use `OPCNR003` (Durable) and `OPCNA005` (Async). Earlier native
 roots are refused with `ConsensusSessionStoreOpenError::FreshInstallationRequired`;
-there is no implicit migration. Older SDK versions refuse the new roots before
+stores from earlier pre-release builds must be reinitialized, with no implicit
+migration. Older SDK versions refuse the new roots before
 reading their selected generation. The format refusal grants no authority to
 retire external effects or choose a replacement history.
 
+Fresh native creation runs on the blocking opener pool, keeping cold base
+construction and authentication off the asynchronous caller's stack. Once
+creation is queued after SQL identity initialization, cancellation retains its
+connection, descriptor owner and verified snapshots until ROOT writing finishes.
+The completed root can be reopened even when its original caller abandoned it.
+
+Native replay retains the latest 65,536 committed notifications. The retirement
+floor advances deterministically with notifying commands and survives
+checkpoints, snapshots and restart. A cursor at or below that floor returns
+`ReplicationLogCursorCompacted` with the first retained sequence; consumers
+must rebuild from a coherent snapshot before resuming. Live watch delivery and
+global sequence numbers continue across retirement. Crossing this storage
+format boundary requires a fresh installation.
+
+Successful ordinary mutations and V1 fenced transitions tag touched keys as
+retired once pruning has removed their record and lease, and no roster reserves
+them. Rejected commands and non-mutating CAS conflicts publish no cleanup.
+Release retains its inactive lease row until the next successful pruning
+mutation. An exact retired row remains through its retirement epoch and the
+next; re-creating the key clears its tag. Committing commands rotate a bounded
+epoch window and publish previous and current absent-key floors. Reads,
+snapshots, delivery grouping and intermediate batch children do not rotate it.
+The fixed retirement threshold is `N = 32,768`, with at most `2N = 65,536`
+exact dead rows. A committing command also rotates early when dead history
+would otherwise exhaust key capacity. The committed metadata records whether
+the latest rotation was triggered by the retirement threshold or capacity.
+Every rotation strictly raises the published floor:
+`floor_cur' = max(floor_cur + 1, retired_max + 1)`, after applying any Async
+recovery floor. It advances the allocator beyond the new floor and resets the
+current retirement counters. Capacity rotations can shorten the elapsed time
+covered by the exact epoch window; they do not create a lifetime key limit.
+
+Observe before preparing a deterministic V1/V2 create. Live and recently dead
+keys return their exact fence. Keys with no retained row return the current
+absent-key floor, raised by the Async recovery floor when applicable. Such a
+create accepts exactly the current or previous floor after Async recovery,
+never an arbitrary higher value. The committed fence remains
+`expected_fence + 1`, which binds the protected record's AAD. Both floors start
+at zero; fresh-zero works through epoch 1 unless Async recovery raises the
+floor. After a create-time `StaleFence`, re-observe and prepare a new request.
+An absent-key preparation survives one rotation. After two rotations, its old
+expected floor is rejected with a no-effect `StaleFence`.
+Ordinary `AcquireLease` keeps its allocation rule.
+
+Retirement and re-creation cannot revive an old credential or reuse a key's
+old fence. Snapshots and restart preserve the epoch, both floors, retirement
+counters and exact row tags. Fake reads leave committed data unchanged. Local
+visibility remembers each record or lab receipt observed as expired across a
+clock rewind. A record change replaces that record's visibility; unrelated
+commits do not revive an expired record or receipt. Writes sample their own
+clock under the state lock, clamped by prior writer attempts and committed
+time. Reader samples never choose write timestamps, cleanup or rotation. Newly written
+zero-TTL records retain their exact expiry boundary. Live replay and rebuild
+prune only at committed entry time. Expiry cleanup runs with successful
+ordinary mutations and V1 fenced transitions; scope authority, child and claim
+records retain their separate lifecycle rules. Pure `FencedTransitionV2`
+traffic does not trigger the global expiry prune. Those workloads and scope
+child/claim history remain open parts of #1252.
+
+The 65,536-row replay window bounds retained notifications, not their lifetime
+sequence or live delivery. The exact retired-key window is bounded independently
+of lifetime key churn. Existing live-state and verification-memory limits
+remain. Ordinary and in-memory lab request outcomes retain their existing safe
+behavior. Removing their independent receipt limits requires an immutable
+caller retry epoch or expiry; #1251 and the receipt part of #1257 remain open.
+
 Both modes physically remove log rows through the selected purge frontier,
 covered by the selected snapshot and applied cut. Snapshots, installs and
-restarts preserve only the retained suffix. Reclamation removes the accumulated
-log-row lifetime limit; generation files still grow toward their existing
-32 GiB Durable and 8 GiB Async ceilings until file rollover is implemented. The
-rollover design, crash/qualification plan and pending owner decisions are
-recorded in [ADR 0022 § Generation-file rollover design](../../docs/adr/0022-native-session-persistence-modes.md).
+restarts preserve only the retained suffix. Ordinary checkpoints continue while
+a background compactor builds a verified base from a selected cut and replays
+its authenticated suffix. The unchanged trigger is twice the compact-base size
+(with a 64 MiB floor), or half the hard ceiling, whichever comes first. Ceilings
+remain 32 GiB Durable and 8 GiB Async. Durable selection precedes reclamation;
+pinned readers finish on authenticated old descriptors, and background row
+relocation visits at most 64 rows per unit without gating checkpoints.
+
+Admission does not depend on compaction time. Exhausting the old file's
+headroom (the ceiling minus the selected cut's extent, including the
+trigger-crossing frame) causes designed, recoverable backpressure, warned at
+three quarters of its ceiling. Async waits before projection/reservation, and file-guard time
+does not age a journal-pressure episode; real journal stalls without that guard
+retain #1130. Capacity checks reject an overflowing candidate before append,
+without poisoning the selected source. Background retries require a newer cut.
+
+When neither the old append nor a fresh selected-cut base plus switch fits,
+the background worker may build and select a complete mode-validated pending
+cut without another delta. If that base itself does not fit, live data is at
+capacity: admission stays held with a diagnostic until internal retirement
+frees space. Installation waits before claiming its application gate during
+live-capacity recovery and yields an unarmed gate if capacity appears during
+the drain, leaving committed internal retirement available. Resource waiters
+recheck refunded memory while guarded; authenticated journal drains do not
+require a new cut or reserialize unchanged state. Shutdown interrupts that wait without selecting partial state. Admission of client
+deletes while live data is at capacity remains an open resident-state policy. This
+improves on backlog's unconditional stop at the append ceiling, without
+changing any bound or deadline. Reopen still fully validates selected state
+and discards interrupted preparations. Generation-file rollover adds no further
+stored-format or acknowledgement change beyond the retention boundary above.
 See [ADR 0022](../../docs/adr/0022-native-session-persistence-modes.md).
 
 Automatic unanimous recovery requires retained reservations and an applied
@@ -870,7 +967,9 @@ The `_at` and placement-attestation variants preserve the same quorum contract.
 Async admission posture, resident/completed generation and sequence, local
 completed committed/applied indices, lag, extent limit, and saturation. It is
 a passive observation. The writer coalesces changes with a 250 ms capture
-schedule and at most one detached generation per voter; 250 ms is not a
+schedule and at most one ordinary capture per voter. One independent
+compactor may own a disjoint preparing file; neither its build nor bounded
+post-switch relocation gates the next checkpoint. The 250 ms schedule is not a
 persistence-latency guarantee. The current generation extent ceiling is 8 GiB,
 separate from the bounded journal/verification working set and any process RSS
 qualification. There is no per-operation disk queue to fill before success.
@@ -1231,10 +1330,11 @@ Production replication uses `SessionConsensusServer` and
 live certificate's canonical SPIFFE URI, logical `ReplicaId`, stable node ID,
 cluster, configuration digest, epoch, peer role, and fresh challenge must all
 agree before an Openraft RPC is dispatched. Resolver or DNS aliases change
-only the dial address; a bare self ID such as `epdg-app-0` can correctly name
+only the dial address; a bare self ID such as `replica-a` can correctly name
 the member whose route is an FQDN because the SDK never compares those strings.
 The exact consensus contract uses transport/wire-schema revision 6, application
-revision 4 and error-set revision 6. The forwarding envelope requires scheduling
+revision 5 and error-set revision 6. Application journal entries require explicit
+producer-selected replay policy. The forwarding envelope requires scheduling
 metadata and an explicit consumer scope, so a peer cannot silently drop the class
 or downgrade a consumer-scoped operation to an internal call. Older profiles fail
 before dispatch. Upgrade all consensus members with a coordinated fresh
@@ -1740,10 +1840,11 @@ reserve relocation slots, because they produce no replacement rows. A memory
 trigger requests checkpoints before optional maintenance consumes the remaining
 allowance. Admission leaves space for consumer reads and checkpoint preparation,
 and waits without holding the state lock, operation permit, or candidate roots.
-Committed pressure waits renew their ten-second inactivity bound only when the
-admission shortfall or live journal reaches a new low; checkpoint completion
-alone does not renew it. A successful reservation resets the wait, so a later
-retry gets a fresh budget. A single checkpoint or relocation drain exceeding
+Committed pressure waits renew their ten-second inactivity bound only after
+at least 64 KiB of admission or journal relief, and the whole pressure episode
+is bounded to thirty seconds. Checkpoint completion alone does not renew it.
+A successful reservation resets the retirement wait, so a later retry gets a
+fresh budget. A single checkpoint or relocation drain exceeding
 ten seconds without observable relief can still fence a healthy voter on very
 slow storage. Shutdown cancels the wait promptly without fencing the WAL,
 preserving its accepted-work drain. A fence is terminal for the store
@@ -1761,12 +1862,19 @@ retirement reservations, preserve first-binding-wins through process exit and
 replay, and create no business effect.
 Public maintenance may poll until its operation deadline and return
 `BackendUnavailable`. Cold replay uses bounded preparation cohorts independently
-of transport batches; it retains the complete suffix until the writer starts.
-The maximum retirement-only suffix is tested below half the cap; arbitrary mixed
-consumer/roster traffic retains the existing verification-exhaustion exposure.
-The scalar maintenance planner does not model new receipt bindings in mixed
-deliveries; exact evaluation reserves any underestimated deletion inventory
-against the hard cap. Planner errors fall back to that evaluation and increment
+of transport batches. Log, roster and business journal reservations all feed
+checkpoint scheduling. Their allocations, including optional journal-page
+construction, leave 16 MiB for checkpoint work under the unchanged process cap.
+Pre-publication pressure retries after dropping the candidate and operation
+permit; malformed data and verification failures retain terminal handling.
+Recovery authenticates and releases complete journals at 24 MiB, or earlier
+when the process counter reaches 64 MiB. After the entire recovery audit and
+strict-source admission, it validates and selects a compact base before exposing
+the owner. It never repairs or selects files between replay cohorts.
+The maintenance planner reserves the maximum deletion inventory for each
+maintenance command in a mixed delivery, including new receipt bindings before
+its expectation. Exact evaluation still reserves every allocation before use.
+Planner errors fall back to that evaluation and increment
 the value-free `application.retirement_plan_fallbacks` diagnostic counter.
 Live delivery still publishes atomically. See the
 [retirement memory proof](../../docs/sdk-1122-reclaim-memory-evidence.md).
@@ -1807,6 +1915,15 @@ or a key handle. Reads cross the wrapper in the opposite direction and use the
 envelope key ID for historical-key lookup. A provider outage therefore blocks
 a new plaintext write before consensus submission but does not prevent already
 sealed Raft traffic, replay, or quorum formation.
+
+Local key lookup and remote seal/unseal report `KeyError::Unavailable` as
+`StoreError::BackendUnavailable("session key provider unavailable")`. Callers
+can retry within their existing request budget when the provider recovers.
+Unknown keys, authentication failures, malformed envelopes and other provider
+errors still return the same coarse `StoreError::Crypto` classification without
+exposing provider details or envelope contents.
+The shared `backend_unavailable` metrics label covers both provider and backend
+outages; the fixed error message distinguishes provider outages.
 
 Both protection wrappers default to `EnvelopeReadPolicy::MigrationCompatible`,
 which retains intentional legacy/plaintext reads and unclassified-row probing.
@@ -1975,44 +2092,6 @@ permission to skip history. `ReplicationLogCursorCompacted { resume_from }`
 remains distinct and requires snapshot installation before its resume point.
 Slow consumers are evicted when the live channel fills, and closed or
 cancelled registrations are pruned without unbounded accumulation.
-
-Ordinary command outcomes are retained under a committed-state rule instead of
-for the life of the store. The rule activates only after committed application
-sequence 65,536: below it every receipt is retained exactly as before. Once
-active, a receipt whose committed response logical time is at or before
-`frontiers.logical_time - 120 seconds` (inclusive boundary) is retired on the
-next publication, so an exact in-window retry replays the original outcome while
-an out-of-window retry receives the typed `BackendOperationOutcomeUnavailable`
-(or `CasIdempotencyOutcomeUnavailable` for compare-and-set) answer and is never
-executed again. A retryable typed capacity refusal is returned for every new
-binding while the resident receipt map is at or above its capacity bound,
-including mid-delta, so new bindings cannot grow the map to the fixed image cap;
-refusals are effect-free, binding-free, may advance the committed logical clock,
-and the next publication's committed-clock retirement reclaims the window.
-The rule derives from the already-persisted application sequence and logical
-time, so every voter retires identically; no new persisted field or format
-boundary is added, and the portable SQL projection/prepared SQL base just carry
-the retained map.
-
-Native state additionally keeps a bounded rolling notification backlog: the
-newest 65,536 notification rows are resident (a row-count bound, not a byte
-budget), and a watcher whose inclusive cursor
-is at or below the derived retention floor receives the existing
-`ReplicationLogCursorCompacted { resume_from }` answer with the lowest
-replayable sequence described above. The floor is derived only from the
-committed watch sequence, so every voter agrees at the same log index and the
-already-persisted snapshot/frontier state carries it; there is no new persisted
-field, acknowledgement or delivery tracker. Retention is therefore a bounded
-replay backlog, not delivery tracking: a slow or lost watcher resynchronises
-from the returned sequence (or installs a snapshot for the compacted-async
-case). The hard 1,048,576-row admission cap remains a last defense instead of
-a lifetime stop. Durable carry for the derived floor is included: generation
-base and delta catalogs, full images, the portable SQLite snapshot projection
-and the prepared SQL base preserve the sparse raw sequences and re-derive the
-identical floor on replay, so close/reopen and snapshot install continue the
-same bounded window. The million-mutation qualification job and
-leader-to-snapshot-install parity remain the final follow-up; no format
-boundary is added.
 
 `ConsensusSessionStore` completes a linearizable read barrier before the
 atomic local handoff using `opc-consensus::LinearizableReadBarrier` in its
@@ -2479,8 +2558,8 @@ by issue #143.
   recovery, while #133 supplies bounded local applied-state restore without
   becoming a second consensus authority. Production qualification remains a
   separate gate.
-- A bare logical self ID such as `epdg-app-0` may select a member whose endpoint
-  is the full `epdg-app-0.<headless-service>.<namespace>.svc.cluster.local`
+- A bare logical self ID such as `replica-a` may select a member whose endpoint
+  is the full `replica-a.<headless-service>.<namespace>.svc.cluster.local`
   FQDN. The SDK never shortens endpoints or treats endpoint text as identity.
 - The local ID declares the node's own configured replica. Admission proves an
   exact descriptor match. The separately supplied local SQLite backend remains
@@ -2508,8 +2587,11 @@ by issue #143.
   Whole-state rebuild is staged and swapped only after every entry replays;
   existing watch subscriptions survive the swap, rebuild does not synthesize
   append events, and the next locally successful append is emitted exactly
-  once. The Fake obtains this test-double behavior by cloning its bounded
-  in-memory data into a watcher-free stage; SQLite uses a database transaction.
+  once. The Fake stages its bounded in-memory data before publication; SQLite
+  uses a database transaction. Failed direct fake writes also discard staged
+  expiry cleanup. A local fake batch preserves per-slot outcomes and emits one
+  replication entry containing only its successful write slots; a batch with
+  no successful writes publishes no cleanup or notification.
   This is backend-local atomicity only. The Openraft-backed production adapter
   publishes journal/watch entries only after committed state-machine apply.
 - Session and lease TTLs use the checked 365-day contract above. This closes
@@ -2731,13 +2813,54 @@ construction still withholds atomic prepared-transition capability.
 
 Lab restore scans use the SDK's authenticated `DurableOpaqueV1` seek-cursor
 format with an allocation-local key and incarnation. Cursors reject another
-allocation, changed scope, record mutation, expiry pruning, or state rebuild;
-pages retain the existing row and byte bounds. The profile names the cursor
-format, not persistence: the lab loses its cursor authority on restart too.
+allocation, changed scope, record mutation, expiry pruning, or a rebuild that
+changes records; pages retain the existing live-row and byte bounds. Expired rows are skipped
+within the same bounded physical-source allowance as native scans. The profile
+names the cursor format, not persistence: the lab loses its cursor authority on restart too.
 
 The process retains at most 100,000 tracked keys and 65,536 transition receipts
-and preparation tokens. History exhaustion rejects new requests rather than
-evicting request identities or fence floors. Restart loses all state and is
-the lab reset boundary; it is not HA recovery. This feature does not implement
+and preparation tokens. Deleted or expired keys with no remaining record or
+active lease retain their exact fence through the current and previous retirement
+epochs. Committing commands rotate after 32,768 retirements, or earlier when
+dead history would exhaust resident capacity. Each rotation strictly advances
+the absent-key floor. Missing keys observe the current floor and deterministic
+acquisition accepts exactly the current or previous floor; live and recently
+retired keys require their exact fence. Ordinary release, expiry pruning and
+ordered replay reclaim key capacity without reviving old credentials. A fence outside
+the allocation counter or at its exhaustion horizon remains individually tracked.
+Every application replication entry carries an explicit replay policy: whether
+expiry cleanup and dead-key retirement run, the committed recovery fence floor,
+capacity rotations, internal resident capacity, and bounded command framing.
+Replay follows these fields independently of the mutation tree. Ordinary native
+writes and V1 transitions request cleanup; V2 and control effects preserve
+unrelated rows. Metadata-only commands publish an empty mutation batch when
+capacity or recovery context changes. Multi-entry commands publish their decided
+floors on the first entry and retain the earlier exact fence view only to admit
+at most 255 explicitly identified continuations. Local writes refuse an incomplete
+command, including write batches whose children all conflict or fail.
+Replay and rebuild use the same rules. A replica unable to hold the committed
+result refuses the entry atomically. The original 256-node entry and 256-request
+command bounds remain. Native portable snapshots and conversion preserve and
+validate the policy, including an explicit native profile at genesis.
+Standalone SQLite replay supports expiry cleanup and bounded command framing;
+unsupported retirement, recovery and internal-capacity policies are refused
+atomically. Its exact transitions select preservation; ordinary writes select
+expiry cleanup. Multi-entry transitions carry their actual command boundaries,
+and replay validates continuations across reopen and rebuild. Local writes are refused
+while a replay command is incomplete.
+Live replay evaluates cleanup and lease checks at the entry's committed time.
+Each notification keeps the outward cursor selected when its command appended
+it, including several recovery boundaries in one committed apply. Live watches
+deliver those entries once and accept the recovery row at its inclusive resume
+cursor. Stored notification rows retain raw coordinates. Local in-memory lease
+operations apply the recovered authority floor before admitting credentials.
+The policy is required in every entry encoding. Peers require matching consumer
+wire and consensus application revisions. The JSON mutation field is `effects`;
+earlier readers requiring
+`op` refuse this encoding. Entries omitting policy are rejected rather than
+interpreted using an older mutation shape.
+Receipt exhaustion still rejects new requests: opaque request identities cannot
+be safely forgotten without a caller-owned retry lifetime. Restart loses all
+state and is the lab reset boundary; it is not HA recovery. This feature does not implement
 the protected-roster V2 protocol or qualify durable throughput. It is disabled
 by default and must not be selected as production persistence.

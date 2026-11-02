@@ -7,6 +7,7 @@ use tempfile::NamedTempFile;
 
 fn entry(sequence: u64, tx_id: &str) -> ReplicationEntry {
     ReplicationEntry {
+        replay_policy: opc_session_store::ReplicationReplayPolicy::prune_expired(),
         sequence,
         tx_id: tx_id.try_into().expect("valid transaction ID"),
         op: ReplicationOp::Batch { ops: Vec::new() },

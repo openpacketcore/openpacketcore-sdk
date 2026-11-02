@@ -1260,7 +1260,7 @@ held by the Python wrapper as the exact nofollow inode via
 inheritance; Rust opens/locks that inode and revalidates procfd, parent, name,
 and path before mkdir, publication, and completion to close the A-to-B
 split-lock seam. The V9 schema digest is
-`sha256:65d456edc15359e9cbac25a6771822219797c53f03aa6ca5d8837e43a6dbc018`.
+`sha256:eb410e3be0c2260ebefc8567507941f9b08d06f5280a0ac43aebef9b7b60039e`.
 
 The protected `/3` pool is rebound to a readiness-proven live leader after each
 loss/restart. Its tenant-negative evidence is exactly three per-voter,

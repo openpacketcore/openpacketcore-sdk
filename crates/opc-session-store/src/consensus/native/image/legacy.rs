@@ -42,11 +42,15 @@ impl Key {
             lease,
             fence: self.fence,
             reserved: self.reserved,
+            retired_epoch: None,
         })
     }
 
     #[cfg(test)]
     pub(super) fn from_current(key: &SessionKey, row: &NativeKeyState) -> io::Result<Self> {
+        if row.retired_epoch.is_some() {
+            return Err(invalid("legacy native row cannot carry a retirement epoch"));
+        }
         let lease = row
             .lease
             .as_ref()

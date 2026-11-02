@@ -523,6 +523,7 @@ fn assert_tree_does_not_contain(root: &Path, needle: &[u8]) {
 fn insert_legacy_empty_replication(replica: &RecoveryReplica, sequence: u64) {
     let timestamp = Timestamp::now_utc();
     let entry = ReplicationEntry {
+        replay_policy: crate::ReplicationReplayPolicy::prune_expired(),
         sequence,
         tx_id: format!("legacy-recovery-{sequence}")
             .try_into()
@@ -1180,6 +1181,7 @@ fn legacy_sequence_audit_rejects_hidden_domain_and_row_payload_mismatches() {
         ];
         let timestamp = Timestamp::now_utc();
         let entry = ReplicationEntry {
+            replay_policy: crate::ReplicationReplayPolicy::prune_expired(),
             sequence: payload_sequence,
             tx_id: "sequence-test".try_into().expect("valid transaction ID"),
             op: ReplicationOp::Batch { ops: Vec::new() },
@@ -1243,6 +1245,7 @@ fn legacy_recovery_rejects_unbounded_or_non_text_transaction_ids() {
         ];
         let timestamp = Timestamp::now_utc();
         let entry = ReplicationEntry {
+            replay_policy: crate::ReplicationReplayPolicy::prune_expired(),
             sequence: 1,
             tx_id: "valid-encoded-id".try_into().expect("valid transaction ID"),
             op: ReplicationOp::Batch { ops: Vec::new() },

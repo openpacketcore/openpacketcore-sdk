@@ -1,12 +1,15 @@
 //! Streaming complete bases. This borrows an immutable full capture;
 //! the caller must prepare/encode it outside State and own its output file.
 //! It writes no selector, grants no writer authority, and reclaims nothing.
-//! Admission requires Catalog::open to read and validate the entire result.
+//! Cold admission requires Catalog::open. A live immutable capture can instead
+//! admit complete expected readback, without allocating a second resident index.
 
+#[cfg(test)]
+use super::super::prefix::CompareWriter;
 use super::*;
 
-pub(super) const MAGIC: &[u8; 8] = b"OPCNJB\x06\x00";
-pub(super) const SLOT_MAGIC: &[u8; 8] = b"OPCNJB\x06\x01";
+pub(super) const MAGIC: &[u8; 8] = b"OPCNJB\x07\x00";
+pub(super) const SLOT_MAGIC: &[u8; 8] = b"OPCNJB\x07\x01";
 pub(super) const V4_MAGIC: &[u8; 8] = b"OPCNJ004";
 pub(super) const V5_MAGIC: &[u8; 8] = b"OPCNJ005";
 pub(super) const V3_MAGIC: &[u8; 8] = b"OPCNJ003";
@@ -40,7 +43,7 @@ pub(crate) struct PreparedBase<'a> {
 }
 
 impl<'a> PreparedBase<'a> {
-    pub(crate) fn prepare(
+    fn capture(
         storage: &'a NativeStorage,
         parameters: BaseParameters,
         check: &impl Fn() -> io::Result<()>,
@@ -97,18 +100,28 @@ impl<'a> PreparedBase<'a> {
             context,
         };
         let format = if header.context.business.frontiers.voter_slots.is_some() {
-            Format::V6_SLOTS
+            Format::V7_SLOTS
         } else {
-            Format::V6
+            Format::V7
         };
-        let mut value = Self {
+        Ok(Self {
             storage,
             header,
             payload_bytes: 0,
             length: 0,
             format,
             _memory: memory,
-        };
+        })
+    }
+
+    pub(crate) fn prepare(
+        storage: &'a NativeStorage,
+        parameters: BaseParameters,
+        check: &impl Fn() -> io::Result<()>,
+    ) -> io::Result<Self> {
+        let maximum = parameters.maximum;
+        let block_bytes = parameters.block_bytes;
+        let mut value = Self::capture(storage, parameters, check)?;
         let mut counter = Counter { bytes: 0 };
         value.write_payload(&mut counter, check)?;
         value.payload_bytes = counter.bytes;
@@ -141,14 +154,18 @@ impl<'a> PreparedBase<'a> {
         writer: &mut dyn Write,
         check: &impl Fn() -> io::Result<()>,
     ) -> io::Result<()> {
+        #[cfg(test)]
+        super::super::rollover_costs::record(|costs| costs.serializations += 1);
         check()?;
         writer.write_all(match self.format {
             Format::V2 => LEGACY_MAGIC,
             Format::V3 => V3_MAGIC,
             Format::V4 => V4_MAGIC,
             Format::V5 => V5_MAGIC,
-            Format::V6 => MAGIC,
-            Format::V6_SLOTS => SLOT_MAGIC,
+            Format::V6 => b"OPCNJB\x06\x00",
+            Format::V6_SLOTS => b"OPCNJB\x06\x01",
+            Format::V7 => MAGIC,
+            Format::V7_SLOTS => SLOT_MAGIC,
             _ => return Err(invalid("native generation discriminator differs")),
         })?;
         let header = encode_header(&self.header)?;
@@ -157,7 +174,14 @@ impl<'a> PreparedBase<'a> {
             check()?;
             writer.write_all(&[0])?;
             write_before(writer, None)?;
-            write_binary(writer, &(key, Some(&**row)))?;
+            if self.format.vocabulary >= Format::V7.vocabulary {
+                write_binary(writer, &(key, Some(&**row)))?;
+            } else {
+                write_binary(
+                    writer,
+                    &(key, Some(key_codec::BeforeEpoch::from_current(row)?)),
+                )?;
+            }
         }
         for (id, row) in &self.storage.business.receipts {
             check()?;
@@ -237,12 +261,22 @@ impl<'a> PreparedBase<'a> {
 
     #[cfg(test)]
     pub(super) fn legacy_for_test(
-        mut self,
+        self,
         maximum: u64,
         check: &impl Fn() -> io::Result<()>,
     ) -> io::Result<Self> {
-        Format::V2.validate_context(&self.header.context)?;
-        self.format = Format::V2;
+        self.format_for_test(Format::V2, maximum, check)
+    }
+
+    #[cfg(test)]
+    pub(super) fn format_for_test(
+        mut self,
+        format: Format,
+        maximum: u64,
+        check: &impl Fn() -> io::Result<()>,
+    ) -> io::Result<Self> {
+        format.validate_context(&self.header.context)?;
+        self.format = format;
         let mut counter = Counter { bytes: 0 };
         self.write_payload(&mut counter, check)?;
         self.payload_bytes = counter.bytes;
@@ -293,6 +327,70 @@ impl<'a> PreparedBase<'a> {
     }
 }
 
+/// A captured canonical stream without a counting traversal or persisted input.
+pub(crate) struct StreamingBase<'a>(PreparedBase<'a>);
+
+impl<'a> StreamingBase<'a> {
+    pub(crate) fn prepare(
+        storage: &'a NativeStorage,
+        parameters: BaseParameters,
+        check: &impl Fn() -> io::Result<()>,
+    ) -> io::Result<Self> {
+        PreparedBase::capture(storage, parameters, check).map(Self)
+    }
+
+    // Exclusive read sections remain covered by their security regressions.
+    // Production compaction always uses the concurrent ordinary read path.
+    #[cfg(test)]
+    pub(crate) fn write_new(
+        &self,
+        file: std::fs::File,
+        maximum: u64,
+        check: &impl Fn() -> io::Result<()>,
+    ) -> io::Result<super::super::prefix::Created> {
+        if let Some(origin) = &self.0.storage.business.snapshot_origin {
+            origin.verify()?;
+        }
+        let created = super::super::prefix::with_read_section(|| {
+            super::super::prefix::Created::encode(
+                file,
+                self.0.identity([0; 32])?,
+                maximum,
+                check,
+                |writer| self.0.write_payload(writer, check),
+            )
+        })?;
+        if let Some(origin) = &self.0.storage.business.snapshot_origin {
+            origin.verify()?;
+        }
+        Ok(created)
+    }
+
+    /// Concurrent append ownership stays on the old source. Use its ordinary
+    /// per-read metadata and block authentication; no read section is entered.
+    pub(crate) fn write_new_concurrent(
+        &self,
+        file: std::fs::File,
+        maximum: u64,
+        check: &impl Fn() -> io::Result<()>,
+    ) -> io::Result<super::super::prefix::Created> {
+        if let Some(origin) = &self.0.storage.business.snapshot_origin {
+            origin.verify()?;
+        }
+        let created = super::super::prefix::Created::encode(
+            file,
+            self.0.identity([0; 32])?,
+            maximum,
+            check,
+            |writer| self.0.write_payload(writer, check),
+        )?;
+        if let Some(origin) = &self.0.storage.business.snapshot_origin {
+            origin.verify()?;
+        }
+        Ok(created)
+    }
+}
+
 pub(super) struct Output<'a> {
     pub(super) writer: &'a mut dyn Write,
     pub(super) hash: Sha256,
@@ -313,5 +411,167 @@ impl Write for Output<'_> {
     }
     fn flush(&mut self) -> io::Result<()> {
         self.writer.flush()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Cursor;
+
+    struct CountedReader<'a> {
+        input: Cursor<&'a [u8]>,
+        reads: usize,
+    }
+
+    impl Read for CountedReader<'_> {
+        fn read(&mut self, bytes: &mut [u8]) -> io::Result<usize> {
+            self.reads += 1;
+            self.input.read(bytes)
+        }
+    }
+
+    fn position_dependent_bytes() -> Vec<u8> {
+        (0..2 * 8192 + 17)
+            .map(|position| (position ^ (position >> 8) ^ (position >> 13)) as u8)
+            .collect()
+    }
+
+    #[test]
+    fn native_base_readback_batches_small_canonical_fields() {
+        let expected = position_dependent_bytes();
+        let mut input = CountedReader {
+            input: Cursor::new(expected.as_slice()),
+            reads: 0,
+        };
+        {
+            let mut writer = CompareWriter::new(&mut input);
+            // Framing emits individual tag bytes. Verified-prefix reads must
+            // scale with bounded buffers, not the number of framing fields.
+            for byte in &expected {
+                writer.write_all(std::slice::from_ref(byte)).unwrap();
+            }
+        }
+        assert_eq!(input.input.position(), expected.len() as u64);
+        assert!(
+            input.reads <= expected.len().div_ceil(8192),
+            "small fields caused {} authenticated reads for {} bytes",
+            input.reads,
+            expected.len(),
+        );
+    }
+
+    #[test]
+    fn native_base_readback_rejects_corruption_across_buffer_boundaries() {
+        let expected = position_dependent_bytes();
+        for write_size in [expected.len(), 1, 31] {
+            for corrupt_at in [0, 17, 8191, 8192, 8209, 16383, expected.len() - 1] {
+                let mut actual = expected.clone();
+                actual[corrupt_at] ^= 1;
+                let mut input = Cursor::new(actual);
+                let mut writer = CompareWriter::new(&mut input);
+                let result = expected
+                    .chunks(write_size)
+                    .try_for_each(|chunk| writer.write_all(chunk));
+                assert_eq!(
+                    result.expect_err("corruption must be compared").kind(),
+                    io::ErrorKind::InvalidData,
+                    "corrupt offset {corrupt_at}, write size {write_size}"
+                );
+            }
+            for truncated_at in [0, 17, 8191, 8192, expected.len() - 1] {
+                let mut input = Cursor::new(&expected[..truncated_at]);
+                let mut writer = CompareWriter::new(&mut input);
+                let result = expected
+                    .chunks(write_size)
+                    .try_for_each(|chunk| writer.write_all(chunk));
+                assert_eq!(
+                    result.expect_err("truncation must be rejected").kind(),
+                    io::ErrorKind::UnexpectedEof,
+                    "truncated offset {truncated_at}, write size {write_size}"
+                );
+            }
+        }
+    }
+
+    fn assert_failed_refill_does_not_reuse_consumed_bytes(failure: io::ErrorKind) {
+        struct FailedRefill {
+            first: Cursor<[u8; 8192]>,
+            failure: io::ErrorKind,
+        }
+
+        impl Read for FailedRefill {
+            fn read(&mut self, bytes: &mut [u8]) -> io::Result<usize> {
+                if self.first.position() < 8192 {
+                    return self.first.read(bytes);
+                }
+                if self.failure == io::ErrorKind::UnexpectedEof {
+                    Ok(0)
+                } else {
+                    Err(self.failure.into())
+                }
+            }
+        }
+
+        let mut input = FailedRefill {
+            first: Cursor::new([0x5a; 8192]),
+            failure,
+        };
+        let mut writer = CompareWriter::new(&mut input);
+        writer.write_all(&[0x5a; 8192]).expect("first chunk");
+        assert_eq!(writer.write(&[0x5a; 17]).unwrap_err().kind(), failure);
+        assert_eq!(
+            writer
+                .write(&[0x5a; 17])
+                .expect_err("retry must refill, not compare consumed bytes")
+                .kind(),
+            failure,
+        );
+        assert_eq!(writer.position, 0);
+        assert_eq!(writer.available, 0);
+    }
+
+    #[test]
+    fn native_base_readback_refill_error_does_not_reuse_consumed_bytes() {
+        assert_failed_refill_does_not_reuse_consumed_bytes(io::ErrorKind::WouldBlock);
+    }
+
+    #[test]
+    fn native_base_readback_refill_eof_does_not_reuse_consumed_bytes() {
+        assert_failed_refill_does_not_reuse_consumed_bytes(io::ErrorKind::UnexpectedEof);
+    }
+
+    #[test]
+    fn native_base_readback_retries_interruptions_and_accepts_short_reads() {
+        struct ShortReader<'a> {
+            input: Cursor<&'a [u8]>,
+            interrupt_next: bool,
+        }
+
+        impl Read for ShortReader<'_> {
+            fn read(&mut self, bytes: &mut [u8]) -> io::Result<usize> {
+                if self.interrupt_next {
+                    self.interrupt_next = false;
+                    return Err(io::ErrorKind::Interrupted.into());
+                }
+                self.interrupt_next = true;
+                let count = bytes.len().min(7);
+                self.input.read(&mut bytes[..count])
+            }
+        }
+
+        let expected = position_dependent_bytes();
+        let mut input = ShortReader {
+            input: Cursor::new(expected.as_slice()),
+            interrupt_next: true,
+        };
+        {
+            let mut writer = CompareWriter::new(&mut input);
+            assert_eq!(writer.write(&[]).unwrap(), 0);
+            for chunk in expected.chunks(31) {
+                writer.write_all(chunk).unwrap();
+            }
+        }
+        assert_eq!(input.input.position(), expected.len() as u64);
     }
 }

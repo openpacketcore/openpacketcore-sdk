@@ -92,6 +92,12 @@ pub(crate) async fn acquire_consensus_timing_test_permit() -> tokio::sync::Semap
 
 pub use opc_types::Timestamp;
 
+mod replay_policy;
+pub use replay_policy::{
+    ReplicationCommandBoundary, ReplicationRecoveryBoundary, ReplicationReplayPolicy,
+    MAX_REPLICATION_INTERNAL_KEYS,
+};
+
 pub mod backend;
 pub mod capability;
 pub mod clock;
@@ -107,6 +113,7 @@ pub mod fenced_transition;
 pub mod fenced_transition_journal;
 pub mod handover;
 mod hex;
+mod key_retention;
 pub mod lease;
 pub mod membership;
 pub mod model;

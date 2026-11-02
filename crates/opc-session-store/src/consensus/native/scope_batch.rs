@@ -206,6 +206,20 @@ impl NativeDelta<'_> {
         };
         let outcome = match result {
             Ok(plan) => {
+                if self.frontiers.watch_sequence >= COUNTER_MAX
+                    && self.requires_capacity_notification(
+                        plan.rows
+                            .iter()
+                            .filter(|(key, _)| !self.has_key(key))
+                            .count(),
+                    )?
+                {
+                    return Ok(self.clock_response(
+                        now,
+                        index,
+                        StoreError::FencedTransitionStorageExhausted,
+                    ));
+                }
                 let outcome = operation
                     .success(&plan.checkpoint)
                     .map_err(|_| invalid("scope batch receipt invalid"))?;
@@ -225,8 +239,9 @@ impl NativeDelta<'_> {
                         ))
                     })
                     .collect::<Result<_, ScopeBatchError>>();
-                self.keys
-                    .extend(rows.map_err(|_| invalid("scope batch record invalid"))?);
+                for (key, row) in rows.map_err(|_| invalid("scope batch record invalid"))? {
+                    self.set_key(key, row);
+                }
                 outcome
             }
             Err(error) => operation.failure(error),

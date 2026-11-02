@@ -94,6 +94,68 @@ fn database(conn: &Connection) -> BTreeMap<String, Vec<Vec<String>>> {
     result
 }
 
+// A SQL-to-native conversion adds the required canonical native profile even
+// before any retirement. Every original carrier still compares byte-for-byte.
+fn expected_with_native_profile(
+    actual_conn: &Connection,
+    expected_conn: &Connection,
+) -> BTreeMap<String, Vec<Vec<String>>> {
+    let actual = database(actual_conn);
+    if native_retention::read(expected_conn).unwrap().is_some() {
+        return database(expected_conn);
+    }
+    let mut expected = database(expected_conn);
+    assert!(native_retention::read(actual_conn).unwrap().unwrap() == Default::default());
+    assert!(native_retention::read(expected_conn).unwrap().is_none());
+    assert!(expected
+        .insert(
+            "consensus_native_retention".into(),
+            actual["consensus_native_retention"].clone()
+        )
+        .is_none());
+    let schema_row = actual["sqlite_master"]
+        .iter()
+        .filter(|row| row[1] == "consensus_native_retention")
+        .cloned()
+        .collect::<Vec<_>>();
+    assert_eq!(
+        schema_row.len(),
+        1,
+        "only the canonical native profile table is added"
+    );
+    expected
+        .get_mut("sqlite_master")
+        .unwrap()
+        .extend(schema_row);
+    expected.get_mut("sqlite_master").unwrap().sort();
+    expected
+}
+
+fn assert_sql_database_parity(actual_conn: &Connection, oracle: &Connection) {
+    assert_sql_database_parity_with_source(actual_conn, oracle, oracle);
+}
+
+fn assert_sql_database_parity_with_source(
+    actual_conn: &Connection,
+    oracle: &Connection,
+    command_source: &Connection,
+) {
+    policy_oracle::table_with_source(
+        actual_conn,
+        oracle,
+        "session_replication_log",
+        command_source,
+    );
+    let actual = database(actual_conn);
+    let mut expected = expected_with_native_profile(actual_conn, oracle);
+    // Every journal field and both source-derived policies were checked above.
+    expected.insert(
+        "session_replication_log".into(),
+        actual["session_replication_log"].clone(),
+    );
+    assert_eq!(actual, expected, "every original schema object, column and canonical carrier plus the required native profile");
+}
+
 fn exported(
     wal: &Wal,
     backend: &SqliteSessionBackend,
@@ -101,11 +163,7 @@ fn exported(
 ) -> Connection {
     let applied = wal.with_native_read(|state| Ok(state.applied())).unwrap();
     let conn = wal.native_export_snapshot().unwrap();
-    assert_eq!(
-        database(&conn),
-        database(&backend.conn.blocking_lock()),
-        "every original schema object, column and canonical carrier"
-    );
+    assert_sql_database_parity(&conn, &backend.conn.blocking_lock());
     validate_protected_roster_recovery_state_sync(&conn, signed.identity).unwrap();
     validate_lease_state_sync(&conn).unwrap();
     assert_eq!(

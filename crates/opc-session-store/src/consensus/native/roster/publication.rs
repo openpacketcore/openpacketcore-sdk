@@ -61,6 +61,14 @@ pub(in crate::consensus::native) fn validate_candidate(
         check()?;
         reserved_matches(key, row, &delta.roster)?;
     }
+    for key in delta.key_removals.keys() {
+        check()?;
+        if delta.roster.index.reservation(key).is_some() {
+            return Err(invalid(
+                "native key retirement retains a roster reservation",
+            ));
+        }
+    }
     let Some(root) = delta.base.roster_root.as_deref() else {
         empty_without_root(&delta.base.roster)?;
         empty_without_root(&delta.roster)?;

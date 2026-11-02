@@ -7,6 +7,7 @@ use rusqlite::{params, Connection};
 
 fn entry(sequence: u64, tx_id: &str) -> ReplicationEntry {
     ReplicationEntry {
+        replay_policy: opc_session_store::ReplicationReplayPolicy::prune_expired(),
         sequence,
         tx_id: ReplicationTxId::new(tx_id).expect("valid transaction ID"),
         op: ReplicationOp::Batch { ops: Vec::new() },
