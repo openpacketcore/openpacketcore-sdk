@@ -466,10 +466,10 @@ impl Fleet {
                 // A caller deadline leaves the same drain running. Cleanup
                 // must join that retained condition before releasing handles;
                 // its final error still fails the original orderly assertion.
-                let completion = store.inner.shutdown.start_or_subscribe(
-                    Arc::clone(&store.inner),
-                    true,
-                );
+                let completion = store
+                    .inner
+                    .shutdown
+                    .start_or_subscribe(Arc::clone(&store.inner), true);
                 super::await_consensus_session_store_shutdown(completion).await
             } else {
                 result

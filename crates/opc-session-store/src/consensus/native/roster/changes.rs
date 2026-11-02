@@ -189,7 +189,12 @@ impl std::ops::DerefMut for Edit {
 
 impl Edit {
     pub(super) fn new(ledger: &Ledger, rows: usize, partitions: usize) -> io::Result<Self> {
-        Self::with_reservation(ledger, rows, partitions, VerificationMemory::reserve_journal)
+        Self::with_reservation(
+            ledger,
+            rows,
+            partitions,
+            VerificationMemory::reserve_journal,
+        )
     }
 
     // Full admission is checkpoint work, not a retained live journal. Keep

@@ -428,7 +428,9 @@ fn apply_with_admission(
     // OpenRaft can deliver several bounded append batches in one apply call.
     for chunk in encoded.chunks(LOG_RPC_ENTRIES) {
         ready(retry, || {
-            storage.log.project(&Operation::Append(chunk.to_vec()), &storage.business, None)
+            storage
+                .log
+                .project(&Operation::Append(chunk.to_vec()), &storage.business, None)
         });
     }
     ready(retry, || {
