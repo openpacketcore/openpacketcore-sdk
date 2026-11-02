@@ -47,11 +47,8 @@ Prefix reclamation releases resident log rows and their checkpoint inventory;
 generation-file rollover (SDK #1253) also replaces the old file with a compact
 base. The Durable 32 GiB and Async 8 GiB ceilings bound the current generation,
 not cumulative append history; live compact data must still fit. ADR 0022
-records the implemented trigger and selection contract. A failed local snapshot build is
-retried under a fixed bounded attempt/backoff budget and keeps the engine on the
-unchanged published snapshot (ADR 0022, SDK #1254); only an indeterminate
-publication state or a store with no published snapshot at all stops the
-engine.
+records the implemented trigger and selection contract. A failed local snapshot
+build still stops the engine; changing that behavior is separate work.
 
 ## Decision
 
