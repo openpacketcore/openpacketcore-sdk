@@ -613,7 +613,26 @@ fn retained_read_error(error: rusqlite::Error) -> RetainedConfigError {
 fn retained_persist_error(error: crate::PersistError) -> RetainedConfigError {
     match error.kind() {
         crate::PersistErrorKind::CorruptBlob => RetainedConfigError::Rejected,
-        _ => RetainedConfigError::Unavailable,
+        crate::PersistErrorKind::Unavailable
+        | crate::PersistErrorKind::PreflightFailed(_)
+        | crate::PersistErrorKind::RollbackNotFound
+        | crate::PersistErrorKind::WalRecoveryFailed
+        | crate::PersistErrorKind::AuditChainBroken
+        | crate::PersistErrorKind::InconsistentState(_)
+        | crate::PersistErrorKind::ForeignKeyViolation
+        | crate::PersistErrorKind::ConstraintViolation(_)
+        | crate::PersistErrorKind::RequestIdCollision
+        | crate::PersistErrorKind::ConfigHistoryCompacted
+        | crate::PersistErrorKind::ConfigHistoryFull
+        | crate::PersistErrorKind::ConfigHistoryProtected
+        | crate::PersistErrorKind::OutcomeUnknown
+        | crate::PersistErrorKind::PathNotWritable(_)
+        | crate::PersistErrorKind::DatabaseLocked
+        | crate::PersistErrorKind::OutOfSpace { .. }
+        | crate::PersistErrorKind::Io(_)
+        | crate::PersistErrorKind::SchemaVersionMismatch { .. }
+        | crate::PersistErrorKind::SchemaDigestMismatch { .. }
+        | crate::PersistErrorKind::Sqlite(_) => RetainedConfigError::Unavailable,
     }
 }
 

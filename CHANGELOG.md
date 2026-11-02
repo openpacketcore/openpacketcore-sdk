@@ -9,10 +9,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
-- `opc-persist`: missing mandatory configuration-history and consensus-state
-  rows retain their corruption classification. Checkpoint, retained-database and
-  backend admission readers preserve read outages as unavailable while rejecting
-  invalid stored data and schema.
+- `opc-persist`: missing mandatory configuration-history, machine, membership,
+  and audit rows are rejected before history reads and runtime apply. Typed
+  query errors in checkpoint row reads, retained catalog validation and backend
+  metadata probes preserve read outages as unavailable. Earlier SQLite open and
+  integrity-check result interpretation are unchanged. `create_rollback_point`
+  reports `RollbackNotFound` for an absent target.
 - `opc-key`, `opc-crypto`, `opc-key-vault`, `opc-session-store`,
   `opc-config-bus`, `opc-persist`: only positive key/ciphertext evidence authorizes
   protected-data rejection. The exhaustive `KeyError::is_definitive_rejection`
@@ -811,13 +813,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   unresolved commits use `ConfigApplyFailed` alarms; rollback retains a
   `StorageCorruption` cause only when the original store error supplies positive
   data evidence. Idempotency and retained-history unavailability return
-  `PersistFailed`; startup rollback preserves the original store error. Missing
-  or revoked active keys on new writes return `Unavailable`, without claiming
+  `PersistFailed`; startup rollback preserves an already Critical source code
+  and otherwise retains its Critical recovery fence. Missing or revoked active
+  keys on new writes return `Unavailable`, without claiming
   stored data damage. Coarse state-machine, recovery and startup task failures
   use `ConfigApplyFailed`. Runtime append, reconciliation and recovery-marker
   cleanup retain the source store code. Rejected stored JSON and metadata retain
-  `Crypto`; missing startup rollback parents, append targets, and marker-clear
-  targets retain Critical severity with `ConfigApplyFailed`. A later read outage
+  `Crypto`; all store codes at startup rollback parent reads, appends and
+  marker clears retain Critical severity. Non-corruption codes retain
+  `ConfigApplyFailed`. A later read outage
   does not replace stored-data evidence from an earlier append failure. Alarm
   severity and recovery fencing remain intact.
   Refs #1197.
@@ -827,8 +831,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   retains its existing `Indeterminate` outcome. Config-history reads distinguish
   rejected bytes (including SQLite corruption) from read outages at the storage
   boundary, preserving the first read failure across transaction completion.
-  Missing mandatory authority rows remain corruption; missing live tables are
-  permanent invariant failures rather than retryable outages. Plain commits
+  Missing mandatory authority rows remain corruption; missing live tables in
+  standalone stores are permanent invariant failures rather than retryable
+  outages. Consensus schema rejection remains corruption. Plain commits
   refused by an initialized required-audit policy report a local conflict;
   existing persisted rejection classes retain their meanings.
   Refs #1197.

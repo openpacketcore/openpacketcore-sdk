@@ -405,7 +405,9 @@ impl ConfigStore for SqliteBackend {
                     params![&tx_id_bytes],
                     |row| row.get(0),
                 )
-                .map_err(sqlite_read_error)?;
+                .optional()
+                .map_err(sqlite_read_error)?
+                .ok_or_else(PersistError::rollback_not_found)?;
             let rows = tx
                 .execute(
                     "UPDATE config_history SET rollback_point = 1 WHERE tx_id = ?1",

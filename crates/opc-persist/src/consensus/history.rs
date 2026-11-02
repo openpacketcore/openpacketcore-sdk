@@ -576,6 +576,18 @@ pub(crate) fn validate_access_sync(
 ) -> io::Result<()> {
     if consensus_required || has_consensus_metadata_sync(conn)? {
         super::sqlite::validate_live_history_schema_sync(conn, cancellation)?;
+        for query in [
+            "SELECT EXISTS(SELECT 1 FROM config_raft_machine WHERE singleton = 1)",
+            "SELECT EXISTS(SELECT 1 FROM config_raft_membership WHERE singleton = 1)",
+            "SELECT EXISTS(SELECT 1 FROM config_raft_management_audit WHERE singleton = 1)",
+        ] {
+            let present: bool = conn
+                .query_row(query, [], |row| row.get(0))
+                .map_err(database_error)?;
+            if !present {
+                return Err(corrupt());
+            }
+        }
     }
     let Some(state) = load_state(conn, key)? else {
         return if consensus_required {
