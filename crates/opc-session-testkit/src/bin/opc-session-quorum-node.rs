@@ -1197,6 +1197,7 @@ async fn qualification_activation_attempt(
 fn qualification_store_error_class(error: &StoreError) -> QualificationTrafficErrorClass {
     match error {
         StoreError::BackendUnavailable(_)
+        | StoreError::KeyProviderUnavailable(_)
         | StoreError::FencedTransitionRecoveryJournalUnavailable => {
             QualificationTrafficErrorClass::BackendUnavailable
         }

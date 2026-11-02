@@ -655,6 +655,7 @@ mod tests {
             StoreError::FencedTransitionStorageExhausted,
             StoreError::SessionRecordReserved,
             StoreError::FencedTransitionRecoveryJournalUnavailable,
+            StoreError::KeyProviderUnavailable("envelope encryption failed".into()),
         ] {
             let encoded = opc_consensus::encode_bounded(&appended)
                 .expect("appended StoreError postcard encoding");
