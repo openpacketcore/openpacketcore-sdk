@@ -57,6 +57,10 @@
 //! unsupported-version planning independent of decode-failure evidence.
 //! Transport admission and rate limits remain caller owned.
 //!
+//! [`FqCsid`] provides standalone typed FQ-CSID values beside the raw IE layer.
+//! Its bounded Node-ID/CSID representation and value-free errors do not infer
+//! enclosing procedure presence rules or generate protocol responses.
+//!
 //! GTPv2-C decode failures carry element identity through
 //! [`Gtpv2cDecodeError`]. Identity is attached by the innermost decode frame
 //! that had already read a complete four-octet IE header *for the element the
@@ -114,6 +118,10 @@ pub use dedicated_bearer::{
     S2bUpdateBearerRequestContext, S2bUpdateBearerResponse, S2bUpdateBearerResult,
     MAX_DEDICATED_BEARER_CONTEXTS, MAX_PGW_APN_LOAD_CONTROL_INFORMATION_IES,
     MAX_PGW_OVERLOAD_CONTROL_INFORMATION_IES,
+};
+pub use ie::fq_csid::{
+    FqCsid, FqCsidBuildError, FqCsidDecodeError, FqCsidMccMncNodeId, FqCsidNodeId, IE_TYPE_FQ_CSID,
+    MAX_FQ_CSID_COUNT,
 };
 
 pub use error_response::{
