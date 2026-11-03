@@ -715,9 +715,11 @@ def run_libraries(plan: dict, shard: int, output: Path) -> None:
     output.write_text(json.dumps({
         "head": subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=ROOT, text=True).strip(),
         "tests": rows, "logical_library_phase": phase, "plans": planned,
+        "library_partition_count": len(library_partition.SHARDS),
         "child_parents": child_parents, "named_test_owners": named_owners,
     }, indent=2) + "\n")
-    print(f"Exact library partition verified: {len(rows)} test identities; mapping: {output}", flush=True)
+    print(f"Exact library partition {shard}/{len(library_partition.SHARDS)} verified: "
+          f"{len(rows)} test identities; mapping: {output}", flush=True)
     for index, command in enumerate(planned[shard]):
         print(f"library shard {shard}: invocation {index + 1}/{len(planned[shard])}", flush=True)
         result = subprocess.run(command, cwd=ROOT)

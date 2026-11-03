@@ -3971,13 +3971,16 @@ mod tests {
             Ok(IngressRedirectInboundOutcome::Delivered(_))
         ));
         drop(operation);
-        tokio::time::timeout(Duration::from_millis(100), async {
-            while first.metrics().delivery_receipts == 0 {
-                tokio::time::sleep(Duration::from_millis(1)).await;
-            }
-        })
+        // Endpoint completion, rather than an observer lifetime or a short
+        // scheduling window, owns the operation. Keep a finite hang guard and
+        // require the authenticated result after that completion signal.
+        tokio::time::timeout(
+            Duration::from_secs(30),
+            first.inner.lifecycle.wait_for_operations(),
+        )
         .await
-        .unwrap_or_else(|_| panic!("endpoint-owned completion exceeded 100 ms observation bound"));
+        .unwrap_or_else(|_| panic!("endpoint-owned completion did not signal within 30 seconds"));
+        assert_eq!(first.metrics().delivery_receipts, 1);
         assert_eq!(first.metrics().send_attempts, 2);
         assert_eq!(second.metrics().cached_receipts_replayed, 1);
         within_profile_channel_completion_bound(profile, first.shutdown())

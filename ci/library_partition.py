@@ -15,13 +15,19 @@ import subprocess
 import cargo_test_selection
 
 
-SHARDS = (0, 1, 2)
+SHARDS = tuple(range(6))
 
 
 def owner(name: str) -> int:
     # Exclusions are passed to every harness, so repeated names across
     # libraries must share an owner. Identities remain distinct in the audit.
-    return int.from_bytes(hashlib.sha256(name.encode()).digest()[:8], "big") % len(SHARDS)
+    # Split each of the original three workloads independently. A second hash
+    # word avoids keeping every expensive test from an old partition together.
+    # This halves execution work without changing the Cargo/profile selection;
+    # compilation and inventory remain a fixed cost on each hosted runner.
+    digest = hashlib.sha256(name.encode()).digest()
+    original = int.from_bytes(digest[:8], "big") % 3
+    return original + 3 * (int.from_bytes(digest[8:16], "big") % 2)
 
 
 def listing(output: str) -> list[str]:
