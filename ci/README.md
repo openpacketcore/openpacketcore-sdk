@@ -8,14 +8,25 @@ to reproduce the shards with the profile and disk setup in
 
 The hosted `misc` runner uses `plan --shard misc --split-libraries` for binary
 unit tests, example compilation, doctests and the heavy-target remainder. Its
-library phase runs on three required `Rust library tests` runners, with the same
+library phase runs on six required `Rust library tests` runners, with the same
 workspace package selection, features, ordinary profile and four test threads.
 Each runner compiles/lists every library and verifies that its compiled targets
 match Cargo metadata. Exact-name exclusions partition the live inventory using
-the first eight SHA-256 bytes modulo three. Duplicate names in different libraries
+the first eight SHA-256 bytes modulo three to choose the original group, then the
+next eight bytes modulo two to choose its half (that group, or the group plus
+three). Duplicate names in different libraries
 share an owner; new tests are assigned automatically. The uploaded mapping
 records the revision, identities, ignored status and exact commands. The logical
 `plan --shard misc` remains available to reproduce the complete unsplit phase.
+
+Local kernel lifecycle qualification creates interfaces and routes in supervised
+private network namespaces. Cleanup verification attributes surviving namespaces
+through the recorded process identities and namespace descriptors. Host interface
+changes remain in the evidence, but do not establish job ownership. A command
+creating an interface in the initial namespace declares its exact name with
+`check-local-kernel-lifecycle-cleanup.py run --owned-interface NAME EVIDENCE -- COMMAND`;
+verification refuses a declared interface that remains, even after its creator
+exits. Existing host interfaces cannot be claimed by that declaration.
 
 Five integration runners pack target runtime estimates after reserving their
 fixed library work. The `recovery_profile` target has an exact named group on

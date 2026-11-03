@@ -293,6 +293,11 @@ class CleanupTests(unittest.TestCase):
             # must still refuse that same owned resource on another verification.
             self.assertEqual(self.verify_fixture(directory, after)[0], 1)
             self.assertEqual(self.verify_fixture(directory, self.before)[0], 0)
+            for names in [["eth0"], ["../bad"], ["same", "same"], "owned-veth", [None]]:
+                with self.subTest(names=names):
+                    record["owned_interfaces"] = names
+                    path.write_text(json.dumps(record))
+                    self.assertEqual(self.verify_fixture(directory, self.before)[0], 1)
 
     def verify_fixture(self, directory, after, processes=None, errors=None):
         with patch.object(CLEANUP, "snapshot", return_value=after), \

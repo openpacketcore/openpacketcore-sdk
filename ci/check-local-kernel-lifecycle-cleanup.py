@@ -1,10 +1,14 @@
 #!/usr/bin/env python3
-"""Attribute native lifecycle namespace residue and require host-state cleanup.
+"""Attribute native lifecycle residue to the qualification that owns it.
 
 Run namespace-creating commands through the run mode. Its child subreaper keeps
 orphaned descendants attributable until cleanup, including children of sudo.
-Unrelated processes may create or release namespaces on a shared host. Pins,
-mounts, named namespaces and interfaces must still match the original baseline.
+Unrelated processes may change a shared host's interfaces and namespaces.
+Qualification interfaces and routes live in the supervised private namespaces;
+retaining either retains an owned namespace and fails verification. A command
+creating an interface in the initial namespace must declare --owned-interface
+before execution. Those names are checked against the final inventory, not
+inferred from changes to a host snapshot. Pins and mounts remain baseline checks.
 """
 
 import argparse
@@ -197,6 +201,15 @@ def write_json(path: Path, value: dict) -> None:
         temporary.unlink(missing_ok=True)
 
 
+def interface_names(names) -> list[str]:
+    if not isinstance(names, list) or any(
+        not isinstance(name, str) or re.fullmatch(r"[A-Za-z0-9_.-]{1,15}", name) is None
+        for name in names
+    ) or len(set(names)) != len(names):
+        raise ValueError("invalid owned interface names")
+    return names
+
+
 def ownership(evidence: Path) -> tuple[dict, dict]:
     context = json.loads((evidence / "ownership.json").read_text())
     baseline = hashlib.sha256((evidence / "before.json").read_bytes()).hexdigest()
@@ -212,6 +225,7 @@ def ownership(evidence: Path) -> tuple[dict, dict]:
                 or not isinstance(record.get("command"), list) or not record["command"]:
             raise ValueError(f"invalid namespace ownership record: {path.name}")
         identity(record["root"])
+        interface_names(record.get("owned_interfaces", []))
         if record["status"] == "complete":
             if type(record.get("exit_code")) is not int or type(record.get("cleanup_passed")) is not bool \
                     or not isinstance(record.get("survivors"), list):
@@ -225,13 +239,30 @@ def ownership(evidence: Path) -> tuple[dict, dict]:
 def verify(evidence: Path, run_id=None, command_exit_code=None) -> int:
     suffix = "" if run_id is None else "-" + run_id
     result_path = evidence / ("result.json" if run_id is None else "attribution" + suffix + ".json")
-    result = {"passed": False, "differences": {}, "namespace_owners": {}, "errors": []}
+    result = {"passed": False, "differences": {}, "namespace_owners": {},
+              "interface_owners": {}, "errors": []}
     current_record = None
     try:
         current = snapshot()
         write_json(evidence / ("after" + suffix + ".json"), current)
-        result["differences"] = differences(json.loads((evidence / "before.json").read_text()), current)
+        before = json.loads((evidence / "before.json").read_text())
+        result["differences"] = differences(before, current)
         _context, records = ownership(evidence)
+        # Keep host churn as evidence, but never turn snapshot subtraction into
+        # ownership. The ledger covers declared initial-namespace interfaces;
+        # namespace attribution below covers every interface and route within
+        # the qualification's isolated network namespaces, including fd holders.
+        result["host_interface_changes"] = result["differences"].pop("interfaces", {})
+        for name, record in records.items():
+            for interface in record.get("owned_interfaces", []):
+                if interface in before["interfaces"]:
+                    raise ValueError("owned interface already existed in the cleanup baseline")
+                if interface in current["interfaces"]:
+                    result["interface_owners"].setdefault(interface, []).append(name)
+        if result["interface_owners"]:
+            result["differences"]["interfaces"] = {
+                "added": sorted(result["interface_owners"]), "removed": [],
+            }
         current_name = None if run_id is None else "run-" + run_id + ".json"
         if current_name is not None:
             current_record = records[current_name]
@@ -472,8 +503,12 @@ def reap_finished_children(excluded: set[int]) -> None:
             pass
 
 
-def run_owned_command(evidence: Path, command: list[str]) -> int:
+def run_owned_command(evidence: Path, command: list[str], owned_interfaces=None) -> int:
     context, _records = ownership(evidence)
+    owned_interfaces = interface_names([] if owned_interfaces is None else owned_interfaces)
+    before = json.loads((evidence / "before.json").read_text())
+    if any(name in before["interfaces"] for name in owned_interfaces):
+        raise ValueError("owned interface already existed in the cleanup baseline")
     # An orphan stays in our process tree until verification. PID start times
     # prevent later PID reuse from inheriting this ownership after we exit.
     libc = ctypes.CDLL(None, use_errno=True)
@@ -482,7 +517,8 @@ def run_owned_command(evidence: Path, command: list[str]) -> int:
     run_id = uuid.uuid4().hex
     root = read_stat(Path("/proc/self/stat"))
     record = {"version": 1, "owner_id": context["id"], "status": "running",
-              "root": {"pid": root["pid"], "start_time": root["start_time"]}, "command": command}
+              "root": {"pid": root["pid"], "start_time": root["start_time"]}, "command": command,
+              "owned_interfaces": owned_interfaces}
     with (evidence / ("run-" + run_id + ".json")).open("x") as output:
         json.dump(record, output, indent=2)
         output.write("\n")
@@ -548,6 +584,8 @@ def main() -> int:
             mode.add_argument("--command-exit-code", type=int)
             mode.add_argument("--dispose-descendants", action="store_true")
         if name == "run":
+            mode.add_argument("--owned-interface", action="append", default=[],
+                              help="interface this command owns in the initial network namespace")
             mode.add_argument("command", nargs=argparse.REMAINDER)
     args = parser.parse_args()
     args.evidence_dir.mkdir(parents=True, exist_ok=True)
@@ -557,7 +595,7 @@ def main() -> int:
             command = args.command[1:] if args.command[:1] == ["--"] else args.command
             if not command:
                 parser.error("run requires a namespace-creating command")
-            return run_owned_command(args.evidence_dir, command)
+            return run_owned_command(args.evidence_dir, command, args.owned_interface)
         if os.geteuid() != 0:
             raise ValueError("snapshot and verify require root to attribute every process namespace")
         if args.mode == "snapshot":
