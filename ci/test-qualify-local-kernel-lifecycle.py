@@ -388,6 +388,8 @@ class CleanupTests(unittest.TestCase):
              event(16, 7, "owned-veth"), "owned-veth", 7, False),
             ("rename-control", ["owned-veth"], set(), event(16, 7, "owned-veth") +
              event(16, 7, "renamed-veth"), "renamed-veth", 7, False),
+            ("name-and-index-control", ["owned-veth"], set(), event(16, 7, "owned-veth"),
+             "owned-veth", 7, True),
         ]
         for label, names, initial, events, live_name, index, own_run in cases:
             with self.subTest(lifetime=label), tempfile.TemporaryDirectory() as directory:

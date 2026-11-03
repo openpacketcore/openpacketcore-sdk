@@ -52,12 +52,13 @@ Commands creating an interface in the initial namespace declare
 `run --owned-interface NAME` before the evidence-directory argument; link events
 record its kernel index and namespace before execution can outrun a name lookup.
 Verification refuses that identity even after a rename. Unrelated interfaces
-added by the host are accepted. Unrelated services may create or release namespaces; their attributed
-namespaces are informational. A namespace with no provable owner fails unless a
-second inventory confirms it has already disappeared. Failed cleanup remains a
-failure in the final verification even if its processes later exit. A missing or
-changed baseline, incomplete process ancestry, unreadable surviving process or
-failed inventory command also fails. The check does not enumerate or reopen BPF
+added by the host are accepted. Unrelated services may create or release
+namespaces; their attributed namespaces are informational. A namespace with no
+provable owner fails unless a second inventory confirms it has already
+disappeared. Failed cleanup remains a failure in the final verification even if
+its processes later exit. A missing or changed baseline, incomplete process
+ancestry, unreadable surviving process or failed inventory command also fails.
+The check does not enumerate or reopen BPF
 program/map IDs. Snapshots and ownership results are uploaded even after
 qualification or preflight failure.
 

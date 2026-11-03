@@ -324,10 +324,13 @@ os.execv({real_ip!r}, [{real_ip!r}, *sys.argv[1:]])
         assert not attribution["errors"], attribution
         if residue:
             assert list(attribution["interface_owners"]) == [live_name]
+            assert attribution["interface_owners"][live_name] == [next(cleanup.glob("run-*.json")).name]
             routes = subprocess.check_output([real_ip, "route", "show", "dev", live_name], text=True)
             assert "198.18.0.0/24" in routes
         if case in {"declared-index-reuse", "initial-index-reuse"}:
             assert any(not row["deleted"] and row["declared_name"] == live_name for row in record["owned_links"])
+        if case == "late-create":
+            assert not record["owned_links"], "the child must create after event capture stops"
         if case == "late-delete":
             assert record["owned_links"][0]["deleted"]
             index = record["owned_links"][0]["ifindex"]
