@@ -27,6 +27,20 @@ SPEC.loader.exec_module(SHARDS)
 
 
 class LibraryPartitionTests(unittest.TestCase):
+    def test_each_original_partition_has_two_independent_halves(self):
+        import hashlib
+
+        self.assertEqual(PARTITION.SHARDS, tuple(range(6)))
+        halves = {index: set() for index in range(3)}
+        for number in range(3000):
+            name = f"module::future_test_{number}"
+            digest = hashlib.sha256(name.encode()).digest()
+            original = int.from_bytes(digest[:8], "big") % 3
+            expected = original + 3 * (int.from_bytes(digest[8:16], "big") % 2)
+            self.assertEqual(PARTITION.owner(name), expected)
+            halves[original].add(expected)
+        self.assertEqual(halves, {index: {index, index + 3} for index in range(3)})
+
     def setUp(self):
         self.assertIsNotNone(PARTITION, "ordinary library work needs a separate exact-name partition")
         self.base = ["cargo", "test", "--locked", "--workspace", "--all-features", "--quiet"]
