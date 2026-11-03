@@ -168,6 +168,14 @@ def main():
         return
     if args.evidence_dir is None:
         parser.error("--evidence-dir is required")
+    # These cases audit our fixtures, not the shared runner's network setup.
+    # A new unrelated host interface must not invalidate their baseline. Sysfs
+    # retains its mounting network namespace, so unsharing net alone is not
+    # sufficient: mount a private read-only view for the isolated namespace.
+    syscall("unshare", 0x40000000 | 0x00020000)  # CLONE_NEWNET | CLONE_NEWNS
+    subprocess.run(["mount", "--make-rprivate", "/"], check=True)
+    subprocess.run(["mount", "-t", "sysfs", "-o", "ro,nosuid,nodev,noexec", "sysfs", "/sys"],
+                   check=True)
     args.evidence_dir.mkdir(parents=True, exist_ok=False)
     syscall("prctl", 36, 1, 0, 0, 0)  # Adopt only this test's exited fixture orphans.
     for orphan in [False, True]:
