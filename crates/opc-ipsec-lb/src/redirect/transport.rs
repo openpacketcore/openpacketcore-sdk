@@ -2665,8 +2665,7 @@ mod tests {
     }
 
     // Live channel round trips need executor scheduling; paused auto-advance
-    // can outrun the channel. Bound previously unbounded round-trip waits;
-    // the existing 100 ms metric-observation bounds remain separate below.
+    // can outrun the channel. Bound previously unbounded round-trip waits.
     fn profile_channel_completion_bound(profile: super::super::IngressRedirectProfile) -> Duration {
         profile
             .receipt_retry_horizon()
@@ -3351,7 +3350,7 @@ mod tests {
                 inner,
                 dropped: AtomicBool::new(false),
                 first_receipt: Mutex::new(None),
-                replay_was_exact: AtomicBool::new(false),
+                replay_was_exact: AtomicBool::new(true),
                 first_data: Mutex::new(None),
                 first_receipt_stall: stall,
                 data_attempts: AtomicU64::new(0),
@@ -3386,13 +3385,15 @@ mod tests {
                 return Ok(());
             }
             if is_receipt {
-                let exact = self
-                    .first_receipt
-                    .lock()
-                    .ok()
-                    .and_then(|receipt| receipt.as_ref().map(|first| first == datagram))
-                    .unwrap_or(false);
-                self.replay_was_exact.store(exact, Ordering::Relaxed);
+                match self.first_receipt.lock() {
+                    Ok(receipt) => {
+                        if let Some(first) = receipt.as_ref() {
+                            self.replay_was_exact
+                                .fetch_and(first == datagram, Ordering::Relaxed);
+                        }
+                    }
+                    Err(_) => self.replay_was_exact.store(false, Ordering::Relaxed),
+                }
             }
             self.inner.send(datagram).await
         }
@@ -4558,7 +4559,7 @@ mod tests {
 
     #[tokio::test]
     async fn full_or_closed_delivery_queue_returns_and_caches_typed_queue_rejection() {
-        let profile = test_profile()
+        let profile = retry_fixture_profile()
             .with_queue_limits(1, 4_096)
             .unwrap_or_else(|error| panic!("valid bounded queue: {error}"));
         let (first_session, second_session) = test_sessions(profile);
@@ -5067,7 +5068,7 @@ mod tests {
 
     #[tokio::test]
     async fn terminal_send_error_after_ambiguous_attempt_is_outcome_unknown() {
-        let profile = test_profile();
+        let profile = retry_fixture_profile();
         let (first_session, second_session) = test_sessions(profile);
         let (record, namespace, clock) = ownership_record("owner-b").await;
         let generation = record.generation();
