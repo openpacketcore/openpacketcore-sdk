@@ -8,6 +8,7 @@ import json
 import os
 from pathlib import Path
 import signal
+import shutil
 import socket
 import subprocess
 import sys
@@ -213,6 +214,134 @@ def run_interface_case(evidence, owned, renamed=False, replacement=False):
     print(f"PASS {evidence.name}", flush=True)
 
 
+LIFETIME_CASES = ["bridge-delete", "bridge-nomaster", "recreate", "late-create",
+                  "declared-index-reuse", "initial-index-reuse", "clean-bridge", "late-delete"]
+
+
+def link_command(case, directory):
+    config = json.loads((directory / "config.json").read_text())
+
+    def ip(*args):
+        subprocess.run([config["ip"], *args], check=True)
+
+    def add(name, index=None):
+        ip("link", "add", name, *(["index", str(index)] if index else []), "type", "dummy")
+        ip("link", "set", name, "up")
+        ip("route", "add", "198.18.0.0/24", "dev", name)
+
+    if case == "initial-index-reuse":
+        ip("link", "del", "foreign0")
+        add("owned-veth", config["initial_index"])
+        return
+    if case != "late-create":
+        add("owned-a" if case == "declared-index-reuse" else "owned-veth")
+    if case in {"late-create", "late-delete"}:
+        # The test's ip wrapper gates the verifier's first link inventory. The
+        # child acts only after monitoring has stopped, then is reaped before
+        # that inventory proceeds. No scheduling delay chooses the outcome.
+        (directory / "armed").touch()
+        if os.fork():
+            os._exit(0)
+        deadline = time.monotonic() + 10
+        while not (directory / "query").exists():
+            if time.monotonic() >= deadline:
+                raise TimeoutError("verifier did not reach the late-link barrier")
+            time.sleep(0.001)
+        if case == "late-create":
+            add("owned-veth")
+        else:
+            ip("link", "del", "owned-veth")
+        process = CLEANUP.read_stat(Path("/proc/self/stat"))
+        CLEANUP.write_json(directory / "done", {"pid": process["pid"], "start": process["start_time"]})
+        os._exit(0)
+    if case == "declared-index-reuse":
+        index = socket.if_nametoindex("owned-a")
+        ip("link", "del", "owned-a")
+        add("owned-b", index)
+    elif case == "recreate":
+        ip("link", "del", "owned-veth")
+        add("owned-veth")
+    else:
+        ip("link", "add", "tmpbr0", "type", "bridge")
+        ip("link", "set", "owned-veth", "master", "tmpbr0")
+        if case == "bridge-nomaster":
+            ip("link", "set", "owned-veth", "nomaster")
+        ip("link", "del", "tmpbr0")
+        if case == "clean-bridge":
+            ip("link", "del", "owned-veth")
+
+
+def run_lifetime_case(evidence, case):
+    evidence.mkdir()
+    cleanup = evidence / "cleanup"
+    command = [sys.executable, str(CHECKER)]
+    real_ip = shutil.which("ip")
+    config = {"ip": real_ip}
+    residue = case not in {"clean-bridge", "late-delete"}
+    live_name = "owned-b" if case == "declared-index-reuse" else "owned-veth"
+    names = ["owned-a", "owned-b"] if case == "declared-index-reuse" else ["owned-veth"]
+    try:
+        if case == "initial-index-reuse":
+            subprocess.run([real_ip, "link", "add", "foreign0", "type", "dummy"], check=True)
+            config["initial_index"] = socket.if_nametoindex("foreign0")
+        (evidence / "config.json").write_text(json.dumps(config))
+        check(command + ["snapshot", str(cleanup)], evidence / "snapshot.log")
+        prefix = []
+        if case in {"late-create", "late-delete"}:
+            binaries = evidence / "bin"
+            binaries.mkdir()
+            wrapper = binaries / "ip"
+            wrapper.write_text(f'''#!{sys.executable}
+import json, os, sys, time
+from pathlib import Path
+directory = Path({str(evidence)!r})
+if sys.argv[1:] == ["-j", "link", "show"] and (directory / "armed").exists():
+    (directory / "query").touch()
+    deadline = time.monotonic() + 10
+    while True:
+        if (directory / "done").exists():
+            child = json.loads((directory / "done").read_text())
+            try:
+                text = Path("/proc/" + str(child["pid"]) + "/stat").read_text()
+                if int(text[text.rindex(")") + 2:].split()[19]) != child["start"]:
+                    break
+            except FileNotFoundError:
+                break
+        if time.monotonic() >= deadline:
+            raise TimeoutError("late-link child was not reaped before inventory")
+        time.sleep(0.001)
+os.execv({real_ip!r}, [{real_ip!r}, *sys.argv[1:]])
+''')
+            wrapper.chmod(0o755)
+            prefix = ["env", "PATH=" + str(binaries) + os.pathsep + os.environ["PATH"]]
+        run = [*prefix, *command, "run"]
+        for name in names:
+            run += ["--owned-interface", name]
+        check(run + [str(cleanup), "--", sys.executable, str(SCRIPT), "--link-command", case,
+                     "--case-directory", str(evidence)], evidence / "run.log", 1 if residue else 0)
+        record = json.loads(next(cleanup.glob("run-*.json")).read_text())
+        attribution = json.loads(next(cleanup.glob("attribution-*.json")).read_text())
+        assert not attribution["errors"], attribution
+        if residue:
+            assert list(attribution["interface_owners"]) == [live_name]
+            routes = subprocess.check_output([real_ip, "route", "show", "dev", live_name], text=True)
+            assert "198.18.0.0/24" in routes
+        if case in {"declared-index-reuse", "initial-index-reuse"}:
+            assert any(not row["deleted"] and row["declared_name"] == live_name for row in record["owned_links"])
+        if case == "late-delete":
+            assert record["owned_links"][0]["deleted"]
+            index = record["owned_links"][0]["ifindex"]
+            subprocess.run([real_ip, "link", "add", "foreign0", "index", str(index), "type", "dummy"], check=True)
+        check(command + ["verify", str(cleanup)], evidence / "post-run-verify.log", 1 if residue else 0)
+        (evidence / "verdict.json").write_text(json.dumps({"case": case, "residue_refused": residue,
+            "owned_links": record["owned_links"], "attribution": attribution}, indent=2) + "\n")
+    finally:
+        for link in CLEANUP.link_inventory()["links"]:
+            if link["ifname"] in {"owned-veth", "owned-a", "owned-b", "foreign0", "tmpbr0"}:
+                subprocess.run([real_ip, "link", "del", link["ifname"]], check=True)
+    print(f"PASS {evidence.name}", flush=True)
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--evidence-dir", type=Path)
@@ -220,11 +349,17 @@ def main():
     parser.add_argument("--orphan", action="store_true")
     parser.add_argument("--descriptors", action="store_true")
     parser.add_argument("--interface-case", choices=["renamed", "replacement"])
+    parser.add_argument("--lifetime-case", choices=LIFETIME_CASES)
+    parser.add_argument("--link-command", choices=LIFETIME_CASES)
+    parser.add_argument("--case-directory", type=Path)
     args = parser.parse_args()
     if os.geteuid() != 0:
         parser.error("root is required; unsupported namespace operations must fail")
     if args.fixture:
         fixture(args.fixture, args.orphan, args.descriptors)
+        return
+    if args.link_command:
+        link_command(args.link_command, args.case_directory)
         return
     if args.evidence_dir is None:
         parser.error("--evidence-dir is required")
@@ -238,6 +373,9 @@ def main():
                    check=True)
     args.evidence_dir.mkdir(parents=True, exist_ok=False)
     syscall("prctl", 36, 1, 0, 0, 0)  # Adopt only this test's exited fixture orphans.
+    if args.lifetime_case:
+        run_lifetime_case(args.evidence_dir / args.lifetime_case, args.lifetime_case)
+        return
     if args.interface_case:
         run_interface_case(args.evidence_dir / (args.interface_case + "-interface"), True,
                            renamed=args.interface_case == "renamed", replacement=args.interface_case == "replacement")
@@ -251,6 +389,8 @@ def main():
         run_interface_case(args.evidence_dir / ("owned-interface" if owned else "unrelated-interface"), owned)
     run_interface_case(args.evidence_dir / "renamed-interface", True, renamed=True)
     run_interface_case(args.evidence_dir / "replacement-interface", True, replacement=True)
+    for case in LIFETIME_CASES:
+        run_lifetime_case(args.evidence_dir / case, case)
 
 
 if __name__ == "__main__":
