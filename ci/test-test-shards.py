@@ -830,6 +830,7 @@ class QuiescentShardPlanTests(unittest.TestCase):
             name for name in TEST_SHARDS.QUIESCENT_LIB_TESTS
             if name not in TEST_SHARDS.OPTIMIZED_QUIESCENT_LIB_TESTS
             and name not in TEST_SHARDS.QUIESCENT_VOID_LIB_TESTS
+            and name not in TEST_SHARDS.QUIESCENT_VERIFICATION_LIB_TESTS
         ]
         targets = [plan["heavy"]["target"], *(f"fixture_{i}" for i in range(9))]
         for name in names:
@@ -844,6 +845,30 @@ class QuiescentShardPlanTests(unittest.TestCase):
                 self.assertEqual(command[0], "cargo")
                 self.assertIn("--exact", command)
                 self.assertIn("--test-threads=1", command)
+
+        budget_names = (
+            "consensus::native::generation::tests::rollover_capacity_tests::"
+            "native_checkpoint_delta_payload_can_exceed_the_verification_allowance",
+            "consensus::native::epoch_floor_tests::"
+            "native_epoch_floor_matches_fake_through_two_real_threshold_rotations",
+        )
+        for name in budget_names:
+            with self.subTest(verification_budget=name):
+                selected = [(shard, command) for shard in TEST_SHARDS.shard_ids(plan)
+                            for command in TEST_SHARDS.commands(plan, shard, targets)
+                            if "--lib" in command and LibraryGroupPlanTests.selected(command, name)]
+                self.assertEqual([owner for owner, _ in selected], ["heavy-0"])
+                self.assertEqual(selected[0][1], TEST_SHARDS.SELECTION + [
+                    "--lib", "--", "--test-threads=1", "--exact", name,
+                ])
+                ordinary = TEST_SHARDS.commands(plan, "misc", targets)[len(TEST_SHARDS.SERIAL_LIB_TESTS)]
+                self.assertEqual(ordinary.count(name), 1)
+                self.assertEqual(ordinary[ordinary.index(name) - 1], "--skip")
+                future = name + "_future"
+                future_owners = [shard for shard in TEST_SHARDS.shard_ids(plan)
+                                 for command in TEST_SHARDS.commands(plan, shard, targets)
+                                 if "--lib" in command and LibraryGroupPlanTests.selected(command, future)]
+                self.assertEqual(future_owners, ["misc"])
 
     def test_scope_scan_tls_contracts_run_once_on_the_serial_shard(self) -> None:
         plan = TEST_SHARDS.load_plan()

@@ -55,6 +55,13 @@ duplicate execution. Live inventories reject missing, ignored or ambiguous names
 The tests retain their four Tokio workers, all assertions and ten-second bounds.
 Successful runs print elapsed time and decode/audit counts for hosted validation.
 
+The checkpoint-delta payload and epoch-floor parity proofs each run in a fresh
+serial process on `heavy-0`, with the original workspace features and ordinary
+test profile. Each uses a large share of the process verification allowance, so
+parallel fixture occupancy would measure admission contention instead of the
+proof. Their payload sizes, assertions and process cap remain unchanged. Exact
+exclusions and live inventory checks keep one owner per test.
+
 The full-bound native log, receipt-history and retention proofs listed in
 [`native_log_bound.py`](native_log_bound.py) each have a dedicated parallel runner:
 
