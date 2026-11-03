@@ -3324,16 +3324,25 @@ mod tests {
         first_receipt: Mutex<Option<Vec<u8>>>,
         replay_was_exact: AtomicBool,
         first_data: Mutex<Option<Vec<u8>>>,
+        first_receipt_stall: Duration,
     }
 
     impl DropFirstReceiptDatagram {
         fn new(inner: Arc<InMemoryIngressRedirectDatagram>) -> Self {
+            Self::with_receipt_stall(inner, Duration::ZERO)
+        }
+
+        fn with_receipt_stall(
+            inner: Arc<InMemoryIngressRedirectDatagram>,
+            stall: Duration,
+        ) -> Self {
             Self {
                 inner,
                 dropped: AtomicBool::new(false),
                 first_receipt: Mutex::new(None),
                 replay_was_exact: AtomicBool::new(false),
                 first_data: Mutex::new(None),
+                first_receipt_stall: stall,
             }
         }
     }
@@ -3355,6 +3364,11 @@ mod tests {
             if is_receipt && !self.dropped.swap(true, Ordering::Relaxed) {
                 if let Ok(mut receipt) = self.first_receipt.lock() {
                     *receipt = Some(datagram.to_vec());
+                }
+                // A real scheduler stall must spend the standard-clock
+                // operation budget, rather than merely advancing Tokio time.
+                if !self.first_receipt_stall.is_zero() {
+                    std::thread::sleep(self.first_receipt_stall);
                 }
                 return Ok(());
             }
@@ -3840,7 +3854,10 @@ mod tests {
         )
         .unwrap_or_else(|error| panic!("in-memory pair: {error}"));
         let first_datagram = Arc::new(first_datagram);
-        let second_wrapper = Arc::new(DropFirstReceiptDatagram::new(Arc::new(second_datagram)));
+        let second_wrapper = Arc::new(DropFirstReceiptDatagram::with_receipt_stall(
+            Arc::new(second_datagram),
+            Duration::from_millis(60),
+        ));
         let reporter = Arc::new(RecordingReporter::default());
         let (first, _first_rx) = IngressRedirectEndpoint::start(
             Arc::clone(&first_session),
@@ -3948,7 +3965,10 @@ mod tests {
             profile.queue_packets(),
         )
         .unwrap_or_else(|error| panic!("in-memory pair: {error}"));
-        let second_datagram = Arc::new(DropFirstReceiptDatagram::new(Arc::new(second_datagram)));
+        let second_datagram = Arc::new(DropFirstReceiptDatagram::with_receipt_stall(
+            Arc::new(second_datagram),
+            Duration::from_millis(60),
+        ));
         let reporter = Arc::new(RecordingReporter::default());
         let (first, _first_rx) = IngressRedirectEndpoint::start(
             first_session,
