@@ -282,8 +282,13 @@ use a new evidence directory on a repeat run, while reusing the build cache.
 Wrap any namespace-creating preflight in the same cleanup `run` mode after the
 snapshot. Its process ownership evidence rejects leaked qualification namespaces
 and unfinished descendants while allowing unrelated host services to come and
-go. Host-visible pins, mounts, named namespaces and interfaces must still match
-the baseline. Missing ownership or incomplete inventories fail cleanup.
+go. Host-visible pins, mounts and named namespaces must still match the baseline.
+Host interface changes are diagnostic evidence. Any preflight creating an
+interface in the initial namespace must declare `--owned-interface NAME` before
+the evidence-directory argument to `run`. The checker records that link's kernel
+index and namespace before judging residue, so renaming it does not hide it.
+Unrelated host interface arrivals do not fail cleanup. Missing ownership or
+incomplete inventories fail cleanup.
 After recording attribution, the owner terminates and reaps its remaining
 descendants, including privileged children. Disposal uses verified process
 identities and pidfds, with a two-second SIGTERM grace followed by up to three

@@ -12,6 +12,7 @@ from pathlib import Path
 import re
 import shlex
 import signal
+import struct
 import subprocess
 import tempfile
 import textwrap
@@ -285,6 +286,7 @@ class CleanupTests(unittest.TestCase):
             record["interface_namespace"] = "500"
             record["owned_links"] = [{"namespace": "500", "ifindex": 7,
                                       "declared_name": "owned-veth", "deleted": False}]
+            record["link_capture_complete"] = True
             path.write_text(json.dumps(record))
             after = copy.deepcopy(self.before)
             after["interfaces"].extend(["owned-veth", "unrelated-veth"])
@@ -310,6 +312,15 @@ class CleanupTests(unittest.TestCase):
                     "ifindex": index, "ifname": "owned-veth"}],
                 })
                 self.assertEqual(code, 0)
+            code, result = self.verify_fixture(directory, after, links={"namespace": "501", "links": []})
+            self.assertEqual(code, 1)
+            self.assertIn("declared interface belongs to another network namespace", result["errors"])
+            record.update(owned_links=[], link_capture_complete=False)
+            path.write_text(json.dumps(record))
+            code, result = self.verify_fixture(directory, renamed)
+            self.assertEqual(code, 1)
+            self.assertIn("declared link capture is incomplete", result["errors"])
+            record["link_capture_complete"] = True
             # Isolate the baseline-claim refusal: the claimed interface has
             # departed, so the ordinary leftover path cannot reject it.
             record["owned_interfaces"] = ["eth0"]
@@ -329,6 +340,38 @@ class CleanupTests(unittest.TestCase):
                     record["owned_interfaces"] = names
                     path.write_text(json.dumps(record))
                     self.assertEqual(self.verify_fixture(directory, self.before)[0], 1)
+
+        # Kernel notifications are queued before exec: even an add/rename/delete
+        # sequence completed before the next controller poll retains its identity.
+        def event(kind, index, name):
+            value = name.encode() + b"\0"
+            attr = struct.pack("=HH", len(value) + 4, 3) + value
+            attr += b"\0" * (-len(attr) % 4)
+            body = struct.pack("=BBHiII", 0, 0, 0, index, 0, 0) + attr
+            return struct.pack("=IHHII", len(body) + 16, kind, 0, 0, 0) + body
+
+        monitor = CLEANUP.DeclaredLinks(["owned-veth"])
+        monitor.observe(event(16, 7, "owned-veth") + event(16, 7, "renamed-veth"))
+        self.assertEqual(monitor.links, [{"namespace": monitor.namespace, "ifindex": 7,
+                         "declared_name": "owned-veth", "deleted": False}])
+        monitor.observe(event(17, 7, "renamed-veth") + event(16, 9, "owned-veth") + event(16, 7, "owned-veth"))
+        self.assertEqual(len(monitor.links), 1)
+        self.assertTrue(monitor.links[0]["deleted"], "name or index reuse must not resurrect a deleted binding")
+        for data in [b"\0" * 15, struct.pack("=IHHII", 100, 16, 0, 0, 0),
+                     struct.pack("=IHHII", 16, 4, 0, 0, 0)]:
+            with self.assertRaises(ValueError):
+                list(CLEANUP.link_events(data))
+        for truncated, sender, error in [(True, 0, None), (False, 123, None), (False, 0, OSError("overflow"))]:
+            with patch.object(CLEANUP.socket, "socket") as opened:
+                monitor = CLEANUP.DeclaredLinks(["owned-veth"])
+                monitor.socket = opened.return_value
+                monitor.socket.recvmsg.return_value = (event(16, 7, "owned-veth"), [],
+                                                       CLEANUP.socket.MSG_TRUNC if truncated else 0, (sender, 0))
+                monitor.socket.recvmsg.side_effect = error
+                monitor.drain()
+                self.assertTrue(monitor.errors)
+                self.assertIsNone(monitor.socket)
+                opened.return_value.close.assert_called_once()
 
     def verify_fixture(self, directory, after, processes=None, errors=None, links=None):
         indices = {"lo": 1, "eth0": 2, "owned-veth": 7, "renamed-veth": 7, "unrelated-veth": 8}
@@ -558,7 +601,7 @@ class CleanupTests(unittest.TestCase):
                         self.assertIn("pid 30", errors[0])
                         self.assertIn("fixture task", errors[0])
 
-    def test_surviving_namespaces_and_host_residue_fail_cleanup(self):
+    def test_raw_inventory_differences_retain_host_interface_diagnostics(self):
         for kind, value in [
             ("net", "102"), ("mnt", "202"), ("named_netns", "leaked-netns"),
             ("bpffs_entries", "leaked-pin f 13"), ("bpffs_mounts", "new bpffs mount"),

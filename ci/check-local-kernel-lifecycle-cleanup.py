@@ -20,6 +20,8 @@ from pathlib import Path
 import re
 import select
 import signal
+import socket
+import struct
 import subprocess
 import sys
 import time
@@ -79,7 +81,8 @@ def differences(before: dict, after: dict) -> dict:
     for name in sorted(required):
         added = sorted(set(after[name]) - set(before[name]))
         # Unrelated system services may finish and release their namespaces.
-        # Host-visible pins, mounts, names and interfaces must remain exact.
+        # Pins, mounts and namespace names remain exact. Interface changes are
+        # diagnostics; verify attributes declared links by namespace and index.
         removed = [] if name in {"net", "mnt"} else sorted(set(before[name]) - set(after[name]))
         if added or removed:
             changed[name] = {"added": added, "removed": removed}
@@ -210,6 +213,119 @@ def interface_names(names) -> list[str]:
     return names
 
 
+def link_inventory() -> dict:
+    namespace = str(os.stat("/proc/self/ns/net").st_ino)
+    links = json.loads(subprocess.check_output(["ip", "-j", "link", "show"], text=True))
+    if not isinstance(links, list) or any(
+        not isinstance(link, dict) or type(link.get("ifindex")) is not int or link["ifindex"] <= 0
+        or not isinstance(link.get("ifname"), str) for link in links
+    ) or namespace != str(os.stat("/proc/self/ns/net").st_ino):
+        raise ValueError("incomplete interface identity inventory")
+    return {"namespace": namespace, "links": [
+        {"namespace": namespace, "ifindex": link["ifindex"], "ifname": link["ifname"]}
+        for link in links
+    ]}
+
+
+def link_events(data: bytes):
+    """Decode kernel RTM_NEWLINK/DELLINK notifications, refusing lost evidence."""
+    offset = 0
+    while offset < len(data):
+        if len(data) - offset < 16:
+            raise ValueError("truncated link event header")
+        length, kind, _flags, _sequence, _pid = struct.unpack_from("=IHHII", data, offset)
+        if length < 16 or offset + length > len(data):
+            raise ValueError("truncated link event")
+        if kind in {2, 4}:  # NLMSG_ERROR / NLMSG_OVERRUN
+            raise ValueError("kernel link event evidence was lost")
+        if kind in {16, 17}:  # RTM_NEWLINK / RTM_DELLINK
+            if length < 32:
+                raise ValueError("truncated link identity")
+            index = struct.unpack_from("=i", data, offset + 20)[0]
+            name, attribute = None, offset + 32
+            while attribute < offset + length:
+                if offset + length - attribute < 4:
+                    raise ValueError("truncated link attribute header")
+                size, tag = struct.unpack_from("=HH", data, attribute)
+                if size < 4 or attribute + size > offset + length:
+                    raise ValueError("truncated link attribute")
+                if tag == 3:  # IFLA_IFNAME
+                    value = data[attribute + 4:attribute + size]
+                    if not value or value[-1] != 0 or name is not None:
+                        raise ValueError("invalid link event name")
+                    name = value[:-1].decode("utf-8", errors="surrogateescape")
+                attribute += (size + 3) & ~3
+            if index <= 0 or name is None:
+                raise ValueError("incomplete link event identity")
+            yield kind, index, name
+        offset += (length + 3) & ~3
+
+
+class DeclaredLinks:
+    """Subscribe before exec so add-and-rename cannot outrun a name poll.
+
+    Each declaration binds its first new link lifetime. Deletion retires that
+    binding, so a later foreign link reusing the name or index is not claimed.
+    """
+
+    def __init__(self, names):
+        self.names, self.claimed = set(names), set()
+        self.namespace = str(os.stat("/proc/self/ns/net").st_ino)
+        self.links, self.errors, self.initial = [], [], set()
+        self.socket = None
+
+    def start(self):
+        if not self.names:
+            return
+        try:
+            self.socket = socket.socket(socket.AF_NETLINK, socket.SOCK_RAW, socket.NETLINK_ROUTE)
+            self.socket.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 1 << 20)
+            self.socket.bind((0, 1))  # RTMGRP_LINK, in the controller's namespace.
+            self.socket.setblocking(False)
+            current = link_inventory()
+            if current["namespace"] != self.namespace:
+                raise ValueError("interface namespace changed before command")
+            if self.names & {link["ifname"] for link in current["links"]}:
+                raise ValueError("owned interface already exists before command")
+            self.initial = {link["ifindex"] for link in current["links"]}
+        except BaseException:
+            self.close()
+            raise
+
+    def observe(self, data):
+        for kind, index, name in link_events(data):
+            existing = next((link for link in self.links if link["ifindex"] == index), None)
+            if existing is not None:
+                if kind == 17:
+                    existing["deleted"] = True
+            elif kind == 16 and index not in self.initial and name in self.names - self.claimed:
+                self.links.append({"namespace": self.namespace, "ifindex": index,
+                                   "declared_name": name, "deleted": False})
+                self.claimed.add(name)
+
+    def drain(self):
+        if self.socket is None:
+            return
+        try:
+            for _ in range(4096):  # Bound work even during unrelated link churn.
+                try:
+                    data, _control, flags, sender = self.socket.recvmsg(1 << 18)
+                except BlockingIOError:
+                    return
+                if flags & socket.MSG_TRUNC or sender[0] != 0:
+                    raise ValueError("incomplete kernel link event evidence")
+                self.observe(data)
+            raise ValueError("link event inventory exceeded its work budget")
+        except (OSError, ValueError) as error:
+            self.errors.append(str(error))
+            self.close()
+
+    def close(self):
+        if self.socket is not None:
+            self.socket.close()
+            self.socket = None
+
+
 def ownership(evidence: Path) -> tuple[dict, dict]:
     context = json.loads((evidence / "ownership.json").read_text())
     baseline = hashlib.sha256((evidence / "before.json").read_bytes()).hexdigest()
@@ -225,7 +341,18 @@ def ownership(evidence: Path) -> tuple[dict, dict]:
                 or not isinstance(record.get("command"), list) or not record["command"]:
             raise ValueError(f"invalid namespace ownership record: {path.name}")
         identity(record["root"])
-        interface_names(record.get("owned_interfaces", []))
+        names = interface_names(record.get("owned_interfaces", []))
+        if names:
+            namespace, links = record.get("interface_namespace"), record.get("owned_links")
+            if not isinstance(namespace, str) or not namespace.isdecimal() or not isinstance(links, list):
+                raise ValueError("incomplete declared link identity evidence")
+            if type(record.get("link_capture_complete")) is not bool:
+                raise ValueError("incomplete link capture status")
+            if any(not isinstance(link, dict) or link.get("namespace") != namespace
+                   or type(link.get("ifindex")) is not int or link["ifindex"] <= 0
+                   or link.get("declared_name") not in names or type(link.get("deleted")) is not bool
+                   for link in links) or len({link["declared_name"] for link in links}) != len(links):
+                raise ValueError("invalid declared link identity evidence")
         if record["status"] == "complete":
             if type(record.get("exit_code")) is not int or type(record.get("cleanup_passed")) is not bool \
                     or not isinstance(record.get("survivors"), list):
@@ -253,12 +380,21 @@ def verify(evidence: Path, run_id=None, command_exit_code=None) -> int:
         # namespace attribution below covers every interface and route within
         # the qualification's isolated network namespaces, including fd holders.
         result["host_interface_changes"] = result["differences"].pop("interfaces", {})
+        links = link_inventory() if any(record.get("owned_interfaces") for record in records.values()) else None
         for name, record in records.items():
             for interface in record.get("owned_interfaces", []):
                 if interface in before["interfaces"]:
                     raise ValueError("owned interface already existed in the cleanup baseline")
-                if interface in current["interfaces"]:
-                    result["interface_owners"].setdefault(interface, []).append(name)
+            result["errors"].extend(record.get("interface_errors", []))
+            if record.get("owned_interfaces") and not record["link_capture_complete"]:
+                result["errors"].append("declared link capture is incomplete")
+            if record.get("owned_interfaces") and record["interface_namespace"] != links["namespace"]:
+                raise ValueError("declared interface belongs to another network namespace")
+            for owned in record.get("owned_links", []):
+                for live in links["links"]:
+                    if not owned["deleted"] and (owned["namespace"], owned["ifindex"]) == (
+                            live["namespace"], live["ifindex"]):
+                        result["interface_owners"].setdefault(live["ifname"], []).append(name)
         if result["interface_owners"]:
             result["differences"]["interfaces"] = {
                 "added": sorted(result["interface_owners"]), "removed": [],
@@ -514,11 +650,14 @@ def run_owned_command(evidence: Path, command: list[str], owned_interfaces=None)
     libc = ctypes.CDLL(None, use_errno=True)
     if libc.prctl(36, 1, 0, 0, 0) != 0:  # PR_SET_CHILD_SUBREAPER
         raise OSError(ctypes.get_errno(), "cannot become namespace-owner subreaper")
+    declared = DeclaredLinks(owned_interfaces)
+    declared.start()
     run_id = uuid.uuid4().hex
     root = read_stat(Path("/proc/self/stat"))
     record = {"version": 1, "owner_id": context["id"], "status": "running",
               "root": {"pid": root["pid"], "start_time": root["start_time"]}, "command": command,
-              "owned_interfaces": owned_interfaces}
+              "owned_interfaces": owned_interfaces, "interface_namespace": declared.namespace,
+              "owned_links": [], "interface_errors": [], "link_capture_complete": not owned_interfaces}
     with (evidence / ("run-" + run_id + ".json")).open("x") as output:
         json.dump(record, output, indent=2)
         output.write("\n")
@@ -536,11 +675,23 @@ def run_owned_command(evidence: Path, command: list[str], owned_interfaces=None)
         try:
             primary = subprocess.Popen(command)
             while primary.poll() is None and interrupted is None:
+                declared.drain()
                 reap_finished_children({primary.pid})
                 time.sleep(0.02)
             code = -interrupted if interrupted is not None else primary.returncode
         except OSError:
             code = 127
+        declared.drain()
+        declared.close()
+        if owned_interfaces:
+            record.update(owned_links=declared.links, interface_errors=declared.errors,
+                          link_capture_complete=True)
+            try:
+                write_json(evidence / ("run-" + run_id + ".json"), record)
+            except OSError:
+                # The initial incomplete marker makes verification fail while
+                # preserving the normal descendant-disposal path below.
+                pass
         # Capture the original leak before disposal, including an interrupted
         # primary command. The verifier has permission to signal sudo children.
         reap_finished_children({primary.pid} if primary else set())
@@ -569,6 +720,7 @@ def run_owned_command(evidence: Path, command: list[str], owned_interfaces=None)
             return 128 + interrupted
         return (code if code > 0 else 128 - code) if code else int(cleanup)
     finally:
+        declared.close()
         for signum, handler in handlers.items():
             signal.signal(signum, handler)
 
