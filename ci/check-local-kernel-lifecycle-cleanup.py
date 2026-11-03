@@ -345,6 +345,8 @@ def ownership(evidence: Path) -> tuple[dict, dict]:
             raise ValueError(f"invalid namespace ownership record: {path.name}")
         identity(record["root"])
         names = interface_names(record.get("owned_interfaces", []))
+        if record.get("owned_links") and not names:
+            raise ValueError("link identities lack interface declarations")
         if names:
             namespace, links = record.get("interface_namespace"), record.get("owned_links")
             if not isinstance(namespace, str) or not namespace.isdecimal() or not isinstance(links, list):

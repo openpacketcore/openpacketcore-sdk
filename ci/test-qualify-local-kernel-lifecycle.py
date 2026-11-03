@@ -510,7 +510,7 @@ class CleanupTests(unittest.TestCase):
             self.assertEqual(result["namespace_owners"]["net"]["102"], {"status": "gone", "owners": []})
 
     def test_incomplete_corrupt_and_mismatched_ownership_fail_closed(self):
-        for fault in ["interrupted", "missing", "bad-json", "wrong-type", "baseline"]:
+        for fault in ["interrupted", "missing", "bad-json", "wrong-type", "baseline", "unclaimed-links"]:
             with self.subTest(fault=fault), tempfile.TemporaryDirectory() as directory:
                 self.owner_fixture(directory)
                 evidence = Path(directory)
@@ -523,6 +523,11 @@ class CleanupTests(unittest.TestCase):
                     (evidence / "ownership.json").unlink()
                 elif fault in {"bad-json", "wrong-type"}:
                     record.write_text("{" if fault == "bad-json" else "[]")
+                elif fault == "unclaimed-links":
+                    value = json.loads(record.read_text())
+                    value["owned_links"] = [{"namespace": "500", "ifindex": 7,
+                                             "declared_name": "owned-veth", "deleted": False}]
+                    record.write_text(json.dumps(value))
                 else:
                     (evidence / "before.json").write_text(json.dumps(self.before) + " ")
                 self.assertEqual(self.verify_fixture(directory, self.before)[0], 1)
