@@ -352,13 +352,14 @@ class CleanupTests(unittest.TestCase):
             body = struct.pack("=BBHiII", family, 0, 0, index, 0, 0) + attr
             return struct.pack("=IHHII", len(body) + 16, kind, 0, 0, 0) + body
 
-        monitor = CLEANUP.DeclaredLinks(["owned-veth"])
-        monitor.observe(event(16, 7, "owned-veth") + event(16, 7, "renamed-veth"))
-        self.assertEqual(monitor.links, [{"namespace": monitor.namespace, "ifindex": 7,
-                         "declared_name": "owned-veth", "deleted": False}])
-        monitor.observe(event(17, 7, "renamed-veth") + event(16, 9, "owned-veth") + event(16, 7, "owned-veth"))
-        self.assertEqual(len(monitor.links), 1)
-        self.assertTrue(monitor.links[0]["deleted"], "name or index reuse must not resurrect a deleted binding")
+        with self.subTest(lifetime="successive-records"):
+            monitor = CLEANUP.DeclaredLinks(["owned-veth"])
+            monitor.observe(event(16, 7, "owned-veth") + event(16, 7, "renamed-veth"))
+            self.assertEqual(monitor.links, [{"namespace": monitor.namespace, "ifindex": 7,
+                             "declared_name": "owned-veth", "deleted": False}])
+            monitor.observe(event(17, 7, "renamed-veth") + event(16, 9, "owned-veth") + event(16, 7, "foreign0"))
+            self.assertEqual([link["ifindex"] for link in monitor.links], [7, 9])
+            self.assertEqual([link["deleted"] for link in monitor.links], [True, False])
         for data in [b"\0" * 15, struct.pack("=IHHII", 100, 16, 0, 0, 0),
                      struct.pack("=IHHII", 16, 4, 0, 0, 0)]:
             with self.assertRaises(ValueError):
@@ -381,6 +382,12 @@ class CleanupTests(unittest.TestCase):
              "owned-veth", 7, False),
             ("recreated", ["owned-veth"], set(), event(16, 7, "owned-veth") +
              event(17, 7, "owned-veth") + event(16, 8, "owned-veth"), "owned-veth", 8, True),
+            ("recreated-renamed", ["owned-veth"], set(), event(16, 7, "owned-veth") +
+             event(17, 7, "owned-veth") + event(16, 8, "owned-veth") +
+             event(16, 8, "renamed-veth"), "renamed-veth", 8, False),
+            ("recreated-renamed-same-index", ["owned-veth"], set(), event(16, 7, "owned-veth") +
+             event(17, 7, "owned-veth") + event(16, 7, "owned-veth") +
+             event(16, 7, "renamed-veth"), "renamed-veth", 7, False),
             ("late-child", ["owned-veth"], set(), b"", "owned-veth", 8, True),
             ("second-declaration", ["owned-a", "owned-b"], set(), event(16, 7, "owned-a") +
              event(17, 7, "owned-a") + event(16, 7, "owned-b"), "owned-b", 7, False),
@@ -434,6 +441,79 @@ class CleanupTests(unittest.TestCase):
             after = {**self.before, "interfaces": [*self.before["interfaces"], "foreign0"]}
             self.assertEqual(self.verify_fixture(directory, after, links={"namespace": "500", "links": [
                 {"namespace": "500", "ifindex": 7, "ifname": "foreign0"}]} )[0], 0)
+        with self.subTest(lifetime="late-controller-rename"):
+            self.assert_late_renamed_capture(event)
+        with self.subTest(lifetime="clean-repeated-lifetimes"), tempfile.TemporaryDirectory() as directory:
+            monitor = CLEANUP.DeclaredLinks(["owned-veth"])
+            monitor.namespace = "500"
+            monitor.observe(event(16, 7, "owned-veth") + event(17, 7, "owned-veth") +
+                            event(16, 8, "owned-veth") + event(17, 8, "owned-veth"))
+            self.owner_fixture(directory)
+            path = Path(directory) / "run-fixture.json"
+            record = json.loads(path.read_text())
+            record.update(owned_interfaces=["owned-veth"], interface_namespace="500",
+                          owned_links=monitor.links, link_capture_complete=True)
+            path.write_text(json.dumps(record))
+            self.assertEqual(self.verify_fixture(directory, self.before)[0], 0)
+
+    def assert_late_renamed_capture(self, event):
+        # Drive the real controller and verifier. Its first helper starts only
+        # after the primary exits; link events arrive while that helper runs.
+        root = {**self.init, **CLEANUP.read_stat(Path("/proc/self/stat")), "ppid": 0}
+        after = {**self.before, "interfaces": [*self.before["interfaces"], "renamed-veth"]}
+        events = event(16, 7, "owned-veth") + event(16, 7, "renamed-veth")
+        state, snapshots = {"ready": False, "emitted": False}, []
+        with tempfile.TemporaryDirectory() as directory:
+            self.owner_fixture(directory)
+
+            def start(monitor):
+                monitor.namespace = "500"
+                monitor.socket = SimpleNamespace(close=lambda: None)
+
+            def drain(monitor):
+                if state["ready"] and monitor.socket is not None and not state["emitted"]:
+                    monitor.observe(events)
+                    state["emitted"] = True
+
+            class Process:
+                def __init__(self, command, **_kwargs):
+                    self.command, self.pid, self.waited = command, 999999, False
+                    self.returncode = 0 if command == ["late-primary"] else None
+                    if self.returncode is None:
+                        state["ready"] = True
+
+                def poll(self):
+                    if self.returncode is not None:
+                        return self.returncode
+                    if not self.waited:
+                        self.waited = True
+                        return None
+                    run_id = self.command[self.command.index("--run-id") + 1]
+                    kwargs = {"capture_pending": True} if "--capture-pending" in self.command else {}
+                    self.returncode = CLEANUP.verify(Path(directory), run_id, 0, **kwargs)
+                    snapshots.append(json.loads((Path(directory) / ("run-" + run_id + ".json")).read_text()))
+                    return self.returncode
+
+            with redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()), \
+                    patch.object(CLEANUP.os, "geteuid", return_value=0), \
+                    patch.object(CLEANUP.ctypes, "CDLL", return_value=SimpleNamespace(prctl=lambda *_: 0)), \
+                    patch.object(CLEANUP.DeclaredLinks, "start", start), \
+                    patch.object(CLEANUP.DeclaredLinks, "drain", drain), \
+                    patch.object(CLEANUP.subprocess, "Popen", Process), \
+                    patch.object(CLEANUP.time, "sleep"), \
+                    patch.object(CLEANUP, "snapshot", return_value=after), \
+                    patch.object(CLEANUP, "link_inventory", return_value={"namespace": "500", "links": [
+                        {"namespace": "500", "ifindex": 7, "ifname": "renamed-veth"}]}), \
+                    patch.object(CLEANUP, "process_inventory", return_value=({root["pid"]: root}, [])), \
+                    patch.object(CLEANUP, "direct_children", return_value=set()):
+                code = CLEANUP.run_owned_command(Path(directory), ["late-primary"], ["owned-veth"])
+            self.assertEqual(code, 1, "late creation and rename must survive the controller's capture boundary")
+            self.assertTrue(state["emitted"])
+            self.assertEqual(snapshots[0]["status"], "running")
+            self.assertFalse(snapshots[0]["link_capture_complete"])
+            self.assertEqual(snapshots[-1]["status"], "complete")
+            self.assertTrue(snapshots[-1]["link_capture_complete"])
+            self.assertEqual(snapshots[-1]["owned_links"][0]["ifindex"], 7)
 
     def verify_fixture(self, directory, after, processes=None, errors=None, links=None, run_id=None):
         indices = {"lo": 1, "eth0": 2, "owned-veth": 7, "renamed-veth": 7, "unrelated-veth": 8}
@@ -510,7 +590,8 @@ class CleanupTests(unittest.TestCase):
             self.assertEqual(result["namespace_owners"]["net"]["102"], {"status": "gone", "owners": []})
 
     def test_incomplete_corrupt_and_mismatched_ownership_fail_closed(self):
-        for fault in ["interrupted", "missing", "bad-json", "wrong-type", "baseline", "unclaimed-links"]:
+        for fault in ["interrupted", "missing", "bad-json", "wrong-type", "baseline", "unclaimed-links",
+                      "duplicate-active-index"]:
             with self.subTest(fault=fault), tempfile.TemporaryDirectory() as directory:
                 self.owner_fixture(directory)
                 evidence = Path(directory)
@@ -527,6 +608,13 @@ class CleanupTests(unittest.TestCase):
                     value = json.loads(record.read_text())
                     value["owned_links"] = [{"namespace": "500", "ifindex": 7,
                                              "declared_name": "owned-veth", "deleted": False}]
+                    record.write_text(json.dumps(value))
+                elif fault == "duplicate-active-index":
+                    value = json.loads(record.read_text())
+                    value.update(owned_interfaces=["owned-a", "owned-b"], interface_namespace="500",
+                                 link_capture_complete=True, owned_links=[
+                                     {"namespace": "500", "ifindex": 7, "declared_name": name, "deleted": False}
+                                     for name in ["owned-a", "owned-b"]])
                     record.write_text(json.dumps(value))
                 else:
                     (evidence / "before.json").write_text(json.dumps(self.before) + " ")
