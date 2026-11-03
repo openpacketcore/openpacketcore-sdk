@@ -257,7 +257,8 @@ def link_events(data: bytes):
                 attribute += (size + 3) & ~3
             if index <= 0 or name is None:
                 raise ValueError("incomplete link event identity")
-            yield kind, index, name
+            if data[offset + 16] == socket.AF_UNSPEC:
+                yield kind, index, name
         offset += (length + 3) & ~3
 
 
@@ -294,7 +295,9 @@ class DeclaredLinks:
 
     def observe(self, data):
         for kind, index, name in link_events(data):
-            existing = next((link for link in self.links if link["ifindex"] == index), None)
+            if kind == 17:
+                self.initial.discard(index)
+            existing = next((link for link in self.links if link["ifindex"] == index and not link["deleted"]), None)
             if existing is not None:
                 if kind == 17:
                     existing["deleted"] = True
@@ -342,6 +345,8 @@ def ownership(evidence: Path) -> tuple[dict, dict]:
             raise ValueError(f"invalid namespace ownership record: {path.name}")
         identity(record["root"])
         names = interface_names(record.get("owned_interfaces", []))
+        if record.get("owned_links") and not names:
+            raise ValueError("link identities lack interface declarations")
         if names:
             namespace, links = record.get("interface_namespace"), record.get("owned_links")
             if not isinstance(namespace, str) or not namespace.isdecimal() or not isinstance(links, list):
@@ -375,12 +380,14 @@ def verify(evidence: Path, run_id=None, command_exit_code=None) -> int:
         before = json.loads((evidence / "before.json").read_text())
         result["differences"] = differences(before, current)
         _context, records = ownership(evidence)
+        current_name = None if run_id is None else "run-" + run_id + ".json"
         # Keep host churn as evidence, but never turn snapshot subtraction into
         # ownership. The ledger covers declared initial-namespace interfaces;
         # namespace attribution below covers every interface and route within
         # the qualification's isolated network namespaces, including fd holders.
         result["host_interface_changes"] = result["differences"].pop("interfaces", {})
         links = link_inventory() if any(record.get("owned_interfaces") for record in records.values()) else None
+        live_ids = {(link["namespace"], link["ifindex"]) for link in links["links"]} if links else set()
         for name, record in records.items():
             for interface in record.get("owned_interfaces", []):
                 if interface in before["interfaces"]:
@@ -390,16 +397,20 @@ def verify(evidence: Path, run_id=None, command_exit_code=None) -> int:
                 result["errors"].append("declared link capture is incomplete")
             if record.get("owned_interfaces") and record["interface_namespace"] != links["namespace"]:
                 raise ValueError("declared interface belongs to another network namespace")
-            for owned in record.get("owned_links", []):
-                for live in links["links"]:
-                    if not owned["deleted"] and (owned["namespace"], owned["ifindex"]) == (
-                            live["namespace"], live["ifindex"]):
-                        result["interface_owners"].setdefault(live["ifname"], []).append(name)
+            if name == current_name:
+                for owned in record.get("owned_links", []):
+                    if (owned["namespace"], owned["ifindex"]) not in live_ids:
+                        owned["deleted"] = True
+            for live in links["links"] if links else []:
+                if (name == current_name and live["ifname"] in record.get("owned_interfaces", [])) or any(
+                    not owned["deleted"] and (owned["namespace"], owned["ifindex"]) ==
+                    (live["namespace"], live["ifindex"]) for owned in record.get("owned_links", [])
+                ):
+                    result["interface_owners"].setdefault(live["ifname"], []).append(name)
         if result["interface_owners"]:
             result["differences"]["interfaces"] = {
                 "added": sorted(result["interface_owners"]), "removed": [],
             }
-        current_name = None if run_id is None else "run-" + run_id + ".json"
         if current_name is not None:
             current_record = records[current_name]
             if current_record["status"] != "running" or command_exit_code is None:
