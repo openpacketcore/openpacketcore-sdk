@@ -46,8 +46,13 @@ PID start times distinguish reused PIDs; sharing a cgroup alone does not make a
 process part of qualification.
 
 The check rejects qualification-owned namespaces, live descendants after a
-command returns, interrupted ownership records and any change to host-visible
-state. Unrelated host services may create or release namespaces; their attributed
+command returns, interrupted ownership records and changes to host-visible pins,
+mounts or named namespaces. Host interface changes remain diagnostic evidence.
+Commands creating an interface in the initial namespace declare
+`run --owned-interface NAME` before the evidence-directory argument; link events
+record its kernel index and namespace before execution can outrun a name lookup.
+Verification refuses that identity even after a rename. Unrelated interfaces
+added by the host are accepted. Unrelated services may create or release namespaces; their attributed
 namespaces are informational. A namespace with no provable owner fails unless a
 second inventory confirms it has already disappeared. Failed cleanup remains a
 failure in the final verification even if its processes later exit. A missing or
