@@ -154,6 +154,43 @@ def run_case(evidence, orphan, descriptors):
     print(f"PASS {evidence.name}", flush=True)
 
 
+def run_interface_case(evidence, owned):
+    evidence.mkdir()
+    cleanup = evidence / "cleanup"
+    command = [sys.executable, str(CHECKER)]
+    check(command + ["snapshot", str(cleanup)], evidence / "snapshot.log")
+    name = "owned-veth" if owned else "unrelated-veth"
+    try:
+        if owned:
+            # Declare the exact fixture name in the owner ledger before its
+            # creating command runs. The route belongs to this same interface.
+            check(command + ["run", "--owned-interface", name, str(cleanup), "--",
+                             "sh", "-ec", 'ip link add "$1" type dummy; '
+                             'ip link set "$1" up; '
+                             'ip route add 198.18.0.0/24 dev "$1"', "fixture", name],
+                  evidence / "owned-run.log", 1)
+        else:
+            # This process is outside the registered command's ownership tree.
+            subprocess.run(["ip", "link", "add", name, "type", "dummy"], check=True)
+            check(command + ["run", str(cleanup), "--", sys.executable, "-c", "pass"],
+                  evidence / "unrelated-run.log")
+        check(command + ["verify", str(cleanup)], evidence / "post-run-verify.log", 1 if owned else 0)
+        result = json.loads((cleanup / "result.json").read_text())
+        assert result["passed"] is not owned
+        assert result["host_interface_changes"]["added"] == [name]
+        assert (name in result["interface_owners"]) is owned
+        if owned:
+            assert result["differences"]["interfaces"]["added"] == [name]
+            routes = subprocess.check_output(["ip", "route", "show", "dev", name], text=True)
+            assert "198.18.0.0/24" in routes, "the negative fixture lost its owned route"
+        else:
+            assert not result["differences"], result
+    finally:
+        subprocess.run(["ip", "link", "del", name], check=True)
+    check(command + ["verify", str(cleanup)], evidence / "departed-verify.log", 1 if owned else 0)
+    print(f"PASS {evidence.name}", flush=True)
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--evidence-dir", type=Path)
@@ -183,6 +220,8 @@ def main():
             name = ("qualification-orphan" if orphan else "unrelated-service")
             name += "-descriptors" if descriptors else "-namespaces"
             run_case(args.evidence_dir / name, orphan, descriptors)
+    for owned in [False, True]:
+        run_interface_case(args.evidence_dir / ("owned-interface" if owned else "unrelated-interface"), owned)
 
 
 if __name__ == "__main__":

@@ -227,6 +227,9 @@ class CleanupTests(unittest.TestCase):
         after = copy.deepcopy(self.before)
         after["net"].append("102")
         after["mnt"].append("202")
+        # A shared runner may gain even a software interface during the job.
+        # Its absence from the baseline does not make it qualification-owned.
+        after["interfaces"].append("unrelated-veth")
         service = {
             "pid": 20, "ppid": 1, "start_time": 200, "state": "S",
             "comm": "systemd-hostnamed",
@@ -270,6 +273,31 @@ class CleanupTests(unittest.TestCase):
             owner = result["namespace_owners"]["net"]["102"]["owners"][0]
             self.assertEqual(owner["pid"], 30)
             self.assertTrue(owner["qualification_owned"])
+
+        # Explicitly recorded host-namespace resources must also be refused,
+        # even after their creating process has exited. Ordinary qualification
+        # interfaces and routes remain covered by their owning namespace above.
+        with tempfile.TemporaryDirectory() as directory:
+            self.owner_fixture(directory)
+            path = Path(directory) / "run-fixture.json"
+            record = json.loads(path.read_text())
+            record["owned_interfaces"] = ["owned-veth"]
+            path.write_text(json.dumps(record))
+            after = copy.deepcopy(self.before)
+            after["interfaces"].extend(["owned-veth", "unrelated-veth"])
+            code, result = self.verify_fixture(directory, after)
+            self.assertEqual(code, 1)
+            self.assertEqual(result["differences"]["interfaces"]["added"], ["owned-veth"])
+            self.assertEqual(result["interface_owners"]["owned-veth"], ["run-fixture.json"])
+            # The final inventory, rather than a fresh before/after subtraction,
+            # must still refuse that same owned resource on another verification.
+            self.assertEqual(self.verify_fixture(directory, after)[0], 1)
+            self.assertEqual(self.verify_fixture(directory, self.before)[0], 0)
+            for names in [["eth0"], ["../bad"], ["same", "same"], "owned-veth", [None]]:
+                with self.subTest(names=names):
+                    record["owned_interfaces"] = names
+                    path.write_text(json.dumps(record))
+                    self.assertEqual(self.verify_fixture(directory, self.before)[0], 1)
 
     def verify_fixture(self, directory, after, processes=None, errors=None):
         with patch.object(CLEANUP, "snapshot", return_value=after), \
