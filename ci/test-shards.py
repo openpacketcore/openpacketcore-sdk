@@ -116,7 +116,17 @@ QUIESCENT_ROSTER_LIB_TESTS = (
     "roster_completion::roster_completion_sqlite_ordinary_wave_does_not_delay_emergency_completion",
     "roster_completion::roster_completion_sqlite_ordinary_wave_consumes_normal_quota",
 )
+# These proofs own a large fraction of the process verification allowance.
+# Keep their literal payloads and cap, and give each a fresh ordinary-profile
+# process rather than admitting concurrent library fixtures against that cap.
+QUIESCENT_VERIFICATION_LIB_TESTS = (
+    "consensus::native::generation::tests::rollover_capacity_tests::"
+    "native_checkpoint_delta_payload_can_exceed_the_verification_allowance",
+    "consensus::native::epoch_floor_tests::"
+    "native_epoch_floor_matches_fake_through_two_real_threshold_rotations",
+)
 QUIESCENT_LIB_TESTS = (
+    *QUIESCENT_VERIFICATION_LIB_TESTS,
     "persistent_three_voter_consumer_write_does_not_spend_budget_on_a_read_quorum",
     "persistent_three_voter_fenced_status_converges_after_response_loss_and_compaction",
     "persistent_three_voter_first_transition_has_one_leader_activation_proof",
@@ -372,6 +382,8 @@ def shard_ids(plan: dict) -> list[str]:
 
 
 def qualified_quiescent_lib_test(name: str) -> str:
+    if name in QUIESCENT_VERIFICATION_LIB_TESTS:
+        return name
     if name == QUIESCENT_SELECTOR_LIB_TEST:
         return f"{QUIESCENT_SELECTOR_LIB_MODULE}::{name}"
     if name in QUIESCENT_VOID_LIB_TESTS:
@@ -382,7 +394,7 @@ def qualified_quiescent_lib_test(name: str) -> str:
 
 
 def quiescent_lib_command(name: str) -> list[str]:
-    """Run one private-lib timing contract in its exact isolated profile."""
+    """Run one timing or verification contract in its exact isolated profile."""
     profile = (
         ["env", "CARGO_PROFILE_TEST_OPT_LEVEL=1"]
         if name in OPTIMIZED_QUIESCENT_LIB_TESTS

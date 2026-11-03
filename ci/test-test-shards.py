@@ -830,6 +830,7 @@ class QuiescentShardPlanTests(unittest.TestCase):
             name for name in TEST_SHARDS.QUIESCENT_LIB_TESTS
             if name not in TEST_SHARDS.OPTIMIZED_QUIESCENT_LIB_TESTS
             and name not in TEST_SHARDS.QUIESCENT_VOID_LIB_TESTS
+            and name not in TEST_SHARDS.QUIESCENT_VERIFICATION_LIB_TESTS
         ]
         targets = [plan["heavy"]["target"], *(f"fixture_{i}" for i in range(9))]
         for name in names:

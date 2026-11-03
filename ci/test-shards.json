@@ -163,14 +163,17 @@
     "scope_transport::child_read_guards::native_scope_child_read_peer_close_releases_cut_and_proof_while_admission_is_held": "it-0",
     "scope_transport::child_read_guards::native_scope_child_read_ten_second_cut_bound_returns_retry_and_releases_ownership": "it-0",
     "scope_transport::child_read_guards::native_scope_child_read_promotes_only_after_current_cut_and_clears_stale_hint": "it-0",
-    "scope_transport::child_read_revocation::native_scope_child_read_held_policy_revocation_returns_unauthorized_without_observation": "it-0"
+    "scope_transport::child_read_revocation::native_scope_child_read_held_policy_revocation_returns_unauthorized_without_observation": "it-0",
+    "consensus::native::generation::tests::rollover_capacity_tests::native_checkpoint_delta_payload_can_exceed_the_verification_allowance": "heavy-0",
+    "consensus::native::epoch_floor_tests::native_epoch_floor_matches_fake_through_two_real_threshold_rotations": "heavy-0"
   },
   "_lib_groups_comment": [
     "Exact names keep moved groups disjoint from misc and from isolated timing contracts.",
     "New unlisted tests still run on misc. Precheck rejects missing or ambiguous names.",
     "Ignored subprocess helpers declare one enabled parent in their group; the parent owns their crash scenarios.",
     "Each full-bound store proof has a dedicated native-log shard and uses serial test O1 with debug checks enabled.",
-    "The full-journal opt-in proof stays ignored; do not turn it into a hosted qualification."
+    "The full-journal opt-in proof stays ignored; do not turn it into a hosted qualification.",
+    "Verification-budget proofs run in separate ordinary-profile processes on heavy-0."
   ],
   "lib_groups": [
     {
