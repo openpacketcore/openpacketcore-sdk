@@ -154,12 +154,13 @@ def run_case(evidence, orphan, descriptors):
     print(f"PASS {evidence.name}", flush=True)
 
 
-def run_interface_case(evidence, owned):
+def run_interface_case(evidence, owned, renamed=False):
     evidence.mkdir()
     cleanup = evidence / "cleanup"
     command = [sys.executable, str(CHECKER)]
     check(command + ["snapshot", str(cleanup)], evidence / "snapshot.log")
     name = "owned-veth" if owned else "unrelated-veth"
+    live_name = "renamed-veth" if renamed else name
     try:
         if owned:
             # Declare the exact fixture name in the owner ledger before its
@@ -167,7 +168,9 @@ def run_interface_case(evidence, owned):
             check(command + ["run", "--owned-interface", name, str(cleanup), "--",
                              "sh", "-ec", 'ip link add "$1" type dummy; '
                              'ip link set "$1" up; '
-                             'ip route add 198.18.0.0/24 dev "$1"', "fixture", name],
+                             'ip route add 198.18.0.0/24 dev "$1"; '
+                             'if [ "$1" != "$2" ]; then ip link set "$1" name "$2"; fi',
+                             "fixture", name, live_name],
                   evidence / "owned-run.log", 1)
         else:
             # This process is outside the registered command's ownership tree.
@@ -177,16 +180,16 @@ def run_interface_case(evidence, owned):
         check(command + ["verify", str(cleanup)], evidence / "post-run-verify.log", 1 if owned else 0)
         result = json.loads((cleanup / "result.json").read_text())
         assert result["passed"] is not owned
-        assert result["host_interface_changes"]["added"] == [name]
-        assert (name in result["interface_owners"]) is owned
+        assert result["host_interface_changes"]["added"] == [live_name]
+        assert (live_name in result["interface_owners"]) is owned
         if owned:
-            assert result["differences"]["interfaces"]["added"] == [name]
-            routes = subprocess.check_output(["ip", "route", "show", "dev", name], text=True)
+            assert result["differences"]["interfaces"]["added"] == [live_name]
+            routes = subprocess.check_output(["ip", "route", "show", "dev", live_name], text=True)
             assert "198.18.0.0/24" in routes, "the negative fixture lost its owned route"
         else:
             assert not result["differences"], result
     finally:
-        subprocess.run(["ip", "link", "del", name], check=True)
+        subprocess.run(["ip", "link", "del", live_name], check=True)
     check(command + ["verify", str(cleanup)], evidence / "departed-verify.log", 1 if owned else 0)
     print(f"PASS {evidence.name}", flush=True)
 
@@ -197,6 +200,7 @@ def main():
     parser.add_argument("--fixture")
     parser.add_argument("--orphan", action="store_true")
     parser.add_argument("--descriptors", action="store_true")
+    parser.add_argument("--interface-case", choices=["renamed"])
     args = parser.parse_args()
     if os.geteuid() != 0:
         parser.error("root is required; unsupported namespace operations must fail")
@@ -215,6 +219,9 @@ def main():
                    check=True)
     args.evidence_dir.mkdir(parents=True, exist_ok=False)
     syscall("prctl", 36, 1, 0, 0, 0)  # Adopt only this test's exited fixture orphans.
+    if args.interface_case == "renamed":
+        run_interface_case(args.evidence_dir / "renamed-interface", True, renamed=True)
+        return
     for orphan in [False, True]:
         for descriptors in [False, True]:
             name = ("qualification-orphan" if orphan else "unrelated-service")
@@ -222,6 +229,7 @@ def main():
             run_case(args.evidence_dir / name, orphan, descriptors)
     for owned in [False, True]:
         run_interface_case(args.evidence_dir / ("owned-interface" if owned else "unrelated-interface"), owned)
+    run_interface_case(args.evidence_dir / "renamed-interface", True, renamed=True)
 
 
 if __name__ == "__main__":

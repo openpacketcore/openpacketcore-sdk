@@ -4008,6 +4008,20 @@ mod tests {
             .await
             .unwrap_or_else(|_| panic!("second endpoint shutdown exceeded profile bound"))
             .unwrap_or_else(|error| panic!("shutdown second: {error}"));
+        // Probe the fixture after shutdown so no extra receipt can affect the
+        // operation: an exact later replay must not erase an earlier mismatch.
+        let receipt = second_wrapper
+            .first_receipt
+            .lock()
+            .unwrap()
+            .clone()
+            .unwrap();
+        let mut different = receipt.clone();
+        *different.last_mut().unwrap() ^= 1;
+        let _ = second_wrapper.send(&different).await;
+        assert!(!second_wrapper.replay_was_exact.load(Ordering::Relaxed));
+        let _ = second_wrapper.send(&receipt).await;
+        assert!(!second_wrapper.replay_was_exact.load(Ordering::Relaxed));
     }
 
     #[tokio::test]

@@ -282,6 +282,9 @@ class CleanupTests(unittest.TestCase):
             path = Path(directory) / "run-fixture.json"
             record = json.loads(path.read_text())
             record["owned_interfaces"] = ["owned-veth"]
+            record["interface_namespace"] = "500"
+            record["owned_links"] = [{"namespace": "500", "ifindex": 7,
+                                      "declared_name": "owned-veth", "deleted": False}]
             path.write_text(json.dumps(record))
             after = copy.deepcopy(self.before)
             after["interfaces"].extend(["owned-veth", "unrelated-veth"])
@@ -293,14 +296,47 @@ class CleanupTests(unittest.TestCase):
             # must still refuse that same owned resource on another verification.
             self.assertEqual(self.verify_fixture(directory, after)[0], 1)
             self.assertEqual(self.verify_fixture(directory, self.before)[0], 0)
+            renamed = copy.deepcopy(self.before)
+            renamed["interfaces"].append("renamed-veth")
+            code, result = self.verify_fixture(directory, renamed)
+            self.assertEqual(code, 1, "renaming an owned link must not hide its kernel identity")
+            self.assertEqual(result["differences"]["interfaces"]["added"], ["renamed-veth"])
+            self.assertEqual(result["interface_owners"]["renamed-veth"], ["run-fixture.json"])
+            # A different link reusing the declared name is not the recorded
+            # link. An identical index in another namespace is not it either.
+            for namespace, index in [("500", 99), ("501", 7)]:
+                code, result = self.verify_fixture(directory, after, links={
+                    "namespace": "500", "links": [{"namespace": namespace,
+                    "ifindex": index, "ifname": "owned-veth"}],
+                })
+                self.assertEqual(code, 0)
+            # Isolate the baseline-claim refusal: the claimed interface has
+            # departed, so the ordinary leftover path cannot reject it.
+            record["owned_interfaces"] = ["eth0"]
+            record["owned_links"] = []
+            path.write_text(json.dumps(record))
+            departed = {**self.before, "interfaces": ["lo"]}
+            code, result = self.verify_fixture(directory, departed)
+            self.assertEqual(code, 1)
+            self.assertIn("owned interface already existed in the cleanup baseline", result["errors"])
+            with patch.object(CLEANUP.subprocess, "Popen") as launched, \
+                    patch.object(CLEANUP.sys, "argv", ["cleanup", "run", "--owned-interface", "eth0",
+                        directory, "--", "must-not-start"]):
+                self.assertEqual(self.run_cleanup(), 1)
+                launched.assert_not_called()
             for names in [["eth0"], ["../bad"], ["same", "same"], "owned-veth", [None]]:
                 with self.subTest(names=names):
                     record["owned_interfaces"] = names
                     path.write_text(json.dumps(record))
                     self.assertEqual(self.verify_fixture(directory, self.before)[0], 1)
 
-    def verify_fixture(self, directory, after, processes=None, errors=None):
+    def verify_fixture(self, directory, after, processes=None, errors=None, links=None):
+        indices = {"lo": 1, "eth0": 2, "owned-veth": 7, "renamed-veth": 7, "unrelated-veth": 8}
+        if links is None:
+            links = {"namespace": "500", "links": [{"namespace": "500", "ifindex": indices.get(name, 9),
+                     "ifname": name} for name in after["interfaces"]]}
         with patch.object(CLEANUP, "snapshot", return_value=after), \
+                patch.object(CLEANUP, "link_inventory", return_value=links, create=True), \
                 patch.object(CLEANUP, "process_inventory", return_value=(processes or {}, errors or [])), \
                 patch.object(CLEANUP.sys, "argv", ["cleanup", "verify", directory]):
             code = self.run_cleanup()
