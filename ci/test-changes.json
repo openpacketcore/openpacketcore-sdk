@@ -2163,6 +2163,13 @@
         "rust:crates/opc-crypto::lib=lib::tests::damaged_key_binding_is_rejected_before_provider_lookup",
         "rust:crates/opc-crypto::lib=lib::tests::decrypt_rejects_wrong_key_aad_corrupt_tag_and_unknown_key_id_with_redacted_errors"
       ]
+    },
+    {
+      "test": "python:ci/test-qualify-local-kernel-lifecycle.py::CleanupTests.test_surviving_namespaces_and_host_residue_fail_cleanup",
+      "kind": "removed",
+      "renamed_to": "python:ci/test-qualify-local-kernel-lifecycle.py::CleanupTests.test_raw_inventory_differences_retain_host_interface_diagnostics",
+      "reason": "Rename the raw inventory-difference test to describe its diagnostic role. Every existing namespace, pin, mount, named-namespace and interface difference assertion remains. Separate verification tests retain refusal of owned namespace and interface residue while accepting unrelated host arrivals.",
+      "issue": 1225
     }
   ]
 }

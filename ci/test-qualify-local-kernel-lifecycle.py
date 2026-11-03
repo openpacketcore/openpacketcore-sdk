@@ -331,10 +331,12 @@ class CleanupTests(unittest.TestCase):
             self.assertEqual(code, 1)
             self.assertIn("owned interface already existed in the cleanup baseline", result["errors"])
             with patch.object(CLEANUP.subprocess, "Popen") as launched, \
+                    patch.object(CLEANUP, "DeclaredLinks") as monitored, \
                     patch.object(CLEANUP.sys, "argv", ["cleanup", "run", "--owned-interface", "eth0",
                         directory, "--", "must-not-start"]):
                 self.assertEqual(self.run_cleanup(), 1)
                 launched.assert_not_called()
+                monitored.assert_not_called()
             for names in [["eth0"], ["../bad"], ["same", "same"], "owned-veth", [None]]:
                 with self.subTest(names=names):
                     record["owned_interfaces"] = names
