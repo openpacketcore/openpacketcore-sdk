@@ -443,6 +443,8 @@ class CleanupTests(unittest.TestCase):
                 {"namespace": "500", "ifindex": 7, "ifname": "foreign0"}]} )[0], 0)
         with self.subTest(lifetime="late-controller-rename"):
             self.assert_late_renamed_capture(event)
+        with self.subTest(lifetime="preliminary-failure-is-sticky"):
+            self.assert_late_renamed_capture(event, disposal_failed=True)
         with self.subTest(lifetime="clean-repeated-lifetimes"), tempfile.TemporaryDirectory() as directory:
             monitor = CLEANUP.DeclaredLinks(["owned-veth"])
             monitor.namespace = "500"
@@ -456,13 +458,13 @@ class CleanupTests(unittest.TestCase):
             path.write_text(json.dumps(record))
             self.assertEqual(self.verify_fixture(directory, self.before)[0], 0)
 
-    def assert_late_renamed_capture(self, event):
+    def assert_late_renamed_capture(self, event, disposal_failed=False):
         # Drive the real controller and verifier. Its first helper starts only
         # after the primary exits; link events arrive while that helper runs.
         root = {**self.init, **CLEANUP.read_stat(Path("/proc/self/stat")), "ppid": 0}
         after = {**self.before, "interfaces": [*self.before["interfaces"], "renamed-veth"]}
         events = event(16, 7, "owned-veth") + event(16, 7, "renamed-veth")
-        state, snapshots = {"ready": False, "emitted": False}, []
+        state, snapshots = {"ready": False, "emitted": False, "cleaned": False, "delete_ready": False}, []
         with tempfile.TemporaryDirectory() as directory:
             self.owner_fixture(directory)
 
@@ -474,6 +476,9 @@ class CleanupTests(unittest.TestCase):
                 if state["ready"] and monitor.socket is not None and not state["emitted"]:
                     monitor.observe(events)
                     state["emitted"] = True
+                if state["delete_ready"] and monitor.socket is not None:
+                    monitor.observe(event(17, 7, "renamed-veth"))
+                    state["delete_ready"] = False
 
             class Process:
                 def __init__(self, command, **_kwargs):
@@ -492,6 +497,9 @@ class CleanupTests(unittest.TestCase):
                     kwargs = {"capture_pending": True} if "--capture-pending" in self.command else {}
                     self.returncode = CLEANUP.verify(Path(directory), run_id, 0, **kwargs)
                     snapshots.append(json.loads((Path(directory) / ("run-" + run_id + ".json")).read_text()))
+                    if disposal_failed and "--dispose-descendants" in self.command:
+                        state.update(cleaned=True, delete_ready=True)
+                        self.returncode = 1
                     return self.returncode
 
             with redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()), \
@@ -501,9 +509,9 @@ class CleanupTests(unittest.TestCase):
                     patch.object(CLEANUP.DeclaredLinks, "drain", drain), \
                     patch.object(CLEANUP.subprocess, "Popen", Process), \
                     patch.object(CLEANUP.time, "sleep"), \
-                    patch.object(CLEANUP, "snapshot", return_value=after), \
-                    patch.object(CLEANUP, "link_inventory", return_value={"namespace": "500", "links": [
-                        {"namespace": "500", "ifindex": 7, "ifname": "renamed-veth"}]}), \
+                    patch.object(CLEANUP, "snapshot", side_effect=lambda: self.before if state["cleaned"] else after), \
+                    patch.object(CLEANUP, "link_inventory", side_effect=lambda: {"namespace": "500", "links": []
+                        if state["cleaned"] else [{"namespace": "500", "ifindex": 7, "ifname": "renamed-veth"}]}), \
                     patch.object(CLEANUP, "process_inventory", return_value=({root["pid"]: root}, [])), \
                     patch.object(CLEANUP, "direct_children", return_value=set()):
                 code = CLEANUP.run_owned_command(Path(directory), ["late-primary"], ["owned-veth"])
@@ -514,6 +522,15 @@ class CleanupTests(unittest.TestCase):
             self.assertEqual(snapshots[-1]["status"], "complete")
             self.assertTrue(snapshots[-1]["link_capture_complete"])
             self.assertEqual(snapshots[-1]["owned_links"][0]["ifindex"], 7)
+            self.assertEqual(snapshots[-1]["owned_links"][0]["deleted"], disposal_failed)
+            final = json.loads((Path(directory) / snapshots[-1]["attribution"]).read_text())
+            self.assertFalse(final["passed"])
+            self.assertEqual(final["errors"], [])
+            if disposal_failed:
+                self.assertEqual(final["differences"], {})
+                self.assertFalse(snapshots[-1]["preliminary_cleanup_passed"])
+            else:
+                self.assertEqual(list(final["interface_owners"]), ["renamed-veth"])
 
     def verify_fixture(self, directory, after, processes=None, errors=None, links=None, run_id=None):
         indices = {"lo": 1, "eth0": 2, "owned-veth": 7, "renamed-veth": 7, "unrelated-veth": 8}
@@ -591,7 +608,7 @@ class CleanupTests(unittest.TestCase):
 
     def test_incomplete_corrupt_and_mismatched_ownership_fail_closed(self):
         for fault in ["interrupted", "missing", "bad-json", "wrong-type", "baseline", "unclaimed-links",
-                      "duplicate-active-index"]:
+                      "duplicate-active-index", "invalid-preliminary-verdict"]:
             with self.subTest(fault=fault), tempfile.TemporaryDirectory() as directory:
                 self.owner_fixture(directory)
                 evidence = Path(directory)
@@ -615,6 +632,10 @@ class CleanupTests(unittest.TestCase):
                                  link_capture_complete=True, owned_links=[
                                      {"namespace": "500", "ifindex": 7, "declared_name": name, "deleted": False}
                                      for name in ["owned-a", "owned-b"]])
+                    record.write_text(json.dumps(value))
+                elif fault == "invalid-preliminary-verdict":
+                    value = json.loads(record.read_text())
+                    value["preliminary_cleanup_passed"] = "yes"
                     record.write_text(json.dumps(value))
                 else:
                     (evidence / "before.json").write_text(json.dumps(self.before) + " ")
