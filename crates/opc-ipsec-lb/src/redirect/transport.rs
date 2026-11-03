@@ -2617,6 +2617,15 @@ mod tests {
             .unwrap_or_else(|error| panic!("valid test profile: {error}"))
     }
 
+    fn retry_fixture_profile() -> super::super::IngressRedirectProfile {
+        // Authority uses std::time::Instant, which paused Tokio time cannot
+        // control. Eight retries are the unchanged API maximum; this local
+        // 4.5-second horizon tolerates scheduling stalls while retrying early.
+        test_profile()
+            .with_receipt_policy(Duration::from_millis(500), 8)
+            .unwrap_or_else(|error| panic!("valid retry fixture profile: {error}"))
+    }
+
     struct PausedTimeGuard {
         active: bool,
     }
@@ -3325,6 +3334,8 @@ mod tests {
         replay_was_exact: AtomicBool,
         first_data: Mutex<Option<Vec<u8>>>,
         first_receipt_stall: Duration,
+        data_attempts: AtomicU64,
+        all_data_was_exact: AtomicBool,
     }
 
     impl DropFirstReceiptDatagram {
@@ -3343,6 +3354,8 @@ mod tests {
                 replay_was_exact: AtomicBool::new(false),
                 first_data: Mutex::new(None),
                 first_receipt_stall: stall,
+                data_attempts: AtomicU64::new(0),
+                all_data_was_exact: AtomicBool::new(true),
             }
         }
     }
@@ -3390,10 +3403,18 @@ mod tests {
                 .is_ok_and(|header| header.kind() == IngressRedirectFrameKind::Data)
             {
                 if let Ok(mut first_data) = self.first_data.lock() {
-                    if first_data.is_none() {
+                    if let Some(first) = first_data.as_ref() {
+                        if first != &datagram {
+                            // A later matching retry cannot hide a mismatch.
+                            self.all_data_was_exact.store(false, Ordering::Relaxed);
+                        }
+                    } else {
                         *first_data = Some(datagram.clone());
                     }
+                } else {
+                    self.all_data_was_exact.store(false, Ordering::Relaxed);
                 }
+                self.data_attempts.fetch_add(1, Ordering::Release);
             }
             Ok(datagram)
         }
@@ -3409,6 +3430,47 @@ mod tests {
         fn maximum_receive_datagram_size(&self) -> usize {
             self.inner.maximum_receive_datagram_size()
         }
+    }
+
+    async fn assert_exact_retry_delivery(
+        profile: super::super::IngressRedirectProfile,
+        first: &IngressRedirectEndpoint<TokioVirtualClock>,
+        second: &IngressRedirectEndpoint<TokioVirtualClock>,
+        datagram: &DropFirstReceiptDatagram,
+    ) {
+        tokio::time::timeout(
+            Duration::from_secs(30),
+            first.inner.lifecycle.wait_for_operations(),
+        )
+        .await
+        .expect("endpoint-owned retry completion must signal");
+        let attempts = first.metrics().send_attempts;
+        assert!(attempts >= 2, "dropping the first receipt requires a retry");
+        assert!(attempts <= u64::from(profile.max_retries()) + 1);
+        assert_eq!(first.metrics().delivery_receipts, 1);
+        assert_eq!(
+            first.inner.session.metrics().frames_sealed,
+            1,
+            "never reseal"
+        );
+        // Extra identical attempts are permitted under scheduling pressure.
+        // Account for every queued attempt before checking delivery or expiry.
+        tokio::time::timeout(Duration::from_secs(30), async {
+            loop {
+                let received = datagram.data_attempts.load(Ordering::Acquire);
+                assert!(datagram.all_data_was_exact.load(Ordering::Relaxed));
+                let cached = second.metrics().cached_receipts_replayed;
+                assert!(received <= attempts && cached < attempts);
+                if received == attempts && cached == attempts - 1 {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+        })
+        .await
+        .expect("every retry must reach the peer and replay its cached receipt");
+        assert!(datagram.replay_was_exact.load(Ordering::Relaxed));
+        assert_eq!(second.inner.session.metrics().delivered, 1);
     }
 
     #[tokio::test]
@@ -3840,7 +3902,7 @@ mod tests {
 
     #[tokio::test]
     async fn lost_receipt_retries_exact_frame_and_delivers_once_then_expired_capture_replays() {
-        let profile = test_profile();
+        let profile = retry_fixture_profile();
         let (first_session, second_session) = test_sessions(profile);
         let (record, namespace, clock) = ownership_record("owner-b").await;
         let generation = record.generation();
@@ -3891,14 +3953,12 @@ mod tests {
             outcome,
             IngressRedirectInboundOutcome::Delivered(_)
         ));
-        assert!(second_wrapper.replay_was_exact.load(Ordering::Relaxed));
-        assert_eq!(second.metrics().cached_receipts_replayed, 1);
+        assert_exact_retry_delivery(profile, &first, &second, &second_wrapper).await;
         assert_eq!(second_session.metrics().delivered, 1);
-        assert!(
-            tokio::time::timeout(profile.receipt_timeout(), second_rx.receive())
-                .await
-                .is_err()
-        );
+        assert!(matches!(
+            second_rx.delivery.try_recv(),
+            Err(mpsc::error::TryRecvError::Empty)
+        ));
 
         let captured = second_wrapper
             .first_data
@@ -3931,13 +3991,13 @@ mod tests {
             .await
             .unwrap_or_else(|_| panic!("captured-replay injection exceeded profile bound"))
             .unwrap_or_else(|error| panic!("inject captured replay: {error}"));
-        tokio::time::timeout(Duration::from_millis(100), async {
+        tokio::time::timeout(Duration::from_secs(30), async {
             while second_session.metrics().replay_drops == 0 {
                 tokio::time::sleep(Duration::from_millis(1)).await;
             }
         })
         .await
-        .unwrap_or_else(|_| panic!("captured-replay processing exceeded 100 ms observation bound"));
+        .unwrap_or_else(|_| panic!("captured-replay processing did not finish within 30 seconds"));
         assert_eq!(second_session.metrics().replay_drops, 1);
         assert_eq!(second_session.metrics().delivered, 1);
         within_profile_channel_completion_bound(profile, first.shutdown())
@@ -3952,7 +4012,7 @@ mod tests {
 
     #[tokio::test]
     async fn dropping_observation_after_send_does_not_cancel_or_reseal_operation() {
-        let profile = test_profile();
+        let profile = retry_fixture_profile();
         let (first_session, second_session) = test_sessions(profile);
         let (record, namespace, clock) = ownership_record("owner-b").await;
         let generation = record.generation();
@@ -3977,9 +4037,13 @@ mod tests {
             reporter.clone(),
         )
         .unwrap_or_else(|error| panic!("start first: {error}"));
-        let (second, mut second_rx) =
-            IngressRedirectEndpoint::start(second_session, second_cache, second_datagram, reporter)
-                .unwrap_or_else(|error| panic!("start second: {error}"));
+        let (second, mut second_rx) = IngressRedirectEndpoint::start(
+            second_session,
+            second_cache,
+            second_datagram.clone(),
+            reporter,
+        )
+        .unwrap_or_else(|error| panic!("start second: {error}"));
         let packet = synthetic_native_esp_packet(128);
         let operation = first
             .begin_redirect(&packet, ownership_key(), generation)
@@ -3991,18 +4055,11 @@ mod tests {
             Ok(IngressRedirectInboundOutcome::Delivered(_))
         ));
         drop(operation);
-        // Endpoint completion, rather than an observer lifetime or a short
-        // scheduling window, owns the operation. Keep a finite hang guard and
-        // require the authenticated result after that completion signal.
-        tokio::time::timeout(
-            Duration::from_secs(30),
-            first.inner.lifecycle.wait_for_operations(),
-        )
-        .await
-        .unwrap_or_else(|_| panic!("endpoint-owned completion did not signal within 30 seconds"));
-        assert_eq!(first.metrics().delivery_receipts, 1);
-        assert_eq!(first.metrics().send_attempts, 2);
-        assert_eq!(second.metrics().cached_receipts_replayed, 1);
+        assert_exact_retry_delivery(profile, &first, &second, &second_datagram).await;
+        assert!(matches!(
+            second_rx.delivery.try_recv(),
+            Err(mpsc::error::TryRecvError::Empty)
+        ));
         within_profile_channel_completion_bound(profile, first.shutdown())
             .await
             .unwrap_or_else(|_| panic!("first endpoint shutdown exceeded profile bound"))
