@@ -25,12 +25,16 @@ through the recorded process identities and namespace descriptors. Host interfac
 changes remain in the evidence, but do not establish job ownership. A command
 creating an interface in the initial namespace declares its exact name with
 `check-local-kernel-lifecycle-cleanup.py run --owned-interface NAME EVIDENCE -- COMMAND`;
-verification binds each declaration to the first link's kernel index and network
-namespace using a subscription opened before command execution. A rename does
-not hide that identity. Deletion retires the binding, so a later foreign link
-reusing the name is not claimed; another creation needs another declaration.
-Existing host interfaces cannot be claimed by that declaration. Missing or lost
-link event evidence fails verification.
+verification records every lifetime carrying a declared name by kernel index
+and network namespace. The subscription opens before command execution and
+remains active through descendant disposal. Deletion retires its active index
+binding while keeping history; re-creation under the same declaration is recorded
+again, including after rename. Only one active record may occupy an index.
+The owning run refuses live declared names and recorded identities. It stays
+pending through preliminary attribution and disposal, then receives a final
+verdict after capture is drained. Later verification judges recorded identities
+only, so foreign name or index reuse after a clean run is accepted. Existing host
+interfaces cannot be claimed. Missing or lost event evidence fails verification.
 
 Five integration runners pack target runtime estimates after reserving their
 fixed library work. The `recovery_profile` target has an exact named group on

@@ -215,7 +215,8 @@ def run_interface_case(evidence, owned, renamed=False, replacement=False):
 
 
 LIFETIME_CASES = ["bridge-delete", "bridge-nomaster", "recreate", "late-create",
-                  "declared-index-reuse", "initial-index-reuse", "clean-bridge", "late-delete"]
+                  "declared-index-reuse", "initial-index-reuse", "clean-bridge", "late-delete",
+                  "recreate-rename", "recreate-rename-same-index", "late-create-rename"]
 
 
 def link_command(case, directory):
@@ -233,11 +234,11 @@ def link_command(case, directory):
         ip("link", "del", "foreign0")
         add("owned-veth", config["initial_index"])
         return
-    if case != "late-create":
+    if case not in {"late-create", "late-create-rename"}:
         add("owned-a" if case == "declared-index-reuse" else "owned-veth")
-    if case in {"late-create", "late-delete"}:
+    if case in {"late-create", "late-delete", "late-create-rename"}:
         # The test's ip wrapper gates the verifier's first link inventory. The
-        # child acts only after monitoring has stopped, then is reaped before
+        # child acts only after the primary exits, then is reaped before
         # that inventory proceeds. No scheduling delay chooses the outcome.
         (directory / "armed").touch()
         if os.fork():
@@ -247,8 +248,10 @@ def link_command(case, directory):
             if time.monotonic() >= deadline:
                 raise TimeoutError("verifier did not reach the late-link barrier")
             time.sleep(0.001)
-        if case == "late-create":
+        if case in {"late-create", "late-create-rename"}:
             add("owned-veth")
+            if case == "late-create-rename":
+                ip("link", "set", "owned-veth", "name", "renamed-veth")
         else:
             ip("link", "del", "owned-veth")
         process = CLEANUP.read_stat(Path("/proc/self/stat"))
@@ -258,9 +261,12 @@ def link_command(case, directory):
         index = socket.if_nametoindex("owned-a")
         ip("link", "del", "owned-a")
         add("owned-b", index)
-    elif case == "recreate":
+    elif case in {"recreate", "recreate-rename", "recreate-rename-same-index"}:
+        index = socket.if_nametoindex("owned-veth")
         ip("link", "del", "owned-veth")
-        add("owned-veth")
+        add("owned-veth", index if case == "recreate-rename-same-index" else None)
+        if case != "recreate":
+            ip("link", "set", "owned-veth", "name", "renamed-veth")
     else:
         ip("link", "add", "tmpbr0", "type", "bridge")
         ip("link", "set", "owned-veth", "master", "tmpbr0")
@@ -278,7 +284,8 @@ def run_lifetime_case(evidence, case):
     real_ip = shutil.which("ip")
     config = {"ip": real_ip}
     residue = case not in {"clean-bridge", "late-delete"}
-    live_name = "owned-b" if case == "declared-index-reuse" else "owned-veth"
+    live_name = ("renamed-veth" if case in {"recreate-rename", "recreate-rename-same-index", "late-create-rename"}
+                 else "owned-b" if case == "declared-index-reuse" else "owned-veth")
     names = ["owned-a", "owned-b"] if case == "declared-index-reuse" else ["owned-veth"]
     try:
         if case == "initial-index-reuse":
@@ -287,7 +294,7 @@ def run_lifetime_case(evidence, case):
         (evidence / "config.json").write_text(json.dumps(config))
         check(command + ["snapshot", str(cleanup)], evidence / "snapshot.log")
         prefix = []
-        if case in {"late-create", "late-delete"}:
+        if case in {"late-create", "late-delete", "late-create-rename"}:
             binaries = evidence / "bin"
             binaries.mkdir()
             wrapper = binaries / "ip"
@@ -329,8 +336,16 @@ os.execv({real_ip!r}, [{real_ip!r}, *sys.argv[1:]])
             assert "198.18.0.0/24" in routes
         if case in {"declared-index-reuse", "initial-index-reuse"}:
             assert any(not row["deleted"] and row["declared_name"] == live_name for row in record["owned_links"])
-        if case == "late-create":
-            assert not record["owned_links"], "the child must create after event capture stops"
+        if case in {"late-create", "late-create-rename"}:
+            assert any(not row["deleted"] and row["ifindex"] == socket.if_nametoindex(live_name)
+                       for row in record["owned_links"]), "capture must include the child's lifetime"
+        if case in {"bridge-delete", "bridge-nomaster"}:
+            assert not record["owned_links"][0]["deleted"], "bridge removal must not retire the port"
+        if case in {"recreate", "recreate-rename", "recreate-rename-same-index"}:
+            assert [row["deleted"] for row in record["owned_links"]] == [True, False]
+            assert record["owned_links"][-1]["ifindex"] == socket.if_nametoindex(live_name)
+            if case == "recreate-rename-same-index":
+                assert record["owned_links"][0]["ifindex"] == record["owned_links"][1]["ifindex"]
         if case == "late-delete":
             assert record["owned_links"][0]["deleted"]
             index = record["owned_links"][0]["ifindex"]
@@ -340,7 +355,7 @@ os.execv({real_ip!r}, [{real_ip!r}, *sys.argv[1:]])
             "owned_links": record["owned_links"], "attribution": attribution}, indent=2) + "\n")
     finally:
         for link in CLEANUP.link_inventory()["links"]:
-            if link["ifname"] in {"owned-veth", "owned-a", "owned-b", "foreign0", "tmpbr0"}:
+            if link["ifname"] in {"owned-veth", "renamed-veth", "owned-a", "owned-b", "foreign0", "tmpbr0"}:
                 subprocess.run([real_ip, "link", "del", link["ifname"]], check=True)
     print(f"PASS {evidence.name}", flush=True)
 
