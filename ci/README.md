@@ -38,7 +38,11 @@ declarations: twelve additional host-test lanes run the admission fixtures
 serially, retaining the original six-package selection, features and profile.
 The long mixed-journal proof runs on its dedicated native-proof lane at its
 original O0 profile. The complete epoch-floor proof also has a dedicated
-native-proof runner at O0. The other fixtures have explicit balanced owners.
+native-proof runner at O0. The two complete retained-snapshot round trips
+likewise keep checked O0, each on its own native-proof runner with a
+120-minute allocation. Their ordinary-runner exclusions and exact target
+prechecks preserve one execution each. The other fixtures have explicit
+balanced owners.
 Their names are excluded from every ordinary egress process and checked against
 the compiled inventory, so new or renamed declarations cannot silently pass as
 empty commands.

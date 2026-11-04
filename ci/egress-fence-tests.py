@@ -42,8 +42,14 @@ EPOCH_PROOF_TEST = (
     "native_epoch_floor_matches_fake_through_two_real_threshold_rotations"
 )
 EPOCH_PROOF_SHARD = max(native_log_bound.EGRESS_SHARDS) + 1
-NATIVE_PROOF_SHARDS = (*native_log_bound.EGRESS_SHARDS, EPOCH_PROOF_SHARD)
 RESOURCE_SHARDS = tuple(range(EPOCH_PROOF_SHARD + 1, EPOCH_PROOF_SHARD + 13))
+RETAINED_SNAPSHOT_TESTS = (
+    "retained_snapshot::async_retained_notification_snapshot_boundary_round_trip",
+    "retained_snapshot::durable_retained_notification_snapshot_boundary_round_trip",
+)
+RETAINED_SNAPSHOT_SHARDS = (max(RESOURCE_SHARDS) + 1, max(RESOURCE_SHARDS) + 2)
+NATIVE_PROOF_SHARDS = (*native_log_bound.EGRESS_SHARDS, EPOCH_PROOF_SHARD,
+                       *RETAINED_SNAPSHOT_SHARDS)
 HOST_TEST_SHARDS = (*ORDINARY_SHARDS, *RESOURCE_SHARDS)
 SHARDS = (*HOST_TEST_SHARDS, PROOF_SHARD, *NATIVE_PROOF_SHARDS)
 REQUIRED_JOBS = ("sources", "oracles", "installer", "host-tests", "host-proofs", "host-native-log-proofs")
@@ -99,7 +105,8 @@ SERIAL_LIB_TESTS = (
     "consensus::store::sequential_wal_sdk_tests::scope_child_read::"
     "scope_child_read_three_large_children_refuse_the_whole_observation",
 )
-ISOLATED_TESTS = (*SPECIAL, *SERIAL_LIB_TESTS, *native_log_bound.TESTS, EPOCH_PROOF_TEST)
+ISOLATED_TESTS = (*SPECIAL, *SERIAL_LIB_TESTS, *native_log_bound.TESTS, EPOCH_PROOF_TEST,
+                  *RETAINED_SNAPSHOT_TESTS)
 
 
 @lru_cache(maxsize=1)
@@ -140,6 +147,8 @@ def shared_allowance_names(rows: list[dict]) -> tuple[str, ...]:
 
 def owner(name: str) -> int:
     """The same name in two harnesses must have the same owner: skips are global."""
+    if name in RETAINED_SNAPSHOT_TESTS:
+        return RETAINED_SNAPSHOT_SHARDS[RETAINED_SNAPSHOT_TESTS.index(name)]
     if name in SERIAL_LIB_TESTS:
         return 1
     if name in (*ROSTER_TIMING_LIB, *ROSTER_WORK_LIB):
@@ -225,8 +234,10 @@ def verify(rows: list[dict]) -> None:
         raise ValueError("duplicate test identity")
     for name in ISOLATED_TESTS:
         matches = [r for r in rows if r["name"] == name]
-        target = "consensus_openraft" if name in ISOLATED_INTEGRATION else "opc_session_store"
-        kind = ["test"] if name in ISOLATED_INTEGRATION else ["lib"]
+        integration = name in (*ISOLATED_INTEGRATION, *RETAINED_SNAPSHOT_TESTS)
+        target = ("fenced_transition_v2_qualification" if name in RETAINED_SNAPSHOT_TESTS
+                  else "consensus_openraft" if integration else "opc_session_store")
+        kind = ["test"] if integration else ["lib"]
         if len(matches) != 1 or matches[0]["package"] != "opc-session-store" or \
                 matches[0]["target"] != target or matches[0]["kind"] != kind or matches[0]["ignored"]:
             raise ValueError("isolated test must resolve exactly once and remain enabled: " + name)
@@ -265,6 +276,14 @@ def optimized_lib_command(name: str) -> dict:
 
 
 def native_proof_commands(shard: int) -> list[dict]:
+    if shard in RETAINED_SNAPSHOT_SHARDS:
+        name = RETAINED_SNAPSHOT_TESTS[RETAINED_SNAPSHOT_SHARDS.index(shard)]
+        return [{"name": name, "env": {"CARGO_PROFILE_TEST_OPT_LEVEL": "0",
+                                     "CARGO_PROFILE_TEST_DEBUG_ASSERTIONS": "true",
+                                     "CARGO_PROFILE_TEST_OVERFLOW_CHECKS": "true"}, "argv": [
+            "cargo", "test", *SELECTION, "--quiet", "--test", "fenced_transition_v2_qualification",
+            "--", "--test-threads=1", "--nocapture", "--exact", name,
+        ]}]
     if shard == EPOCH_PROOF_SHARD:
         command = serial_lib_command(EPOCH_PROOF_TEST)
         command["env"] = {"CARGO_PROFILE_TEST_OPT_LEVEL": "0",
@@ -282,7 +301,8 @@ def precheck_native_log_bound(commands: list[dict]) -> None:
     """Prove each full-bound name resolves and stays enabled in its test profile."""
     for command in commands:
         name = command["name"]
-        if name not in (*native_log_bound.TESTS, *ROSTER_TIMING_LIB, *ROSTER_WORK_LIB, EPOCH_PROOF_TEST):
+        if name not in (*native_log_bound.TESTS, *ROSTER_TIMING_LIB, *ROSTER_WORK_LIB,
+                        EPOCH_PROOF_TEST, *RETAINED_SNAPSHOT_TESTS):
             continue
         argv = [*command["argv"], "--list"]
         env = dict(os.environ, **command["env"])
@@ -363,11 +383,14 @@ def verify_plans(planned: dict[int, list[dict]], rows: list[dict]) -> None:
     if planned[EPOCH_PROOF_SHARD] != native_proof_commands(EPOCH_PROOF_SHARD):
         raise ValueError("the complete epoch proof must keep one original-profile process")
     native_locations[EPOCH_PROOF_TEST] = (EPOCH_PROOF_SHARD, 0)
+    for shard in RETAINED_SNAPSHOT_SHARDS:
+        if planned[shard] != native_proof_commands(shard):
+            raise ValueError("each retained snapshot proof must keep one original-profile process")
     for index, name in enumerate((*ROSTER_TIMING_LIB, *ROSTER_WORK_LIB), 1):
         native_locations[name] = (ROSTER_TIMING_SHARD, index)
     metadata = cargo_test_selection.workspace_metadata(ROOT)
     resolved = {
-        (shard, index): cargo_test_selection.resolve(command["argv"], metadata)
+        (shard, index): cargo_test_selection.resolve(command["argv"], metadata, include_integration=True)
         for shard, commands in planned.items() for index, command in enumerate(commands)
     }
     serial_locations = {name: (1, index) for index, name in enumerate(SERIAL_LIB_TESTS)}
@@ -388,13 +411,21 @@ def verify_plans(planned: dict[int, list[dict]], rows: list[dict]) -> None:
         ]
         if selections != [expected_location]:
             raise ValueError("full native log proof selections are missing or overlapping: " + name)
+    for name, shard in zip(RETAINED_SNAPSHOT_TESTS, RETAINED_SNAPSHOT_SHARDS):
+        selections = [
+            location for location, selection in resolved.items()
+            if selection.selects("opc-session-store", "fenced_transition_v2_qualification", ("test",), name)
+        ]
+        if selections != [(shard, 0)]:
+            raise ValueError("retained snapshot proof selections are missing or overlapping: " + name)
     for shard in ORDINARY_SHARDS:
         ordinary = [c for c in planned[shard] if c["name"] == "ordinary"]
         if len(ordinary) != 1:
             raise ValueError("ordinary test command must run exactly once per shard")
         argv = ordinary[0]["argv"]
         skips = [argv[i + 1] for i, arg in enumerate(argv[:-1]) if arg == "--skip"]
-        if "--exact" not in argv or any(skips.count(name) != 1 for name in (*SERIAL_LIB_TESTS, *shared, *native_log_bound.TESTS, EPOCH_PROOF_TEST)):
+        if "--exact" not in argv or any(skips.count(name) != 1 for name in (*SERIAL_LIB_TESTS, *shared, *native_log_bound.TESTS,
+                                                                      EPOCH_PROOF_TEST, *RETAINED_SNAPSHOT_TESTS)):
             raise ValueError("ordinary tests must exclude exactly the serial library and full native log tests")
 
 
