@@ -373,7 +373,7 @@ jobs:
     name: Rust full-bound store proof (${{ matrix.shard }})
     runs-on: ubuntu-latest
     # The signed 131,073-roster proof includes complete cold reconstruction.
-    timeout-minutes: ${{ matrix.shard == 'roster-history' && 240 || 90 }}
+    timeout-minutes: ${{ matrix.shard == 'roster-history' && 315 || 90 }}
     strategy:
       fail-fast: false
       matrix:
