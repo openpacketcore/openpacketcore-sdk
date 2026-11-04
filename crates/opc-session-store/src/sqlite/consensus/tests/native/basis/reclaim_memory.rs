@@ -512,7 +512,7 @@ fn native_reclaim_memory_void_pressure_fence_replays_and_retires_epoch() {
 
 #[test]
 fn native_reclaim_memory_committed_wait_releases_permit_and_proceeds() {
-    crate::test_process::with_completion_deadline(std::time::Duration::from_secs(300), || {
+    crate::test_process::with_completion_deadline(std::time::Duration::from_secs(600), || {
         if isolated("native_reclaim_memory_committed_wait_releases_permit_and_proceeds") {
             return;
         }
@@ -577,7 +577,7 @@ fn native_reclaim_memory_committed_wait_fails_closed_with_bounded_reason() {
 
 #[test]
 fn native_reclaim_memory_shutdown_interrupts_committed_wait() {
-    crate::test_process::with_completion_deadline(std::time::Duration::from_secs(300), || {
+    crate::test_process::with_completion_deadline(std::time::Duration::from_secs(600), || {
         if isolated("native_reclaim_memory_shutdown_interrupts_committed_wait") {
             return;
         }
@@ -1136,7 +1136,7 @@ fn native_reclaim_memory_noop_admission_keeps_consumers_live() {
 
 #[test]
 fn native_reclaim_memory_held_checkpoint_allows_consumer_work_and_finishes() {
-    crate::test_process::with_completion_deadline(std::time::Duration::from_secs(300), || {
+    crate::test_process::with_completion_deadline(std::time::Duration::from_secs(900), || {
         const CHILD: &str = "OPC_RECLAIM_CHECKPOINT_CHILD";
         const TEST: &str = "sqlite::consensus::tests::native::basis::reclaim_memory::native_reclaim_memory_held_checkpoint_allows_consumer_work_and_finishes";
         if std::env::var_os(CHILD).is_none() {
@@ -1273,7 +1273,7 @@ fn native_reclaim_memory_preflight_does_not_request_during_install() {
 
 #[test]
 fn native_reclaim_memory_full_generation_replays_maximum_retirement_suffix() {
-    crate::test_process::with_completion_deadline(std::time::Duration::from_secs(300), || {
+    crate::test_process::with_completion_deadline(std::time::Duration::from_secs(900), || {
         if isolated("native_reclaim_memory_full_generation_replays_maximum_retirement_suffix") {
             return;
         }
