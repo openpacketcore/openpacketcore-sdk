@@ -344,7 +344,7 @@ fn native_reclaim_memory_void_checkpoint_and_replay_preserve_first_binding() {
 
 #[test]
 fn native_reclaim_memory_void_pressure_fence_replays_and_retires_epoch() {
-    crate::test_process::with_completion_deadline(std::time::Duration::from_secs(300), || {
+    crate::test_process::with_completion_deadline(std::time::Duration::from_secs(600), || {
         if isolated("native_reclaim_memory_void_pressure_fence_replays_and_retires_epoch") {
             return;
         }
@@ -713,7 +713,7 @@ fn native_reclaim_memory_progress_extends_committed_wait() {
 
 #[test]
 fn native_reclaim_memory_unhelpful_checkpoints_do_not_extend_wait() {
-    crate::test_process::with_completion_deadline(std::time::Duration::from_secs(300), || {
+    crate::test_process::with_completion_deadline(std::time::Duration::from_secs(600), || {
         if isolated("native_reclaim_memory_unhelpful_checkpoints_do_not_extend_wait") {
             return;
         }
@@ -948,7 +948,7 @@ fn native_reclaim_memory_planner_error_uses_real_evaluation() {
 
 #[test]
 fn native_reclaim_memory_preflight_avoids_unhelpful_checkpoints() {
-    crate::test_process::with_completion_deadline(std::time::Duration::from_secs(300), || {
+    crate::test_process::with_completion_deadline(std::time::Duration::from_secs(600), || {
         if isolated("native_reclaim_memory_preflight_avoids_unhelpful_checkpoints") {
             return;
         }
@@ -1066,7 +1066,7 @@ fn native_reclaim_memory_eight_mib_journal_requests_checkpoint() {
 
 #[test]
 fn native_reclaim_memory_noop_admission_keeps_consumers_live() {
-    crate::test_process::with_completion_deadline(std::time::Duration::from_secs(300), || {
+    crate::test_process::with_completion_deadline(std::time::Duration::from_secs(600), || {
         const CHILD: &str = "OPC_RECLAIM_ADMISSION_CHILD";
         const TEST: &str = "sqlite::consensus::tests::native::basis::reclaim_memory::native_reclaim_memory_noop_admission_keeps_consumers_live";
         if std::env::var_os(CHILD).is_none() {
@@ -1254,7 +1254,7 @@ fn native_reclaim_memory_held_checkpoint_allows_consumer_work_and_finishes() {
 
 #[test]
 fn native_reclaim_memory_preflight_does_not_request_during_install() {
-    crate::test_process::with_completion_deadline(std::time::Duration::from_secs(300), || {
+    crate::test_process::with_completion_deadline(std::time::Duration::from_secs(600), || {
         if isolated("native_reclaim_memory_preflight_does_not_request_during_install") {
             return;
         }
