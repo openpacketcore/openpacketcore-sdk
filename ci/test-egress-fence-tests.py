@@ -823,6 +823,15 @@ class RequiredCheckTests(unittest.TestCase):
 
 
 class WorkflowTests(unittest.TestCase):
+    def test_test_jobs_bound_debug_artifact_storage(self):
+        workflow = (FENCE.ROOT / ".github/workflows/egress-fence.yml").read_text()
+        parts = re.split(r"^  ([a-z][a-z-]+):\n", workflow.split("\njobs:\n", 1)[1],
+                         flags=re.MULTILINE)
+        jobs = dict(zip(parts[1::2], parts[2::2]))
+        for name in ("host-tests", "host-proofs", "host-native-log-proofs"):
+            with self.subTest(job=name):
+                self.assertIn('    env:\n      CARGO_PROFILE_TEST_DEBUG: "0"\n', jobs[name])
+
     def assert_native_proof_matrix(self, native):
         self.assertIn(f"shard: {list(FENCE.NATIVE_PROOF_SHARDS)}\n", native)
 
