@@ -1436,7 +1436,9 @@ impl SessionRaftRpcHandler {
             Ok(payload) => payload,
             Err(error) => return rejected_response(error),
         };
-        let response = if self.persistence.mode() == super::SessionPersistenceMode::Async {
+        let response = if self.persistence.mode() == super::SessionPersistenceMode::Async
+            || request.family == SessionConsensusRpcFamily::InstallSnapshot
+        {
             let permit = match tokio::time::timeout_at(
                 deadline,
                 Arc::clone(&self.persistence.cold_rpc_admission).acquire_owned(),
@@ -1450,6 +1452,9 @@ impl SessionRaftRpcHandler {
             let (send, receive) = tokio::sync::oneshot::channel();
             // A cancelled transport must not drop the attempt's read guard
             // while Raft still owns an accepted append or snapshot install.
+            // Receiver preparation may outlive a snapshot chunk's caller;
+            // retain it so cancellation cannot discard the first chunk and
+            // force every retry to prepare another empty receiver.
             // The finite permit is retained until its real engine completion.
             tokio::spawn(async move {
                 let response = handler

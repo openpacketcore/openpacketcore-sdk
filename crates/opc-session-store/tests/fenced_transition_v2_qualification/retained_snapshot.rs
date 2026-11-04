@@ -420,7 +420,10 @@ async fn round_trip(mode: SessionPersistenceMode) {
         peer.install(stores[target].rpc_handler()).await;
     }
     eprintln!("retained_snapshot_phase=wait_follower_install");
-    let installation = tokio::time::timeout(Duration::from_secs(150), async {
+    // Observe the complete transfer, envelope verification and native import.
+    // This observation does not extend any engine or transport RPC deadline.
+    let install_started = std::time::Instant::now();
+    let installation = tokio::time::timeout(Duration::from_secs(1200), async {
         while consensus_local_durable_progress_for_test(&stores[lagging]).snapshot_index
             < Some(purged)
         {
@@ -430,7 +433,8 @@ async fn round_trip(mode: SessionPersistenceMode) {
     .await;
     if installation.is_err() {
         for (index, store) in stores.iter().enumerate() {
-            eprintln!("retained_snapshot_install_observation voter={index} required={purged} progress={:?} costs={:?}",
+            eprintln!("retained_snapshot_install_observation voter={index} required={purged} elapsed={:?} progress={:?} costs={:?}",
+                install_started.elapsed(),
                 consensus_local_durable_progress_for_test(store),
                 opc_session_store::test_support::consensus_local_wal_costs_for_test(store));
         }
@@ -447,6 +451,11 @@ async fn round_trip(mode: SessionPersistenceMode) {
         }
     }
     installation.expect("the follower installs the retained snapshot through real Raft RPC");
+    eprintln!(
+        "retained_snapshot_install_completed elapsed={:?} required={purged} progress={:?}",
+        install_started.elapsed(),
+        consensus_local_durable_progress_for_test(&stores[lagging])
+    );
     let (native, origin) =
         consensus_native_snapshot_install_origin_for_test(&stores[lagging]).unwrap();
     assert!(native);

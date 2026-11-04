@@ -9,6 +9,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Retain accepted snapshot chunk processing after caller cancellation, so
+  repeated delivery can continue the same receiver under bounded admission.
+
 - Rootless full roster admission uses checkpoint memory headroom during store
   creation, reopen, generation selection, snapshot export and install, while
   retaining the process cap and live-journal allowance.
