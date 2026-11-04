@@ -806,14 +806,24 @@ fn native_rollover_shutdown_and_install_cancel_inside_real_io_adapters() {
                     false,
                 );
                 let build = Park::at(Point::AfterNativeBasisAdmission, false);
+                // Async reopen starts a capture immediately. Hold its first
+                // append until the adapter witness is armed.
+                let startup = Park::at(Point::BeforeNativeGenerationAppend, false);
+                let _release_startup = Release(Arc::clone(&startup));
+                startup.arm();
+                let opening_thread = std::thread::current().id();
                 let cancelled = Arc::new((Mutex::new(false), Condvar::new()));
                 let control = IoControl {
                     native_rollover_bytes: Some(65536),
                     hook: Arc::new({
                         let adapter = Arc::clone(&adapter);
                         let build = Arc::clone(&build);
+                        let startup = Arc::clone(&startup);
                         let cancelled = Arc::clone(&cancelled);
                         move |point| {
+                            if std::thread::current().id() != opening_thread {
+                                startup.hook(point)?;
+                            }
                             adapter.hook(point)?;
                             build.hook(point)?;
                             if point == Point::NativeCompactorCancelled {
@@ -876,6 +886,7 @@ fn native_rollover_shutdown_and_install_cancel_inside_real_io_adapters() {
                 if compare {
                     build.arm();
                 }
+                startup.release();
                 fixture.wal.checkpoint().unwrap();
                 if compare {
                     build.entered();

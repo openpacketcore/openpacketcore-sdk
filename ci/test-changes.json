@@ -938,7 +938,7 @@
     {
       "test": "rust:crates/opc-session-store::lib=lib::sqlite::consensus::tests::native::basis::rollover::concurrency::native_rollover_shutdown_and_install_cancel_inside_real_io_adapters",
       "kind": "fixture-setup-changed",
-      "reason": "Rename the subprocess recursion and I/O-case environment markers by behaviour. Every existing Durable/Async and applicable I/O, install or shutdown child case still runs. Each parent now requires the exact named child and a one-test success summary as well as successful exit; no case, bound, deadline or assertion is removed.",
+      "reason": "Rename the subprocess recursion and I/O-case environment markers by behaviour. Every existing Durable/Async and applicable I/O, install or shutdown child case still runs. Each parent now requires the exact named child and a one-test success summary as well as successful exit; no case, bound, deadline or assertion is removed. During reopen, hold any background generation append until the adapter and comparison witnesses are armed; then release it before requesting the checkpoint. This preserves all existing cancellation, source-health and reopen checks.",
       "issue": 1253
     },
     {
