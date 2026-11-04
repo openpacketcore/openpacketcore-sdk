@@ -96,20 +96,29 @@ async fn wait_for_notifications(store: &ConsensusSessionStore, sequence: u64) {
 }
 
 async fn snapshot(store: &ConsensusSessionStore) {
-    let before = store.status().completed_snapshot_count;
+    let before = store.status();
+    let phase_before =
+        opc_session_store::test_support::consensus_snapshot_build_phase_for_test(store);
     trigger_consensus_snapshot_for_test(store)
         .await
         .expect("request the production snapshot finalizer");
     tokio::time::timeout(Duration::from_secs(30), async {
         loop {
-            if store.status().completed_snapshot_count > before {
+            if store.status().completed_snapshot_count > before.completed_snapshot_count {
                 break;
             }
             tokio::time::sleep(Duration::from_millis(50)).await;
         }
     })
     .await
-    .expect("the production finalizer publishes the exact retained prefix");
+    .unwrap_or_else(|error| {
+        panic!(
+            "the production finalizer publishes the exact retained prefix: {error:?}; request_enqueued=true, before={before:?}, after={:?}, phase_before={phase_before:?}, phase_after={:?}, durable_progress={:?}",
+            store.status(),
+            opc_session_store::test_support::consensus_snapshot_build_phase_for_test(store),
+            consensus_local_durable_progress_for_test(store)
+        )
+    });
 }
 
 async fn purge_verified_snapshot(store: &ConsensusSessionStore) {
