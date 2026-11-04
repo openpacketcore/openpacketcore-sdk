@@ -2877,6 +2877,100 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     #[tokio::test]
+    async fn durable_snapshot_chunk_survives_caller_cancellation_before_receiver_ready() {
+        use std::future::Future as _;
+
+        for selected in [FixedAuthorityBackend::Sqlite, FixedAuthorityBackend::Native] {
+            let fixture = fixed_follower_fixture(Duration::from_secs(5), true, selected).await;
+            fixture.raft.runtime_config().elect(false);
+            let (previous, membership) =
+                fixture.state_machine.clone().applied_state().await.unwrap();
+            let committed = LogId::new(CommittedLeaderId::new(1, fixture.leader), 1);
+            let held_apply = Arc::clone(&fixture.backend.consensus_apply_gate)
+                .acquire_owned()
+                .await
+                .unwrap();
+            assert_eq!(
+                fixture
+                    .raft
+                    .append_entries(AppendEntriesRequest {
+                        vote: Vote::new_committed(1, fixture.leader),
+                        prev_log_id: previous,
+                        entries: vec![Entry {
+                            log_id: committed,
+                            payload: EntryPayload::Blank,
+                        }],
+                        leader_commit: Some(committed),
+                    })
+                    .await
+                    .unwrap(),
+                AppendEntriesResponse::Success
+            );
+            let request = |offset| {
+                let rpc = InstallSnapshotRequest::<SessionRaftTypeConfig> {
+                    vote: Vote::new_committed(1, fixture.leader),
+                    meta: opc_consensus::engine::SnapshotMeta {
+                        last_log_id: Some(committed),
+                        last_membership: membership.clone(),
+                        snapshot_id: "cancelled-first-chunk".into(),
+                    },
+                    offset,
+                    data: vec![0x51],
+                    done: false,
+                };
+                SessionConsensusWireRequest::try_new(
+                    fixture.scope,
+                    fixture.leader,
+                    SessionConsensusRpcFamily::InstallSnapshot,
+                    encode_bounded(&rpc).unwrap(),
+                )
+                .unwrap()
+            };
+            let admission = Arc::clone(&fixture.handler.persistence.cold_rpc_admission);
+            let all_permits = u32::try_from(admission.available_permits()).unwrap();
+            let mut first = Box::pin(fixture.handler.handle(fixture.leader, request(0)));
+            std::future::poll_fn(|cx| {
+                assert!(first.as_mut().poll(cx).is_pending());
+                std::task::Poll::Ready(())
+            })
+            .await;
+            fixture.raft.with_raft_state(|_| ()).await.unwrap();
+            drop(first);
+            drop(held_apply);
+            fixture
+                .raft
+                .wait(Some(Duration::from_secs(5)))
+                .applied_index(Some(committed.index), "release receiver preparation")
+                .await
+                .unwrap();
+            let drained = tokio::time::timeout(
+                Duration::from_secs(5),
+                admission.acquire_many_owned(all_permits),
+            )
+            .await
+            .expect("accepted snapshot work drains after the caller is cancelled")
+            .unwrap();
+            drop(drained);
+            let response = tokio::time::timeout(
+                Duration::from_secs(5),
+                fixture.handler.handle(fixture.leader, request(1)),
+            )
+            .await
+            .expect("the next chunk observes the retained receiver");
+            let response: Result<
+                InstallSnapshotResponse<SessionConsensusNodeId>,
+                RaftError<SessionConsensusNodeId, InstallSnapshotError>,
+            > = decode_bounded(&response.result.unwrap()).unwrap();
+            fixture.raft.shutdown().await.unwrap();
+            assert!(
+                response.is_ok(),
+                "{selected:?}: cancellation discarded the accepted first chunk: {response:?}"
+            );
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
     async fn native_voter_engine_accepts_new_snapshot_after_interrupted_transfer() {
         let mut source =
             fixed_follower_fixture(Duration::from_secs(1), true, FixedAuthorityBackend::Native)
