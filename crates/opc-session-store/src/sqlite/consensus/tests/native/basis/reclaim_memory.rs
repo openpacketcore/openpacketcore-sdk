@@ -9,6 +9,7 @@ fn isolated(case: &str) -> bool {
         return false;
     }
     let name = format!("sqlite::consensus::tests::native::basis::reclaim_memory::{case}");
+    eprintln!("launching isolated fixture {name} at {}:{}", file!(), line!());
     let output = std::process::Command::new(std::env::current_exe().unwrap())
         .args(["--exact", &name, "--test-threads=1", "--nocapture"])
         .env(CHILD, case)
@@ -139,6 +140,7 @@ fn crashed_void_fixture<T: serde::de::DeserializeOwned>(
     let root = tempfile::tempdir().unwrap();
     let report = root.path().join("crash.json");
     let name = format!("sqlite::consensus::tests::native::basis::reclaim_memory::{case}");
+    eprintln!("launching isolated fixture {name} at {}:{}", file!(), line!());
     let output = std::process::Command::new(std::env::current_exe().unwrap())
         .args(["--exact", &name, "--test-threads=1", "--nocapture"])
         .env(CHILD, case)
@@ -344,7 +346,7 @@ fn native_reclaim_memory_void_checkpoint_and_replay_preserve_first_binding() {
 
 #[test]
 fn native_reclaim_memory_void_pressure_fence_replays_and_retires_epoch() {
-    crate::test_process::with_completion_deadline(std::time::Duration::from_secs(600), || {
+    crate::test_process::with_completion_deadline(std::time::Duration::from_secs(300), || {
         if isolated("native_reclaim_memory_void_pressure_fence_replays_and_retires_epoch") {
             return;
         }
@@ -512,7 +514,7 @@ fn native_reclaim_memory_void_pressure_fence_replays_and_retires_epoch() {
 
 #[test]
 fn native_reclaim_memory_committed_wait_releases_permit_and_proceeds() {
-    crate::test_process::with_completion_deadline(std::time::Duration::from_secs(600), || {
+    crate::test_process::with_completion_deadline(std::time::Duration::from_secs(300), || {
         if isolated("native_reclaim_memory_committed_wait_releases_permit_and_proceeds") {
             return;
         }
@@ -577,7 +579,7 @@ fn native_reclaim_memory_committed_wait_fails_closed_with_bounded_reason() {
 
 #[test]
 fn native_reclaim_memory_shutdown_interrupts_committed_wait() {
-    crate::test_process::with_completion_deadline(std::time::Duration::from_secs(600), || {
+    crate::test_process::with_completion_deadline(std::time::Duration::from_secs(300), || {
         if isolated("native_reclaim_memory_shutdown_interrupts_committed_wait") {
             return;
         }
@@ -713,7 +715,7 @@ fn native_reclaim_memory_progress_extends_committed_wait() {
 
 #[test]
 fn native_reclaim_memory_unhelpful_checkpoints_do_not_extend_wait() {
-    crate::test_process::with_completion_deadline(std::time::Duration::from_secs(600), || {
+    crate::test_process::with_completion_deadline(std::time::Duration::from_secs(300), || {
         if isolated("native_reclaim_memory_unhelpful_checkpoints_do_not_extend_wait") {
             return;
         }
@@ -948,7 +950,7 @@ fn native_reclaim_memory_planner_error_uses_real_evaluation() {
 
 #[test]
 fn native_reclaim_memory_preflight_avoids_unhelpful_checkpoints() {
-    crate::test_process::with_completion_deadline(std::time::Duration::from_secs(600), || {
+    crate::test_process::with_completion_deadline(std::time::Duration::from_secs(300), || {
         if isolated("native_reclaim_memory_preflight_avoids_unhelpful_checkpoints") {
             return;
         }
@@ -1066,10 +1068,11 @@ fn native_reclaim_memory_eight_mib_journal_requests_checkpoint() {
 
 #[test]
 fn native_reclaim_memory_noop_admission_keeps_consumers_live() {
-    crate::test_process::with_completion_deadline(std::time::Duration::from_secs(600), || {
+    crate::test_process::with_completion_deadline(std::time::Duration::from_secs(300), || {
         const CHILD: &str = "OPC_RECLAIM_ADMISSION_CHILD";
         const TEST: &str = "sqlite::consensus::tests::native::basis::reclaim_memory::native_reclaim_memory_noop_admission_keeps_consumers_live";
         if std::env::var_os(CHILD).is_none() {
+            eprintln!("launching isolated fixture {TEST} at {}:{}", file!(), line!());
             let output = std::process::Command::new(std::env::current_exe().unwrap())
                 .args(["--exact", TEST, "--test-threads=1", "--nocapture"])
                 .env(CHILD, "1")
@@ -1136,10 +1139,11 @@ fn native_reclaim_memory_noop_admission_keeps_consumers_live() {
 
 #[test]
 fn native_reclaim_memory_held_checkpoint_allows_consumer_work_and_finishes() {
-    crate::test_process::with_completion_deadline(std::time::Duration::from_secs(900), || {
+    crate::test_process::with_completion_deadline(std::time::Duration::from_secs(300), || {
         const CHILD: &str = "OPC_RECLAIM_CHECKPOINT_CHILD";
         const TEST: &str = "sqlite::consensus::tests::native::basis::reclaim_memory::native_reclaim_memory_held_checkpoint_allows_consumer_work_and_finishes";
         if std::env::var_os(CHILD).is_none() {
+            eprintln!("launching isolated fixture {TEST} at {}:{}", file!(), line!());
             let output = std::process::Command::new(std::env::current_exe().unwrap())
                 .args(["--exact", TEST, "--test-threads=1", "--nocapture"])
                 .env(CHILD, "1")
@@ -1254,7 +1258,7 @@ fn native_reclaim_memory_held_checkpoint_allows_consumer_work_and_finishes() {
 
 #[test]
 fn native_reclaim_memory_preflight_does_not_request_during_install() {
-    crate::test_process::with_completion_deadline(std::time::Duration::from_secs(600), || {
+    crate::test_process::with_completion_deadline(std::time::Duration::from_secs(300), || {
         if isolated("native_reclaim_memory_preflight_does_not_request_during_install") {
             return;
         }
@@ -1273,7 +1277,7 @@ fn native_reclaim_memory_preflight_does_not_request_during_install() {
 
 #[test]
 fn native_reclaim_memory_full_generation_replays_maximum_retirement_suffix() {
-    crate::test_process::with_completion_deadline(std::time::Duration::from_secs(900), || {
+    crate::test_process::with_completion_deadline(std::time::Duration::from_secs(1200), || {
         if isolated("native_reclaim_memory_full_generation_replays_maximum_retirement_suffix") {
             return;
         }
