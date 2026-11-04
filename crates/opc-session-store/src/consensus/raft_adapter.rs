@@ -2883,6 +2883,9 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[tokio::test]
     async fn durable_snapshot_chunk_survives_caller_cancellation_before_receiver_ready() {
+        if crate::test_process::run_completion_parent(Duration::from_secs(60)) {
+            return;
+        }
         use std::future::Future as _;
 
         for selected in [FixedAuthorityBackend::Sqlite, FixedAuthorityBackend::Native] {
