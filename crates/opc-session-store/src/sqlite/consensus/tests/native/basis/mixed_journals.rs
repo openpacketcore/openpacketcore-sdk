@@ -192,7 +192,7 @@ struct CrashReport {
 
 #[test]
 fn native_journal_pressure_mixed_captured_and_live_crash_reopens() {
-    crate::test_process::with_completion_deadline(std::time::Duration::from_secs(1800), || {
+    crate::test_process::with_completion_deadline(std::time::Duration::from_secs(300), || {
         const CASE: &str = "native_journal_pressure_mixed_captured_and_live_crash_reopens";
         if isolated(CASE) {
             return;
