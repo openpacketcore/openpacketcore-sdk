@@ -1179,13 +1179,13 @@
       "test": "rust:crates/opc-session-store::lib=lib::sqlite::consensus::tests::native::basis::reclaim_memory::native_reclaim_memory_noop_admission_keeps_consumers_live",
       "kind": "disabled",
       "issue": 1250,
-      "reason": "The parent re-executes the exact test in a fresh child with its marker set and --test-threads=1, and asserts that the child ran exactly one passing, non-ignored test. The complete body therefore runs isolated from other tests sharing the process allowance. The enclosing fixture process has a 600-second completion deadline, including teardown."
+      "reason": "The parent re-executes the exact test in a fresh child with its marker set and --test-threads=1, and asserts that the child ran exactly one passing, non-ignored test. The complete body therefore runs isolated from other tests sharing the process allowance. The enclosing fixture process has a 300-second completion deadline, including teardown."
     },
     {
       "test": "rust:crates/opc-session-store::lib=lib::sqlite::consensus::tests::native::basis::reclaim_memory::native_reclaim_memory_held_checkpoint_allows_consumer_work_and_finishes",
       "kind": "disabled",
       "issue": 1250,
-      "reason": "The parent re-executes the exact test in a fresh child with its marker set and --test-threads=1, and asserts that the child ran exactly one passing, non-ignored test. The complete body therefore runs isolated from other tests sharing the process allowance. The enclosing fixture process has a 900-second completion deadline, including teardown."
+      "reason": "The parent re-executes the exact test in a fresh child with its marker set and --test-threads=1, and asserts that the child ran exactly one passing, non-ignored test. The complete body therefore runs isolated from other tests sharing the process allowance. The enclosing fixture process has a 300-second completion deadline, including teardown."
     },
     {
       "test": "rust:crates/opc-config-bus-consensus::test=adapter::storage_failures::consensus_history_heap_outage_is_retryable_without_changing_bytes",
@@ -1299,13 +1299,13 @@
       "test": "rust:crates/opc-session-store::lib=lib::sqlite::consensus::tests::native::basis::reclaim_memory::native_reclaim_memory_void_pressure_fence_replays_and_retires_epoch",
       "kind": "fixture-setup-changed",
       "issue": 1250,
-      "reason": "The exact test runs in a fresh child with its marker set and --test-threads=1. The parent requires a successful exit and exactly one passing, non-ignored test, preserving the original assertions and process-local resource bounds. The enclosing fixture process has a 600-second completion deadline, including teardown."
+      "reason": "The exact test runs in a fresh child with its marker set and --test-threads=1. The parent requires a successful exit and exactly one passing, non-ignored test, preserving the original assertions and process-local resource bounds. The enclosing fixture process has a 300-second completion deadline, including teardown."
     },
     {
       "test": "rust:crates/opc-session-store::lib=lib::sqlite::consensus::tests::native::basis::reclaim_memory::native_reclaim_memory_committed_wait_releases_permit_and_proceeds",
       "kind": "fixture-setup-changed",
       "issue": 1250,
-      "reason": "The exact test runs in a fresh child with its marker set and --test-threads=1. The parent requires a successful exit and exactly one passing, non-ignored test, preserving the original assertions and process-local resource bounds. The enclosing fixture process has a 600-second completion deadline, including teardown."
+      "reason": "The exact test runs in a fresh child with its marker set and --test-threads=1. The parent requires a successful exit and exactly one passing, non-ignored test, preserving the original assertions and process-local resource bounds. The enclosing fixture process has a 300-second completion deadline, including teardown."
     },
     {
       "test": "rust:crates/opc-session-store::lib=lib::sqlite::consensus::tests::native::basis::reclaim_memory::native_reclaim_memory_committed_wait_fails_closed_with_bounded_reason",
@@ -1317,7 +1317,7 @@
       "test": "rust:crates/opc-session-store::lib=lib::sqlite::consensus::tests::native::basis::reclaim_memory::native_reclaim_memory_shutdown_interrupts_committed_wait",
       "kind": "fixture-setup-changed",
       "issue": 1250,
-      "reason": "The exact test runs in a fresh child with its marker set and --test-threads=1. The parent requires a successful exit and exactly one passing, non-ignored test, preserving the original assertions and process-local resource bounds. The enclosing fixture process has a 600-second completion deadline, including teardown."
+      "reason": "The exact test runs in a fresh child with its marker set and --test-threads=1. The parent requires a successful exit and exactly one passing, non-ignored test, preserving the original assertions and process-local resource bounds. The enclosing fixture process has a 300-second completion deadline, including teardown."
     },
     {
       "test": "rust:crates/opc-session-store::lib=lib::sqlite::consensus::tests::native::basis::reclaim_memory::native_reclaim_memory_shutdown_interrupts_wait_with_writer_already_blocked",
@@ -1335,7 +1335,7 @@
       "test": "rust:crates/opc-session-store::lib=lib::sqlite::consensus::tests::native::basis::reclaim_memory::native_reclaim_memory_unhelpful_checkpoints_do_not_extend_wait",
       "kind": "fixture-setup-changed",
       "issue": 1250,
-      "reason": "The exact test runs in a fresh child with its marker set and --test-threads=1. The parent requires a successful exit and exactly one passing, non-ignored test, preserving the original assertions and process-local resource bounds. The enclosing fixture process has a 600-second completion deadline, including teardown."
+      "reason": "The exact test runs in a fresh child with its marker set and --test-threads=1. The parent requires a successful exit and exactly one passing, non-ignored test, preserving the original assertions and process-local resource bounds. The enclosing fixture process has a 300-second completion deadline, including teardown."
     },
     {
       "test": "rust:crates/opc-session-store::lib=lib::sqlite::consensus::tests::native::basis::reclaim_memory::native_reclaim_memory_shortfall_relief_extends_committed_wait",
@@ -1359,7 +1359,7 @@
       "test": "rust:crates/opc-session-store::lib=lib::sqlite::consensus::tests::native::basis::reclaim_memory::native_reclaim_memory_preflight_avoids_unhelpful_checkpoints",
       "kind": "fixture-setup-changed",
       "issue": 1250,
-      "reason": "The exact test runs in a fresh child with its marker set and --test-threads=1. The parent requires a successful exit and exactly one passing, non-ignored test, preserving the original assertions and process-local resource bounds. The enclosing fixture process has a 600-second completion deadline, including teardown."
+      "reason": "The exact test runs in a fresh child with its marker set and --test-threads=1. The parent requires a successful exit and exactly one passing, non-ignored test, preserving the original assertions and process-local resource bounds. The enclosing fixture process has a 300-second completion deadline, including teardown."
     },
     {
       "test": "rust:crates/opc-session-store::lib=lib::sqlite::consensus::tests::native::basis::reclaim_memory::native_reclaim_memory_requested_checkpoint_relieves_wait",
@@ -1377,13 +1377,13 @@
       "test": "rust:crates/opc-session-store::lib=lib::sqlite::consensus::tests::native::basis::reclaim_memory::native_reclaim_memory_preflight_does_not_request_during_install",
       "kind": "fixture-setup-changed",
       "issue": 1250,
-      "reason": "The exact test runs in a fresh child with its marker set and --test-threads=1. The parent requires a successful exit and exactly one passing, non-ignored test, preserving the original assertions and process-local resource bounds. The enclosing fixture process has a 600-second completion deadline, including teardown."
+      "reason": "The exact test runs in a fresh child with its marker set and --test-threads=1. The parent requires a successful exit and exactly one passing, non-ignored test, preserving the original assertions and process-local resource bounds. The enclosing fixture process has a 300-second completion deadline, including teardown."
     },
     {
       "test": "rust:crates/opc-session-store::lib=lib::sqlite::consensus::tests::native::basis::reclaim_memory::native_reclaim_memory_full_generation_replays_maximum_retirement_suffix",
       "kind": "fixture-setup-changed",
       "issue": 1250,
-      "reason": "The exact test runs in a fresh child with its marker set and --test-threads=1. The parent requires a successful exit and exactly one passing, non-ignored test, preserving the original assertions and process-local resource bounds. The enclosing fixture process has a 900-second completion deadline, including teardown."
+      "reason": "The exact test runs in a fresh child with its marker set and --test-threads=1. The parent requires a successful exit and exactly one passing, non-ignored test, preserving the original assertions and process-local resource bounds. The enclosing fixture process has a 1,200-second completion deadline, including teardown."
     },
     {
       "test": "rust:crates/opc-session-store::lib=lib::sqlite::consensus::tests::native::basis::reclaim_memory::native_journal_pressure_consumer_application_waits_without_fencing",
@@ -2455,7 +2455,7 @@
       "test": "rust:crates/opc-session-store::lib=lib::sqlite::consensus::tests::native::basis::reclaim_memory::native_reclaim_memory_committed_wait_releases_permit_and_proceeds",
       "kind": "disabled",
       "issue": 1250,
-      "reason": "The parent re-executes this exact test in a fresh child with the completion marker set and --test-threads=1, enforces a 600-second process deadline, and requires exactly one passing, non-ignored test. The fixture body runs in the child rather than being skipped."
+      "reason": "The parent re-executes this exact test in a fresh child with the completion marker set and --test-threads=1, enforces a 300-second process deadline, and requires exactly one passing, non-ignored test. The fixture body runs in the child rather than being skipped."
     },
     {
       "test": "rust:crates/opc-session-store::lib=lib::sqlite::consensus::tests::native::basis::reclaim_memory::native_reclaim_memory_eight_mib_journal_requests_checkpoint",
@@ -2467,7 +2467,7 @@
       "test": "rust:crates/opc-session-store::lib=lib::sqlite::consensus::tests::native::basis::reclaim_memory::native_reclaim_memory_full_generation_replays_maximum_retirement_suffix",
       "kind": "disabled",
       "issue": 1250,
-      "reason": "The parent re-executes this exact test in a fresh child with the completion marker set and --test-threads=1, enforces a 900-second process deadline, and requires exactly one passing, non-ignored test. The fixture body runs in the child rather than being skipped."
+      "reason": "The parent re-executes this exact test in a fresh child with the completion marker set and --test-threads=1, enforces a 1,200-second process deadline, and requires exactly one passing, non-ignored test. The fixture body runs in the child rather than being skipped."
     },
     {
       "test": "rust:crates/opc-session-store::lib=lib::sqlite::consensus::tests::native::basis::reclaim_memory::native_reclaim_memory_planner_error_uses_real_evaluation",
@@ -2479,13 +2479,13 @@
       "test": "rust:crates/opc-session-store::lib=lib::sqlite::consensus::tests::native::basis::reclaim_memory::native_reclaim_memory_preflight_avoids_unhelpful_checkpoints",
       "kind": "disabled",
       "issue": 1250,
-      "reason": "The parent re-executes this exact test in a fresh child with the completion marker set and --test-threads=1, enforces a 600-second process deadline, and requires exactly one passing, non-ignored test. The fixture body runs in the child rather than being skipped."
+      "reason": "The parent re-executes this exact test in a fresh child with the completion marker set and --test-threads=1, enforces a 300-second process deadline, and requires exactly one passing, non-ignored test. The fixture body runs in the child rather than being skipped."
     },
     {
       "test": "rust:crates/opc-session-store::lib=lib::sqlite::consensus::tests::native::basis::reclaim_memory::native_reclaim_memory_preflight_does_not_request_during_install",
       "kind": "disabled",
       "issue": 1250,
-      "reason": "The parent re-executes this exact test in a fresh child with the completion marker set and --test-threads=1, enforces a 600-second process deadline, and requires exactly one passing, non-ignored test. The fixture body runs in the child rather than being skipped."
+      "reason": "The parent re-executes this exact test in a fresh child with the completion marker set and --test-threads=1, enforces a 300-second process deadline, and requires exactly one passing, non-ignored test. The fixture body runs in the child rather than being skipped."
     },
     {
       "test": "rust:crates/opc-session-store::lib=lib::sqlite::consensus::tests::native::basis::reclaim_memory::native_reclaim_memory_progress_extends_committed_wait",
@@ -2509,7 +2509,7 @@
       "test": "rust:crates/opc-session-store::lib=lib::sqlite::consensus::tests::native::basis::reclaim_memory::native_reclaim_memory_shutdown_interrupts_committed_wait",
       "kind": "disabled",
       "issue": 1250,
-      "reason": "The parent re-executes this exact test in a fresh child with the completion marker set and --test-threads=1, enforces a 600-second process deadline, and requires exactly one passing, non-ignored test. The fixture body runs in the child rather than being skipped."
+      "reason": "The parent re-executes this exact test in a fresh child with the completion marker set and --test-threads=1, enforces a 300-second process deadline, and requires exactly one passing, non-ignored test. The fixture body runs in the child rather than being skipped."
     },
     {
       "test": "rust:crates/opc-session-store::lib=lib::sqlite::consensus::tests::native::basis::reclaim_memory::native_reclaim_memory_shutdown_interrupts_wait_with_writer_already_blocked",
@@ -2527,7 +2527,7 @@
       "test": "rust:crates/opc-session-store::lib=lib::sqlite::consensus::tests::native::basis::reclaim_memory::native_reclaim_memory_unhelpful_checkpoints_do_not_extend_wait",
       "kind": "disabled",
       "issue": 1250,
-      "reason": "The parent re-executes this exact test in a fresh child with the completion marker set and --test-threads=1, enforces a 600-second process deadline, and requires exactly one passing, non-ignored test. The fixture body runs in the child rather than being skipped."
+      "reason": "The parent re-executes this exact test in a fresh child with the completion marker set and --test-threads=1, enforces a 300-second process deadline, and requires exactly one passing, non-ignored test. The fixture body runs in the child rather than being skipped."
     },
     {
       "test": "rust:crates/opc-session-store::lib=lib::sqlite::consensus::tests::native::basis::reclaim_memory::native_reclaim_memory_void_checkpoint_and_replay_preserve_first_binding",
@@ -2539,7 +2539,7 @@
       "test": "rust:crates/opc-session-store::lib=lib::sqlite::consensus::tests::native::basis::reclaim_memory::native_reclaim_memory_void_pressure_fence_replays_and_retires_epoch",
       "kind": "disabled",
       "issue": 1250,
-      "reason": "The parent re-executes this exact test in a fresh child with the completion marker set and --test-threads=1, enforces a 600-second process deadline, and requires exactly one passing, non-ignored test. The fixture body runs in the child rather than being skipped."
+      "reason": "The parent re-executes this exact test in a fresh child with the completion marker set and --test-threads=1, enforces a 300-second process deadline, and requires exactly one passing, non-ignored test. The fixture body runs in the child rather than being skipped."
     }
   ]
 }
