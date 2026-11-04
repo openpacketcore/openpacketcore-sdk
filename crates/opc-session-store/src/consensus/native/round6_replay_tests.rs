@@ -136,7 +136,12 @@ async fn round6_session_store_watch_emits_recovery_row_at_resume_cursor() {
     };
     fake.replicate_entry(context(101, boundary)).await.unwrap();
     let mut watch = SessionStore::new(fake).watch(101).await.unwrap();
-    assert_eq!(watch.next().await.unwrap().unwrap().sequence, 101);
+    let row = tokio::time::timeout(Duration::from_secs(180), watch.next())
+        .await
+        .expect("recovery watch stalled before its committed resume row")
+        .unwrap()
+        .unwrap();
+    assert_eq!(row.sequence, 101);
 }
 
 async fn local_lease_after_recovery(operation: u8) {

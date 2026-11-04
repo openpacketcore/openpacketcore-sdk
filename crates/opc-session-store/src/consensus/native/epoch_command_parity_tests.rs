@@ -1,4 +1,5 @@
 use super::*;
+use crate::consensus::native::test_journal::journal_page_for_test_sync;
 use crate::{Clock, FakeSessionBackend, SessionBackend, SessionLeaseManager};
 use changes::tests::{apply, time};
 
@@ -22,11 +23,7 @@ async fn native_v1_and_fake_retire_expired_keys_without_an_ordinary_cleanup() {
     let clock = Arc::new(CommandClock(std::sync::Mutex::new(time(2))));
     let fake = FakeSessionBackend::in_memory_lab().with_clock(clock.clone());
     fake.replicate_entry(
-        native
-            .business
-            .replication_log(1, 1, &|| Ok(()))
-            .unwrap()
-            .remove(0),
+        journal_page_for_test_sync(|| native.business.replication_log(1, 1, &|| Ok(()))).remove(0),
     )
     .await
     .unwrap();
@@ -68,7 +65,7 @@ async fn native_v1_and_fake_retire_expired_keys_without_an_ordinary_cleanup() {
         );
     }
     let replayed = FakeSessionBackend::in_memory_lab().with_clock(clock);
-    for entry in native.business.replication_log(1, 8, &|| Ok(())).unwrap() {
+    for entry in journal_page_for_test_sync(|| native.business.replication_log(1, 8, &|| Ok(()))) {
         replayed.replicate_entry(entry).await.unwrap();
     }
     assert_eq!(replayed.key_retention_for_test().await, actual);
@@ -81,11 +78,7 @@ async fn native_and_fake_cas_conflicts_publish_no_retirement_or_rotation() {
     let clock = Arc::new(CommandClock(std::sync::Mutex::new(time(2))));
     let fake = FakeSessionBackend::in_memory_lab().with_clock(clock.clone());
     fake.replicate_entry(
-        native
-            .business
-            .replication_log(1, 1, &|| Ok(()))
-            .unwrap()
-            .remove(0),
+        journal_page_for_test_sync(|| native.business.replication_log(1, 1, &|| Ok(()))).remove(0),
     )
     .await
     .unwrap();
@@ -156,7 +149,7 @@ async fn native_capacity_decisions_replay_and_rebuild_under_a_larger_fake_limit(
     let (mut native, retired) = key_retention_tests::retired_key_fixture();
     let clock = Arc::new(CommandClock(std::sync::Mutex::new(time(2))));
     let fake = FakeSessionBackend::in_memory_lab().with_clock(clock.clone());
-    let prefix = native.business.replication_log(1, 16, &|| Ok(())).unwrap();
+    let prefix = journal_page_for_test_sync(|| native.business.replication_log(1, 16, &|| Ok(())));
     for entry in &prefix {
         fake.replicate_entry(entry.clone()).await.unwrap();
     }
@@ -195,7 +188,7 @@ async fn native_capacity_decisions_replay_and_rebuild_under_a_larger_fake_limit(
         native.business.frontiers.retention.keys
     );
     assert!(applied.notifications[0].replay_policy.capacity_rotations == 2);
-    let all = native.business.replication_log(1, 16, &|| Ok(())).unwrap();
+    let all = journal_page_for_test_sync(|| native.business.replication_log(1, 16, &|| Ok(())));
     let rebuilt = FakeSessionBackend::in_memory_lab().with_clock(clock);
     rebuilt
         .rebuild_replication_state(all.clone())
@@ -219,7 +212,7 @@ async fn native_capacity_decisions_replay_and_rebuild_under_a_larger_fake_limit(
     )
     .unwrap();
     assert_eq!(
-        cold.business.replication_log(1, 16, &|| Ok(())).unwrap(),
+        journal_page_for_test_sync(|| cold.business.replication_log(1, 16, &|| Ok(()))),
         all
     );
     assert!(cold.business.frontiers == native.business.frontiers);
@@ -229,11 +222,8 @@ async fn native_capacity_decisions_replay_and_rebuild_under_a_larger_fake_limit(
 #[test]
 fn native_capacity_notification_codec_preserves_original_payload_bounds() {
     let (native, _, _) = changes::tests::fixture();
-    let original = native
-        .business
-        .replication_log(1, 1, &|| Ok(()))
-        .unwrap()
-        .remove(0);
+    let original =
+        journal_page_for_test_sync(|| native.business.replication_log(1, 1, &|| Ok(()))).remove(0);
     let expected_payload = changes::notification_payload(&original).unwrap();
     let crate::ReplicationOp::Batch { ops } = &original.op else {
         panic!("fixture must carry both real effects");
@@ -347,7 +337,7 @@ async fn native_and_fake_keep_command_time_after_a_no_effect_conflict() {
     .responses[0]
         .result
         .is_ok());
-    for entry in native.business.replication_log(1, 8, &|| Ok(())).unwrap() {
+    for entry in journal_page_for_test_sync(|| native.business.replication_log(1, 8, &|| Ok(()))) {
         fake.replicate_entry(entry).await.unwrap();
     }
     let before = native.business.frontiers.retention.keys;
@@ -419,7 +409,7 @@ async fn native_capacity_marker_refusal_preserves_a_smaller_fake_atomically() {
     let (mut native, retired) = key_retention_tests::retired_key_fixture();
     let clock = Arc::new(CommandClock(std::sync::Mutex::new(time(2))));
     let replica = FakeSessionBackend::in_memory_lab().with_clock(clock);
-    for entry in native.business.replication_log(1, 16, &|| Ok(())).unwrap() {
+    for entry in journal_page_for_test_sync(|| native.business.replication_log(1, 16, &|| Ok(()))) {
         replica.replicate_entry(entry).await.unwrap();
     }
     let key = new_key(retired.key(), b"capacity-refusal-successor");
@@ -449,7 +439,9 @@ async fn native_capacity_marker_refusal_preserves_a_smaller_fake_atomically() {
     assert!(watch.next().now_or_never().is_none());
     assert!(matches!(
         smaller
-            .rebuild_replication_state(native.business.replication_log(1, 16, &|| Ok(())).unwrap())
+            .rebuild_replication_state(journal_page_for_test_sync(|| native
+                .business
+                .replication_log(1, 16, &|| Ok(()))))
             .await,
         Err(StoreError::BackendUnavailable(_))
     ));
@@ -493,11 +485,8 @@ fn native_capacity_marker_belongs_only_to_its_command_in_one_apply() {
         }
     });
     assert_eq!(
-        grouped.business.replication_log(1, 16, &|| Ok(())).unwrap(),
-        separate
-            .business
-            .replication_log(1, 16, &|| Ok(()))
-            .unwrap()
+        journal_page_for_test_sync(|| grouped.business.replication_log(1, 16, &|| Ok(()))),
+        journal_page_for_test_sync(|| separate.business.replication_log(1, 16, &|| Ok(())))
     );
     assert!(grouped.business.frontiers == separate.business.frontiers);
     grouped.validate_image().unwrap();
@@ -509,7 +498,7 @@ async fn native_capacity_rotation_without_a_mutation_notification_still_replays(
     let (mut native, retired) = key_retention_tests::retired_key_fixture();
     let fake = FakeSessionBackend::in_memory_lab()
         .with_clock(Arc::new(CommandClock(std::sync::Mutex::new(time(2)))));
-    for entry in native.business.replication_log(1, 16, &|| Ok(())).unwrap() {
+    for entry in journal_page_for_test_sync(|| native.business.replication_log(1, 16, &|| Ok(()))) {
         fake.replicate_entry(entry).await.unwrap();
     }
     let identity = native.business.identity;
@@ -592,7 +581,7 @@ async fn native_multi_create_capacity_replays_at_each_entry_boundary() {
     let fake = FakeSessionBackend::in_memory_lab()
         .with_clock(Arc::new(CommandClock(std::sync::Mutex::new(time(2)))));
     let fake = with_tracked_key_limit_for_test(&fake, 3);
-    for entry in native.business.replication_log(1, 16, &|| Ok(())).unwrap() {
+    for entry in journal_page_for_test_sync(|| native.business.replication_log(1, 16, &|| Ok(()))) {
         fake.replicate_entry(entry).await.unwrap();
     }
     let history = native.business.history().unwrap().active_epoch().unwrap();
@@ -775,7 +764,8 @@ async fn assert_metadata_capacity_replays(
     let fake = FakeSessionBackend::in_memory_lab()
         .with_clock(Arc::new(CommandClock(std::sync::Mutex::new(time(2)))));
     let fake = crate::fake::tests::with_tracked_key_limit_for_test(&fake, maximum);
-    let mut journal = native.business.replication_log(1, 128, &|| Ok(())).unwrap();
+    let mut journal =
+        journal_page_for_test_sync(|| native.business.replication_log(1, 128, &|| Ok(())));
     for row in &journal {
         fake.replicate_entry(row.clone()).await.unwrap();
     }
@@ -863,10 +853,8 @@ async fn native_maximum_create_batch_capacity_replays_every_entry_and_rebuilds_p
     let fake = FakeSessionBackend::in_memory_lab()
         .with_clock(Arc::new(CommandClock(std::sync::Mutex::new(time(2)))));
     let fake = crate::fake::tests::with_tracked_key_limit_for_test(&fake, maximum);
-    let mut journal = native
-        .business
-        .replication_log(1, 2048, &|| Ok(()))
-        .unwrap();
+    let mut journal =
+        journal_page_for_test_sync(|| native.business.replication_log(1, 2048, &|| Ok(())));
     for row in &journal {
         fake.replicate_entry(row.clone()).await.unwrap();
     }
@@ -1013,11 +1001,8 @@ async fn native_maximum_create_batch_capacity_replays_every_entry_and_rebuilds_p
 #[test]
 fn native_capacity_boundary_codec_preserves_original_payload_bounds() {
     let (native, _, _) = changes::tests::fixture();
-    let original = native
-        .business
-        .replication_log(1, 1, &|| Ok(()))
-        .unwrap()
-        .remove(0);
+    let original =
+        journal_page_for_test_sync(|| native.business.replication_log(1, 1, &|| Ok(()))).remove(0);
     let expected_payload = changes::notification_payload(&original).unwrap();
     let crate::ReplicationOp::Batch { ops } = &original.op else {
         panic!("fixture must carry both real effects");
@@ -1177,7 +1162,7 @@ async fn native_metadata_capacity_boundary_preserves_unpruned_expired_rows() {
     command.logical_time = time(4);
     let fake = FakeSessionBackend::in_memory_lab()
         .with_clock(Arc::new(CommandClock(std::sync::Mutex::new(time(4)))));
-    for row in native.business.replication_log(1, 16, &|| Ok(())).unwrap() {
+    for row in journal_page_for_test_sync(|| native.business.replication_log(1, 16, &|| Ok(()))) {
         fake.replicate_entry(row).await.unwrap();
     }
     let maximum = native.business.keys.len();
@@ -1207,11 +1192,8 @@ async fn native_metadata_capacity_boundary_preserves_unpruned_expired_rows() {
 #[test]
 fn native_capacity_boundary_codec_bounds_continuations_and_recovery_floor() {
     let (native, _, _) = changes::tests::fixture();
-    let mut row = native
-        .business
-        .replication_log(1, 1, &|| Ok(()))
-        .unwrap()
-        .remove(0);
+    let mut row =
+        journal_page_for_test_sync(|| native.business.replication_log(1, 1, &|| Ok(()))).remove(0);
     let crate::ReplicationOp::Batch { ops } = row.op.clone() else {
         unreachable!()
     };
@@ -1258,7 +1240,8 @@ async fn replay_capacity_with_later_recreation(reject_middle: bool) {
     let fake = FakeSessionBackend::in_memory_lab()
         .with_clock(Arc::new(CommandClock(std::sync::Mutex::new(time(2)))));
     let fake = crate::fake::tests::with_tracked_key_limit_for_test(&fake, maximum);
-    let mut journal = native.business.replication_log(1, 64, &|| Ok(())).unwrap();
+    let mut journal =
+        journal_page_for_test_sync(|| native.business.replication_log(1, 64, &|| Ok(())));
     for row in &journal {
         fake.replicate_entry(row.clone()).await.unwrap();
     }
@@ -1379,7 +1362,7 @@ async fn committed_v2_entry_remains_replayable_after_released_key_capacity_rotat
     }
     let fake = FakeSessionBackend::in_memory_lab()
         .with_clock(Arc::new(CommandClock(std::sync::Mutex::new(time(2)))));
-    for row in native.business.replication_log(1, 64, &|| Ok(())).unwrap() {
+    for row in journal_page_for_test_sync(|| native.business.replication_log(1, 64, &|| Ok(()))) {
         fake.replicate_entry(row).await.unwrap();
     }
     let history = native.business.history().unwrap().active_epoch().unwrap();
@@ -1440,7 +1423,7 @@ async fn native_v2_capacity_replay_keeps_floors_after_a_release() {
     }
     let fake = FakeSessionBackend::in_memory_lab()
         .with_clock(Arc::new(CommandClock(std::sync::Mutex::new(time(2)))));
-    for row in native.business.replication_log(1, 64, &|| Ok(())).unwrap() {
+    for row in journal_page_for_test_sync(|| native.business.replication_log(1, 64, &|| Ok(()))) {
         fake.replicate_entry(row).await.unwrap();
     }
     let history = native.business.history().unwrap().active_epoch().unwrap();
@@ -1471,12 +1454,10 @@ async fn native_v2_capacity_replay_keeps_floors_after_a_release() {
 }
 
 fn policy_watch_head(native: &mut NativeStorage, head: u64) {
-    let original = native
-        .business
-        .replication_log(1, 256, &|| Ok(()))
-        .unwrap()
-        .pop()
-        .unwrap();
+    let original =
+        journal_page_for_test_sync(|| native.business.replication_log(1, 256, &|| Ok(())))
+            .pop()
+            .unwrap();
     native.business.notifications.clear();
     let window = retention::NOTIFICATION_WINDOW as u64;
     for sequence in head - window + 1..=head {

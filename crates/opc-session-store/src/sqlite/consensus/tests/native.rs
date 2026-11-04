@@ -998,101 +998,103 @@ fn native_selected_snapshot_admission_failure_precedes_pending_wal_repair() {
 
 #[test]
 fn round6_sqlite_batch_entries_declare_their_true_command_boundaries() {
-    let fixture = Fixture::new();
-    fixture.parity(&[formation()]);
-    let initial = fenced_transition_v2_request(0xE2, 1, "framing-activation");
-    fixture.parity(&[activation(1, initial, timestamp(1))]);
-    let before: u64 = fixture
-        .oracle
-        .conn
-        .blocking_lock()
-        .query_row(
-            "SELECT COALESCE(MAX(sequence),0) FROM session_replication_log",
-            [],
-            |r| r.get(0),
-        )
-        .unwrap();
-    let children = (0..4)
-        .map(|slot| sdk741_component_request(Sdk741Payload::Renew, 1, slot, None))
-        .collect();
-    let command = fenced_transition_v2_batch_entry(2, children, timestamp(2));
-    let EntryPayload::Normal(ref normal) = command.payload else {
-        unreachable!()
-    };
-    let id = *normal.request_id.as_bytes();
-    let result = fixture.parity(&[command]);
-    assert_eq!(result.notifications.len(), 4);
-    let conn = fixture.oracle.conn.blocking_lock();
-    let mut statement = conn
+    crate::test_process::with_completion_deadline(std::time::Duration::from_secs(300), || {
+        let fixture = Fixture::new();
+        fixture.parity(&[formation()]);
+        let initial = fenced_transition_v2_request(0xE2, 1, "framing-activation");
+        fixture.parity(&[activation(1, initial, timestamp(1))]);
+        let before: u64 = fixture
+            .oracle
+            .conn
+            .blocking_lock()
+            .query_row(
+                "SELECT COALESCE(MAX(sequence),0) FROM session_replication_log",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        let children = (0..4)
+            .map(|slot| sdk741_component_request(Sdk741Payload::Renew, 1, slot, None))
+            .collect();
+        let command = fenced_transition_v2_batch_entry(2, children, timestamp(2));
+        let EntryPayload::Normal(ref normal) = command.payload else {
+            unreachable!()
+        };
+        let id = *normal.request_id.as_bytes();
+        let result = fixture.parity(&[command]);
+        assert_eq!(result.notifications.len(), 4);
+        let conn = fixture.oracle.conn.blocking_lock();
+        let mut statement = conn
         .prepare(
             "SELECT entry_json FROM session_replication_log WHERE sequence > ?1 ORDER BY sequence",
         )
         .unwrap();
-    let entries = statement
-        .query_map([before], |r| r.get::<_, String>(0))
-        .unwrap()
-        .map(|r| serde_json::from_str::<crate::ReplicationEntry>(&r.unwrap()).unwrap())
-        .collect::<Vec<_>>();
-    assert_eq!(entries.len(), 4);
-    for (position, entry) in entries.iter().enumerate() {
-        let expected = if position == 0 {
-            crate::ReplicationCommandBoundary::Start {
-                id,
-                following_entries: 3,
-            }
-        } else {
-            crate::ReplicationCommandBoundary::Continue {
-                id,
-                remaining_entries: (3 - position) as u16,
-            }
-        };
-        assert_eq!(entry.replay_policy.command, expected);
-    }
-    let all_entries = conn
-        .prepare("SELECT entry_json FROM session_replication_log ORDER BY sequence")
-        .unwrap()
-        .query_map([], |r| r.get::<_, String>(0))
-        .unwrap()
-        .map(|row| serde_json::from_str::<crate::ReplicationEntry>(&row.unwrap()).unwrap())
-        .collect::<Vec<_>>();
-    let replica = SqliteSessionBackend::in_memory().unwrap();
-    let rebuilt = SqliteSessionBackend::in_memory().unwrap();
-    let replica_conn = replica.conn.blocking_lock();
-    let rebuilt_conn = rebuilt.conn.blocking_lock();
-    for entry in &all_entries {
-        crate::sqlite::replication::replicate_entry_sync(&replica_conn, entry, &replica.caps)
-            .unwrap();
-        crate::sqlite::replication::rebuild_replication_state_sync(
-            &rebuilt_conn,
-            &all_entries[..entry.sequence as usize],
-            &rebuilt.caps,
-        )
-        .unwrap();
-    }
-    let rows = |connection: &Connection| {
-        [
-            "session_records",
-            "leases",
-            "key_fences",
-            "lease_globals",
-            "session_replication_log",
-        ]
-        .map(|table| {
-            let mut query = connection
-                .prepare(&format!("SELECT * FROM {table} ORDER BY 1, 2"))
+        let entries = statement
+            .query_map([before], |r| r.get::<_, String>(0))
+            .unwrap()
+            .map(|r| serde_json::from_str::<crate::ReplicationEntry>(&r.unwrap()).unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(entries.len(), 4);
+        for (position, entry) in entries.iter().enumerate() {
+            let expected = if position == 0 {
+                crate::ReplicationCommandBoundary::Start {
+                    id,
+                    following_entries: 3,
+                }
+            } else {
+                crate::ReplicationCommandBoundary::Continue {
+                    id,
+                    remaining_entries: (3 - position) as u16,
+                }
+            };
+            assert_eq!(entry.replay_policy.command, expected);
+        }
+        let all_entries = conn
+            .prepare("SELECT entry_json FROM session_replication_log ORDER BY sequence")
+            .unwrap()
+            .query_map([], |r| r.get::<_, String>(0))
+            .unwrap()
+            .map(|row| serde_json::from_str::<crate::ReplicationEntry>(&row.unwrap()).unwrap())
+            .collect::<Vec<_>>();
+        let replica = SqliteSessionBackend::in_memory().unwrap();
+        let rebuilt = SqliteSessionBackend::in_memory().unwrap();
+        let replica_conn = replica.conn.blocking_lock();
+        let rebuilt_conn = rebuilt.conn.blocking_lock();
+        for entry in &all_entries {
+            crate::sqlite::replication::replicate_entry_sync(&replica_conn, entry, &replica.caps)
                 .unwrap();
-            let width = query.column_count();
-            query
-                .query_map([], |row| {
-                    (0..width)
-                        .map(|column| row.get::<_, rusqlite::types::Value>(column))
-                        .collect::<rusqlite::Result<Vec<_>>>()
-                })
-                .unwrap()
-                .collect::<rusqlite::Result<Vec<_>>>()
-                .unwrap()
-        })
-    };
-    assert_eq!(rows(&conn), rows(&replica_conn));
-    assert_eq!(rows(&conn), rows(&rebuilt_conn));
+            crate::sqlite::replication::rebuild_replication_state_sync(
+                &rebuilt_conn,
+                &all_entries[..entry.sequence as usize],
+                &rebuilt.caps,
+            )
+            .unwrap();
+        }
+        let rows = |connection: &Connection| {
+            [
+                "session_records",
+                "leases",
+                "key_fences",
+                "lease_globals",
+                "session_replication_log",
+            ]
+            .map(|table| {
+                let mut query = connection
+                    .prepare(&format!("SELECT * FROM {table} ORDER BY 1, 2"))
+                    .unwrap();
+                let width = query.column_count();
+                query
+                    .query_map([], |row| {
+                        (0..width)
+                            .map(|column| row.get::<_, rusqlite::types::Value>(column))
+                            .collect::<rusqlite::Result<Vec<_>>>()
+                    })
+                    .unwrap()
+                    .collect::<rusqlite::Result<Vec<_>>>()
+                    .unwrap()
+            })
+        };
+        assert_eq!(rows(&conn), rows(&replica_conn));
+        assert_eq!(rows(&conn), rows(&rebuilt_conn));
+    });
 }

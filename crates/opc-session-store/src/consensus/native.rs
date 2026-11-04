@@ -48,6 +48,8 @@ mod row_map;
 mod scope_authority;
 mod scope_batch;
 mod scope_records;
+#[cfg(test)]
+pub(crate) mod test_journal;
 pub(crate) use scope_records::ScopeRecordCapture;
 mod shared;
 use row_map::RowMap;

@@ -1,5 +1,6 @@
 use super::*;
 use crate::consensus::native::ordinary_retention_tests::{acquire, window_fixture};
+use crate::consensus::native::test_journal::journal_page_for_test_sync;
 
 const RETENTION_IMAGE_MAXIMUM: u64 = 128 * 1024 * 1024;
 
@@ -564,11 +565,9 @@ fn native_notification_retention_passes_original_lifetime_limit_and_reopens() {
         }
     );
     assert_eq!(
-        reopened
-            .business
-            .replication_log(1_048_577, 1, &|| Ok(()))
-            .unwrap()[0]
-            .sequence,
+        journal_page_for_test_sync(|| reopened.business.replication_log(1_048_577, 1, &|| Ok(())))
+            [0]
+        .sequence,
         1_048_577
     );
     eprintln!(
@@ -624,7 +623,7 @@ fn native_notification_retention_survives_checkpoint_reopen_and_base_rewrite() {
             StoreError::ReplicationLogCursorCompacted { resume_from: 9 }
         );
         assert_eq!(
-            state.replication_log(9, 1, &|| Ok(())).unwrap()[0].sequence,
+            journal_page_for_test_sync(|| state.replication_log(9, 1, &|| Ok(())))[0].sequence,
             9
         );
     }
@@ -666,10 +665,7 @@ fn native_notification_retention_relocation_tracks_sequence_after_concurrent_pru
         first_new
     );
     assert_eq!(
-        storage
-            .business
-            .replication_log(first_new, 2, &|| Ok(()))
-            .unwrap()
+        journal_page_for_test_sync(|| storage.business.replication_log(first_new, 2, &|| Ok(())))
             .iter()
             .map(|row| row.sequence)
             .collect::<Vec<_>>(),
@@ -972,7 +968,8 @@ fn native_capacity_application_marker_survives_delta_and_base_rewrite() {
     });
     assert_eq!(applied.notifications.len(), 1);
     assert!(applied.notifications[0].replay_policy.capacity_rotations == 2);
-    let expected_entries = storage.business.replication_log(1, 16, &|| Ok(())).unwrap();
+    let expected_entries =
+        journal_page_for_test_sync(|| storage.business.replication_log(1, 16, &|| Ok(())));
     let expected = Version::capture(&storage)
         .unwrap()
         .context_digest()
@@ -982,7 +979,7 @@ fn native_capacity_application_marker_survives_delta_and_base_rewrite() {
         .into_storage(&|| Ok(()))
         .unwrap();
     assert_eq!(
-        cold.business.replication_log(1, 16, &|| Ok(())).unwrap(),
+        journal_page_for_test_sync(|| cold.business.replication_log(1, 16, &|| Ok(()))),
         expected_entries
     );
     assert_eq!(
@@ -993,10 +990,7 @@ fn native_capacity_application_marker_survives_delta_and_base_rewrite() {
     let (_rewritten, catalog) = Files::new(&cold);
     let rewritten = catalog.into_storage(&|| Ok(())).unwrap();
     assert_eq!(
-        rewritten
-            .business
-            .replication_log(1, 16, &|| Ok(()))
-            .unwrap(),
+        journal_page_for_test_sync(|| rewritten.business.replication_log(1, 16, &|| Ok(()))),
         expected_entries
     );
     assert_eq!(
@@ -1018,7 +1012,8 @@ fn native_capacity_boundaries_survive_full_image_and_generation_base_rewrite() {
         &mut storage,
         &old,
     );
-    let expected_entries = storage.business.replication_log(1, 32, &|| Ok(())).unwrap();
+    let expected_entries =
+        journal_page_for_test_sync(|| storage.business.replication_log(1, 32, &|| Ok(())));
     let expected = Version::capture(&storage)
         .unwrap()
         .context_digest()
@@ -1029,7 +1024,7 @@ fn native_capacity_boundaries_survive_full_image_and_generation_base_rewrite() {
         .unwrap();
     delta.validate_image().unwrap();
     assert_eq!(
-        delta.business.replication_log(1, 32, &|| Ok(())).unwrap(),
+        journal_page_for_test_sync(|| delta.business.replication_log(1, 32, &|| Ok(()))),
         expected_entries
     );
     assert_eq!(
@@ -1046,7 +1041,7 @@ fn native_capacity_boundaries_survive_full_image_and_generation_base_rewrite() {
     )
     .unwrap();
     assert_eq!(
-        cold.business.replication_log(1, 32, &|| Ok(())).unwrap(),
+        journal_page_for_test_sync(|| cold.business.replication_log(1, 32, &|| Ok(()))),
         expected_entries
     );
     assert_eq!(
@@ -1057,10 +1052,7 @@ fn native_capacity_boundaries_survive_full_image_and_generation_base_rewrite() {
     let rewritten = catalog.into_storage(&|| Ok(())).unwrap();
     rewritten.validate_image().unwrap();
     assert_eq!(
-        rewritten
-            .business
-            .replication_log(1, 32, &|| Ok(()))
-            .unwrap(),
+        journal_page_for_test_sync(|| rewritten.business.replication_log(1, 32, &|| Ok(()))),
         expected_entries
     );
     assert_eq!(

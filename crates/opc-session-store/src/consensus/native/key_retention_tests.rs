@@ -1,4 +1,5 @@
 use super::*;
+use crate::consensus::native::test_journal::journal_page_for_test_sync;
 use changes::tests::{clock, fixture, time};
 use std::time::Duration;
 
@@ -567,12 +568,10 @@ fn native_metadata_capacity_reserves_its_watch_counter_before_key_publication() 
         let (mut storage, old) = retired_key_fixture();
         // An admitted bounded window isolates the signed counter horizon;
         // retirement still uses its original threshold and actual dead row.
-        let original = storage
-            .business
-            .replication_log(1, 16, &|| Ok(()))
-            .unwrap()
-            .pop()
-            .unwrap();
+        let original =
+            journal_page_for_test_sync(|| storage.business.replication_log(1, 16, &|| Ok(())))
+                .pop()
+                .unwrap();
         storage.business.notifications.clear();
         let window = retention::NOTIFICATION_WINDOW as u64;
         for sequence in head - window + 1..=head {
@@ -646,12 +645,10 @@ fn native_metadata_capacity_reserves_its_watch_counter_before_key_publication() 
 #[test]
 fn native_new_internal_capacity_requires_a_journal_position_even_without_key_pressure() {
     let (mut storage, _) = retired_key_fixture();
-    let original = storage
-        .business
-        .replication_log(1, 16, &|| Ok(()))
-        .unwrap()
-        .pop()
-        .unwrap();
+    let original =
+        journal_page_for_test_sync(|| storage.business.replication_log(1, 16, &|| Ok(())))
+            .pop()
+            .unwrap();
     storage.business.notifications.clear();
     let window = retention::NOTIFICATION_WINDOW as u64;
     for sequence in COUNTER_MAX - window + 1..=COUNTER_MAX {

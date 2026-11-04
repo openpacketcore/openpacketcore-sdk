@@ -8,16 +8,40 @@ to reproduce the shards with the profile and disk setup in
 
 The hosted `misc` runner uses `plan --shard misc --split-libraries` for binary
 unit tests, example compilation, doctests and the heavy-target remainder. Its
-library phase runs on six required `Rust library tests` runners, with the same
+library phase runs on twelve required `Rust library tests` runners, with the same
 workspace package selection, features, ordinary profile and four test threads.
 Each runner compiles/lists every library and verifies that its compiled targets
 match Cargo metadata. Exact-name exclusions partition the live inventory using
 the first eight SHA-256 bytes modulo three to choose the original group, then the
-next eight bytes modulo two to choose its half (that group, or the group plus
-three). Duplicate names in different libraries
+next eight bytes modulo four to choose its quarter (that group, or the group
+plus three, six or nine). Duplicate names in different libraries
 share an owner; new tests are assigned automatically. The uploaded mapping
 records the revision, identities, ignored status and exact commands. The logical
 `plan --shard misc` remains available to reproduce the complete unsplit phase.
+
+Fixtures with observed verification allocations or shared scheduling gates
+have exact owners in `serial_lib_shards`. Each runs in a fresh process before its owner's
+parallel remainder, with the same package selection and test profile. Library
+groups with shared admissions likewise keep one enabled case per process;
+ignored child helpers remain with the enabled parent that invokes them.
+Small direct reservations receive the same process isolation. A parent that
+uses no shared allowance can keep its fixture-owned child process. Core and
+egress process owners are explicit; the egress precheck requires declarations
+to match its complete enabled inventory.
+The complementary exclusions and compiled-inventory verifier prevent omissions
+or duplicate execution. Short journal-page fixture reads retry only the fixed
+native-state admission refusal, under a finite deadline. Corruption and other
+backend errors remain failures. Test-only synchronization witnesses also have
+finite diagnostic guards, including a private-process guard for blocking
+teardown. The egress package selection reuses these exact process-ownership
+declarations: twelve additional host-test lanes run the admission fixtures
+serially, retaining the original six-package selection, features and profile.
+The long mixed-journal proof runs on its dedicated native-proof lane at its
+original O0 profile. The complete epoch-floor proof also has a dedicated
+native-proof runner at O0. The other fixtures have explicit balanced owners.
+Their names are excluded from every ordinary egress process and checked against
+the compiled inventory, so new or renamed declarations cannot silently pass as
+empty commands.
 
 Local kernel lifecycle qualification creates interfaces and routes in supervised
 private network namespaces. Cleanup verification attributes surviving namespaces
@@ -55,12 +79,15 @@ duplicate execution. Live inventories reject missing, ignored or ambiguous names
 The tests retain their four Tokio workers, all assertions and ten-second bounds.
 Successful runs print elapsed time and decode/audit counts for hosted validation.
 
-The checkpoint-delta payload and epoch-floor parity proofs each run in a fresh
-serial process on `heavy-0`, with the original workspace features and ordinary
-test profile. Each uses a large share of the process verification allowance, so
-parallel fixture occupancy would measure admission contention instead of the
+Large verification proofs each run in a fresh serial process with the original
+workspace features and ordinary test profile. The epoch-floor parity proof runs
+on `heavy-1`; the remaining memory, codec and refund proofs are balanced across
+`heavy-0` and `heavy-1`. The three maximum-log admission proofs run on `heavy-0`. Each owns a large share of the process verification allowance,
+so parallel fixture occupancy would measure admission contention instead of the
 proof. Their payload sizes, assertions and process cap remain unchanged. Exact
-exclusions and live inventory checks keep one owner per test.
+exclusions and live inventory checks keep one owner per test. Short native
+fixture journal reads retry only the value-free committed-state availability
+refusal within a ten-second real-time guard; other errors are not retried.
 
 The full-bound native log, receipt-history and retention proofs listed in
 [`native_log_bound.py`](native_log_bound.py) each have a dedicated parallel runner:
@@ -84,6 +111,7 @@ The full-bound native log, receipt-history and retention proofs listed in
 | Completed-roster history and cold reopen | `roster-history` | `18` | O3 |
 | Notification retirement beyond the original lifetime limit and reopen | `native-log-14` | `19` | O1 |
 | Dead-key retirement beyond the original lifetime limit and reopen | `native-log-15` | `20` | O1 |
+| Complete mixed-journal cold replay | `native-log-16` | `21` | O0 |
 
 Each runs in its own serial test process, with debug assertions and
 overflow checks enabled, preserving the original package/feature selection.

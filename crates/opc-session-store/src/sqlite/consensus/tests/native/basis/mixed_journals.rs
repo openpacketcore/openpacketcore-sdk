@@ -24,7 +24,7 @@ fn isolated(case: &str) -> bool {
     let output = std::process::Command::new(std::env::current_exe().unwrap())
         .args(["--exact", &name, "--test-threads=1", "--nocapture"])
         .env(CHILD, case)
-        .test_output()
+        .test_output_with_deadline(std::time::Duration::from_secs(1800))
         .unwrap();
     assert!(
         output.status.success(),
@@ -190,255 +190,265 @@ struct CrashReport {
 
 #[test]
 fn native_journal_pressure_mixed_captured_and_live_crash_reopens() {
-    const CASE: &str = "native_journal_pressure_mixed_captured_and_live_crash_reopens";
-    if isolated(CASE) {
-        return;
-    }
-    const CRASH: &str = "OPC_MIXED_JOURNAL_CRASH";
-    if let Some(report) = std::env::var_os(CRASH) {
-        let gate = Gate::new(Point::BeforeNativeGenerationAppend, 1);
-        let fixture = MixedFixture::new(gate.control());
-        let entries = [
-            roster::terminal(&fixture.signed, 5),
-            fenced_transition_v2_entry(6, consumer(1, 0), timestamp(3)),
-            maintenance(7, history(4096, 1, 1), timestamp(3)),
-        ]
-        .map(|entry| scoped(fixture.signed.identity, entry));
-        roster::commit(&fixture.wal, &entries);
-        VerificationMemory::begin_retirement_phase_for_test();
-        let applied = fixture.wal.native_apply_committed(&entries).unwrap();
-        assert!(applied
-            .responses
-            .iter()
-            .all(|response| response.result.is_ok()));
-        let owners = fixture.wal.native_journal_owners_for_test().unwrap();
-        assert!(owners[..3].iter().all(|bytes| *bytes > 0));
-        std::thread::scope(|scope| {
-            let _checkpoint = scope.spawn(|| fixture.wal.checkpoint());
-            gate.entered();
-            assert_eq!(
-                fixture.wal.native_journal_owners_for_test().unwrap()[..3],
-                [0; 3]
-            );
-            let _other_images = VerificationMemory::reserve(56 * 1024 * 1024).unwrap();
-            let late = timestamp(3).add_seconds(24 * 60 * 60).unwrap();
-            let mut clock = roster::ordinary(
-                &fixture.signed,
-                8,
-                SessionMutationIntent::AdvanceLogicalTime,
-            );
-            let EntryPayload::Normal(command) = &mut clock.payload else {
-                unreachable!()
-            };
-            command.logical_time = late;
-            let request = consumer(2, 0);
+    crate::test_process::with_completion_deadline(std::time::Duration::from_secs(1800), || {
+        const CASE: &str = "native_journal_pressure_mixed_captured_and_live_crash_reopens";
+        if isolated(CASE) {
+            return;
+        }
+        const CRASH: &str = "OPC_MIXED_JOURNAL_CRASH";
+        if let Some(report) = std::env::var_os(CRASH) {
+            let gate = Gate::new(Point::BeforeNativeGenerationAppend, 1);
+            let fixture = MixedFixture::new(gate.control());
             let entries = [
-                clock,
-                fenced_transition_v2_entry(9, request.clone(), late),
-                maintenance(10, history(3072, 2, 2), late),
+                roster::terminal(&fixture.signed, 5),
+                fenced_transition_v2_entry(6, consumer(1, 0), timestamp(3)),
+                maintenance(7, history(4096, 1, 1), timestamp(3)),
             ]
             .map(|entry| scoped(fixture.signed.identity, entry));
             roster::commit(&fixture.wal, &entries);
+            VerificationMemory::begin_retirement_phase_for_test();
             let applied = fixture.wal.native_apply_committed(&entries).unwrap();
             assert!(applied
                 .responses
                 .iter()
                 .all(|response| response.result.is_ok()));
             let owners = fixture.wal.native_journal_owners_for_test().unwrap();
-            assert!(
-                owners[..3].iter().all(|bytes| *bytes > 0),
-                "live business, roster and log journals coexist with the captured cut"
-            );
-            assert!(matches!(
-                status(&fixture.wal, &request),
-                FencedTransitionV2Status::Recorded(_)
-            ));
-            let [_, fill_peak, cap] = VerificationMemory::usage_for_test();
-            let retirement_peak = VerificationMemory::retirement_peak_for_test();
-            assert!(fill_peak <= cap && retirement_peak <= cap);
-            let report_value = CrashReport {
-                directory: fixture.directory.path().join("wal"),
-                basis: fixture.wal.binding().basis,
-                digest: fixture
-                    .wal
-                    .with_native_read(|state| Ok(state.clone()))
-                    .unwrap()
-                    .mixed_business_digest_for_test()
-                    .unwrap(),
-                consumer: request,
-                fill_peak,
-                retirement_peak,
-            };
-            std::fs::write(report, serde_json::to_vec(&report_value).unwrap()).unwrap();
-            std::process::exit(73); // Both journals and the blocked writer still exist.
-        });
-        unreachable!();
-    }
-    let directory = tempfile::tempdir().unwrap();
-    let report_path = directory.path().join("crash.json");
-    let test = format!("sqlite::consensus::tests::native::basis::mixed_journals::{CASE}");
-    let output = std::process::Command::new(std::env::current_exe().unwrap())
-        .args(["--exact", &test, "--test-threads=1", "--nocapture"])
-        .env(CRASH, &report_path)
-        .env("TMPDIR", directory.path())
-        .test_output()
-        .unwrap();
-    assert_eq!(
-        output.status.code(),
-        Some(73),
-        "{}\n{}",
-        String::from_utf8_lossy(&output.stdout),
-        String::from_utf8_lossy(&output.stderr)
-    );
-    let report: CrashReport = serde_json::from_slice(&std::fs::read(report_path).unwrap()).unwrap();
-    let signed = roster_v2_fresh_wal_persistence_fixture(Phase::Established);
-    let binding = crate::sqlite::consensus::wal::Binding {
-        identity: signed.identity,
-        generation: [0xD4; 32],
-        basis: report.basis,
-        native: true,
-        persistence: crate::SessionPersistenceMode::Durable,
-        async_closed_format: false,
-        async_recovery_format: false,
-    };
-    let (wal, observation) =
-        Wal::open_mixed_replay_for_test(&report.directory, binding, Arc::new(signed.root)).unwrap();
-    assert_eq!(
-        wal.with_native_read(|state| Ok(state.clone()))
-            .unwrap()
-            .mixed_business_digest_for_test()
-            .unwrap(),
-        report.digest
-    );
-    assert!(matches!(
-        status(&wal, &report.consumer),
-        FencedTransitionV2Status::Recorded(_)
-    ));
-    assert_eq!(
-        wal.with_native_read(|state| state.history_state()).unwrap(),
-        history(2048, 3, 2)
-    );
-    let entry = scoped(
-        signed.identity,
-        maintenance(
-            11,
-            history(2048, 3, 2),
-            timestamp(4).add_seconds(24 * 60 * 60).unwrap(),
-        ),
-    );
-    roster::commit(&wal, std::slice::from_ref(&entry));
-    assert!(wal.native_apply_committed(&[entry]).unwrap().responses[0]
-        .result
-        .is_ok());
-    wal.checkpoint().unwrap();
-    let stopping = Instant::now();
-    wal.shutdown().unwrap();
-    assert!(stopping.elapsed() < Duration::from_secs(5));
-    assert!(observation[3] <= PROCESS_VERIFICATION_BYTES);
-    eprintln!("native_mixed_journal_crash fill_peak={} retirement_peak={} cold_peak={} cap={PROCESS_VERIFICATION_BYTES}", report.fill_peak, report.retirement_peak, observation[3]);
+            assert!(owners[..3].iter().all(|bytes| *bytes > 0));
+            std::thread::scope(|scope| {
+                let _checkpoint = scope.spawn(|| fixture.wal.checkpoint());
+                gate.entered();
+                assert_eq!(
+                    fixture.wal.native_journal_owners_for_test().unwrap()[..3],
+                    [0; 3]
+                );
+                let _other_images = VerificationMemory::reserve(56 * 1024 * 1024).unwrap();
+                let late = timestamp(3).add_seconds(24 * 60 * 60).unwrap();
+                let mut clock = roster::ordinary(
+                    &fixture.signed,
+                    8,
+                    SessionMutationIntent::AdvanceLogicalTime,
+                );
+                let EntryPayload::Normal(command) = &mut clock.payload else {
+                    unreachable!()
+                };
+                command.logical_time = late;
+                let request = consumer(2, 0);
+                let entries = [
+                    clock,
+                    fenced_transition_v2_entry(9, request.clone(), late),
+                    maintenance(10, history(3072, 2, 2), late),
+                ]
+                .map(|entry| scoped(fixture.signed.identity, entry));
+                roster::commit(&fixture.wal, &entries);
+                let applied = fixture.wal.native_apply_committed(&entries).unwrap();
+                assert!(applied
+                    .responses
+                    .iter()
+                    .all(|response| response.result.is_ok()));
+                let owners = fixture.wal.native_journal_owners_for_test().unwrap();
+                assert!(
+                    owners[..3].iter().all(|bytes| *bytes > 0),
+                    "live business, roster and log journals coexist with the captured cut"
+                );
+                assert!(matches!(
+                    status(&fixture.wal, &request),
+                    FencedTransitionV2Status::Recorded(_)
+                ));
+                let [_, fill_peak, cap] = VerificationMemory::usage_for_test();
+                let retirement_peak = VerificationMemory::retirement_peak_for_test();
+                assert!(fill_peak <= cap && retirement_peak <= cap);
+                let report_value = CrashReport {
+                    directory: fixture.directory.path().join("wal"),
+                    basis: fixture.wal.binding().basis,
+                    digest: fixture
+                        .wal
+                        .with_native_read(|state| Ok(state.clone()))
+                        .unwrap()
+                        .mixed_business_digest_for_test()
+                        .unwrap(),
+                    consumer: request,
+                    fill_peak,
+                    retirement_peak,
+                };
+                std::fs::write(report, serde_json::to_vec(&report_value).unwrap()).unwrap();
+                std::process::exit(73); // Both journals and the blocked writer still exist.
+            });
+            unreachable!();
+        }
+        let directory = tempfile::tempdir().unwrap();
+        let report_path = directory.path().join("crash.json");
+        let test = format!("sqlite::consensus::tests::native::basis::mixed_journals::{CASE}");
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", &test, "--test-threads=1", "--nocapture"])
+            .env(CRASH, &report_path)
+            .env("TMPDIR", directory.path())
+            .test_output_with_deadline(std::time::Duration::from_secs(1800))
+            .unwrap();
+        assert_eq!(
+            output.status.code(),
+            Some(73),
+            "{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let report: CrashReport =
+            serde_json::from_slice(&std::fs::read(report_path).unwrap()).unwrap();
+        let signed = roster_v2_fresh_wal_persistence_fixture(Phase::Established);
+        let binding = crate::sqlite::consensus::wal::Binding {
+            identity: signed.identity,
+            generation: [0xD4; 32],
+            basis: report.basis,
+            native: true,
+            persistence: crate::SessionPersistenceMode::Durable,
+            async_closed_format: false,
+            async_recovery_format: false,
+        };
+        let (wal, observation) =
+            Wal::open_mixed_replay_for_test(&report.directory, binding, Arc::new(signed.root))
+                .unwrap();
+        assert_eq!(
+            wal.with_native_read(|state| Ok(state.clone()))
+                .unwrap()
+                .mixed_business_digest_for_test()
+                .unwrap(),
+            report.digest
+        );
+        assert!(matches!(
+            status(&wal, &report.consumer),
+            FencedTransitionV2Status::Recorded(_)
+        ));
+        assert_eq!(
+            wal.with_native_read(|state| state.history_state()).unwrap(),
+            history(2048, 3, 2)
+        );
+        let entry = scoped(
+            signed.identity,
+            maintenance(
+                11,
+                history(2048, 3, 2),
+                timestamp(4).add_seconds(24 * 60 * 60).unwrap(),
+            ),
+        );
+        roster::commit(&wal, std::slice::from_ref(&entry));
+        assert!(wal.native_apply_committed(&[entry]).unwrap().responses[0]
+            .result
+            .is_ok());
+        wal.checkpoint().unwrap();
+        let stopping = Instant::now();
+        wal.shutdown().unwrap();
+        assert!(stopping.elapsed() < Duration::from_secs(5));
+        assert!(observation[3] <= PROCESS_VERIFICATION_BYTES);
+        eprintln!("native_mixed_journal_crash fill_peak={} retirement_peak={} cold_peak={} cap={PROCESS_VERIFICATION_BYTES}", report.fill_peak, report.retirement_peak, observation[3]);
+    });
 }
 
 #[test]
 fn native_journal_pressure_large_mixed_cold_replay_rebases_before_exhaustion() {
-    const CASE: &str = "native_journal_pressure_large_mixed_cold_replay_rebases_before_exhaustion";
-    if isolated(CASE) {
-        return;
-    }
-    let MixedFixture {
-        directory,
-        wal,
-        signed,
-        root,
-    } = MixedFixture::new(IoControl::default());
-    let first = roster::terminal(&signed, 5);
-    wal.submit(append(&[first])).unwrap().wait().unwrap();
-    const BATCHES: u64 = 8192;
-    let mut pending = Vec::new();
-    for batch in 0..BATCHES {
-        let requests = (0..8).map(|slot| consumer(batch + 1, slot)).collect();
-        pending.push(scoped(
-            signed.identity,
-            fenced_transition_v2_batch_entry(6 + batch, requests, timestamp(3)),
-        ));
-        if pending.len() == 64 {
-            wal.submit(append(&pending)).unwrap().wait().unwrap();
-            pending.clear();
+    crate::test_process::with_completion_deadline(std::time::Duration::from_secs(1800), || {
+        const CASE: &str =
+            "native_journal_pressure_large_mixed_cold_replay_rebases_before_exhaustion";
+        if isolated(CASE) {
+            return;
         }
-    }
-    assert!(pending.is_empty());
-    let last = 6 + BATCHES;
-    let retirement = scoped(
-        signed.identity,
-        maintenance(last, history(4096, 1, BATCHES as usize * 8), timestamp(4)),
-    );
-    roster::commit(&wal, std::slice::from_ref(&retirement));
-    wal.checkpoint().unwrap(); // The complete committed log is cold; business remains at entry 4.
-    assert_eq!(
-        wal.with_native_read(|state| Ok(state.applied())).unwrap(),
-        Some(log_id(4))
-    );
-    let fill_peak = VerificationMemory::usage_for_test()[1];
-    let binding = wal.binding();
-    wal.shutdown().unwrap();
-    drop(wal);
-    let (wal, observation) =
-        Wal::open_mixed_replay_for_test(&directory.path().join("wal"), binding, Arc::clone(&root))
-            .unwrap();
-    assert_eq!(
-        observation[0], 1,
-        "large recovery must authenticate and release complete journals"
-    );
-    assert!(observation[1] < 24 * 1024 * 1024);
-    assert!(
-        observation[3] < 96 * 1024 * 1024,
-        "cold peak={}",
-        observation[3]
-    );
-    assert_eq!(
-        wal.with_native_read(|state| Ok(state.applied())).unwrap(),
-        Some(log_id(last))
-    );
-    assert_eq!(
-        wal.with_native_read(|state| state.history_state()).unwrap(),
-        history(3072, 2, BATCHES as usize * 8)
-    );
-    for row in [1, BATCHES / 2, BATCHES] {
-        for slot in [0, 7] {
-            assert!(matches!(
-                status(&wal, &consumer(row, slot)),
-                FencedTransitionV2Status::Recorded(_)
+        let MixedFixture {
+            directory,
+            wal,
+            signed,
+            root,
+        } = MixedFixture::new(IoControl::default());
+        let first = roster::terminal(&signed, 5);
+        wal.submit(append(&[first])).unwrap().wait().unwrap();
+        const BATCHES: u64 = 8192;
+        let mut pending = Vec::new();
+        for batch in 0..BATCHES {
+            let requests = (0..8).map(|slot| consumer(batch + 1, slot)).collect();
+            pending.push(scoped(
+                signed.identity,
+                fenced_transition_v2_batch_entry(6 + batch, requests, timestamp(3)),
             ));
+            if pending.len() == 64 {
+                wal.submit(append(&pending)).unwrap().wait().unwrap();
+                pending.clear();
+            }
         }
-    }
-    let retry = roster::terminal(&signed, last + 1);
-    roster::commit(&wal, std::slice::from_ref(&retry));
-    assert!(matches!(
-        &wal.native_apply_committed(&[retry]).unwrap().responses[0].result,
-        Ok(SessionMutationOutcome::RosterTerminalV2(
-            ConsensusRosterTerminalOutcome::Committed { replayed: true, .. }
-        ))
-    ));
-    wal.checkpoint().unwrap();
-    let stopping = Instant::now();
-    wal.shutdown().unwrap();
-    assert!(stopping.elapsed() < Duration::from_secs(5));
-    drop(wal);
-    let reopened = Opening::new(
-        &directory.path().join("wal"),
-        binding,
-        Some(root),
-        Limits::default(),
-        IoControl::default(),
-    )
-    .unwrap()
-    .finish(|| Ok(()))
-    .unwrap();
-    assert_eq!(
-        reopened
-            .with_native_read(|state| Ok(state.applied()))
-            .unwrap(),
-        Some(log_id(last + 1))
-    );
-    reopened.shutdown().unwrap();
-    eprintln!("native_mixed_journal_replay receipts={} fill_peak={fill_peak} journal={} retained={} cold_peak={} cap={PROCESS_VERIFICATION_BYTES}", BATCHES * 8, observation[1], observation[2], observation[3]);
+        assert!(pending.is_empty());
+        let last = 6 + BATCHES;
+        let retirement = scoped(
+            signed.identity,
+            maintenance(last, history(4096, 1, BATCHES as usize * 8), timestamp(4)),
+        );
+        roster::commit(&wal, std::slice::from_ref(&retirement));
+        wal.checkpoint().unwrap(); // The complete committed log is cold; business remains at entry 4.
+        assert_eq!(
+            wal.with_native_read(|state| Ok(state.applied())).unwrap(),
+            Some(log_id(4))
+        );
+        let fill_peak = VerificationMemory::usage_for_test()[1];
+        let binding = wal.binding();
+        wal.shutdown().unwrap();
+        drop(wal);
+        let (wal, observation) = Wal::open_mixed_replay_for_test(
+            &directory.path().join("wal"),
+            binding,
+            Arc::clone(&root),
+        )
+        .unwrap();
+        assert_eq!(
+            observation[0], 1,
+            "large recovery must authenticate and release complete journals"
+        );
+        assert!(observation[1] < 24 * 1024 * 1024);
+        assert!(
+            observation[3] < 96 * 1024 * 1024,
+            "cold peak={}",
+            observation[3]
+        );
+        assert_eq!(
+            wal.with_native_read(|state| Ok(state.applied())).unwrap(),
+            Some(log_id(last))
+        );
+        assert_eq!(
+            wal.with_native_read(|state| state.history_state()).unwrap(),
+            history(3072, 2, BATCHES as usize * 8)
+        );
+        for row in [1, BATCHES / 2, BATCHES] {
+            for slot in [0, 7] {
+                assert!(matches!(
+                    status(&wal, &consumer(row, slot)),
+                    FencedTransitionV2Status::Recorded(_)
+                ));
+            }
+        }
+        let retry = roster::terminal(&signed, last + 1);
+        roster::commit(&wal, std::slice::from_ref(&retry));
+        assert!(matches!(
+            &wal.native_apply_committed(&[retry]).unwrap().responses[0].result,
+            Ok(SessionMutationOutcome::RosterTerminalV2(
+                ConsensusRosterTerminalOutcome::Committed { replayed: true, .. }
+            ))
+        ));
+        wal.checkpoint().unwrap();
+        let stopping = Instant::now();
+        wal.shutdown().unwrap();
+        assert!(stopping.elapsed() < Duration::from_secs(5));
+        drop(wal);
+        let reopened = Opening::new(
+            &directory.path().join("wal"),
+            binding,
+            Some(root),
+            Limits::default(),
+            IoControl::default(),
+        )
+        .unwrap()
+        .finish(|| Ok(()))
+        .unwrap();
+        assert_eq!(
+            reopened
+                .with_native_read(|state| Ok(state.applied()))
+                .unwrap(),
+            Some(log_id(last + 1))
+        );
+        reopened.shutdown().unwrap();
+        eprintln!("native_mixed_journal_replay receipts={} fill_peak={fill_peak} journal={} retained={} cold_peak={} cap={PROCESS_VERIFICATION_BYTES}", BATCHES * 8, observation[1], observation[2], observation[3]);
+    });
 }

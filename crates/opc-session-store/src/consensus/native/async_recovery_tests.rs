@@ -1,5 +1,6 @@
 use super::*;
 use crate::consensus::native::changes::tests::{apply, request, time};
+use crate::consensus::native::test_journal::journal_page_for_test_sync;
 use crate::consensus::{
     SessionConsensusClusterId, SessionConsensusConfigurationEpoch, SessionConsensusConfigurationId,
 };
@@ -149,12 +150,11 @@ fn native_async_boundary_retires_unexpired_credentials_and_absent_key_fences() {
         storage.business.replication_log(old_tail, 1, &|| Ok(())),
         Err(StoreError::ReplicationLogCursorCompacted { .. })
     ));
-    assert!(storage
-        .business
-        .replication_log(floor + 1, 32, &|| Ok(()))
-        .unwrap()
-        .iter()
-        .all(|entry| entry.sequence > floor));
+    assert!(
+        journal_page_for_test_sync(|| storage.business.replication_log(floor + 1, 32, &|| Ok(())))
+            .iter()
+            .all(|entry| entry.sequence > floor)
+    );
     storage.validate_image().unwrap();
 }
 
@@ -416,18 +416,14 @@ fn native_async_boundary_coalesced_history_cannot_omit_transient_receipts() {
 fn native_async_boundary_watch_does_not_relabel_predecessor_effects() {
     let mut storage = fixture();
     acquire(&mut storage, 1, 1);
-    let predecessor = storage
-        .business
-        .replication_log(1, 32, &|| Ok(()))
-        .unwrap()
-        .remove(0);
+    let predecessor =
+        journal_page_for_test_sync(|| storage.business.replication_log(1, 32, &|| Ok(())))
+            .remove(0);
     assert_eq!(storage.business.watch_sequence(), 1);
     let term = recover(&mut storage, 2);
     let floor = Reservation::initial().ceiling();
-    let context = storage
-        .business
-        .replication_log(floor + 1, 32, &|| Ok(()))
-        .unwrap();
+    let context =
+        journal_page_for_test_sync(|| storage.business.replication_log(floor + 1, 32, &|| Ok(())));
     assert_eq!(context.len(), 1);
     assert_eq!(context[0].sequence, floor + 1);
     assert!(matches!(&context[0].op, crate::ReplicationOp::Batch { ops } if ops.is_empty()));
@@ -454,10 +450,8 @@ fn native_async_boundary_watch_does_not_relabel_predecessor_effects() {
         "the old effect keeps its original position and policy"
     );
     acquire(&mut storage, term, 3);
-    let page = storage
-        .business
-        .replication_log(floor + 1, 32, &|| Ok(()))
-        .unwrap();
+    let page =
+        journal_page_for_test_sync(|| storage.business.replication_log(floor + 1, 32, &|| Ok(())));
     assert_eq!(page.len(), 2);
     assert_eq!(page[0], context[0]);
     assert_eq!(page[1].sequence, floor + 2);

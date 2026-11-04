@@ -11,7 +11,9 @@ from __future__ import annotations
 
 import argparse
 from collections import Counter
+from functools import lru_cache
 import hashlib
+import importlib.util
 import json
 import os
 from pathlib import Path
@@ -32,7 +34,18 @@ SELECTION = ["--locked", *[arg for name in PACKAGES for arg in ("-p", name)],
              "--all-features"]
 ORDINARY_SHARDS = (0, 1, 2)
 PROOF_SHARD = 3
-SHARDS = (*ORDINARY_SHARDS, PROOF_SHARD, *native_log_bound.EGRESS_SHARDS)
+# Shared admissions keep fresh processes. The complete epoch proof keeps its
+# original O0 profile on a dedicated native-proof runner; shorter fixtures have
+# explicit balanced owners on the ordinary-profile resource runners.
+EPOCH_PROOF_TEST = (
+    "consensus::native::epoch_floor_tests::"
+    "native_epoch_floor_matches_fake_through_two_real_threshold_rotations"
+)
+EPOCH_PROOF_SHARD = max(native_log_bound.EGRESS_SHARDS) + 1
+NATIVE_PROOF_SHARDS = (*native_log_bound.EGRESS_SHARDS, EPOCH_PROOF_SHARD)
+RESOURCE_SHARDS = tuple(range(EPOCH_PROOF_SHARD + 1, EPOCH_PROOF_SHARD + 13))
+HOST_TEST_SHARDS = (*ORDINARY_SHARDS, *RESOURCE_SHARDS)
+SHARDS = (*HOST_TEST_SHARDS, PROOF_SHARD, *NATIVE_PROOF_SHARDS)
 REQUIRED_JOBS = ("sources", "oracles", "installer", "host-tests", "host-proofs", "host-native-log-proofs")
 ISOLATED_LIB = (
     "consensus::storage::tests::promoted_mismatch_never_unlinks_a_same_name_replacement",
@@ -86,7 +99,43 @@ SERIAL_LIB_TESTS = (
     "consensus::store::sequential_wal_sdk_tests::scope_child_read::"
     "scope_child_read_three_large_children_refuse_the_whole_observation",
 )
-ISOLATED_TESTS = (*SPECIAL, *SERIAL_LIB_TESTS, *native_log_bound.TESTS)
+ISOLATED_TESTS = (*SPECIAL, *SERIAL_LIB_TESTS, *native_log_bound.TESTS, EPOCH_PROOF_TEST)
+
+
+@lru_cache(maxsize=1)
+def declared_shared_allowance_names() -> frozenset[str]:
+    """Reuse exact core process-ownership declarations; profiles stay local."""
+    spec = importlib.util.spec_from_file_location("core_test_shards", ROOT / "ci/test-shards.py")
+    assert spec is not None and spec.loader is not None
+    core = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(core)
+    plan = json.loads((ROOT / "ci/test-shards.json").read_text())
+    names = set(core.moved_lib_names(plan)) - core.lib_child_parents(plan).keys()
+    return frozenset(names - set(ISOLATED_TESTS))
+
+
+@lru_cache(maxsize=1)
+def shared_allowance_owners() -> dict[str, int]:
+    owners = json.loads((ROOT / "ci/test-shards.json").read_text()).get("egress_serial_lib_shards", {})
+    if not isinstance(owners, dict) or any(
+        name not in declared_shared_allowance_names() or type(owner) is not int
+        or owner not in RESOURCE_SHARDS for name, owner in owners.items()
+    ):
+        raise ValueError("invalid shared-allowance resource owner")
+    return owners
+
+
+def shared_allowance_names(rows: list[dict]) -> tuple[str, ...]:
+    """Resolve the common declarations against this compiled selection."""
+    available = {row["name"] for row in rows}
+    selected = sorted(declared_shared_allowance_names().intersection(available))
+    for name in selected:
+        matches = [row for row in rows if row["name"] == name]
+        if len(matches) != 1 or matches[0]["package"] != "opc-session-store" or \
+                matches[0]["target"] != "opc_session_store" or \
+                matches[0]["kind"] != ["lib"] or matches[0]["ignored"]:
+            raise ValueError("shared-allowance test must resolve once as an enabled store library test: " + name)
+    return tuple(selected)
 
 
 def owner(name: str) -> int:
@@ -99,7 +148,15 @@ def owner(name: str) -> int:
         return PROOF_SHARD
     if name in native_log_bound.TESTS:
         return native_log_bound.EGRESS_SHARDS[native_log_bound.TESTS.index(name)]
-    return int.from_bytes(hashlib.sha256(name.encode()).digest()[:8], "big") % len(ORDINARY_SHARDS)
+    hashed = int.from_bytes(hashlib.sha256(name.encode()).digest()[:8], "big")
+    if name == EPOCH_PROOF_TEST:
+        return EPOCH_PROOF_SHARD
+    if name in declared_shared_allowance_names():
+        try:
+            return shared_allowance_owners()[name]
+        except KeyError as error:
+            raise ValueError("shared-allowance test needs an explicit resource owner: " + name) from error
+    return hashed % len(ORDINARY_SHARDS)
 
 
 def listing(output: str) -> list[str]:
@@ -173,6 +230,7 @@ def verify(rows: list[dict]) -> None:
         if len(matches) != 1 or matches[0]["package"] != "opc-session-store" or \
                 matches[0]["target"] != target or matches[0]["kind"] != kind or matches[0]["ignored"]:
             raise ValueError("isolated test must resolve exactly once and remain enabled: " + name)
+    shared_allowance_names(rows)
     for row in rows:
         if row["shard"] != owner(row["name"]):
             raise ValueError("test assigned to the wrong shard")
@@ -207,6 +265,12 @@ def optimized_lib_command(name: str) -> dict:
 
 
 def native_proof_commands(shard: int) -> list[dict]:
+    if shard == EPOCH_PROOF_SHARD:
+        command = serial_lib_command(EPOCH_PROOF_TEST)
+        command["env"] = {"CARGO_PROFILE_TEST_OPT_LEVEL": "0",
+                          "CARGO_PROFILE_TEST_DEBUG_ASSERTIONS": "true",
+                          "CARGO_PROFILE_TEST_OVERFLOW_CHECKS": "true"}
+        return [command]
     name = native_log_bound.TESTS[native_log_bound.EGRESS_SHARDS.index(shard)]
     commands = [native_log_bound_command(name)]
     if shard == ROSTER_TIMING_SHARD:
@@ -218,7 +282,7 @@ def precheck_native_log_bound(commands: list[dict]) -> None:
     """Prove each full-bound name resolves and stays enabled in its test profile."""
     for command in commands:
         name = command["name"]
-        if name not in (*native_log_bound.TESTS, *ROSTER_TIMING_LIB, *ROSTER_WORK_LIB):
+        if name not in (*native_log_bound.TESTS, *ROSTER_TIMING_LIB, *ROSTER_WORK_LIB, EPOCH_PROOF_TEST):
             continue
         argv = [*command["argv"], "--list"]
         env = dict(os.environ, **command["env"])
@@ -236,13 +300,17 @@ def plans(rows: list[dict], shard: int) -> list[dict]:
     commands = []
     if shard == 1:
         commands.extend(serial_lib_command(name) for name in SERIAL_LIB_TESTS)
+    shared = shared_allowance_names(rows)
+    if shard in RESOURCE_SHARDS:
+        commands.extend(serial_lib_command(name) for name in shared if owner(name) == shard)
     if shard in ORDINARY_SHARDS:
-        skipped = sorted({r["name"] for r in rows if r["name"] in ISOLATED_TESTS or r["shard"] != shard})
+        skipped = sorted({r["name"] for r in rows
+                          if r["name"] in (*ISOLATED_TESTS, *shared) or r["shard"] != shard})
         commands.append({"name": "ordinary", "env": {}, "argv": [
             "cargo", "test", *SELECTION, "--quiet", "--tests", "--", "--test-threads=4",
             "--exact", *[arg for name in skipped for arg in ("--skip", name)],
         ]})
-    if shard in native_log_bound.EGRESS_SHARDS:
+    if shard in NATIVE_PROOF_SHARDS:
         commands.extend(native_proof_commands(shard))
     if shard == PROOF_SHARD:
         for name in (*ISOLATED_INTEGRATION, *ISOLATED_LIB):
@@ -272,10 +340,16 @@ def plans(rows: list[dict], shard: int) -> list[dict]:
     return commands
 
 
-def verify_plans(planned: dict[int, list[dict]]) -> None:
+def verify_plans(planned: dict[int, list[dict]], rows: list[dict]) -> None:
     """The required serial phase must precede, and not overlap, ordinary tests."""
     if set(planned) != set(SHARDS):
         raise ValueError("missing or unexpected test shard")
+    verify(rows)
+    shared = shared_allowance_names(rows)
+    for shard in RESOURCE_SHARDS:
+        expected_shared = [serial_lib_command(name) for name in shared if owner(name) == shard]
+        if planned[shard] != expected_shared:
+            raise ValueError("shared-allowance tests must each run once before the parallel phase")
     isolated = [(shard, index, command) for shard, commands in planned.items()
                 for index, command in enumerate(commands) if command["name"] in SERIAL_LIB_TESTS]
     expected = [(1, index, serial_lib_command(name)) for index, name in enumerate(SERIAL_LIB_TESTS)]
@@ -286,6 +360,9 @@ def verify_plans(planned: dict[int, list[dict]]) -> None:
         if planned[shard] != native_proof_commands(shard):
             raise ValueError("each full native log proof must run first at its unchanged profile, followed only by assigned roster proofs")
         native_locations[name] = (shard, 0)
+    if planned[EPOCH_PROOF_SHARD] != native_proof_commands(EPOCH_PROOF_SHARD):
+        raise ValueError("the complete epoch proof must keep one original-profile process")
+    native_locations[EPOCH_PROOF_TEST] = (EPOCH_PROOF_SHARD, 0)
     for index, name in enumerate((*ROSTER_TIMING_LIB, *ROSTER_WORK_LIB), 1):
         native_locations[name] = (ROSTER_TIMING_SHARD, index)
     metadata = cargo_test_selection.workspace_metadata(ROOT)
@@ -293,12 +370,16 @@ def verify_plans(planned: dict[int, list[dict]]) -> None:
         (shard, index): cargo_test_selection.resolve(command["argv"], metadata)
         for shard, commands in planned.items() for index, command in enumerate(commands)
     }
-    for serial_index, name in enumerate(SERIAL_LIB_TESTS):
+    serial_locations = {name: (1, index) for index, name in enumerate(SERIAL_LIB_TESTS)}
+    for shard in RESOURCE_SHARDS:
+        serial_locations.update({name: (shard, index)
+                                 for index, name in enumerate(name for name in shared if owner(name) == shard)})
+    for name, expected_location in serial_locations.items():
         selections = [
             location for location, selection in resolved.items()
             if selection.selects("opc-session-store", "opc_session_store", ("lib",), name)
         ]
-        if selections != [(1, serial_index)]:
+        if selections != [expected_location]:
             raise ValueError("serial library test selections are missing or overlapping: " + name)
     for name, expected_location in native_locations.items():
         selections = [
@@ -313,7 +394,7 @@ def verify_plans(planned: dict[int, list[dict]]) -> None:
             raise ValueError("ordinary test command must run exactly once per shard")
         argv = ordinary[0]["argv"]
         skips = [argv[i + 1] for i, arg in enumerate(argv[:-1]) if arg == "--skip"]
-        if "--exact" not in argv or any(skips.count(name) != 1 for name in (*SERIAL_LIB_TESTS, *native_log_bound.TESTS)):
+        if "--exact" not in argv or any(skips.count(name) != 1 for name in (*SERIAL_LIB_TESTS, *shared, *native_log_bound.TESTS, EPOCH_PROOF_TEST)):
             raise ValueError("ordinary tests must exclude exactly the serial library and full native log tests")
 
 
@@ -341,24 +422,26 @@ def main() -> int:
         return 0
     if args.output is None or (not args.inventory_only and args.shard is None):
         parser.error("--output and either --shard or --inventory-only are required")
-    if not args.inventory_only and args.shard in native_log_bound.EGRESS_SHARDS:
-        # These runners need only O1. The ordinary runners still inventory all
-        # names and verify their ownership, while this live O1 precheck rejects
+    if not args.inventory_only and args.shard in NATIVE_PROOF_SHARDS:
+        # Dedicated runners use each proof's declared profile. The ordinary
+        # runners inventory every name; this live profile check rejects
         # a missing, ignored or ambiguous proof before it can pass as a no-op.
-        name = native_log_bound.TESTS[native_log_bound.EGRESS_SHARDS.index(args.shard)]
         commands = native_proof_commands(args.shard)
+        name = commands[0]["name"]
         args.output.parent.mkdir(parents=True, exist_ok=True)
         args.output.write_text(json.dumps({
             "head": capture(["git", "rev-parse", "HEAD"]).strip(),
             "plans": {str(args.shard): commands},
         }, indent=2) + "\n")
-        print("Precheck O1 full native log proof:", name, flush=True)
+        print("Precheck full native proof:", name, flush=True)
         precheck_native_log_bound(commands)
         run_commands(commands)
         return 0
     rows = inventory()
+    if set(shared_allowance_owners()) != set(shared_allowance_names(rows)):
+        raise ValueError("resource owners must match the complete enabled shared-allowance inventory")
     plan = {str(shard): plans(rows, shard) for shard in SHARDS}
-    verify_plans({int(shard): commands for shard, commands in plan.items()})
+    verify_plans({int(shard): commands for shard, commands in plan.items()}, rows)
     report = {"head": capture(["git", "rev-parse", "HEAD"]).strip(), "tests": rows,
               "ordinary_selection": SELECTION, "plans": plan,
               "isolated_proofs_shard": PROOF_SHARD,

@@ -623,6 +623,19 @@ mod tests {
     use std::time::Duration;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
+    // A missing client, frame or release must fail the fixture, not retain a
+    // server task until the CI job deadline. Provider operation limits stay fixed.
+    fn spawn_fixture<T: Send + 'static>(
+        step: &'static str,
+        work: impl std::future::Future<Output = T> + Send + 'static,
+    ) -> tokio::task::JoinHandle<T> {
+        tokio::spawn(async move {
+            tokio::time::timeout(Duration::from_secs(180), work)
+                .await
+                .unwrap_or_else(|_| panic!("key-provider fixture stalled at {step}"))
+        })
+    }
+
     #[tokio::test]
     async fn kms_error_verdict_requires_a_recognized_machine_reason() {
         let mut failures = Vec::new();
@@ -925,7 +938,7 @@ mod tests {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let endpoint = format!("tcp://{}", listener.local_addr().unwrap());
         let acceptor = tokio_rustls::TlsAcceptor::from(std::sync::Arc::new(server));
-        let task = tokio::spawn(async move {
+        let task = spawn_fixture("mock key-provider worker", async move {
             for _ in 0..5 {
                 let (stream, _) = listener.accept().await.unwrap();
                 assert!(
@@ -976,7 +989,7 @@ mod tests {
     async fn kms_peer_alert_errors(alert: Option<u8>) -> [KeyError; 5] {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let endpoint = format!("tcp://{}", listener.local_addr().unwrap());
-        let task = tokio::spawn(async move {
+        let task = spawn_fixture("mock key-provider worker", async move {
             for _ in 0..5 {
                 let (mut stream, _) = listener.accept().await.unwrap();
                 let mut header = [0u8; 5];
@@ -1040,7 +1053,7 @@ mod tests {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let endpoint = format!("tcp://{}", listener.local_addr().unwrap());
         let acceptor = tokio_rustls::TlsAcceptor::from(std::sync::Arc::new(server));
-        let task = tokio::spawn(async move {
+        let task = spawn_fixture("mock key-provider worker", async move {
             for _ in 0..5 {
                 let (stream, _) = listener.accept().await.unwrap();
                 let error = acceptor.accept(stream).await.unwrap_err();
@@ -1173,7 +1186,7 @@ mod tests {
         let listener = tokio::net::UnixListener::bind(&path).expect("bind mock KMS socket");
         let task_path = path.clone();
         let (request_tx, request_rx) = tokio::sync::oneshot::channel();
-        let handle = tokio::spawn(async move {
+        let handle = spawn_fixture("mock key-provider worker", async move {
             let (mut stream, _) = listener.accept().await.expect("accept mock KMS client");
             let mut len_buf = [0u8; 4];
             stream
@@ -1235,7 +1248,7 @@ mod tests {
         let task_path = path.clone();
         let (request_tx, request_rx) = tokio::sync::mpsc::channel(2);
         let (release_tx, release_rx) = tokio::sync::oneshot::channel();
-        let handle = tokio::spawn(async move {
+        let handle = spawn_fixture("mock key-provider worker", async move {
             let mut release_rx = Some(release_rx);
             for request_index in 0..2 {
                 let (mut stream, _) = listener.accept().await.expect("accept KMS client");
@@ -2254,7 +2267,7 @@ mod tests {
         ));
         let aad = session_aad();
 
-        let first = tokio::spawn({
+        let first = spawn_fixture("mock key-provider worker", {
             let provider = std::sync::Arc::clone(&provider);
             let aad = aad.clone();
             async move { provider.seal(&aad, b"in flight").await }

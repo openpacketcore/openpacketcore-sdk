@@ -289,7 +289,7 @@ async fn scope_authority_four_thousand_successions_keep_native_checkpoint_and_sn
                         "one checkpoint, no session rows and two fixed replay contexts"
                     );
                     let contexts = wal.with_native_read(|state| {
-                        Ok(state.replication_log(1, 8, &|| Ok(())))
+                        Ok(crate::consensus::native::test_journal::journal_page_result_for_test(|| state.replication_log(1, 8, &|| Ok(()))))
                     }).unwrap().unwrap();
                     assert_eq!(contexts.len(), 2);
                     // Activation owns one internal row. Initial admission

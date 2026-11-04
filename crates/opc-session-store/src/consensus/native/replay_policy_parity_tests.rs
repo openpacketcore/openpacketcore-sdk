@@ -1,3 +1,5 @@
+use crate::test_process::witness::{JoinExt, ReceiverExt};
+
 use super::*;
 use crate::fake::tests::{
     replay_key_id_for_test, replay_state_for_test, ReplayRowForTest, ReplayStateForTest,
@@ -82,28 +84,7 @@ fn native_state(native: &NativeStorage) -> ReplayStateForTest {
     }
 }
 
-// Optional page construction may refuse while another test owns the bounded
-// output pool. Retry only that value-free availability refusal, within a new
-// fixture guard; corruption or persistent refusal still fails the test.
-async fn journal_page_for_test(
-    native: &NativeStorage,
-    start: u64,
-    limit: usize,
-) -> Vec<ReplicationEntry> {
-    let deadline = std::time::Instant::now() + Duration::from_secs(10);
-    loop {
-        match native.business.replication_log(start, limit, &|| Ok(())) {
-            Ok(rows) => return rows,
-            Err(StoreError::BackendUnavailable(reason))
-                if reason == "native committed state unavailable"
-                    && std::time::Instant::now() < deadline =>
-            {
-                tokio::time::sleep(Duration::from_millis(1)).await;
-            }
-            Err(error) => panic!("native fixture journal remains unavailable: {error:?}"),
-        }
-    }
-}
+use super::test_journal::{journal_page_for_test, journal_page_for_test_sync};
 
 async fn replay_prefix(native: &NativeStorage, clock: Arc<ReplayClock>) -> FakeSessionBackend {
     let fake = FakeSessionBackend::new().with_clock(clock);
@@ -1253,6 +1234,9 @@ async fn released_lease_replay_preserves_physical_expiry_and_guard_deadline() {
 
 #[tokio::test]
 async fn explicit_policy_watch_rebuild_and_application_restore_round_trip() {
+    if crate::test_process::run_completion_parent(std::time::Duration::from_secs(300)) {
+        return;
+    }
     use crate::test_process::CommandExt as _;
     const CHILD: &str = "OPC_REPLAY_POLICY_ROUND_TRIP_CHILD";
     const TEST: &str = "consensus::native::replay_policy_parity_tests::explicit_policy_watch_rebuild_and_application_restore_round_trip";
@@ -1262,7 +1246,7 @@ async fn explicit_policy_watch_rebuild_and_application_restore_round_trip() {
         let output = std::process::Command::new(std::env::current_exe().unwrap())
             .args(["--exact", TEST, "--test-threads=1", "--nocapture"])
             .env(CHILD, "1")
-            .test_output()
+            .test_output_with_deadline(std::time::Duration::from_secs(1800))
             .unwrap();
         let stdout = String::from_utf8(output.stdout).unwrap();
         let stderr = String::from_utf8(output.stderr).unwrap();
@@ -1513,6 +1497,9 @@ mod round6_roster_parity;
 
 #[tokio::test]
 async fn parity_fixture_tolerates_transient_journal_page_admission_refusal() {
+    if crate::test_process::run_completion_parent(std::time::Duration::from_secs(300)) {
+        return;
+    }
     const CHILD: &str = "OPC_PARITY_PAGE_REFUSAL_CHILD";
     const TEST: &str = "consensus::native::replay_policy_parity_tests::parity_fixture_tolerates_transient_journal_page_admission_refusal";
     if std::env::var_os(CHILD).is_none() {
@@ -1520,7 +1507,7 @@ async fn parity_fixture_tolerates_transient_journal_page_admission_refusal() {
         let output = std::process::Command::new(std::env::current_exe().unwrap())
             .args(["--exact", TEST, "--test-threads=1", "--nocapture"])
             .env(CHILD, "1")
-            .test_output()
+            .test_output_with_deadline(std::time::Duration::from_secs(1800))
             .unwrap();
         assert!(
             output.status.success(),
@@ -1545,9 +1532,58 @@ async fn parity_fixture_tolerates_transient_journal_page_admission_refusal() {
     ))
     .catch_unwind()
     .await;
-    release.join().unwrap();
+    release.test_join().unwrap();
     assert!(
         result.is_ok(),
         "an optional page refusal must not fail a valid parity fixture"
     );
+    // Unrelated availability reasons and typed errors are never retried.
+    for error in [
+        StoreError::BackendUnavailable("different refusal".to_owned()),
+        StoreError::ReplicationLogCursorCompacted { resume_from: 123 },
+    ] {
+        let attempts = std::cell::Cell::new(0);
+        let error = std::cell::RefCell::new(Some(error));
+        let result = super::test_journal::journal_page_result_for_test::<()>(|| {
+            attempts.set(attempts.get() + 1);
+            Err(error
+                .borrow_mut()
+                .take()
+                .expect("no retry for another error"))
+        });
+        assert!(result.is_err());
+        assert_eq!(attempts.get(), 1);
+    }
+    // The synchronous fixture must also outlive a page refusal. Release is
+    // triggered by the observed refusal, so no schedule chooses the outcome.
+    std::thread::scope(|scope| {
+        let occupied =
+            crate::consensus::verified_snapshot::JournalPageMemory::reserve(32 * 1024 * 1024)
+                .unwrap();
+        let (released, release) = std::sync::mpsc::sync_channel(1);
+        let holder = scope.spawn(move || {
+            release.test_recv().unwrap();
+            drop(occupied);
+        });
+        let attempts = std::cell::Cell::new(0);
+        let read = || {
+            attempts.set(attempts.get() + 1);
+            let result = native.business.replication_log(1, 1024, &|| Ok(()));
+            if attempts.get() == 1 {
+                assert!(
+                    matches!(&result, Err(StoreError::BackendUnavailable(reason))
+                    if reason == "native committed state unavailable")
+                );
+                released.send(()).unwrap();
+            }
+            result
+        };
+        let rows = journal_page_for_test_sync(read);
+        holder.test_join().unwrap();
+        assert!(!rows.is_empty());
+        assert!(
+            attempts.get() >= 2,
+            "the fixture must retry after admission is released"
+        );
+    });
 }
