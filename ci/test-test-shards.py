@@ -6,6 +6,7 @@ from __future__ import annotations
 import copy
 import importlib.util
 import io
+import json
 import os
 import re
 import shlex
@@ -332,7 +333,7 @@ class ScopePayloadSerialPhaseTests(unittest.TestCase):
         self.assertEqual(commands[:len(self.NAMES)], [TEST_SHARDS.SELECTION + [
             "--lib", "--", "--test-threads=1", "--nocapture", "--exact", name,
         ] for name in self.NAMES])
-        ordinary = commands[len(self.NAMES)]
+        ordinary = commands[len(TEST_SHARDS.serial_lib_names(self.plan))]
         self.assertIn("--test-threads=4", ordinary)
         self.assertIn("--exact", ordinary)
         for serial in self.NAMES:
@@ -390,7 +391,7 @@ class ScopePayloadSerialPhaseTests(unittest.TestCase):
                 def changed(plan, shard, targets):
                     commands = copy.deepcopy(original(plan, shard, targets))
                     if shard == "misc":
-                        ordinary_index = len(self.NAMES)
+                        ordinary_index = len(TEST_SHARDS.serial_lib_names(self.plan))
                         if mutation == "missing":
                             commands.pop(serial_index)
                         elif mutation == "duplicate":
@@ -434,7 +435,7 @@ class ScopePayloadSerialPhaseTests(unittest.TestCase):
 
     def test_repeated_ordinary_library_command_is_not_exempt_from_overlap_checks(self) -> None:
         original = TEST_SHARDS.commands
-        ordinary = original(self.plan, "misc", self.targets)[len(self.NAMES)]
+        ordinary = original(self.plan, "misc", self.targets)[len(TEST_SHARDS.serial_lib_names(self.plan))]
 
         def changed(plan, shard, targets):
             commands = copy.deepcopy(original(plan, shard, targets))
@@ -731,7 +732,7 @@ class QuiescentShardPlanTests(unittest.TestCase):
                 name = f"{module}::{suffix}"
                 mentions = [command for command in commands if name in command]
                 self.assertEqual(len(mentions), 2)
-                self.assertEqual(mentions[0], commands[len(TEST_SHARDS.SERIAL_LIB_TESTS)])
+                self.assertEqual(mentions[0], commands[len(TEST_SHARDS.serial_lib_names(plan))])
                 self.assertEqual(mentions[0].count(name), 1)
                 self.assertEqual(mentions[0][mentions[0].index(name) - 1], "--skip")
                 self.assertIn("--exact", mentions[0])
@@ -846,22 +847,19 @@ class QuiescentShardPlanTests(unittest.TestCase):
                 self.assertIn("--exact", command)
                 self.assertIn("--test-threads=1", command)
 
-        budget_names = (
-            "consensus::native::generation::tests::rollover_capacity_tests::"
-            "native_checkpoint_delta_payload_can_exceed_the_verification_allowance",
-            "consensus::native::epoch_floor_tests::"
-            "native_epoch_floor_matches_fake_through_two_real_threshold_rotations",
-        )
+        budget_names = TEST_SHARDS.QUIESCENT_VERIFICATION_LIB_TESTS
         for name in budget_names:
             with self.subTest(verification_budget=name):
                 selected = [(shard, command) for shard in TEST_SHARDS.shard_ids(plan)
                             for command in TEST_SHARDS.commands(plan, shard, targets)
                             if "--lib" in command and LibraryGroupPlanTests.selected(command, name)]
-                self.assertEqual([owner for owner, _ in selected], ["heavy-0"])
+                self.assertEqual([owner for owner, _ in selected], [
+                    plan["quiescent_lib_shards"][name]
+                ])
                 self.assertEqual(selected[0][1], TEST_SHARDS.SELECTION + [
                     "--lib", "--", "--test-threads=1", "--exact", name,
                 ])
-                ordinary = TEST_SHARDS.commands(plan, "misc", targets)[len(TEST_SHARDS.SERIAL_LIB_TESTS)]
+                ordinary = TEST_SHARDS.commands(plan, "misc", targets)[len(TEST_SHARDS.serial_lib_names(plan))]
                 self.assertEqual(ordinary.count(name), 1)
                 self.assertEqual(ordinary[ordinary.index(name) - 1], "--skip")
                 future = name + "_future"
@@ -1164,9 +1162,10 @@ class LibraryGroupPlanTests(unittest.TestCase):
             TEST_SHARDS.precheck(self.plan, "heavy-1")
             for shard in TEST_SHARDS.native_log_bound.CORE_SHARDS:
                 TEST_SHARDS.precheck(self.plan, shard)
-        optimized = (*self.NATIVE_FULL_BOUND, TEST_SHARDS.native_log_bound.ROSTER_HISTORY_TEST,
+        profiled = (*self.NATIVE_FULL_BOUND, TEST_SHARDS.native_log_bound.ROSTER_HISTORY_TEST,
+                     TEST_SHARDS.native_log_bound.LONG_JOURNAL_TEST,
                      *TEST_SHARDS.WORK_PROOF_LIB_TESTS)
-        for name in optimized:
+        for name in profiled:
             selected = [command for command in calls if name in command]
             with self.subTest(name=name):
                 self.assertEqual(len(selected), 2)
@@ -1174,6 +1173,8 @@ class LibraryGroupPlanTests(unittest.TestCase):
                 if name in TEST_SHARDS.WORK_PROOF_LIB_TESTS:
                     expected += ["CARGO_PROFILE_TEST_DEBUG_ASSERTIONS=true",
                                  "CARGO_PROFILE_TEST_OVERFLOW_CHECKS=true"]
+                if name == TEST_SHARDS.native_log_bound.LONG_JOURNAL_TEST:
+                    expected = ["env", "CARGO_PROFILE_TEST_OPT_LEVEL=0"]
                 if name == TEST_SHARDS.native_log_bound.ROSTER_HISTORY_TEST:
                     expected = ["env", "CARGO_PROFILE_TEST_OPT_LEVEL=3",
                                 "CARGO_PROFILE_TEST_DEBUG_ASSERTIONS=true",
@@ -1181,7 +1182,7 @@ class LibraryGroupPlanTests(unittest.TestCase):
                 self.assertTrue(all(command[:len(expected)] == expected for command in selected))
                 self.assertEqual(sum("--ignored" in command for command in selected), 1)
         ordinary = [command for command in calls
-                    if not any(name in command for name in optimized)]
+                    if not any(name in command for name in profiled)]
         self.assertTrue(ordinary)
         self.assertTrue(all(command[:len(TEST_SHARDS.SELECTION)] == TEST_SHARDS.SELECTION
                             for command in ordinary))
@@ -1363,7 +1364,7 @@ class HostedLibraryTransferTests(unittest.TestCase):
     def test_hosted_misc_preserves_every_non_library_command_and_transfers_the_complete_library_phase(self):
         logical = TEST_SHARDS.commands(self.plan, "misc", self.targets)
         support = TEST_SHARDS.hosted_commands(self.plan, "misc", self.targets)
-        self.assertEqual(support, logical[len(TEST_SHARDS.SERIAL_LIB_TESTS) + 1:])
+        self.assertEqual(support, logical[len(TEST_SHARDS.serial_lib_names(self.plan)) + 1:])
         self.assertEqual(len(support), 4)
         self.assertFalse(any("--lib" in command for command in support))
         for shard in TEST_SHARDS.shard_ids(self.plan):
@@ -1450,10 +1451,61 @@ class HostedLibraryTransferTests(unittest.TestCase):
                 self.assertEqual(report["child_parents"], children)
                 self.assertTrue(all(report["named_test_owners"][child] == "it-1" for child in children))
                 self.assertEqual([call.args[0] for call in execute.call_args_list], report["plans"][str(shard)])
-                self.assertEqual(execute.call_count, 3 if shard == 0 else 1)
+                expected_serial = [*TEST_SHARDS.SERIAL_LIB_TESTS] if shard == 0 else []
+                expected_serial += [name for name, owner in self.plan.get("serial_lib_shards", {}).items()
+                                    if owner == shard]
+                self.assertEqual(execute.call_count, len(expected_serial) + 1)
+                self.assertEqual({command[-1] for command in report["plans"][str(shard)][:-1]},
+                                 set(expected_serial))
                 if shard == 0:
                     self.assertEqual(report["plans"]["0"][:2],
                                      [TEST_SHARDS.serial_lib_command(name) for name in TEST_SHARDS.SERIAL_LIB_TESTS])
+
+
+class LongReplayLaneTests(unittest.TestCase):
+    def test_long_replay_has_one_original_profile_owner_outside_libraries(self):
+        plan = json.loads(TEST_SHARDS.PLAN_PATH.read_text())
+        name = ("sqlite::consensus::tests::native::basis::mixed_journals::"
+                "native_journal_pressure_large_mixed_cold_replay_rebases_before_exhaustion")
+        self.assertNotIn(name, plan.get("serial_lib_shards", {}))
+        groups = [group for group in plan["lib_groups"] if name in TEST_SHARDS.lib_group_names(group)]
+        module, short = name.rsplit("::", 1)
+        self.assertEqual(groups, [{"shard": "native-log-16", "module": module, "tests": [short]}])
+        command = TEST_SHARDS.lib_group_command(groups[0])
+        self.assertIn("CARGO_PROFILE_TEST_OPT_LEVEL=0", command)
+        self.assertEqual(command[-4:], ["--test-threads=1", "--nocapture", "--exact", name])
+
+class DescriptorGateLaneTests(unittest.TestCase):
+    def test_descriptor_deadlines_have_fresh_exact_process_owners(self):
+        plan = TEST_SHARDS.load_plan()
+        for short in (
+            "captured_output_accepts_a_silent_child_only_after_exit",
+            "captured_output_releases_snapshot_gate_before_child_exit",
+            "captured_readiness_timeout_reaps_child_and_releases_snapshot_gate",
+        ):
+            name = "test_process::tests::" + short
+            with self.subTest(name=name):
+                self.assertIn(name, plan["serial_lib_shards"])
+                command = TEST_SHARDS.serial_lib_command(name)
+                self.assertEqual(command[-4:], ["--test-threads=1", "--nocapture", "--exact", name])
+
+class AdmissionFixtureOwnershipTests(unittest.TestCase):
+    def test_fixture_admissions_keep_fresh_original_profile_processes(self):
+        plan = TEST_SHARDS.load_plan()
+        names = (
+            "consensus::native::application::tests::native_application_capture_does_not_copy_or_overwrite_transferred_changes",
+            "authenticated_consumer_fixture::tests::fixture_multiple_consumers_share_voters_with_separate_retained_journals",
+            "ebpf::tests::remote_selector_regression::cancelled_observer_retains_fence_until_exact_readback",
+            "stateless_quorum_consumer::persistent_three_voter_v1_ingress_rejects_v2_absent_roster_before_provider_work",
+        )
+        for name in names:
+            with self.subTest(name=name):
+                self.assertIn(name, plan.get("serial_lib_shards", {}))
+                self.assertIn(plan["serial_lib_shards"][name], TEST_SHARDS.library_partition.SHARDS)
+                command = TEST_SHARDS.serial_lib_command(name)
+                self.assertIn("--test-threads=1", command)
+                self.assertEqual(command[-2:], ["--exact", name])
+                self.assertNotIn("--profile", command)
 
 
 if __name__ == "__main__":

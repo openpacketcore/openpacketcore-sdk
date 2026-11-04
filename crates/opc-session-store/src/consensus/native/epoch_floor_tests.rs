@@ -1,4 +1,5 @@
 use super::*;
+use crate::consensus::native::test_journal::journal_page_for_test_sync;
 use changes::tests::{apply, time};
 use key_retention_tests::{command, ephemeral_request, prune_intent};
 
@@ -66,7 +67,7 @@ async fn native_epoch_floor_matches_fake_through_two_real_threshold_rotations() 
 
     let (mut native, _, live) = changes::tests::fixture();
     let fake = FakeSessionBackend::in_memory_lab().with_clock(Arc::new(FixedClock));
-    let initial = native.business.replication_log(1, 1, &|| Ok(())).unwrap();
+    let initial = journal_page_for_test_sync(|| native.business.replication_log(1, 1, &|| Ok(())));
     fake.replicate_entry(initial[0].clone()).await.unwrap();
     let mut watch = fake.watch(2).await.unwrap();
     let mut index = 2;

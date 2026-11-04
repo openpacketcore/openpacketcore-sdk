@@ -1,5 +1,6 @@
 //! Test-only access to the real resource waits and terminal notifications.
 use super::*;
+use crate::test_process::witness::CondvarExt;
 
 impl Wal {
     pub(in crate::sqlite::consensus) fn native_hold_ceiling_checkpoint_for_test(&self, held: bool) {
@@ -73,7 +74,7 @@ impl Wal {
     pub(in crate::sqlite::consensus) fn native_wait_for_background_failure_for_test(&self) -> bool {
         let mut state = lock_state(&self.shared).unwrap();
         while state.status == Status::Running {
-            state = self.shared.ready.wait(state).unwrap();
+            state = self.shared.ready.test_wait(state).unwrap();
         }
         state.status == Status::Failed
     }
@@ -91,7 +92,7 @@ impl Wal {
             !state.native_basis_ready
         } {
             assert!(state.status == Status::Running);
-            state = self.shared.ready.wait(state).unwrap();
+            state = self.shared.ready.test_wait(state).unwrap();
         }
     }
 }

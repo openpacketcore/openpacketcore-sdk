@@ -15,19 +15,19 @@ import subprocess
 import cargo_test_selection
 
 
-SHARDS = tuple(range(6))
+SHARDS = tuple(range(12))
 
 
 def owner(name: str) -> int:
     # Exclusions are passed to every harness, so repeated names across
     # libraries must share an owner. Identities remain distinct in the audit.
-    # Split each of the original three workloads independently. A second hash
+    # Split each original workload into four. A second hash
     # word avoids keeping every expensive test from an old partition together.
-    # This halves execution work without changing the Cargo/profile selection;
+    # This reduces ordinary execution work without changing the Cargo/profile selection;
     # compilation and inventory remain a fixed cost on each hosted runner.
     digest = hashlib.sha256(name.encode()).digest()
     original = int.from_bytes(digest[:8], "big") % 3
-    return original + 3 * (int.from_bytes(digest[8:16], "big") % 2)
+    return original + 3 * (int.from_bytes(digest[8:16], "big") % 4)
 
 
 def listing(output: str) -> list[str]:
@@ -132,28 +132,39 @@ def verify_named_owners(rows: list[dict], names: tuple[str, ...], child_parents:
     return owners
 
 
-def commands(phase: list[list[str]], ordinary_index: int, rows: list[dict], shard: int) -> list[list[str]]:
+def commands(phase: list[list[str]], ordinary_index: int, rows: list[dict], shard: int,
+             serial_owners: dict[str, int] | None = None) -> list[list[str]]:
     if shard not in SHARDS:
         raise ValueError("unknown library shard")
     validate_rows(rows)
+    serial_owners = serial_owners or {}
+    serial_names = [command[-1] for command in phase[:ordinary_index]]
+    if any(name not in serial_names or type(owner) is not int or owner not in SHARDS
+           for name, owner in serial_owners.items()):
+        raise ValueError("invalid isolated library owner")
+    validate_rows(rows, tuple(serial_owners))
     ordinary = list(phase[ordinary_index])
     if "--lib" not in ordinary or "--exact" not in ordinary or "--test-threads=4" not in ordinary:
         raise ValueError("ordinary library phase must retain its exact filters and four test threads")
     skipped = {ordinary[index + 1] for index, arg in enumerate(ordinary[:-1]) if arg == "--skip"}
     extra = sorted({row["name"] for row in rows if owner(row["name"]) != shard} - skipped)
     ordinary.extend(arg for name in extra for arg in ("--skip", name))
-    # Preserve all isolated commands and their ordering on one runner. The
-    # ordinary command keeps its relative position between those phases.
-    return [*(phase[:ordinary_index] if shard == 0 else []), ordinary,
+    # Each resource-sensitive case owns one fresh process. Explicit owners
+    # balance those processes across the existing runners; the two historical
+    # timing contracts and all following phases retain their original owner.
+    isolated = [command for command in phase[:ordinary_index]
+                if serial_owners.get(command[-1], 0) == shard]
+    return [*isolated, ordinary,
             *(phase[ordinary_index + 1:] if shard == 0 else [])]
 
 
-def verify(phase: list[list[str]], ordinary_index: int, rows: list[dict], planned: dict[int, list[list[str]]], metadata: dict) -> None:
+def verify(phase: list[list[str]], ordinary_index: int, rows: list[dict], planned: dict[int, list[list[str]]], metadata: dict,
+           serial_owners: dict[str, int] | None = None) -> None:
     validate_rows(rows)
     if set(planned) != set(SHARDS):
         raise ValueError("missing or unexpected library shard")
     for shard in SHARDS:
-        if planned[shard] != commands(phase, ordinary_index, rows, shard):
+        if planned[shard] != commands(phase, ordinary_index, rows, shard, serial_owners):
             raise ValueError("library phase changed selection, profile, ordering or exact ownership")
     before = [cargo_test_selection.resolve(argv, metadata) for argv in phase]
     after = [cargo_test_selection.resolve(argv, metadata) for shard in SHARDS for argv in planned[shard]]

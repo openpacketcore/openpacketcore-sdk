@@ -75,32 +75,44 @@ fn native_release(mode: SessionPersistenceMode, release: Release) {
 
 #[test]
 fn native_root_lock_duplicate_does_not_outlive_durable_opening() {
-    native_release(SessionPersistenceMode::Durable, Release::OpeningDropped);
+    crate::test_process::with_completion_deadline(std::time::Duration::from_secs(300), || {
+        native_release(SessionPersistenceMode::Durable, Release::OpeningDropped);
+    });
 }
 
 #[test]
 fn native_root_lock_duplicate_does_not_outlive_async_opening() {
-    native_release(SessionPersistenceMode::Async, Release::OpeningDropped);
+    crate::test_process::with_completion_deadline(std::time::Duration::from_secs(300), || {
+        native_release(SessionPersistenceMode::Async, Release::OpeningDropped);
+    });
 }
 
 #[test]
 fn native_root_lock_duplicate_does_not_outlive_failed_durable_validation() {
-    native_release(SessionPersistenceMode::Durable, Release::ValidationFailed);
+    crate::test_process::with_completion_deadline(std::time::Duration::from_secs(300), || {
+        native_release(SessionPersistenceMode::Durable, Release::ValidationFailed);
+    });
 }
 
 #[test]
 fn native_root_lock_duplicate_does_not_outlive_failed_async_validation() {
-    native_release(SessionPersistenceMode::Async, Release::ValidationFailed);
+    crate::test_process::with_completion_deadline(std::time::Duration::from_secs(300), || {
+        native_release(SessionPersistenceMode::Async, Release::ValidationFailed);
+    });
 }
 
 #[test]
 fn native_root_lock_duplicate_does_not_outlive_durable_writer() {
-    native_release(SessionPersistenceMode::Durable, Release::WriterStopped);
+    crate::test_process::with_completion_deadline(std::time::Duration::from_secs(300), || {
+        native_release(SessionPersistenceMode::Durable, Release::WriterStopped);
+    });
 }
 
 #[test]
 fn native_root_lock_duplicate_does_not_outlive_async_writer() {
-    native_release(SessionPersistenceMode::Async, Release::WriterStopped);
+    crate::test_process::with_completion_deadline(std::time::Duration::from_secs(300), || {
+        native_release(SessionPersistenceMode::Async, Release::WriterStopped);
+    });
 }
 
 #[test]

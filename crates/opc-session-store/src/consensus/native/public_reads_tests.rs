@@ -1,5 +1,7 @@
 //! Journal read admission is independent of committed history validity.
 
+use crate::consensus::native::test_journal::journal_page_for_test_sync;
+
 use super::*;
 use crate::consensus::native::changes::tests::fixture;
 
@@ -45,7 +47,7 @@ fn native_bulk_journal_page_rejects_before_copying_and_smaller_page_still_reads(
     );
     assert!(state.frontiers == before);
     state.require_business_proof().unwrap();
-    let smaller = state.replication_log(0, 8, &|| Ok(())).unwrap();
+    let smaller = journal_page_for_test_sync(|| state.replication_log(0, 8, &|| Ok(())));
     assert_eq!(
         smaller.len(),
         8,

@@ -1,3 +1,4 @@
+use crate::consensus::native::test_journal::journal_page_for_test_sync;
 #[path = "retired_admission_generation_tests.rs"]
 mod retired_admission_tests;
 
@@ -1815,12 +1816,10 @@ fn roster_capacity_and_horizon_refusal_preserve_namespace_frontier() {
                 ))
             ));
             drop(trial);
-            let original = storage
-                .business
-                .replication_log(1, 16, &|| Ok(()))
-                .unwrap()
-                .pop()
-                .unwrap();
+            let original =
+                journal_page_for_test_sync(|| storage.business.replication_log(1, 16, &|| Ok(())))
+                    .pop()
+                    .unwrap();
             storage.business.notifications.clear();
             let window = retention::NOTIFICATION_WINDOW as u64;
             for sequence in head - window + 1..=head {

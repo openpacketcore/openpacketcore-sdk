@@ -1,4 +1,5 @@
 use super::*;
+use crate::consensus::native::test_journal::journal_page_for_test_sync;
 use changes::tests::{clock, fixture, time};
 use std::time::Duration;
 
@@ -59,157 +60,160 @@ pub(crate) fn retired_notification_fixture() -> (
 
 #[test]
 fn native_notification_retention_bounds_committed_replay_and_rejects_stale_cursor() {
-    use crate::test_process::CommandExt as _;
-    const CHILD: &str = "OPC_NATIVE_NOTIFICATION_REPLAY_CHILD";
-    const TEST: &str = "consensus::native::ordinary_retention_tests::native_notification_retention_bounds_committed_replay_and_rejects_stale_cursor";
-    if std::env::var_os(CHILD).is_none() {
-        // This complete window owns a process-wide verification reservation.
-        // Keep its replay checks independent of concurrent unit fixtures.
-        let output = std::process::Command::new(std::env::current_exe().unwrap())
-            .args(["--exact", TEST, "--test-threads=1", "--nocapture"])
-            .env(CHILD, "1")
-            .test_output()
+    crate::test_process::with_completion_deadline(std::time::Duration::from_secs(300), || {
+        use crate::test_process::CommandExt as _;
+        const CHILD: &str = "OPC_NATIVE_NOTIFICATION_REPLAY_CHILD";
+        const TEST: &str = "consensus::native::ordinary_retention_tests::native_notification_retention_bounds_committed_replay_and_rejects_stale_cursor";
+        if std::env::var_os(CHILD).is_none() {
+            // This complete window owns a process-wide verification reservation.
+            // Keep its replay checks independent of concurrent unit fixtures.
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", TEST, "--test-threads=1", "--nocapture"])
+                .env(CHILD, "1")
+                .test_output_with_deadline(std::time::Duration::from_secs(1800))
+                .unwrap();
+            let stdout = String::from_utf8(output.stdout).unwrap();
+            let stderr = String::from_utf8(output.stderr).unwrap();
+            println!(
+                "native_notification_replay_child={}",
+                serde_json::json!({
+                    "exit_code": output.status.code(),
+                    "stdout": stdout,
+                    "stderr": stderr,
+                    "notification_window": WATCH_WINDOW,
+                })
+            );
+            assert!(
+                output.status.success(),
+                "the complete notification window must replay in the child"
+            );
+            assert!(
+                stdout.contains(&format!("test {TEST} ... ok"))
+                    && stdout.contains("test result: ok. 1 passed; 0 failed; 0 ignored;"),
+                "the exact bounded replay test must execute in the child"
+            );
+            return;
+        }
+        let (storage, _, outcome) = fixture();
+        let mut state = storage.business;
+        let mut key = outcome.lease().key().clone();
+        key.stable_id = bytes::Bytes::from_static(b"notification-retention-key")
+            .try_into()
             .unwrap();
-        let stdout = String::from_utf8(output.stdout).unwrap();
-        let stderr = String::from_utf8(output.stderr).unwrap();
-        println!(
-            "native_notification_replay_child={}",
-            serde_json::json!({
-                "exit_code": output.status.code(),
-                "stdout": stdout,
-                "stderr": stderr,
-                "notification_window": WATCH_WINDOW,
-            })
+        for index in 2..WATCH_WINDOW as u64 + 4 {
+            let applied = state.apply(&[acquire(index, &key)]).unwrap();
+            assert!(applied.responses[0].result.is_ok());
+            assert_eq!(applied.notifications.len(), 1);
+            assert_eq!(applied.notifications[0].sequence, index);
+        }
+        assert_eq!(state.notifications.len(), WATCH_WINDOW);
+        assert_eq!(state.frontiers.watch_sequence, WATCH_WINDOW as u64 + 3);
+        assert_eq!(
+            state.replication_log(1, 1, &|| Ok(())).unwrap_err(),
+            StoreError::ReplicationLogCursorCompacted { resume_from: 4 }
         );
-        assert!(
-            output.status.success(),
-            "the complete notification window must replay in the child"
+        let replay = journal_page_for_test_sync(|| state.replication_log(4, 2, &|| Ok(())));
+        assert_eq!(
+            replay.iter().map(|row| row.sequence).collect::<Vec<_>>(),
+            [4, 5]
         );
-        assert!(
-            stdout.contains(&format!("test {TEST} ... ok"))
-                && stdout.contains("test result: ok. 1 passed; 0 failed; 0 ignored;"),
-            "the exact bounded replay test must execute in the child"
-        );
-        return;
-    }
-    let (storage, _, outcome) = fixture();
-    let mut state = storage.business;
-    let mut key = outcome.lease().key().clone();
-    key.stable_id = bytes::Bytes::from_static(b"notification-retention-key")
-        .try_into()
-        .unwrap();
-    for index in 2..WATCH_WINDOW as u64 + 4 {
-        let applied = state.apply(&[acquire(index, &key)]).unwrap();
-        assert!(applied.responses[0].result.is_ok());
-        assert_eq!(applied.notifications.len(), 1);
-        assert_eq!(applied.notifications[0].sequence, index);
-    }
-    assert_eq!(state.notifications.len(), WATCH_WINDOW);
-    assert_eq!(state.frontiers.watch_sequence, WATCH_WINDOW as u64 + 3);
-    assert_eq!(
-        state.replication_log(1, 1, &|| Ok(())).unwrap_err(),
-        StoreError::ReplicationLogCursorCompacted { resume_from: 4 }
-    );
-    let replay = state.replication_log(4, 2, &|| Ok(())).unwrap();
-    assert_eq!(
-        replay.iter().map(|row| row.sequence).collect::<Vec<_>>(),
-        [4, 5]
-    );
-    assert!(state.replication_log(1, 0, &|| Ok(())).unwrap().is_empty());
-    state.validate_full_business().unwrap();
+        assert!(journal_page_for_test_sync(|| state.replication_log(1, 0, &|| Ok(()))).is_empty());
+        state.validate_full_business().unwrap();
+    });
 }
 
 #[test]
 fn native_notification_retention_survives_full_image_round_trip() {
-    use crate::test_process::CommandExt as _;
-    const CHILD: &str = "OPC_NATIVE_NOTIFICATION_ROUND_TRIP_CHILD";
-    const TEST: &str = "consensus::native::ordinary_retention_tests::native_notification_retention_survives_full_image_round_trip";
-    if std::env::var_os(CHILD).is_none() {
-        // The complete window and its decoded image share the process-wide
-        // verification budget. Keep this fixture's budget independent of
-        // concurrent unit fixtures while preserving every row and assertion.
-        let output = std::process::Command::new(std::env::current_exe().unwrap())
-            .args(["--exact", TEST, "--test-threads=1", "--nocapture"])
-            .env(CHILD, "1")
-            .test_output()
-            .unwrap();
-        let stdout = String::from_utf8(output.stdout).unwrap();
-        let stderr = String::from_utf8(output.stderr).unwrap();
-        println!(
-            "native_notification_round_trip_child={}",
-            serde_json::json!({
-                "exit_code": output.status.code(),
-                "stdout": stdout,
-                "stderr": stderr,
-                "notification_window": WATCH_WINDOW,
-            })
-        );
-        assert!(
-            output.status.success(),
-            "the complete notification window must round-trip in the child"
-        );
-        assert!(
-            stdout.contains(&format!("test {TEST} ... ok"))
-                && stdout.contains("test result: ok. 1 passed; 0 failed; 0 ignored;"),
-            "the exact notification round-trip test must execute in the child"
-        );
-        return;
-    }
-    let (mut storage, key) = window_fixture();
-    for index in 3..11 {
-        changes::tests::apply(&mut storage, &[acquire(index, &key)]);
-    }
-    let floor = storage.business.frontiers.retention.watch_retired_through;
-    let watch = storage.business.frontiers.watch_sequence;
-    assert_eq!(floor, 8);
-    let mut bytes = Vec::new();
-    storage.write_image(&mut bytes, [0xCE; 32], 17).unwrap();
-    let restored = NativeStorage::read_image(
-        &mut bytes.as_slice(),
-        [0xCE; 32],
-        17,
-        storage.business.identity(),
-    )
-    .unwrap();
-    assert!(restored.business.frontiers == storage.business.frontiers);
-    assert_eq!(restored.business.notifications.len(), WATCH_WINDOW);
-    assert_eq!(
-        restored.business.notifications.front().unwrap().sequence(),
-        floor + 1
-    );
-    assert_eq!(
-        restored.business.notifications.back().unwrap().sequence(),
-        watch
-    );
-    restored.business.validate_full_business_rows().unwrap();
-    restored.validate_image().unwrap();
-    assert_eq!(
-        restored
-            .business
-            .replication_log(0, 8, &|| Ok(()))
-            .unwrap_err(),
-        StoreError::ReplicationLogCursorCompacted {
-            resume_from: floor + 1
+    crate::test_process::with_completion_deadline(std::time::Duration::from_secs(300), || {
+        use crate::test_process::CommandExt as _;
+        const CHILD: &str = "OPC_NATIVE_NOTIFICATION_ROUND_TRIP_CHILD";
+        const TEST: &str = "consensus::native::ordinary_retention_tests::native_notification_retention_survives_full_image_round_trip";
+        if std::env::var_os(CHILD).is_none() {
+            // The complete window and its decoded image share the process-wide
+            // verification budget. Keep this fixture's budget independent of
+            // concurrent unit fixtures while preserving every row and assertion.
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", TEST, "--test-threads=1", "--nocapture"])
+                .env(CHILD, "1")
+                .test_output_with_deadline(std::time::Duration::from_secs(1800))
+                .unwrap();
+            let stdout = String::from_utf8(output.stdout).unwrap();
+            let stderr = String::from_utf8(output.stderr).unwrap();
+            println!(
+                "native_notification_round_trip_child={}",
+                serde_json::json!({
+                    "exit_code": output.status.code(),
+                    "stdout": stdout,
+                    "stderr": stderr,
+                    "notification_window": WATCH_WINDOW,
+                })
+            );
+            assert!(
+                output.status.success(),
+                "the complete notification window must round-trip in the child"
+            );
+            assert!(
+                stdout.contains(&format!("test {TEST} ... ok"))
+                    && stdout.contains("test result: ok. 1 passed; 0 failed; 0 ignored;"),
+                "the exact notification round-trip test must execute in the child"
+            );
+            return;
         }
-    );
-    // Replay the complete window through bounded pages, as an ordinary reader
-    // does, without reserving the whole window's worst-case verification size.
-    let mut next = floor + 1;
-    let mut delivered = 0;
-    while next <= watch {
-        let page = restored
-            .business
-            .replication_log(next, 128, &|| Ok(()))
-            .unwrap();
-        assert!(!page.is_empty());
-        for entry in &page {
-            assert_eq!(entry.sequence, next);
-            next += 1;
+        let (mut storage, key) = window_fixture();
+        for index in 3..11 {
+            changes::tests::apply(&mut storage, &[acquire(index, &key)]);
         }
-        delivered += page.len();
-    }
-    assert_eq!(delivered, WATCH_WINDOW);
-    assert_eq!(next, watch + 1);
+        let floor = storage.business.frontiers.retention.watch_retired_through;
+        let watch = storage.business.frontiers.watch_sequence;
+        assert_eq!(floor, 8);
+        let mut bytes = Vec::new();
+        storage.write_image(&mut bytes, [0xCE; 32], 17).unwrap();
+        let restored = NativeStorage::read_image(
+            &mut bytes.as_slice(),
+            [0xCE; 32],
+            17,
+            storage.business.identity(),
+        )
+        .unwrap();
+        assert!(restored.business.frontiers == storage.business.frontiers);
+        assert_eq!(restored.business.notifications.len(), WATCH_WINDOW);
+        assert_eq!(
+            restored.business.notifications.front().unwrap().sequence(),
+            floor + 1
+        );
+        assert_eq!(
+            restored.business.notifications.back().unwrap().sequence(),
+            watch
+        );
+        restored.business.validate_full_business_rows().unwrap();
+        restored.validate_image().unwrap();
+        assert_eq!(
+            restored
+                .business
+                .replication_log(0, 8, &|| Ok(()))
+                .unwrap_err(),
+            StoreError::ReplicationLogCursorCompacted {
+                resume_from: floor + 1
+            }
+        );
+        // Replay the complete window through bounded pages, as an ordinary reader
+        // does, without reserving the whole window's worst-case verification size.
+        let mut next = floor + 1;
+        let mut delivered = 0;
+        while next <= watch {
+            let page = journal_page_for_test_sync(|| {
+                restored.business.replication_log(next, 128, &|| Ok(()))
+            });
+            assert!(!page.is_empty());
+            for entry in &page {
+                assert_eq!(entry.sequence, next);
+                next += 1;
+            }
+            delivered += page.len();
+        }
+        assert_eq!(delivered, WATCH_WINDOW);
+        assert_eq!(next, watch + 1);
+    });
 }
 
 /// An admitted complete window whose first row is a real committed recovery.

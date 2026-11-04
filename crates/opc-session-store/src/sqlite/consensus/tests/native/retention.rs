@@ -1,6 +1,7 @@
 use super::*;
 use crate::consensus::native::generation::{Catalog, CatalogScope, SqlitePreparedBase};
 use crate::consensus::native::ordinary_retention_tests::retired_notification_fixture;
+use crate::consensus::native::test_journal::journal_page_for_test_sync;
 use crate::sqlite::consensus::tests::sequential_wal::IncomingSnapshot;
 use crate::sqlite::consensus::wal::Binding;
 use crate::sqlite::ops::RestoreScanIncarnation;
@@ -163,7 +164,7 @@ fn native_notification_retention_portable_snapshot_roundtrip_and_install() {
         StoreError::ReplicationLogCursorCompacted { resume_from: 2 }
     );
     assert_eq!(
-        cold.business.replication_log(2, 1, &|| Ok(())).unwrap()[0].sequence,
+        journal_page_for_test_sync(|| cold.business.replication_log(2, 1, &|| Ok(())))[0].sequence,
         2
     );
 
@@ -221,7 +222,8 @@ fn capacity_snapshot_fixture() -> (
 ) {
     let (storage, _old) =
         crate::consensus::native::key_retention_tests::rotated_application_fixture();
-    let entries = storage.business.replication_log(1, 16, &|| Ok(())).unwrap();
+    let entries =
+        journal_page_for_test_sync(|| storage.business.replication_log(1, 16, &|| Ok(())));
     assert!(entries.last().unwrap().replay_policy.capacity_rotations == 2);
     let backend = SqliteSessionBackend::in_memory().unwrap();
     {
@@ -287,12 +289,17 @@ fn default_policy_snapshot_fixture() -> (
 fn current_policy_entries(
     storage: &crate::consensus::native::NativeStorage,
 ) -> Vec<ReplicationEntry> {
-    match storage.business.replication_log(1, 256, &|| Ok(())) {
+    match crate::consensus::native::test_journal::journal_page_result_for_test(|| {
+        storage.business.replication_log(1, 256, &|| Ok(()))
+    }) {
         Ok(entries) => entries,
-        Err(StoreError::ReplicationLogCursorCompacted { resume_from }) => storage
-            .business
-            .replication_log(resume_from, 256, &|| Ok(()))
-            .unwrap(),
+        Err(StoreError::ReplicationLogCursorCompacted { resume_from }) => {
+            journal_page_for_test_sync(|| {
+                storage
+                    .business
+                    .replication_log(resume_from, 256, &|| Ok(()))
+            })
+        }
         Err(error) => panic!("unexpected journal read: {error:?}"),
     }
 }

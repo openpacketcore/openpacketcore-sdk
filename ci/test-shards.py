@@ -124,6 +124,70 @@ QUIESCENT_VERIFICATION_LIB_TESTS = (
     "native_checkpoint_delta_payload_can_exceed_the_verification_allowance",
     "consensus::native::epoch_floor_tests::"
     "native_epoch_floor_matches_fake_through_two_real_threshold_rotations",
+    "consensus::native::changes::tests::"
+    "native_scratch_worker_accepts_exact_original_log_limit_with_large_conflict_body",
+    "consensus::native::changes::tests::reclaim_memory::"
+    "native_reclaim_memory_candidate_counts_effects_and_tops_up_shortfall",
+    "consensus::native::changes::tests::reclaim_memory::"
+    "native_reclaim_memory_mixed_delivery_retains_full_reservation",
+    "consensus::native::changes::tests::reclaim_memory::"
+    "native_reclaim_memory_refund_probe_covers_early_shrink",
+    "consensus::native::changes::tests::reclaim_memory::"
+    "native_reclaim_memory_refund_probe_follows_split_owner",
+    "consensus::native::changes::tests::reclaim_memory::"
+    "native_reclaim_memory_void_mixed_delivery_retains_full_reservation",
+    "consensus::native::generation::catalog::tests::"
+    "native_journal_page_admission_preserves_selected_ranges_cancellation_and_integrity",
+    "consensus::native::generation::decode::tests::"
+    "native_generation_cold_log_preflight_accepts_original_256_profile_and_exact_16mib_conflict",
+    "consensus::native::generation::decode::tests::"
+    "native_owned_key_notification_and_log_copies_release_decoder_backing_with_large_valid_aad",
+    "consensus::native::generation::decode::tests::roster::"
+    "native_roster_log_maximum_admission_body_keeps_original_bounds_and_detached_storage",
+    "consensus::native::generation::decode::tests::roster::"
+    "native_roster_notification_codecs_charge_both_records_and_release_decoder_payloads",
+    "consensus::native::prefix::tests::"
+    "native_prefix_reservations_use_existing_process_limit_and_shared_view_ownership",
+    "consensus::native::scratch::tests::"
+    "native_scratch_production_path_uses_existing_global_budget",
+    "consensus::storage::tests::native_log_retained_bound::"
+    "native_log_three_cycles_reclaim_and_reopen_async",
+    "consensus::storage::tests::native_reopen_formats::responsiveness::"
+    "native_format_preflight_cancels_queued_scans",
+    "consensus::storage::tests::native_reopen_formats::responsiveness::"
+    "native_format_preflight_cancels_running_scans",
+    "consensus::storage::tests::native_reopen_formats::responsiveness::"
+    "native_format_preflight_keeps_runtime_responsive_before_scope_lookup",
+    "consensus::storage::tests::native_reopen_formats::responsiveness::"
+    "native_format_preflight_keeps_runtime_responsive_for_matching_scope",
+    "consensus::storage::tests::native_reopen_formats::responsiveness::"
+    "native_full_open_cancels_running_admission_and_releases_owners",
+    "consensus::storage::tests::native_reopen_formats::responsiveness::"
+    "native_full_open_keeps_runtime_responsive_for_installed_generation",
+    "consensus::storage::tests::native_reopen_formats::responsiveness::"
+    "native_full_open_keeps_runtime_responsive_for_selected_generation",
+    "consensus::storage::tests::native_reopen_formats::responsiveness::"
+    "native_full_open_worker_failures_keep_typed_refusals",
+    "consensus::store::async_persistence::tests::writer::"
+    "async_persistence_public_v2_and_snapshot_work_continue_during_writer_stall",
+    "consensus::store::sequential_wal_sdk_tests::native_log_bound::"
+    "native_leader_three_cycles_reproposes_one_idempotent_request_and_reopens",
+    "consensus::store::sequential_wal_sdk_tests::scope_batch::"
+    "scope_batch_requires_every_voter_then_commits_one_command_and_recovers_exact_rows",
+    "sqlite::consensus::tests::native::basis::cold_reads::"
+    "native_selected_log_read_returns_eight_full_256_request_rows_with_shared_memory_bound",
+    "sqlite::consensus::tests::native::basis::public_reads::"
+    "native_consensus_restore_late_delivery_preserves_terminal_cursor_error",
+    "sqlite::consensus::tests::native::basis::public_reads::"
+    "native_public_dispatch_ignores_sql_lanes_and_rejects_retained_closed_owner",
+    "sqlite::consensus::tests::native::public_reads::"
+    "native_public_record_journal_and_restore_pages_preserve_sql_cursors_across_cold_reopen",
+    "sqlite::consensus::tests::native::public_reads::"
+    "native_public_restore_filtered_progress_and_stale_revision_match_original_page_limits",
+    "sqlite::consensus::tests::native::public_reads::"
+    "native_public_selected_journal_ranges_preserve_sql_bytes_and_cancellation",
+    "sqlite::consensus::tests::native::retained_snapshot::"
+    "canonical_native_notification_history_round_trips_through_cold_native_catalog",
 )
 QUIESCENT_LIB_TESTS = (
     *QUIESCENT_VERIFICATION_LIB_TESTS,
@@ -439,8 +503,13 @@ def lib_group_names(group: dict) -> list[str]:
     return [f"{group['module']}::{name}" for name in group["tests"]]
 
 
+def serial_lib_names(plan: dict) -> tuple[str, ...]:
+    """Keep process-wide scheduling gates out of the parallel harness."""
+    return (*SERIAL_LIB_TESTS, *sorted(plan.get("serial_lib_shards", {})))
+
+
 def moved_lib_names(plan: dict) -> list[str]:
-    return [*SERIAL_LIB_TESTS, *(
+    return [*serial_lib_names(plan), *(
         qualified_quiescent_lib_test(name) for name in QUIESCENT_LIB_TESTS
     )] + [
         name for group in plan.get("lib_groups", []) for name in lib_group_names(group)
@@ -466,7 +535,7 @@ def lib_group_command(group: dict) -> list[str]:
                 "CARGO_PROFILE_TEST_DEBUG_ASSERTIONS=true",
                 "CARGO_PROFILE_TEST_OVERFLOW_CHECKS=true", *SELECTION,
                 "--lib", "--", "--test-threads=1", "--nocapture", "--exact", *names]
-    native = next((name for name in names if name in native_log_bound.TESTS), None)
+    native = next((name for name in names if name in native_log_bound.CORE_TESTS), None)
     if native is not None:
         profile = native_log_bound.profile_env(native)
         return ["env", *(f"{key}={value}" for key, value in profile.items()), *SELECTION,
@@ -663,7 +732,7 @@ def commands(plan: dict, shard: str, targets: list[str]) -> list[list[str]]:
             for arg in ("--skip", name)
         ]
         return [
-            *(serial_lib_command(name) for name in SERIAL_LIB_TESTS),
+            *(serial_lib_command(name) for name in serial_lib_names(plan)),
             SELECTION + ["--lib", "--", *HARNESS, "--exact", *lib_skips],
             *extra,
             # Library names must never filter a binary's unrelated tests.
@@ -714,9 +783,11 @@ def run_libraries(plan: dict, shard: int, output: Path) -> None:
     phase = [command for command in commands(plan, "misc", targets) if "--lib" in command]
     print("Compile and inventory the complete workspace library selection", flush=True)
     rows, metadata = library_partition.inventory(SELECTION, ROOT)
-    planned = {index: library_partition.commands(phase, len(SERIAL_LIB_TESTS), rows, index)
+    ordinary_index = len(serial_lib_names(plan))
+    serial_owners = plan.get("serial_lib_shards", {})
+    planned = {index: library_partition.commands(phase, ordinary_index, rows, index, serial_owners)
                for index in library_partition.SHARDS}
-    library_partition.verify(phase, len(SERIAL_LIB_TESTS), rows, planned, metadata)
+    library_partition.verify(phase, ordinary_index, rows, planned, metadata, serial_owners)
     all_libraries = {f"library-{index}": invocations for index, invocations in planned.items()}
     all_libraries.update({owner: [command for command in commands(plan, owner, targets) if "--lib" in command]
                           for owner in shard_ids(plan) if owner != "misc"})
@@ -821,7 +892,7 @@ def verify_commands(plan: dict, targets: list[str]) -> None:
     if len(set(qualification)) != len(qualification) or set(qualification) & set(named):
         sys.exit("qualification names are duplicated or also assigned to a required shard")
     misc_commands = commands(plan, "misc", targets)
-    serial = [serial_lib_command(name) for name in SERIAL_LIB_TESTS]
+    serial = [serial_lib_command(name) for name in serial_lib_names(plan)]
     if misc_commands[:len(serial)] != serial:
         sys.exit("misc must run its exact serial library phase before parallel tests")
     ordinary_index = len(serial)
@@ -995,6 +1066,15 @@ def verify_lib_plan(plan: dict) -> None:
         sys.exit("serial library test also belongs to an isolated timing contract")
     claimed.update(SERIAL_LIB_TESTS)
     rust_path = re.compile(r"[A-Za-z_][A-Za-z_0-9]*(?:::[A-Za-z_][A-Za-z_0-9]*)*")
+    serial_owners = plan.get("serial_lib_shards", {})
+    if not isinstance(serial_owners, dict) or any(
+        not rust_path.fullmatch(name) or type(owner) is not int or owner not in library_partition.SHARDS
+        for name, owner in serial_owners.items()
+    ):
+        sys.exit("invalid isolated library process owner")
+    if claimed.intersection(serial_owners):
+        sys.exit("isolated library process overlaps another serial contract")
+    claimed.update(serial_owners)
     for group in plan.get("lib_groups", []):
         if group["shard"] not in group_shards:
             sys.exit(f"invalid library-group shard: {group['shard']!r}")
@@ -1011,8 +1091,8 @@ def verify_lib_plan(plan: dict) -> None:
             for child, parent in children.items()
         ):
             sys.exit("subprocess children require enabled parents in the same library group")
-        if any(name in native_log_bound.TESTS for name in names):
-            if len(names) != 1 or group["shard"] != native_log_bound.CORE_SHARDS[native_log_bound.TESTS.index(names[0])]:
+        if any(name in native_log_bound.CORE_TESTS for name in names):
+            if len(names) != 1 or group["shard"] != native_log_bound.CORE_SHARDS[native_log_bound.CORE_TESTS.index(names[0])]:
                 sys.exit("full native log proofs must each own one dedicated parallel shard")
         elif any(name in WORK_PROOF_LIB_TESTS for name in names):
             if len(names) != 1 or group["shard"] != WORK_PROOF_SHARD:
@@ -1023,7 +1103,7 @@ def verify_lib_plan(plan: dict) -> None:
             if name in claimed:
                 sys.exit(f"library test is claimed more than once: {name!r}")
             claimed.add(name)
-    if not set(native_log_bound.TESTS).issubset(claimed):
+    if not set(native_log_bound.CORE_TESTS).issubset(claimed):
         sys.exit("full native log proofs are missing from the heavy library groups")
     if not set(WORK_PROOF_LIB_TESTS).issubset(claimed):
         sys.exit("backend work proofs are missing from their O1 headroom lane")
@@ -1185,7 +1265,7 @@ def precheck(plan: dict, shard: str, *, split_libraries: bool = False) -> None:
                     f"missing {dict(Counter(names) - selected)}, "
                     f"unexpected {dict(selected - Counter(names))}"
                 )
-            if any(name in (*native_log_bound.TESTS, *WORK_PROOF_LIB_TESTS) for name in names):
+            if any(name in (*native_log_bound.CORE_TESTS, *WORK_PROOF_LIB_TESTS) for name in names):
                 output = subprocess.run(
                     [*command, "--ignored"], cwd=ROOT, text=True,
                     stdout=subprocess.PIPE, check=True

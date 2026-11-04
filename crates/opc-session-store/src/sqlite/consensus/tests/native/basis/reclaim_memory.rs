@@ -1,3 +1,5 @@
+use crate::test_process::witness::{JoinExt, ReceiverExt};
+
 use super::super::lifecycle::maintenance;
 use super::*;
 
@@ -10,7 +12,7 @@ fn isolated(case: &str) -> bool {
     let output = std::process::Command::new(std::env::current_exe().unwrap())
         .args(["--exact", &name, "--test-threads=1", "--nocapture"])
         .env(CHILD, case)
-        .test_output()
+        .test_output_with_deadline(std::time::Duration::from_secs(1800))
         .unwrap();
     assert!(
         output.status.success(),
@@ -140,7 +142,7 @@ fn crashed_void_fixture<T: serde::de::DeserializeOwned>(
         .env(CHILD, case)
         .env(REPORT, &report)
         .env("TMPDIR", root.path())
-        .test_output()
+        .test_output_with_deadline(std::time::Duration::from_secs(1800))
         .unwrap();
     assert_eq!(
         output.status.code(),
@@ -378,7 +380,7 @@ fn native_reclaim_memory_void_pressure_fence_replays_and_retires_epoch() {
                 });
                 let result = rx.recv_timeout(Duration::from_secs(12));
                 drop(pressure);
-                apply.join().unwrap();
+                apply.test_join().unwrap();
                 assert_eq!(
                     result
                         .expect("void-profile pressure wait is bounded")
@@ -518,7 +520,9 @@ fn native_reclaim_memory_committed_wait_releases_permit_and_proceeds() {
         assert_eq!(selected(&fixture), before);
         assert!(!apply.is_finished());
         drop(pressure);
-        assert!(apply.join().unwrap().unwrap().responses[0].result.is_ok());
+        assert!(apply.test_join().unwrap().unwrap().responses[0]
+            .result
+            .is_ok());
     });
     fixture.wal.shutdown().unwrap();
 }
@@ -595,7 +599,7 @@ fn assert_shutdown_interrupts_committed_wait(block_writer_first: bool) {
     std::thread::scope(|scope| {
         let apply = scope.spawn(|| fixture.wal.native_apply_committed(&[entry]));
         wait_started_rx
-            .recv()
+            .test_recv()
             .expect("committed apply entered the retirement wait");
         let (waits, operations, _) = fixture.wal.retirement_wait_state_for_test().unwrap();
         assert!(waits > 0);
@@ -616,7 +620,7 @@ fn assert_shutdown_interrupts_committed_wait(block_writer_first: bool) {
         let queued = fixture.wal.submit(Operation::Barrier).unwrap();
         let started = Instant::now();
         fixture.wal.stop_retirement_waits();
-        let error = apply.join().unwrap().err().unwrap();
+        let error = apply.test_join().unwrap().err().unwrap();
         gate.release();
         assert_eq!(error.to_string(), "native retirement admission stopped");
         assert!(started.elapsed() < Duration::from_secs(1));
@@ -672,7 +676,7 @@ fn native_reclaim_memory_progress_extends_committed_wait() {
         std::thread::sleep(Duration::from_secs(5));
         let still_waiting = !apply.is_finished();
         drop(pressure);
-        let result = apply.join().unwrap();
+        let result = apply.test_join().unwrap();
         assert!(
             still_waiting,
             "progressing storage must outlive the original ten-second deadline"
@@ -725,7 +729,7 @@ fn native_reclaim_memory_unhelpful_checkpoints_do_not_extend_wait() {
         gate.entered();
         std::thread::sleep(Duration::from_millis(100));
         gate.release();
-        checkpoint.join().unwrap().unwrap();
+        checkpoint.test_join().unwrap().unwrap();
         let after = selected(&fixture);
         assert_ne!(after, before);
         assert!(VerificationMemory::used_bytes() >= used_before);
@@ -736,7 +740,7 @@ fn native_reclaim_memory_unhelpful_checkpoints_do_not_extend_wait() {
         assert!(VerificationMemory::used_bytes() >= used_before);
         let result = rx.recv_timeout(Duration::from_secs(12).saturating_sub(started.elapsed()));
         drop((pressure, extra)); // Let a regressed unbounded waiter join too.
-        apply.join().unwrap();
+        apply.test_join().unwrap();
         let error = result
             .expect("checkpoints without admission relief cannot renew the bound")
             .unwrap_err();
@@ -763,7 +767,7 @@ fn native_reclaim_memory_shortfall_relief_extends_committed_wait() {
         std::thread::sleep(Duration::from_secs(5));
         let still_waiting = !apply.is_finished();
         drop(pressure);
-        let result = apply.join().unwrap();
+        let result = apply.test_join().unwrap();
         assert!(
             still_waiting,
             "a smaller shortfall renews the inactivity budget"
@@ -852,7 +856,7 @@ fn native_reclaim_memory_successful_reservation_resets_wait_after_retry() {
         std::thread::sleep(Duration::from_millis(100));
         let still_waiting = !apply.is_finished();
         drop(second_pressure);
-        let result = apply.join().unwrap();
+        let result = apply.test_join().unwrap();
         assert_eq!(
             waits, 2,
             "successful reservation ends the first pressure episode"
@@ -978,7 +982,7 @@ fn native_reclaim_memory_requested_checkpoint_relieves_wait() {
         gate.entered(); // Only the waiting apply can have requested this capture.
         let waited = fixture.wal.retirement_wait_state_for_test().unwrap().0;
         gate.release();
-        let result = apply.join().unwrap();
+        let result = apply.test_join().unwrap();
         assert!(waited > 0);
         assert!(result.unwrap().responses[0].result.is_ok());
     });
@@ -1026,7 +1030,7 @@ fn native_reclaim_memory_noop_admission_keeps_consumers_live() {
         let output = std::process::Command::new(std::env::current_exe().unwrap())
             .args(["--exact", TEST, "--test-threads=1", "--nocapture"])
             .env(CHILD, "1")
-            .test_output()
+            .test_output_with_deadline(std::time::Duration::from_secs(1800))
             .unwrap();
         assert!(
             output.status.success(),
@@ -1079,7 +1083,7 @@ fn native_reclaim_memory_noop_admission_keeps_consumers_live() {
         drop(pressure);
         assert!(fixture.wal.native_retirement_ready().unwrap());
         gate.release();
-        checkpoint.join().unwrap().unwrap();
+        checkpoint.test_join().unwrap().unwrap();
     });
     fixture.wal.shutdown().unwrap();
 }
@@ -1092,7 +1096,7 @@ fn native_reclaim_memory_held_checkpoint_allows_consumer_work_and_finishes() {
         let output = std::process::Command::new(std::env::current_exe().unwrap())
             .args(["--exact", TEST, "--test-threads=1", "--nocapture"])
             .env(CHILD, "1")
-            .test_output()
+            .test_output_with_deadline(std::time::Duration::from_secs(1800))
             .unwrap();
         let stdout = String::from_utf8(output.stdout).unwrap();
         let stderr = String::from_utf8(output.stderr).unwrap();
@@ -1178,8 +1182,8 @@ fn native_reclaim_memory_held_checkpoint_allows_consumer_work_and_finishes() {
         assert!(progress.load(Ordering::Acquire) >= 16);
         assert_eq!(status(&fixture.wal, &sentinel), sentinel_status);
         gate.release();
-        checkpoint.join().unwrap().unwrap();
-        retiring.join().unwrap().unwrap();
+        checkpoint.test_join().unwrap().unwrap();
+        retiring.test_join().unwrap().unwrap();
     });
     let history = fixture
         .wal
@@ -1326,401 +1330,418 @@ fn native_reclaim_memory_full_generation_replays_maximum_retirement_suffix() {
 
 #[test]
 fn native_journal_pressure_consumer_application_waits_without_fencing() {
-    if isolated("native_journal_pressure_consumer_application_waits_without_fencing") {
-        return;
-    }
-    use crate::consensus::verified_snapshot::{VerificationMemory, PROCESS_VERIFICATION_BYTES};
-    for mode in [
-        crate::SessionPersistenceMode::Durable,
-        crate::SessionPersistenceMode::Async,
-    ] {
-        let fixture = Fixture::with_persistence(Limits::default(), IoControl::default(), mode);
-        let initial = fenced_transition_v2_request(0xD9, 1, "journal-pressure-initial");
-        fixture.parity(&[formation(), activation(1, initial, timestamp(1))]);
-        let request = sdk741_component_request(Sdk741Payload::Create, 2, 0, None);
-        let entry = fenced_transition_v2_entry(2, request.clone(), timestamp(2));
-        fixture.append_commit(std::slice::from_ref(&entry));
-        fixture.wal.checkpoint().unwrap();
-        until(|| fixture.wal.native_cold_counts_for_test().unwrap() == [1, 1, 3]);
-        let pressure = VerificationMemory::reserve(
-            PROCESS_VERIFICATION_BYTES - VerificationMemory::used_bytes() - 64 * 1024,
-        )
-        .unwrap();
-        let (tx, rx) = mpsc::channel();
-        std::thread::scope(|scope| {
-            let apply = scope.spawn(|| {
-                tx.send(fixture.wal.native_apply_committed(&[entry]).map(|_| ()))
-                    .unwrap();
-            });
-            let early = rx.recv_timeout(Duration::from_secs(1));
-            drop(pressure);
-            apply.join().unwrap();
-            assert!(
+    crate::test_process::with_completion_deadline(std::time::Duration::from_secs(300), || {
+        if isolated("native_journal_pressure_consumer_application_waits_without_fencing") {
+            return;
+        }
+        use crate::consensus::verified_snapshot::{VerificationMemory, PROCESS_VERIFICATION_BYTES};
+        for mode in [
+            crate::SessionPersistenceMode::Durable,
+            crate::SessionPersistenceMode::Async,
+        ] {
+            let fixture = Fixture::with_persistence(Limits::default(), IoControl::default(), mode);
+            let initial = fenced_transition_v2_request(0xD9, 1, "journal-pressure-initial");
+            fixture.parity(&[formation(), activation(1, initial, timestamp(1))]);
+            let request = sdk741_component_request(Sdk741Payload::Create, 2, 0, None);
+            let entry = fenced_transition_v2_entry(2, request.clone(), timestamp(2));
+            fixture.append_commit(std::slice::from_ref(&entry));
+            fixture.wal.checkpoint().unwrap();
+            until(|| fixture.wal.native_cold_counts_for_test().unwrap() == [1, 1, 3]);
+            let pressure = VerificationMemory::reserve(
+                PROCESS_VERIFICATION_BYTES - VerificationMemory::used_bytes() - 64 * 1024,
+            )
+            .unwrap();
+            let (tx, rx) = mpsc::channel();
+            std::thread::scope(|scope| {
+                let apply = scope.spawn(|| {
+                    tx.send(fixture.wal.native_apply_committed(&[entry]).map(|_| ()))
+                        .unwrap();
+                });
+                let early = rx.recv_timeout(Duration::from_secs(1));
+                drop(pressure);
+                apply.test_join().unwrap();
+                assert!(
                 matches!(early, Err(mpsc::RecvTimeoutError::Timeout)),
                 "committed application must wait without fencing under memory pressure: {early:?}"
             );
-            rx.recv_timeout(Duration::from_secs(5)).unwrap().unwrap();
-        });
-        assert!(matches!(
-            status(&fixture.wal, &request),
-            FencedTransitionV2Status::Recorded(_)
-        ));
-        assert!(fixture.wal.storage_health().1.is_none());
-        fixture.wal.checkpoint().unwrap();
-        fixture.wal.shutdown().unwrap();
-    }
+                rx.recv_timeout(Duration::from_secs(5)).unwrap().unwrap();
+            });
+            assert!(matches!(
+                status(&fixture.wal, &request),
+                FencedTransitionV2Status::Recorded(_)
+            ));
+            assert!(fixture.wal.storage_health().1.is_none());
+            fixture.wal.checkpoint().unwrap();
+            fixture.wal.shutdown().unwrap();
+        }
+    });
 }
 
 #[test]
 fn native_journal_pressure_successful_preparation_resets_wait_after_retry() {
-    if isolated("native_journal_pressure_successful_preparation_resets_wait_after_retry") {
-        return;
-    }
-    use crate::consensus::verified_snapshot::{VerificationMemory, PROCESS_VERIFICATION_BYTES};
-    for mode in [
-        crate::SessionPersistenceMode::Durable,
-        crate::SessionPersistenceMode::Async,
-    ] {
-        let armed = Arc::new(AtomicBool::new(false));
-        let waits = Arc::new(AtomicUsize::new(0));
-        let preparations = Arc::new(AtomicUsize::new(0));
-        let (entered_tx, entered_rx) = mpsc::channel();
-        let (resume_tx, resume_rx) = mpsc::channel();
-        let resume = Mutex::new(resume_rx);
-        let fixture = Fixture::with_persistence(
-            Limits::default(),
-            IoControl {
-                hook: Arc::new({
-                    let armed = Arc::clone(&armed);
-                    let waits = Arc::clone(&waits);
-                    let preparations = Arc::clone(&preparations);
-                    move |point| {
-                        if !armed.load(Ordering::Acquire) {
-                            return Ok(());
+    crate::test_process::with_completion_deadline(std::time::Duration::from_secs(300), || {
+        if isolated("native_journal_pressure_successful_preparation_resets_wait_after_retry") {
+            return;
+        }
+        use crate::consensus::verified_snapshot::{VerificationMemory, PROCESS_VERIFICATION_BYTES};
+        for mode in [
+            crate::SessionPersistenceMode::Durable,
+            crate::SessionPersistenceMode::Async,
+        ] {
+            let armed = Arc::new(AtomicBool::new(false));
+            let waits = Arc::new(AtomicUsize::new(0));
+            let preparations = Arc::new(AtomicUsize::new(0));
+            let (entered_tx, entered_rx) = mpsc::channel();
+            let (resume_tx, resume_rx) = mpsc::channel();
+            let resume = Mutex::new(resume_rx);
+            let fixture = Fixture::with_persistence(
+                Limits::default(),
+                IoControl {
+                    hook: Arc::new({
+                        let armed = Arc::clone(&armed);
+                        let waits = Arc::clone(&waits);
+                        let preparations = Arc::clone(&preparations);
+                        move |point| {
+                            if !armed.load(Ordering::Acquire) {
+                                return Ok(());
+                            }
+                            if point == Point::NativeJournalWaitStarted {
+                                waits.fetch_add(1, Ordering::SeqCst);
+                            }
+                            if point == Point::BeforeNativeApplyPublish
+                                && preparations.fetch_add(1, Ordering::SeqCst) == 0
+                            {
+                                entered_tx.send(()).map_err(io::Error::other)?;
+                                resume
+                                    .lock()
+                                    .unwrap()
+                                    .recv_timeout(Duration::from_secs(20))
+                                    .map_err(io::Error::other)?;
+                            }
+                            Ok(())
                         }
-                        if point == Point::NativeJournalWaitStarted {
-                            waits.fetch_add(1, Ordering::SeqCst);
-                        }
-                        if point == Point::BeforeNativeApplyPublish
-                            && preparations.fetch_add(1, Ordering::SeqCst) == 0
-                        {
-                            entered_tx.send(()).map_err(io::Error::other)?;
-                            resume
-                                .lock()
-                                .unwrap()
-                                .recv_timeout(Duration::from_secs(20))
-                                .map_err(io::Error::other)?;
-                        }
-                        Ok(())
-                    }
-                }),
-                ..IoControl::default()
-            },
-            mode,
-        );
-        let initial = fenced_transition_v2_request(0xDD, 1, "journal-retry-initial");
-        fixture.parity(&[formation(), activation(1, initial, timestamp(1))]);
-        let request = sdk741_component_request(Sdk741Payload::Create, 5, 0, None);
-        let entry = fenced_transition_v2_entry(2, request.clone(), timestamp(2));
-        fixture.append_commit(std::slice::from_ref(&entry));
-        fixture.wal.checkpoint().unwrap();
-        // Journal admission preserves 16 MiB for other verification work.
-        // Leave 8 MiB here, then less on the second wait, so the second
-        // pressure episode cannot be mistaken for relief in the first.
-        let first_pressure = VerificationMemory::reserve(
-            PROCESS_VERIFICATION_BYTES - VerificationMemory::used_bytes() - 8 * 1024 * 1024,
-        )
-        .unwrap();
-        armed.store(true, Ordering::Release);
-        std::thread::scope(|scope| {
-            let apply = scope.spawn(|| fixture.wal.native_apply_committed(&[entry]));
-            until(|| waits.load(Ordering::SeqCst) == 1 || apply.is_finished());
-            assert_eq!(waits.load(Ordering::SeqCst), 1);
-            drop(first_pressure);
-            entered_rx.recv_timeout(Duration::from_secs(5)).unwrap();
-            let meta = opc_consensus::engine::SnapshotMeta {
-                last_log_id: Some(log_id(1)),
-                last_membership: fixture
-                    .wal
-                    .with_native_read(|state| Ok(state.membership()))
-                    .unwrap(),
-                snapshot_id: fixture.wal.native_snapshot_id().unwrap(),
-            };
-            fixture
-                .wal
-                .native_publish_snapshot((
-                    meta,
-                    format!("snapshot-{}.opc", uuid::Uuid::new_v4()),
-                    [0xDD; 32],
-                    100,
-                ))
-                .unwrap();
-            let second_pressure = VerificationMemory::reserve(
-                PROCESS_VERIFICATION_BYTES - VerificationMemory::used_bytes() - 64 * 1024,
+                    }),
+                    ..IoControl::default()
+                },
+                mode,
+            );
+            let initial = fenced_transition_v2_request(0xDD, 1, "journal-retry-initial");
+            fixture.parity(&[formation(), activation(1, initial, timestamp(1))]);
+            let request = sdk741_component_request(Sdk741Payload::Create, 5, 0, None);
+            let entry = fenced_transition_v2_entry(2, request.clone(), timestamp(2));
+            fixture.append_commit(std::slice::from_ref(&entry));
+            fixture.wal.checkpoint().unwrap();
+            // Journal admission preserves 16 MiB for other verification work.
+            // Leave 8 MiB here, then less on the second wait, so the second
+            // pressure episode cannot be mistaken for relief in the first.
+            let first_pressure = VerificationMemory::reserve(
+                PROCESS_VERIFICATION_BYTES - VerificationMemory::used_bytes() - 8 * 1024 * 1024,
             )
             .unwrap();
-            // Preparation has succeeded, but its predecessor is now stale.
-            // Time spent preparing must not age the next admission episode.
-            std::thread::sleep(Duration::from_secs(11));
-            resume_tx.send(()).unwrap();
-            until(|| waits.load(Ordering::SeqCst) == 2 || apply.is_finished());
-            std::thread::sleep(Duration::from_millis(100));
-            let still_waiting = !apply.is_finished();
-            drop(second_pressure);
-            let result = apply.join().unwrap();
-            assert_eq!(waits.load(Ordering::SeqCst), 2, "{mode:?}");
-            assert!(
-                still_waiting,
-                "new journal wait inherited an expired timer: {result:?}"
-            );
-            assert!(result.unwrap().responses[0].result.is_ok());
-        });
-        assert_eq!(preparations.load(Ordering::SeqCst), 2);
-        assert!(matches!(
-            status(&fixture.wal, &request),
-            FencedTransitionV2Status::Recorded(_)
-        ));
-        assert!(fixture.wal.storage_health().1.is_none());
-        fixture.wal.checkpoint().unwrap();
-        fixture.wal.shutdown().unwrap();
-    }
+            armed.store(true, Ordering::Release);
+            std::thread::scope(|scope| {
+                let apply = scope.spawn(|| fixture.wal.native_apply_committed(&[entry]));
+                until(|| waits.load(Ordering::SeqCst) == 1 || apply.is_finished());
+                assert_eq!(waits.load(Ordering::SeqCst), 1);
+                drop(first_pressure);
+                entered_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+                let meta = opc_consensus::engine::SnapshotMeta {
+                    last_log_id: Some(log_id(1)),
+                    last_membership: fixture
+                        .wal
+                        .with_native_read(|state| Ok(state.membership()))
+                        .unwrap(),
+                    snapshot_id: fixture.wal.native_snapshot_id().unwrap(),
+                };
+                fixture
+                    .wal
+                    .native_publish_snapshot((
+                        meta,
+                        format!("snapshot-{}.opc", uuid::Uuid::new_v4()),
+                        [0xDD; 32],
+                        100,
+                    ))
+                    .unwrap();
+                let second_pressure = VerificationMemory::reserve(
+                    PROCESS_VERIFICATION_BYTES - VerificationMemory::used_bytes() - 64 * 1024,
+                )
+                .unwrap();
+                // Preparation has succeeded, but its predecessor is now stale.
+                // Time spent preparing must not age the next admission episode.
+                std::thread::sleep(Duration::from_secs(11));
+                resume_tx.send(()).unwrap();
+                until(|| waits.load(Ordering::SeqCst) == 2 || apply.is_finished());
+                std::thread::sleep(Duration::from_millis(100));
+                let still_waiting = !apply.is_finished();
+                drop(second_pressure);
+                let result = apply.test_join().unwrap();
+                assert_eq!(waits.load(Ordering::SeqCst), 2, "{mode:?}");
+                assert!(
+                    still_waiting,
+                    "new journal wait inherited an expired timer: {result:?}"
+                );
+                assert!(result.unwrap().responses[0].result.is_ok());
+            });
+            assert_eq!(preparations.load(Ordering::SeqCst), 2);
+            assert!(matches!(
+                status(&fixture.wal, &request),
+                FencedTransitionV2Status::Recorded(_)
+            ));
+            assert!(fixture.wal.storage_health().1.is_none());
+            fixture.wal.checkpoint().unwrap();
+            fixture.wal.shutdown().unwrap();
+        }
+    });
 }
 
 #[test]
 fn native_journal_pressure_log_append_waits_without_fencing() {
-    if isolated("native_journal_pressure_log_append_waits_without_fencing") {
-        return;
-    }
-    use crate::consensus::verified_snapshot::{VerificationMemory, PROCESS_VERIFICATION_BYTES};
-    for mode in [
-        crate::SessionPersistenceMode::Durable,
-        crate::SessionPersistenceMode::Async,
-    ] {
-        let fixture = Fixture::with_persistence(Limits::default(), IoControl::default(), mode);
-        let request = fenced_transition_v2_request(0xDA, 1, "journal-pressure-log");
-        fixture.parity(&[formation(), activation(1, request, timestamp(1))]);
-        fixture.wal.checkpoint().unwrap();
-        until(|| fixture.wal.native_cold_counts_for_test().unwrap() == [1, 1, 2]);
-        let entries = (2..514)
-            .map(|index| Entry {
-                log_id: log_id(index),
-                payload: EntryPayload::Blank,
-            })
-            .collect::<Vec<_>>();
-        let operations = entries.chunks(64).map(append).collect::<Vec<_>>();
-        let pressure = VerificationMemory::reserve(
-            PROCESS_VERIFICATION_BYTES - VerificationMemory::used_bytes() - 1024,
-        )
-        .unwrap();
-        let (tx, rx) = mpsc::channel();
-        std::thread::scope(|scope| {
-            let append = scope.spawn(|| {
-                let result = operations.into_iter().try_fold(0, |_, operation| {
-                    fixture
-                        .wal
-                        .submit(operation)
-                        .and_then(|ticket| ticket.wait())
-                });
-                tx.send(result).unwrap();
-            });
-            let early = rx.recv_timeout(Duration::from_secs(1));
-            drop(pressure);
-            append.join().unwrap();
-            assert!(
-                matches!(early, Err(mpsc::RecvTimeoutError::Timeout)),
-                "log admission must wait before reserving journal memory: {early:?}"
-            );
-            rx.recv_timeout(Duration::from_secs(5)).unwrap().unwrap();
-        });
-        let mut read = Vec::new();
-        for start in (2..514).step_by(64) {
-            read.extend(fixture.wal.read(start, start + 64).unwrap());
+    crate::test_process::with_completion_deadline(std::time::Duration::from_secs(300), || {
+        if isolated("native_journal_pressure_log_append_waits_without_fencing") {
+            return;
         }
-        assert_eq!(read.len(), 512);
-        assert_eq!(
-            serde_json::to_vec(&read).unwrap(),
-            serde_json::to_vec(&entries).unwrap()
-        );
-        assert!(fixture.wal.storage_health().1.is_none());
-        fixture.wal.checkpoint().unwrap();
-        fixture.wal.shutdown().unwrap();
-    }
-}
-
-#[test]
-fn native_journal_pressure_tiny_relief_does_not_renew_retirement_wait() {
-    if isolated("native_journal_pressure_tiny_relief_does_not_renew_retirement_wait") {
-        return;
-    }
-    let (fixture, entry) = waiting_fixture();
-    let mut pressure =
-        crate::consensus::verified_snapshot::VerificationMemory::reserve(96 * 1024 * 1024).unwrap();
-    let (tx, rx) = mpsc::channel();
-    std::thread::scope(|scope| {
-        let apply = scope.spawn(|| {
-            tx.send(fixture.wal.native_apply_committed(&[entry]).map(|_| ()))
-                .unwrap();
-        });
-        let mut result = None;
-        for _ in 0..6 {
-            if let Ok(value) = rx.recv_timeout(Duration::from_secs(2)) {
-                result = Some(value);
-                break;
-            }
-            pressure.shrink_to(pressure.reserved_bytes() - 1).unwrap();
-        }
-        drop(pressure);
-        apply.join().unwrap();
-        let error = result
-            .expect("one-byte relief cannot keep a pressure wait alive")
-            .unwrap_err();
-        assert_eq!(error.to_string(), "native retirement admission timed out");
-    });
-    assert!(fixture.wal.shutdown().is_err());
-}
-
-#[test]
-fn native_journal_pressure_meaningful_relief_has_a_total_retirement_bound() {
-    if isolated("native_journal_pressure_meaningful_relief_has_a_total_retirement_bound") {
-        return;
-    }
-    let (fixture, entry) = waiting_fixture();
-    let mut pressure =
-        crate::consensus::verified_snapshot::VerificationMemory::reserve(96 * 1024 * 1024).unwrap();
-    let (tx, rx) = mpsc::channel();
-    std::thread::scope(|scope| {
-        let apply = scope.spawn(|| {
-            tx.send(fixture.wal.native_apply_committed(&[entry]).map(|_| ()))
-                .unwrap();
-        });
-        let mut result = None;
-        for _ in 0..16 {
-            if let Ok(value) = rx.recv_timeout(Duration::from_secs(2)) {
-                result = Some(value);
-                break;
-            }
-            pressure
-                .shrink_to(pressure.reserved_bytes() - 512 * 1024)
-                .unwrap();
-        }
-        drop(pressure);
-        apply.join().unwrap();
-        let error = result
-            .expect("progress cannot renew committed pressure forever")
-            .unwrap_err();
-        assert_eq!(error.to_string(), "native retirement admission timed out");
-    });
-    assert!(fixture.wal.shutdown().is_err());
-}
-
-#[test]
-fn native_journal_pressure_detached_preparation_releases_before_wait() {
-    if isolated("native_journal_pressure_detached_preparation_releases_before_wait") {
-        return;
-    }
-    use crate::consensus::verified_snapshot::{VerificationMemory, PROCESS_VERIFICATION_BYTES};
-    let gate = Gate::new(Point::BeforeNativeApplyPrepare, 2);
-    let fixture = Fixture::with_control(Limits::default(), gate.control());
-    let initial = fenced_transition_v2_request(0xDB, 1, "detached-journal-pressure");
-    fixture.parity(&[formation(), activation(1, initial, timestamp(1))]);
-    let request = sdk741_component_request(Sdk741Payload::Create, 3, 0, None);
-    let entry = fenced_transition_v2_entry(2, request.clone(), timestamp(2));
-    fixture.append_commit(std::slice::from_ref(&entry));
-    fixture.wal.checkpoint().unwrap();
-    let (tx, rx) = mpsc::channel();
-    std::thread::scope(|scope| {
-        let apply = scope.spawn(|| {
-            tx.send(fixture.wal.native_apply_committed(&[entry]).map(|_| ()))
-                .unwrap();
-        });
-        gate.entered();
-        let pressure = VerificationMemory::reserve(
-            PROCESS_VERIFICATION_BYTES - VerificationMemory::used_bytes() - 1024,
-        )
-        .unwrap();
-        let captured_usage = VerificationMemory::used_bytes();
-        gate.release();
-        until(|| {
-            VerificationMemory::used_bytes() + 64 * 1024 < captured_usage || apply.is_finished()
-        });
-        let early = rx.recv_timeout(Duration::from_secs(1));
-        assert_eq!(
-            fixture
-                .wal
-                .with_native_read(|state| Ok(state.applied()))
-                .unwrap(),
-            Some(log_id(1))
-        );
-        drop(pressure);
-        apply.join().unwrap();
-        assert!(
-            matches!(early, Err(mpsc::RecvTimeoutError::Timeout)),
-            "detached pressure must release its capture and wait: {early:?}"
-        );
-        rx.recv_timeout(Duration::from_secs(5)).unwrap().unwrap();
-    });
-    assert!(matches!(
-        status(&fixture.wal, &request),
-        FencedTransitionV2Status::Recorded(_)
-    ));
-    fixture.wal.shutdown().unwrap();
-}
-
-#[test]
-fn native_journal_pressure_shutdown_interrupts_consumer_and_append_waits() {
-    if isolated("native_journal_pressure_shutdown_interrupts_consumer_and_append_waits") {
-        return;
-    }
-    use crate::consensus::verified_snapshot::{VerificationMemory, PROCESS_VERIFICATION_BYTES};
-    for mode in [
-        crate::SessionPersistenceMode::Durable,
-        crate::SessionPersistenceMode::Async,
-    ] {
-        for application in [false, true] {
+        use crate::consensus::verified_snapshot::{VerificationMemory, PROCESS_VERIFICATION_BYTES};
+        for mode in [
+            crate::SessionPersistenceMode::Durable,
+            crate::SessionPersistenceMode::Async,
+        ] {
             let fixture = Fixture::with_persistence(Limits::default(), IoControl::default(), mode);
-            let initial = fenced_transition_v2_request(0xDC, 1, "journal-stop");
-            fixture.parity(&[formation(), activation(1, initial, timestamp(1))]);
-            let entry = fenced_transition_v2_entry(
-                2,
-                sdk741_component_request(Sdk741Payload::Create, 4, 0, None),
-                timestamp(2),
-            );
-            if application {
-                fixture.append_commit(std::slice::from_ref(&entry));
-            }
+            let request = fenced_transition_v2_request(0xDA, 1, "journal-pressure-log");
+            fixture.parity(&[formation(), activation(1, request, timestamp(1))]);
             fixture.wal.checkpoint().unwrap();
+            until(|| fixture.wal.native_cold_counts_for_test().unwrap() == [1, 1, 2]);
+            let entries = (2..514)
+                .map(|index| Entry {
+                    log_id: log_id(index),
+                    payload: EntryPayload::Blank,
+                })
+                .collect::<Vec<_>>();
+            let operations = entries.chunks(64).map(append).collect::<Vec<_>>();
             let pressure = VerificationMemory::reserve(
                 PROCESS_VERIFICATION_BYTES - VerificationMemory::used_bytes() - 1024,
             )
             .unwrap();
             let (tx, rx) = mpsc::channel();
             std::thread::scope(|scope| {
-                let work = scope.spawn(|| {
-                    let result = if application {
+                let append = scope.spawn(|| {
+                    let result = operations.into_iter().try_fold(0, |_, operation| {
                         fixture
                             .wal
-                            .native_apply_committed(std::slice::from_ref(&entry))
-                            .map(|_| ())
-                    } else {
-                        fixture
-                            .wal
-                            .submit(append(std::slice::from_ref(&entry)))
+                            .submit(operation)
                             .and_then(|ticket| ticket.wait())
-                            .map(|_| ())
-                    };
+                    });
                     tx.send(result).unwrap();
                 });
-                assert!(matches!(
-                    rx.recv_timeout(Duration::from_millis(250)),
-                    Err(mpsc::RecvTimeoutError::Timeout)
-                ));
-                let stopping = Instant::now();
-                fixture.wal.shutdown().unwrap();
-                assert!(rx.recv_timeout(Duration::from_secs(5)).unwrap().is_err());
-                work.join().unwrap();
-                assert!(stopping.elapsed() < Duration::from_secs(5));
+                let early = rx.recv_timeout(Duration::from_secs(1));
+                drop(pressure);
+                append.test_join().unwrap();
+                assert!(
+                    matches!(early, Err(mpsc::RecvTimeoutError::Timeout)),
+                    "log admission must wait before reserving journal memory: {early:?}"
+                );
+                rx.recv_timeout(Duration::from_secs(5)).unwrap().unwrap();
             });
-            drop(pressure);
+            let mut read = Vec::new();
+            for start in (2..514).step_by(64) {
+                read.extend(fixture.wal.read(start, start + 64).unwrap());
+            }
+            assert_eq!(read.len(), 512);
+            assert_eq!(
+                serde_json::to_vec(&read).unwrap(),
+                serde_json::to_vec(&entries).unwrap()
+            );
+            assert!(fixture.wal.storage_health().1.is_none());
+            fixture.wal.checkpoint().unwrap();
+            fixture.wal.shutdown().unwrap();
         }
-    }
+    });
+}
+
+#[test]
+fn native_journal_pressure_tiny_relief_does_not_renew_retirement_wait() {
+    crate::test_process::with_completion_deadline(std::time::Duration::from_secs(300), || {
+        if isolated("native_journal_pressure_tiny_relief_does_not_renew_retirement_wait") {
+            return;
+        }
+        let (fixture, entry) = waiting_fixture();
+        let mut pressure =
+            crate::consensus::verified_snapshot::VerificationMemory::reserve(96 * 1024 * 1024)
+                .unwrap();
+        let (tx, rx) = mpsc::channel();
+        std::thread::scope(|scope| {
+            let apply = scope.spawn(|| {
+                tx.send(fixture.wal.native_apply_committed(&[entry]).map(|_| ()))
+                    .unwrap();
+            });
+            let mut result = None;
+            for _ in 0..6 {
+                if let Ok(value) = rx.recv_timeout(Duration::from_secs(2)) {
+                    result = Some(value);
+                    break;
+                }
+                pressure.shrink_to(pressure.reserved_bytes() - 1).unwrap();
+            }
+            drop(pressure);
+            apply.test_join().unwrap();
+            let error = result
+                .expect("one-byte relief cannot keep a pressure wait alive")
+                .unwrap_err();
+            assert_eq!(error.to_string(), "native retirement admission timed out");
+        });
+        assert!(fixture.wal.shutdown().is_err());
+    });
+}
+
+#[test]
+fn native_journal_pressure_meaningful_relief_has_a_total_retirement_bound() {
+    crate::test_process::with_completion_deadline(std::time::Duration::from_secs(300), || {
+        if isolated("native_journal_pressure_meaningful_relief_has_a_total_retirement_bound") {
+            return;
+        }
+        let (fixture, entry) = waiting_fixture();
+        let mut pressure =
+            crate::consensus::verified_snapshot::VerificationMemory::reserve(96 * 1024 * 1024)
+                .unwrap();
+        let (tx, rx) = mpsc::channel();
+        std::thread::scope(|scope| {
+            let apply = scope.spawn(|| {
+                tx.send(fixture.wal.native_apply_committed(&[entry]).map(|_| ()))
+                    .unwrap();
+            });
+            let mut result = None;
+            for _ in 0..16 {
+                if let Ok(value) = rx.recv_timeout(Duration::from_secs(2)) {
+                    result = Some(value);
+                    break;
+                }
+                pressure
+                    .shrink_to(pressure.reserved_bytes() - 512 * 1024)
+                    .unwrap();
+            }
+            drop(pressure);
+            apply.test_join().unwrap();
+            let error = result
+                .expect("progress cannot renew committed pressure forever")
+                .unwrap_err();
+            assert_eq!(error.to_string(), "native retirement admission timed out");
+        });
+        assert!(fixture.wal.shutdown().is_err());
+    });
+}
+
+#[test]
+fn native_journal_pressure_detached_preparation_releases_before_wait() {
+    crate::test_process::with_completion_deadline(std::time::Duration::from_secs(300), || {
+        if isolated("native_journal_pressure_detached_preparation_releases_before_wait") {
+            return;
+        }
+        use crate::consensus::verified_snapshot::{VerificationMemory, PROCESS_VERIFICATION_BYTES};
+        let gate = Gate::new(Point::BeforeNativeApplyPrepare, 2);
+        let fixture = Fixture::with_control(Limits::default(), gate.control());
+        let initial = fenced_transition_v2_request(0xDB, 1, "detached-journal-pressure");
+        fixture.parity(&[formation(), activation(1, initial, timestamp(1))]);
+        let request = sdk741_component_request(Sdk741Payload::Create, 3, 0, None);
+        let entry = fenced_transition_v2_entry(2, request.clone(), timestamp(2));
+        fixture.append_commit(std::slice::from_ref(&entry));
+        fixture.wal.checkpoint().unwrap();
+        let (tx, rx) = mpsc::channel();
+        std::thread::scope(|scope| {
+            let apply = scope.spawn(|| {
+                tx.send(fixture.wal.native_apply_committed(&[entry]).map(|_| ()))
+                    .unwrap();
+            });
+            gate.entered();
+            let pressure = VerificationMemory::reserve(
+                PROCESS_VERIFICATION_BYTES - VerificationMemory::used_bytes() - 1024,
+            )
+            .unwrap();
+            let captured_usage = VerificationMemory::used_bytes();
+            gate.release();
+            until(|| {
+                VerificationMemory::used_bytes() + 64 * 1024 < captured_usage || apply.is_finished()
+            });
+            let early = rx.recv_timeout(Duration::from_secs(1));
+            assert_eq!(
+                fixture
+                    .wal
+                    .with_native_read(|state| Ok(state.applied()))
+                    .unwrap(),
+                Some(log_id(1))
+            );
+            drop(pressure);
+            apply.test_join().unwrap();
+            assert!(
+                matches!(early, Err(mpsc::RecvTimeoutError::Timeout)),
+                "detached pressure must release its capture and wait: {early:?}"
+            );
+            rx.recv_timeout(Duration::from_secs(5)).unwrap().unwrap();
+        });
+        assert!(matches!(
+            status(&fixture.wal, &request),
+            FencedTransitionV2Status::Recorded(_)
+        ));
+        fixture.wal.shutdown().unwrap();
+    });
+}
+
+#[test]
+fn native_journal_pressure_shutdown_interrupts_consumer_and_append_waits() {
+    crate::test_process::with_completion_deadline(std::time::Duration::from_secs(300), || {
+        if isolated("native_journal_pressure_shutdown_interrupts_consumer_and_append_waits") {
+            return;
+        }
+        use crate::consensus::verified_snapshot::{VerificationMemory, PROCESS_VERIFICATION_BYTES};
+        for mode in [
+            crate::SessionPersistenceMode::Durable,
+            crate::SessionPersistenceMode::Async,
+        ] {
+            for application in [false, true] {
+                let fixture =
+                    Fixture::with_persistence(Limits::default(), IoControl::default(), mode);
+                let initial = fenced_transition_v2_request(0xDC, 1, "journal-stop");
+                fixture.parity(&[formation(), activation(1, initial, timestamp(1))]);
+                let entry = fenced_transition_v2_entry(
+                    2,
+                    sdk741_component_request(Sdk741Payload::Create, 4, 0, None),
+                    timestamp(2),
+                );
+                if application {
+                    fixture.append_commit(std::slice::from_ref(&entry));
+                }
+                fixture.wal.checkpoint().unwrap();
+                let pressure = VerificationMemory::reserve(
+                    PROCESS_VERIFICATION_BYTES - VerificationMemory::used_bytes() - 1024,
+                )
+                .unwrap();
+                let (tx, rx) = mpsc::channel();
+                std::thread::scope(|scope| {
+                    let work = scope.spawn(|| {
+                        let result = if application {
+                            fixture
+                                .wal
+                                .native_apply_committed(std::slice::from_ref(&entry))
+                                .map(|_| ())
+                        } else {
+                            fixture
+                                .wal
+                                .submit(append(std::slice::from_ref(&entry)))
+                                .and_then(|ticket| ticket.wait())
+                                .map(|_| ())
+                        };
+                        tx.send(result).unwrap();
+                    });
+                    assert!(matches!(
+                        rx.recv_timeout(Duration::from_millis(250)),
+                        Err(mpsc::RecvTimeoutError::Timeout)
+                    ));
+                    let stopping = Instant::now();
+                    fixture.wal.shutdown().unwrap();
+                    assert!(rx.recv_timeout(Duration::from_secs(5)).unwrap().is_err());
+                    work.test_join().unwrap();
+                    assert!(stopping.elapsed() < Duration::from_secs(5));
+                });
+                drop(pressure);
+            }
+        }
+    });
 }

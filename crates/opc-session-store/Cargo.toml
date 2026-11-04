@@ -71,6 +71,8 @@ opc-tokio-fd-sys = { path = "../opc-tokio-fd-sys", version = "0.2.0" }
 opc-sqlite-file-control-sys = { path = "../opc-sqlite-file-control-sys", version = "0.2.0", features = ["borrowed-file-identity"] }
 
 [dev-dependencies]
+# Reap the owned process group when a fixture teardown cannot complete.
+rustix = { version = "1", features = ["process"] }
 opc-consensus = { path = "../opc-consensus", version = "0.2.0", features = ["dangerous-test-hooks"] }
 # Measure native owner allocations in focused, single-threaded unit tests.
 # This workspace dependency is never linked into the production store.

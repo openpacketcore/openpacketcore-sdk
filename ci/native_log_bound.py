@@ -1,4 +1,4 @@
-"""Full-size native persistence proofs use optimized test profiles with checks.
+"""Full-size native persistence proofs retain explicit checked test profiles.
 
 Keep exact names: the million-entry log and 131,073-roster history boundaries
 and the ordinary smoke regressions stay fixed in separate test processes.
@@ -9,6 +9,11 @@ ROSTER_HISTORY_TEST = (
     "native_roster_completed_history_exceeds_old_capacity_and_cold_reopens"
 )
 ROSTER_HISTORY_SHARD = "roster-history"
+
+LONG_JOURNAL_TEST = (
+    "sqlite::consensus::tests::native::basis::mixed_journals::"
+    "native_journal_pressure_large_mixed_cold_replay_rebases_before_exhaustion"
+)
 
 TESTS = (
     "consensus::store::sequential_wal_sdk_tests::native_log_bound::"
@@ -44,14 +49,17 @@ TESTS = (
     "native_notification_retention_passes_original_lifetime_limit_and_reopens",
     "consensus::native::generation::catalog::tests::retention_tests::"
     "native_key_retention_passes_original_lifetime_limit_and_reopens",
+    LONG_JOURNAL_TEST,
 )
+
+CORE_TESTS = TESTS
 
 # One expensive proof per hosted runner. Keep these separate from the ordinary
 # matrices: their compilation alone exceeded the old heavy/egress headroom.
 def core_shards() -> tuple[str, ...]:
     shards = []
     log_index = 0
-    for name in TESTS:
+    for name in CORE_TESTS:
         if name == ROSTER_HISTORY_TEST:
             shards.append(ROSTER_HISTORY_SHARD)
         else:
@@ -65,7 +73,10 @@ EGRESS_SHARDS = tuple(range(4, 4 + len(TESTS)))
 
 
 def profile_env(name: str) -> dict[str, str]:
-    """Keep the signed history proof fast without disabling debug checks."""
+    """Select each proof's original optimization and enabled checks."""
+    if name == LONG_JOURNAL_TEST:
+        # The long replay fixture keeps its original unoptimized profile.
+        return {"CARGO_PROFILE_TEST_OPT_LEVEL": "0"}
     if name == ROSTER_HISTORY_TEST:
         return {
             "CARGO_PROFILE_TEST_OPT_LEVEL": "3",

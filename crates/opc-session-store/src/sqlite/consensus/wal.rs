@@ -543,8 +543,16 @@ impl Ticket {
     #[cfg(test)]
     pub(super) fn wait(self) -> io::Result<u64> {
         self.0
-            .recv()
-            .map_err(|_| io::Error::other("private WAL writer lost completion"))?
+            .recv_timeout(Duration::from_secs(180))
+            .map_err(|error| match error {
+                mpsc::RecvTimeoutError::Timeout => io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "private WAL ticket still waiting for writer completion after 180s",
+                ),
+                mpsc::RecvTimeoutError::Disconnected => {
+                    io::Error::other("private WAL writer lost completion")
+                }
+            })?
     }
 
     #[cfg(test)]

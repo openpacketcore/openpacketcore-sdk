@@ -152,11 +152,12 @@ async fn native_public_dispatch_ignores_sql_lanes_and_rejects_retained_closed_ow
             .unwrap();
         assert_eq!(page.loaded_count, 1);
         assert_eq!(
-            backend
-                .consensus_get_replication_log(0, 2)
-                .await
-                .unwrap()
-                .len(),
+            crate::consensus::native::test_journal::journal_page_result_for_test_async(
+                || backend.consensus_get_replication_log(0, 2)
+            )
+            .await
+            .unwrap()
+            .len(),
             1
         );
         assert_eq!(
