@@ -6793,8 +6793,12 @@ async fn build_file_backed_snapshot_database(
         let expected_members = core.expected_members.clone();
         let expected_bindings = core.expected_bindings.clone();
         let fixed_placement_policy = core.fixed_placement_policy;
+        #[cfg(feature = "test-control")]
+        let native_observation = Arc::clone(&core.snapshot_observation);
         let (result, snapshot_guard) = tokio::task::spawn_blocking(move || {
             let result = (|| {
+                #[cfg(feature = "test-control")]
+                native_observation.record_phase_for_test("native_export");
                 // Native export writes the portable projection directly into
                 // the eventual sealed inode. Reclaim the empty raw reservation
                 // before allocating pages; there is no full-size compaction copy.
@@ -6815,6 +6819,8 @@ async fn build_file_backed_snapshot_database(
                         "native snapshot export stopped after Raft shutdown",
                     ));
                 }
+                #[cfg(feature = "test-control")]
+                native_observation.record_phase_for_test("native_finalize");
                 consensus::finalize_native_snapshot_database_sync(
                     export,
                     vacuum_snapshot,
