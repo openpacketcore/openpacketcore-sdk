@@ -2444,6 +2444,102 @@
       "kind": "assertions-decreased",
       "reason": "Pairwise inequalities are now checked by a nested loop over all indices, including the new capacity counter, instead of three separate pair assertions. The loop still compares every distinct pair and the bounds check remains.",
       "issue": 1087
+    },
+    {
+      "test": "rust:crates/opc-session-store::lib=lib::sqlite::consensus::tests::native::basis::reclaim_memory::native_reclaim_memory_committed_wait_fails_closed_with_bounded_reason",
+      "kind": "disabled",
+      "issue": 1250,
+      "reason": "The parent re-executes this exact test in a fresh child with the completion marker set and --test-threads=1, enforces a 300-second process deadline, and requires exactly one passing, non-ignored test. The fixture body runs in the child rather than being skipped."
+    },
+    {
+      "test": "rust:crates/opc-session-store::lib=lib::sqlite::consensus::tests::native::basis::reclaim_memory::native_reclaim_memory_committed_wait_releases_permit_and_proceeds",
+      "kind": "disabled",
+      "issue": 1250,
+      "reason": "The parent re-executes this exact test in a fresh child with the completion marker set and --test-threads=1, enforces a 300-second process deadline, and requires exactly one passing, non-ignored test. The fixture body runs in the child rather than being skipped."
+    },
+    {
+      "test": "rust:crates/opc-session-store::lib=lib::sqlite::consensus::tests::native::basis::reclaim_memory::native_reclaim_memory_eight_mib_journal_requests_checkpoint",
+      "kind": "disabled",
+      "issue": 1250,
+      "reason": "The parent re-executes this exact test in a fresh child with the completion marker set and --test-threads=1, enforces a 300-second process deadline, and requires exactly one passing, non-ignored test. The fixture body runs in the child rather than being skipped."
+    },
+    {
+      "test": "rust:crates/opc-session-store::lib=lib::sqlite::consensus::tests::native::basis::reclaim_memory::native_reclaim_memory_full_generation_replays_maximum_retirement_suffix",
+      "kind": "disabled",
+      "issue": 1250,
+      "reason": "The parent re-executes this exact test in a fresh child with the completion marker set and --test-threads=1, enforces a 300-second process deadline, and requires exactly one passing, non-ignored test. The fixture body runs in the child rather than being skipped."
+    },
+    {
+      "test": "rust:crates/opc-session-store::lib=lib::sqlite::consensus::tests::native::basis::reclaim_memory::native_reclaim_memory_planner_error_uses_real_evaluation",
+      "kind": "disabled",
+      "issue": 1250,
+      "reason": "The parent re-executes this exact test in a fresh child with the completion marker set and --test-threads=1, enforces a 300-second process deadline, and requires exactly one passing, non-ignored test. The fixture body runs in the child rather than being skipped."
+    },
+    {
+      "test": "rust:crates/opc-session-store::lib=lib::sqlite::consensus::tests::native::basis::reclaim_memory::native_reclaim_memory_preflight_avoids_unhelpful_checkpoints",
+      "kind": "disabled",
+      "issue": 1250,
+      "reason": "The parent re-executes this exact test in a fresh child with the completion marker set and --test-threads=1, enforces a 300-second process deadline, and requires exactly one passing, non-ignored test. The fixture body runs in the child rather than being skipped."
+    },
+    {
+      "test": "rust:crates/opc-session-store::lib=lib::sqlite::consensus::tests::native::basis::reclaim_memory::native_reclaim_memory_preflight_does_not_request_during_install",
+      "kind": "disabled",
+      "issue": 1250,
+      "reason": "The parent re-executes this exact test in a fresh child with the completion marker set and --test-threads=1, enforces a 300-second process deadline, and requires exactly one passing, non-ignored test. The fixture body runs in the child rather than being skipped."
+    },
+    {
+      "test": "rust:crates/opc-session-store::lib=lib::sqlite::consensus::tests::native::basis::reclaim_memory::native_reclaim_memory_progress_extends_committed_wait",
+      "kind": "disabled",
+      "issue": 1250,
+      "reason": "The parent re-executes this exact test in a fresh child with the completion marker set and --test-threads=1, enforces a 300-second process deadline, and requires exactly one passing, non-ignored test. The fixture body runs in the child rather than being skipped."
+    },
+    {
+      "test": "rust:crates/opc-session-store::lib=lib::sqlite::consensus::tests::native::basis::reclaim_memory::native_reclaim_memory_requested_checkpoint_relieves_wait",
+      "kind": "disabled",
+      "issue": 1250,
+      "reason": "The parent re-executes this exact test in a fresh child with the completion marker set and --test-threads=1, enforces a 300-second process deadline, and requires exactly one passing, non-ignored test. The fixture body runs in the child rather than being skipped."
+    },
+    {
+      "test": "rust:crates/opc-session-store::lib=lib::sqlite::consensus::tests::native::basis::reclaim_memory::native_reclaim_memory_shortfall_relief_extends_committed_wait",
+      "kind": "disabled",
+      "issue": 1250,
+      "reason": "The parent re-executes this exact test in a fresh child with the completion marker set and --test-threads=1, enforces a 300-second process deadline, and requires exactly one passing, non-ignored test. The fixture body runs in the child rather than being skipped."
+    },
+    {
+      "test": "rust:crates/opc-session-store::lib=lib::sqlite::consensus::tests::native::basis::reclaim_memory::native_reclaim_memory_shutdown_interrupts_committed_wait",
+      "kind": "disabled",
+      "issue": 1250,
+      "reason": "The parent re-executes this exact test in a fresh child with the completion marker set and --test-threads=1, enforces a 300-second process deadline, and requires exactly one passing, non-ignored test. The fixture body runs in the child rather than being skipped."
+    },
+    {
+      "test": "rust:crates/opc-session-store::lib=lib::sqlite::consensus::tests::native::basis::reclaim_memory::native_reclaim_memory_shutdown_interrupts_wait_with_writer_already_blocked",
+      "kind": "disabled",
+      "issue": 1250,
+      "reason": "The parent re-executes this exact test in a fresh child with the completion marker set and --test-threads=1, enforces a 300-second process deadline, and requires exactly one passing, non-ignored test. The fixture body runs in the child rather than being skipped."
+    },
+    {
+      "test": "rust:crates/opc-session-store::lib=lib::sqlite::consensus::tests::native::basis::reclaim_memory::native_reclaim_memory_successful_reservation_resets_wait_after_retry",
+      "kind": "disabled",
+      "issue": 1250,
+      "reason": "The parent re-executes this exact test in a fresh child with the completion marker set and --test-threads=1, enforces a 300-second process deadline, and requires exactly one passing, non-ignored test. The fixture body runs in the child rather than being skipped."
+    },
+    {
+      "test": "rust:crates/opc-session-store::lib=lib::sqlite::consensus::tests::native::basis::reclaim_memory::native_reclaim_memory_unhelpful_checkpoints_do_not_extend_wait",
+      "kind": "disabled",
+      "issue": 1250,
+      "reason": "The parent re-executes this exact test in a fresh child with the completion marker set and --test-threads=1, enforces a 300-second process deadline, and requires exactly one passing, non-ignored test. The fixture body runs in the child rather than being skipped."
+    },
+    {
+      "test": "rust:crates/opc-session-store::lib=lib::sqlite::consensus::tests::native::basis::reclaim_memory::native_reclaim_memory_void_checkpoint_and_replay_preserve_first_binding",
+      "kind": "disabled",
+      "issue": 1250,
+      "reason": "The parent re-executes this exact test in a fresh child with the completion marker set and --test-threads=1, enforces a 300-second process deadline, and requires exactly one passing, non-ignored test. The fixture body runs in the child rather than being skipped."
+    },
+    {
+      "test": "rust:crates/opc-session-store::lib=lib::sqlite::consensus::tests::native::basis::reclaim_memory::native_reclaim_memory_void_pressure_fence_replays_and_retires_epoch",
+      "kind": "disabled",
+      "issue": 1250,
+      "reason": "The parent re-executes this exact test in a fresh child with the completion marker set and --test-threads=1, enforces a 300-second process deadline, and requires exactly one passing, non-ignored test. The fixture body runs in the child rather than being skipped."
     }
   ]
 }
