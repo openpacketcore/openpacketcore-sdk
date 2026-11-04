@@ -9,7 +9,11 @@ fn isolated(case: &str) -> bool {
         return false;
     }
     let name = format!("sqlite::consensus::tests::native::basis::reclaim_memory::{case}");
-    eprintln!("launching isolated fixture {name} at {}:{}", file!(), line!());
+    eprintln!(
+        "launching isolated fixture {name} at {}:{}",
+        file!(),
+        line!()
+    );
     let output = std::process::Command::new(std::env::current_exe().unwrap())
         .args(["--exact", &name, "--test-threads=1", "--nocapture"])
         .env(CHILD, case)
@@ -140,7 +144,11 @@ fn crashed_void_fixture<T: serde::de::DeserializeOwned>(
     let root = tempfile::tempdir().unwrap();
     let report = root.path().join("crash.json");
     let name = format!("sqlite::consensus::tests::native::basis::reclaim_memory::{case}");
-    eprintln!("launching isolated fixture {name} at {}:{}", file!(), line!());
+    eprintln!(
+        "launching isolated fixture {name} at {}:{}",
+        file!(),
+        line!()
+    );
     let output = std::process::Command::new(std::env::current_exe().unwrap())
         .args(["--exact", &name, "--test-threads=1", "--nocapture"])
         .env(CHILD, case)
@@ -1072,7 +1080,11 @@ fn native_reclaim_memory_noop_admission_keeps_consumers_live() {
         const CHILD: &str = "OPC_RECLAIM_ADMISSION_CHILD";
         const TEST: &str = "sqlite::consensus::tests::native::basis::reclaim_memory::native_reclaim_memory_noop_admission_keeps_consumers_live";
         if std::env::var_os(CHILD).is_none() {
-            eprintln!("launching isolated fixture {TEST} at {}:{}", file!(), line!());
+            eprintln!(
+                "launching isolated fixture {TEST} at {}:{}",
+                file!(),
+                line!()
+            );
             let output = std::process::Command::new(std::env::current_exe().unwrap())
                 .args(["--exact", TEST, "--test-threads=1", "--nocapture"])
                 .env(CHILD, "1")
@@ -1143,7 +1155,11 @@ fn native_reclaim_memory_held_checkpoint_allows_consumer_work_and_finishes() {
         const CHILD: &str = "OPC_RECLAIM_CHECKPOINT_CHILD";
         const TEST: &str = "sqlite::consensus::tests::native::basis::reclaim_memory::native_reclaim_memory_held_checkpoint_allows_consumer_work_and_finishes";
         if std::env::var_os(CHILD).is_none() {
-            eprintln!("launching isolated fixture {TEST} at {}:{}", file!(), line!());
+            eprintln!(
+                "launching isolated fixture {TEST} at {}:{}",
+                file!(),
+                line!()
+            );
             let output = std::process::Command::new(std::env::current_exe().unwrap())
                 .args(["--exact", TEST, "--test-threads=1", "--nocapture"])
                 .env(CHILD, "1")

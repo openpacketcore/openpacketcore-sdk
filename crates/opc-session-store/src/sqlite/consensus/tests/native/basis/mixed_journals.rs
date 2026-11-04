@@ -21,6 +21,11 @@ fn isolated(case: &str) -> bool {
         return false;
     }
     let name = format!("sqlite::consensus::tests::native::basis::mixed_journals::{case}");
+    eprintln!(
+        "launching isolated fixture {name} at {}:{}",
+        file!(),
+        line!()
+    );
     let output = std::process::Command::new(std::env::current_exe().unwrap())
         .args(["--exact", &name, "--test-threads=1", "--nocapture"])
         .env(CHILD, case)
@@ -280,6 +285,7 @@ fn native_journal_pressure_mixed_captured_and_live_crash_reopens() {
         let directory = tempfile::tempdir().unwrap();
         let report_path = directory.path().join("crash.json");
         let test = format!("sqlite::consensus::tests::native::basis::mixed_journals::{CASE}");
+        eprintln!("launching crash fixture {test} at {}:{}", file!(), line!());
         let output = std::process::Command::new(std::env::current_exe().unwrap())
             .args(["--exact", &test, "--test-threads=1", "--nocapture"])
             .env(CRASH, &report_path)
