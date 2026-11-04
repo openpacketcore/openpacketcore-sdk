@@ -1463,9 +1463,17 @@ impl SessionRaftRpcHandler {
                 let _ = send.send(response);
                 drop(permit);
             });
-            match tokio::time::timeout_at(deadline, receive).await {
-                Ok(Ok(response)) => response,
-                _ => return rejected_response(SessionConsensusPeerError::Timeout),
+            if self.persistence.mode() == super::SessionPersistenceMode::Async {
+                match tokio::time::timeout_at(deadline, receive).await {
+                    Ok(Ok(response)) => response,
+                    _ => return rejected_response(SessionConsensusPeerError::Timeout),
+                }
+            } else {
+                // Preserve durable engine-completion observation. A transport
+                // deadline may drop this receiver while accepted work continues.
+                receive
+                    .await
+                    .unwrap_or_else(|_| rejected_response(SessionConsensusPeerError::Timeout))
             }
         } else {
             self.handle_payload_before(authenticated_sender, request, deadline)
