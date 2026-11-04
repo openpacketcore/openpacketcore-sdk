@@ -20,6 +20,8 @@ fn isolated(case: &str) -> bool {
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
     );
+    assert!(String::from_utf8_lossy(&output.stdout)
+        .contains("test result: ok. 1 passed; 0 failed; 0 ignored;"));
     for line in String::from_utf8_lossy(&output.stderr)
         .lines()
         .filter(|line| {
@@ -151,6 +153,7 @@ fn crashed_void_fixture<T: serde::de::DeserializeOwned>(
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
     );
+    assert!(String::from_utf8_lossy(&output.stdout).contains("running 1 test"));
     let report = serde_json::from_slice(&std::fs::read(report).unwrap()).unwrap();
     (root, report)
 }
@@ -1038,6 +1041,8 @@ fn native_reclaim_memory_noop_admission_keeps_consumers_live() {
             String::from_utf8_lossy(&output.stdout),
             String::from_utf8_lossy(&output.stderr)
         );
+        assert!(String::from_utf8_lossy(&output.stdout)
+            .contains("test result: ok. 1 passed; 0 failed; 0 ignored;"));
         return;
     }
     let gate = Gate::new(Point::BeforeNativeGenerationAppend, 1);

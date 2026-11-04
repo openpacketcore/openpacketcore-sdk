@@ -86,6 +86,8 @@ fn retained_heap_outage_is_unavailable_without_changing_bytes() {
         String::from_utf8_lossy(&child.stdout),
         String::from_utf8_lossy(&child.stderr)
     );
+    assert!(String::from_utf8_lossy(&child.stdout)
+        .contains("test result: ok. 1 passed; 0 failed; 0 ignored;"));
     open_authority_sync(
         options(&directory.path().join("retained.sqlite")),
         key(),

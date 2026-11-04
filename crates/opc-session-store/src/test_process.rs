@@ -384,6 +384,7 @@ mod tests {
             .test_output_with_deadline(Duration::from_secs(5))
             .unwrap();
         assert!(!output.status.success());
+        assert!(String::from_utf8_lossy(&output.stdout).contains("running 1 test"));
         assert!(String::from_utf8_lossy(&output.stderr).contains("stuck blocking teardown or wait"));
         assert!(
             started.elapsed() < Duration::from_secs(5),
@@ -475,6 +476,11 @@ pub(crate) fn run_completion_parent(timeout: std::time::Duration) -> bool {
         "{name}: fixture failed\n{}\n{}",
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&output.stdout)
+            .contains("test result: ok. 1 passed; 0 failed; 0 ignored;"),
+        "{name}: isolated fixture did not run exactly one test"
     );
     true
 }

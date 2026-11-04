@@ -2170,6 +2170,468 @@
       "renamed_to": "python:ci/test-qualify-local-kernel-lifecycle.py::CleanupTests.test_raw_inventory_differences_retain_host_interface_diagnostics",
       "reason": "Rename the raw inventory-difference test to describe its diagnostic role. Every existing namespace, pin, mount, named-namespace and interface difference assertion remains. Separate verification tests retain refusal of owned namespace and interface residue while accepting unrelated host arrivals.",
       "issue": 1225
+    },
+    {
+      "test": "rust:crates/opc-session-store::lib=lib::sqlite::consensus::tests::native::basis::reclaim_memory::native_reclaim_memory_noop_admission_keeps_consumers_live",
+      "kind": "disabled",
+      "issue": 1250,
+      "reason": "The parent re-executes the exact test in a fresh child with its marker set and --test-threads=1, and asserts that the child ran exactly one passing, non-ignored test. The complete body therefore runs isolated from other tests sharing the process allowance."
+    },
+    {
+      "test": "rust:crates/opc-session-store::lib=lib::sqlite::consensus::tests::native::basis::reclaim_memory::native_reclaim_memory_held_checkpoint_allows_consumer_work_and_finishes",
+      "kind": "disabled",
+      "issue": 1250,
+      "reason": "The parent re-executes the exact test in a fresh child with its marker set and --test-threads=1, and asserts that the child ran exactly one passing, non-ignored test. The complete body therefore runs isolated from other tests sharing the process allowance."
+    },
+    {
+      "test": "rust:crates/opc-config-bus-consensus::test=adapter::storage_failures::consensus_history_heap_outage_is_retryable_without_changing_bytes",
+      "kind": "fixture-setup-changed",
+      "issue": 1250,
+      "reason": "The exact test runs in a fresh child with its marker set and --test-threads=1. The parent requires a successful exit and exactly one passing, non-ignored test, preserving the original assertions and process-local resource bounds."
+    },
+    {
+      "test": "rust:crates/opc-persist::lib=lib::backend::tests::open_metadata_heap_outage_is_unavailable_without_changing_bytes",
+      "kind": "fixture-setup-changed",
+      "issue": 1250,
+      "reason": "The exact test runs in a fresh child with its marker set and --test-threads=1. The parent requires a successful exit and exactly one passing, non-ignored test, preserving the original assertions and process-local resource bounds."
+    },
+    {
+      "test": "rust:crates/opc-persist::lib=lib::consumer_checkpoint::tests::checkpoint_heap_outage_is_unavailable_without_changing_bytes",
+      "kind": "fixture-setup-changed",
+      "issue": 1250,
+      "reason": "The exact test runs in a fresh child with its marker set and --test-threads=1. The parent requires a successful exit and exactly one passing, non-ignored test, preserving the original assertions and process-local resource bounds."
+    },
+    {
+      "test": "rust:crates/opc-persist::lib=lib::consumer_checkpoint::tests::checkpoint_local_encryption_failure_is_not_evidence_against_stored_data",
+      "kind": "fixture-setup-changed",
+      "issue": 1250,
+      "reason": "The exact test runs in a fresh child with its marker set and --test-threads=1. The parent requires a successful exit and exactly one passing, non-ignored test, preserving the original assertions and process-local resource bounds."
+    },
+    {
+      "test": "rust:crates/opc-persist::lib=lib::retained::tests::retained_heap_outage_is_unavailable_without_changing_bytes",
+      "kind": "fixture-setup-changed",
+      "issue": 1250,
+      "reason": "The exact test runs in a fresh child with its marker set and --test-threads=1. The parent requires a successful exit and exactly one passing, non-ignored test, preserving the original assertions and process-local resource bounds."
+    },
+    {
+      "test": "rust:crates/opc-session-store::lib=lib::consensus::native::changes::tests::reclaim_memory::native_reclaim_memory_coalesced_delivery_preserves_atomic_publication",
+      "kind": "fixture-setup-changed",
+      "issue": 1250,
+      "reason": "The exact test runs in a fresh child with its marker set and --test-threads=1. The parent requires a successful exit and exactly one passing, non-ignored test, preserving the original assertions and process-local resource bounds."
+    },
+    {
+      "test": "rust:crates/opc-session-store::lib=lib::consensus::native::changes::tests::reclaim_memory::native_reclaim_memory_replay_multiple_full_transport_cohorts",
+      "kind": "fixture-setup-changed",
+      "issue": 1250,
+      "reason": "The exact test runs in a fresh child with its marker set and --test-threads=1. The parent requires a successful exit and exactly one passing, non-ignored test, preserving the original assertions and process-local resource bounds."
+    },
+    {
+      "test": "rust:crates/opc-session-store::lib=lib::consensus::native::changes::tests::reclaim_memory::native_reclaim_memory_void_journal_charges_rows_and_retains_capture_ownership",
+      "kind": "fixture-setup-changed",
+      "issue": 1250,
+      "reason": "The exact test runs in a fresh child with its marker set and --test-threads=1. The parent requires a successful exit and exactly one passing, non-ignored test, preserving the original assertions and process-local resource bounds."
+    },
+    {
+      "test": "rust:crates/opc-session-store::lib=lib::consensus::native::changes::tests::journal_admission::native_fixture_append_retries_typed_pressure_without_partial_publication",
+      "kind": "fixture-setup-changed",
+      "issue": 1250,
+      "reason": "The exact test runs in a fresh child with its marker set and --test-threads=1. The parent requires a successful exit and exactly one passing, non-ignored test, preserving the original assertions and process-local resource bounds."
+    },
+    {
+      "test": "rust:crates/opc-session-store::lib=lib::consensus::native::ordinary_retention_tests::native_notification_retention_bounds_committed_replay_and_rejects_stale_cursor",
+      "kind": "fixture-setup-changed",
+      "issue": 1250,
+      "reason": "The exact test runs in a fresh child with its marker set and --test-threads=1. The parent requires a successful exit and exactly one passing, non-ignored test, preserving the original assertions and process-local resource bounds."
+    },
+    {
+      "test": "rust:crates/opc-session-store::lib=lib::consensus::native::replay_policy_parity_tests::parity_fixture_tolerates_transient_journal_page_admission_refusal",
+      "kind": "fixture-setup-changed",
+      "issue": 1250,
+      "reason": "The exact test runs in a fresh child with its marker set and --test-threads=1. The parent requires a successful exit and exactly one passing, non-ignored test, preserving the original assertions and process-local resource bounds."
+    },
+    {
+      "test": "rust:crates/opc-session-store::lib=lib::consensus::native::roster::store::tests::publication_tests::native_empty_roster_snapshot_validation_uses_checkpoint_headroom",
+      "kind": "fixture-setup-changed",
+      "issue": 1250,
+      "reason": "The exact test runs in a fresh child with its marker set and --test-threads=1. The parent requires a successful exit and exactly one passing, non-ignored test, preserving the original assertions and process-local resource bounds."
+    },
+    {
+      "test": "rust:crates/opc-session-store::lib=lib::sqlite::consensus::wal::native_basis::rollover::compactor::wait_tests::native_rollover_coordinator_cancel_cannot_land_before_wait_registration",
+      "kind": "fixture-setup-changed",
+      "issue": 1250,
+      "reason": "The exact test runs in a fresh child with its marker set and --test-threads=1. The parent requires a successful exit and exactly one passing, non-ignored test, preserving the original assertions and process-local resource bounds."
+    },
+    {
+      "test": "rust:crates/opc-session-store::lib=lib::sqlite::consensus::wal::native_basis::rollover::compactor::wait_tests::native_rollover_coordinator_capacity_restart_returns_to_its_owner",
+      "kind": "fixture-setup-changed",
+      "issue": 1250,
+      "reason": "The exact test runs in a fresh child with its marker set and --test-threads=1. The parent requires a successful exit and exactly one passing, non-ignored test, preserving the original assertions and process-local resource bounds."
+    },
+    {
+      "test": "rust:crates/opc-session-store::lib=lib::sqlite::consensus::wal::native_basis::rollover::compactor::wait_tests::native_rollover_durable_restart_wait_returns_a_completed_capacity_outcome",
+      "kind": "fixture-setup-changed",
+      "issue": 1250,
+      "reason": "The exact test runs in a fresh child with its marker set and --test-threads=1. The parent requires a successful exit and exactly one passing, non-ignored test, preserving the original assertions and process-local resource bounds."
+    },
+    {
+      "test": "rust:crates/opc-session-store::lib=lib::sqlite::consensus::tests::native::basis::mixed_journals::native_journal_pressure_mixed_captured_and_live_crash_reopens",
+      "kind": "fixture-setup-changed",
+      "issue": 1250,
+      "reason": "The exact parent test runs in a fresh child with its marker set and --test-threads=1, requiring exactly one passing test. Its nested crash child selects one test and intentionally exits at the live-WAL boundary; the parent requires the specific exit and recovery report."
+    },
+    {
+      "test": "rust:crates/opc-session-store::lib=lib::sqlite::consensus::tests::native::basis::mixed_journals::native_journal_pressure_large_mixed_cold_replay_rebases_before_exhaustion",
+      "kind": "fixture-setup-changed",
+      "issue": 1250,
+      "reason": "The exact test runs in a fresh child with its marker set and --test-threads=1. The parent requires a successful exit and exactly one passing, non-ignored test, preserving the original assertions and process-local resource bounds."
+    },
+    {
+      "test": "rust:crates/opc-session-store::lib=lib::sqlite::consensus::tests::native::basis::reclaim_memory::native_reclaim_memory_void_checkpoint_and_replay_preserve_first_binding",
+      "kind": "fixture-setup-changed",
+      "issue": 1250,
+      "reason": "The exact test runs in a fresh child with its marker set and --test-threads=1. The parent requires a successful exit and exactly one passing, non-ignored test, preserving the original assertions and process-local resource bounds."
+    },
+    {
+      "test": "rust:crates/opc-session-store::lib=lib::sqlite::consensus::tests::native::basis::reclaim_memory::native_reclaim_memory_void_pressure_fence_replays_and_retires_epoch",
+      "kind": "fixture-setup-changed",
+      "issue": 1250,
+      "reason": "The exact test runs in a fresh child with its marker set and --test-threads=1. The parent requires a successful exit and exactly one passing, non-ignored test, preserving the original assertions and process-local resource bounds."
+    },
+    {
+      "test": "rust:crates/opc-session-store::lib=lib::sqlite::consensus::tests::native::basis::reclaim_memory::native_reclaim_memory_committed_wait_releases_permit_and_proceeds",
+      "kind": "fixture-setup-changed",
+      "issue": 1250,
+      "reason": "The exact test runs in a fresh child with its marker set and --test-threads=1. The parent requires a successful exit and exactly one passing, non-ignored test, preserving the original assertions and process-local resource bounds."
+    },
+    {
+      "test": "rust:crates/opc-session-store::lib=lib::sqlite::consensus::tests::native::basis::reclaim_memory::native_reclaim_memory_committed_wait_fails_closed_with_bounded_reason",
+      "kind": "fixture-setup-changed",
+      "issue": 1250,
+      "reason": "The exact test runs in a fresh child with its marker set and --test-threads=1. The parent requires a successful exit and exactly one passing, non-ignored test, preserving the original assertions and process-local resource bounds."
+    },
+    {
+      "test": "rust:crates/opc-session-store::lib=lib::sqlite::consensus::tests::native::basis::reclaim_memory::native_reclaim_memory_shutdown_interrupts_committed_wait",
+      "kind": "fixture-setup-changed",
+      "issue": 1250,
+      "reason": "The exact test runs in a fresh child with its marker set and --test-threads=1. The parent requires a successful exit and exactly one passing, non-ignored test, preserving the original assertions and process-local resource bounds."
+    },
+    {
+      "test": "rust:crates/opc-session-store::lib=lib::sqlite::consensus::tests::native::basis::reclaim_memory::native_reclaim_memory_shutdown_interrupts_wait_with_writer_already_blocked",
+      "kind": "fixture-setup-changed",
+      "issue": 1250,
+      "reason": "The exact test runs in a fresh child with its marker set and --test-threads=1. The parent requires a successful exit and exactly one passing, non-ignored test, preserving the original assertions and process-local resource bounds."
+    },
+    {
+      "test": "rust:crates/opc-session-store::lib=lib::sqlite::consensus::tests::native::basis::reclaim_memory::native_reclaim_memory_progress_extends_committed_wait",
+      "kind": "fixture-setup-changed",
+      "issue": 1250,
+      "reason": "The exact test runs in a fresh child with its marker set and --test-threads=1. The parent requires a successful exit and exactly one passing, non-ignored test, preserving the original assertions and process-local resource bounds."
+    },
+    {
+      "test": "rust:crates/opc-session-store::lib=lib::sqlite::consensus::tests::native::basis::reclaim_memory::native_reclaim_memory_unhelpful_checkpoints_do_not_extend_wait",
+      "kind": "fixture-setup-changed",
+      "issue": 1250,
+      "reason": "The exact test runs in a fresh child with its marker set and --test-threads=1. The parent requires a successful exit and exactly one passing, non-ignored test, preserving the original assertions and process-local resource bounds."
+    },
+    {
+      "test": "rust:crates/opc-session-store::lib=lib::sqlite::consensus::tests::native::basis::reclaim_memory::native_reclaim_memory_shortfall_relief_extends_committed_wait",
+      "kind": "fixture-setup-changed",
+      "issue": 1250,
+      "reason": "The exact test runs in a fresh child with its marker set and --test-threads=1. The parent requires a successful exit and exactly one passing, non-ignored test, preserving the original assertions and process-local resource bounds."
+    },
+    {
+      "test": "rust:crates/opc-session-store::lib=lib::sqlite::consensus::tests::native::basis::reclaim_memory::native_reclaim_memory_successful_reservation_resets_wait_after_retry",
+      "kind": "fixture-setup-changed",
+      "issue": 1250,
+      "reason": "The exact test runs in a fresh child with its marker set and --test-threads=1. The parent requires a successful exit and exactly one passing, non-ignored test, preserving the original assertions and process-local resource bounds."
+    },
+    {
+      "test": "rust:crates/opc-session-store::lib=lib::sqlite::consensus::tests::native::basis::reclaim_memory::native_reclaim_memory_planner_error_uses_real_evaluation",
+      "kind": "fixture-setup-changed",
+      "issue": 1250,
+      "reason": "The exact test runs in a fresh child with its marker set and --test-threads=1. The parent requires a successful exit and exactly one passing, non-ignored test, preserving the original assertions and process-local resource bounds."
+    },
+    {
+      "test": "rust:crates/opc-session-store::lib=lib::sqlite::consensus::tests::native::basis::reclaim_memory::native_reclaim_memory_preflight_avoids_unhelpful_checkpoints",
+      "kind": "fixture-setup-changed",
+      "issue": 1250,
+      "reason": "The exact test runs in a fresh child with its marker set and --test-threads=1. The parent requires a successful exit and exactly one passing, non-ignored test, preserving the original assertions and process-local resource bounds."
+    },
+    {
+      "test": "rust:crates/opc-session-store::lib=lib::sqlite::consensus::tests::native::basis::reclaim_memory::native_reclaim_memory_requested_checkpoint_relieves_wait",
+      "kind": "fixture-setup-changed",
+      "issue": 1250,
+      "reason": "The exact test runs in a fresh child with its marker set and --test-threads=1. The parent requires a successful exit and exactly one passing, non-ignored test, preserving the original assertions and process-local resource bounds."
+    },
+    {
+      "test": "rust:crates/opc-session-store::lib=lib::sqlite::consensus::tests::native::basis::reclaim_memory::native_reclaim_memory_eight_mib_journal_requests_checkpoint",
+      "kind": "fixture-setup-changed",
+      "issue": 1250,
+      "reason": "The exact test runs in a fresh child with its marker set and --test-threads=1. The parent requires a successful exit and exactly one passing, non-ignored test, preserving the original assertions and process-local resource bounds."
+    },
+    {
+      "test": "rust:crates/opc-session-store::lib=lib::sqlite::consensus::tests::native::basis::reclaim_memory::native_reclaim_memory_preflight_does_not_request_during_install",
+      "kind": "fixture-setup-changed",
+      "issue": 1250,
+      "reason": "The exact test runs in a fresh child with its marker set and --test-threads=1. The parent requires a successful exit and exactly one passing, non-ignored test, preserving the original assertions and process-local resource bounds."
+    },
+    {
+      "test": "rust:crates/opc-session-store::lib=lib::sqlite::consensus::tests::native::basis::reclaim_memory::native_reclaim_memory_full_generation_replays_maximum_retirement_suffix",
+      "kind": "fixture-setup-changed",
+      "issue": 1250,
+      "reason": "The exact test runs in a fresh child with its marker set and --test-threads=1. The parent requires a successful exit and exactly one passing, non-ignored test, preserving the original assertions and process-local resource bounds."
+    },
+    {
+      "test": "rust:crates/opc-session-store::lib=lib::sqlite::consensus::tests::native::basis::reclaim_memory::native_journal_pressure_consumer_application_waits_without_fencing",
+      "kind": "fixture-setup-changed",
+      "issue": 1250,
+      "reason": "The exact test runs in a fresh child with its marker set and --test-threads=1. The parent requires a successful exit and exactly one passing, non-ignored test, preserving the original assertions and process-local resource bounds."
+    },
+    {
+      "test": "rust:crates/opc-session-store::lib=lib::sqlite::consensus::tests::native::basis::reclaim_memory::native_journal_pressure_successful_preparation_resets_wait_after_retry",
+      "kind": "fixture-setup-changed",
+      "issue": 1250,
+      "reason": "The exact test runs in a fresh child with its marker set and --test-threads=1. The parent requires a successful exit and exactly one passing, non-ignored test, preserving the original assertions and process-local resource bounds."
+    },
+    {
+      "test": "rust:crates/opc-session-store::lib=lib::sqlite::consensus::tests::native::basis::reclaim_memory::native_journal_pressure_log_append_waits_without_fencing",
+      "kind": "fixture-setup-changed",
+      "issue": 1250,
+      "reason": "The exact test runs in a fresh child with its marker set and --test-threads=1. The parent requires a successful exit and exactly one passing, non-ignored test, preserving the original assertions and process-local resource bounds."
+    },
+    {
+      "test": "rust:crates/opc-session-store::lib=lib::sqlite::consensus::tests::native::basis::reclaim_memory::native_journal_pressure_tiny_relief_does_not_renew_retirement_wait",
+      "kind": "fixture-setup-changed",
+      "issue": 1250,
+      "reason": "The exact test runs in a fresh child with its marker set and --test-threads=1. The parent requires a successful exit and exactly one passing, non-ignored test, preserving the original assertions and process-local resource bounds."
+    },
+    {
+      "test": "rust:crates/opc-session-store::lib=lib::sqlite::consensus::tests::native::basis::reclaim_memory::native_journal_pressure_meaningful_relief_has_a_total_retirement_bound",
+      "kind": "fixture-setup-changed",
+      "issue": 1250,
+      "reason": "The exact test runs in a fresh child with its marker set and --test-threads=1. The parent requires a successful exit and exactly one passing, non-ignored test, preserving the original assertions and process-local resource bounds."
+    },
+    {
+      "test": "rust:crates/opc-session-store::lib=lib::sqlite::consensus::tests::native::basis::reclaim_memory::native_journal_pressure_detached_preparation_releases_before_wait",
+      "kind": "fixture-setup-changed",
+      "issue": 1250,
+      "reason": "The exact test runs in a fresh child with its marker set and --test-threads=1. The parent requires a successful exit and exactly one passing, non-ignored test, preserving the original assertions and process-local resource bounds."
+    },
+    {
+      "test": "rust:crates/opc-session-store::lib=lib::sqlite::consensus::tests::native::basis::reclaim_memory::native_journal_pressure_shutdown_interrupts_consumer_and_append_waits",
+      "kind": "fixture-setup-changed",
+      "issue": 1250,
+      "reason": "The exact test runs in a fresh child with its marker set and --test-threads=1. The parent requires a successful exit and exactly one passing, non-ignored test, preserving the original assertions and process-local resource bounds."
+    },
+    {
+      "test": "rust:crates/opc-session-store::lib=lib::sqlite::consensus::tests::native::basis::rollover::background::native_rollover_admission_advances_while_compactor_parked",
+      "kind": "fixture-setup-changed",
+      "issue": 1250,
+      "reason": "The exact test runs in a fresh child with its marker set and --test-threads=1. The parent requires a successful exit and exactly one passing, non-ignored test, preserving the original assertions and process-local resource bounds."
+    },
+    {
+      "test": "rust:crates/opc-session-store::lib=lib::sqlite::consensus::tests::native::basis::rollover::background::native_rollover_journal_pressure_is_relieved_while_compactor_parked",
+      "kind": "fixture-setup-changed",
+      "issue": 1250,
+      "reason": "The exact test runs in a fresh child with its marker set and --test-threads=1. The parent requires a successful exit and exactly one passing, non-ignored test, preserving the original assertions and process-local resource bounds."
+    },
+    {
+      "test": "rust:crates/opc-session-store::lib=lib::sqlite::consensus::tests::native::basis::rollover::background::native_rollover_background_relocation_does_not_gate_checkpoints",
+      "kind": "fixture-setup-changed",
+      "issue": 1250,
+      "reason": "The exact test runs in a fresh child with its marker set and --test-threads=1. The parent requires a successful exit and exactly one passing, non-ignored test, preserving the original assertions and process-local resource bounds."
+    },
+    {
+      "test": "rust:crates/opc-session-store::lib=lib::sqlite::consensus::tests::native::basis::rollover::background::native_rollover_ceiling_backpressure_never_refuses_or_poisons",
+      "kind": "fixture-setup-changed",
+      "issue": 1250,
+      "reason": "The exact test runs in a fresh child with its marker set and --test-threads=1. The parent requires a successful exit and exactly one passing, non-ignored test, preserving the original assertions and process-local resource bounds."
+    },
+    {
+      "test": "rust:crates/opc-session-store::lib=lib::sqlite::consensus::tests::native::basis::rollover::background::native_rollover_real_journal_stall_without_file_guard_still_fences",
+      "kind": "fixture-setup-changed",
+      "issue": 1250,
+      "reason": "The exact test runs in a fresh child with its marker set and --test-threads=1. The parent requires a successful exit and exactly one passing, non-ignored test, preserving the original assertions and process-local resource bounds."
+    },
+    {
+      "test": "rust:crates/opc-session-store::lib=lib::sqlite::consensus::tests::native::basis::rollover::background::native_rollover_pending_capacity_selects_a_complete_base_without_delta",
+      "kind": "fixture-setup-changed",
+      "issue": 1250,
+      "reason": "The exact test runs in a fresh child with its marker set and --test-threads=1. The parent requires a successful exit and exactly one passing, non-ignored test, preserving the original assertions and process-local resource bounds."
+    },
+    {
+      "test": "rust:crates/opc-session-store::lib=lib::sqlite::consensus::tests::native::basis::rollover::background::native_rollover_live_capacity_retirement_resumes_without_relabeling",
+      "kind": "fixture-setup-changed",
+      "issue": 1250,
+      "reason": "The exact test runs in a fresh child with its marker set and --test-threads=1. The parent requires a successful exit and exactly one passing, non-ignored test, preserving the original assertions and process-local resource bounds."
+    },
+    {
+      "test": "rust:crates/opc-session-store::lib=lib::sqlite::consensus::tests::native::basis::rollover::background::native_rollover_pending_capacity_reopens_at_each_new_boundary",
+      "kind": "fixture-setup-changed",
+      "issue": 1250,
+      "reason": "The exact test runs in a fresh child with its marker set and --test-threads=1. The parent requires a successful exit and exactly one passing, non-ignored test, preserving the original assertions and process-local resource bounds."
+    },
+    {
+      "test": "rust:crates/opc-session-store::lib=lib::sqlite::consensus::tests::native::basis::rollover::background::native_rollover_multiple_full_journals_drain_and_keep_the_owned_preparation",
+      "kind": "fixture-setup-changed",
+      "issue": 1250,
+      "reason": "The exact test runs in a fresh child with its marker set and --test-threads=1. The parent requires a successful exit and exactly one passing, non-ignored test, preserving the original assertions and process-local resource bounds."
+    },
+    {
+      "test": "rust:crates/opc-session-store::lib=lib::sqlite::consensus::tests::native::basis::rollover::background::native_rollover_pinned_base_and_suffix_readers_survive_the_switch",
+      "kind": "fixture-setup-changed",
+      "issue": 1250,
+      "reason": "The exact test runs in a fresh child with its marker set and --test-threads=1. The parent requires a successful exit and exactly one passing, non-ignored test, preserving the original assertions and process-local resource bounds."
+    },
+    {
+      "test": "rust:crates/opc-session-store::lib=lib::sqlite::consensus::tests::native::basis::rollover::background::native_rollover_switch_replays_exact_suffix",
+      "kind": "fixture-setup-changed",
+      "issue": 1250,
+      "reason": "The exact test runs in a fresh child with its marker set and --test-threads=1. The parent requires a successful exit and exactly one passing, non-ignored test, preserving the original assertions and process-local resource bounds."
+    },
+    {
+      "test": "rust:crates/opc-session-store::lib=lib::sqlite::consensus::tests::native::basis::rollover::concurrency::native_rollover_child_filter_rejects_a_successful_empty_selection",
+      "kind": "fixture-setup-changed",
+      "issue": 1250,
+      "reason": "The enclosing fixture runs one exact passing child with its marker set and --test-threads=1. Its negative control intentionally selects zero tests and asserts that the child result is rejected."
+    },
+    {
+      "test": "rust:crates/opc-session-store::lib=lib::sqlite::consensus::tests::native::basis::rollover::concurrency::native_rollover_durable_groups_complete_with_caught_up_compactor_and_active_checkpoint",
+      "kind": "fixture-setup-changed",
+      "issue": 1250,
+      "reason": "The exact test runs in a fresh child with its marker set and --test-threads=1. The parent requires a successful exit and exactly one passing, non-ignored test, preserving the original assertions and process-local resource bounds."
+    },
+    {
+      "test": "rust:crates/opc-session-store::lib=lib::sqlite::consensus::tests::native::basis::rollover::concurrency::native_rollover_relocation_worker_panic_notifies_and_fails_closed",
+      "kind": "fixture-setup-changed",
+      "issue": 1250,
+      "reason": "The exact test runs in a fresh child with its marker set and --test-threads=1. The parent requires a successful exit and exactly one passing, non-ignored test, preserving the original assertions and process-local resource bounds."
+    },
+    {
+      "test": "rust:crates/opc-session-store::lib=lib::sqlite::consensus::tests::native::basis::rollover::concurrency::native_rollover_async_capacity_error_clears_guard_and_install_fails_fast",
+      "kind": "fixture-setup-changed",
+      "issue": 1250,
+      "reason": "The exact test runs in a fresh child with its marker set and --test-threads=1. The parent requires a successful exit and exactly one passing, non-ignored test, preserving the original assertions and process-local resource bounds."
+    },
+    {
+      "test": "rust:crates/opc-session-store::lib=lib::sqlite::consensus::tests::native::basis::rollover::install_claim::native_rollover_ceiling_checkpoint_yields_install_until_relocation_drains",
+      "kind": "fixture-setup-changed",
+      "issue": 1250,
+      "reason": "The exact test runs in a fresh child with its marker set and --test-threads=1. The parent requires a successful exit and exactly one passing, non-ignored test, preserving the original assertions and process-local resource bounds."
+    },
+    {
+      "test": "rust:crates/opc-session-store::lib=lib::sqlite::consensus::tests::native::basis::rollover::install_claim::native_rollover_withdrawn_install_claim_preserves_queued_relocation",
+      "kind": "fixture-setup-changed",
+      "issue": 1250,
+      "reason": "The exact test runs in a fresh child with its marker set and --test-threads=1. The parent requires a successful exit and exactly one passing, non-ignored test, preserving the original assertions and process-local resource bounds."
+    },
+    {
+      "test": "rust:crates/opc-session-store::lib=lib::sqlite::consensus::tests::native::basis::rollover::install_claim::native_rollover_unarmed_install_claim_does_not_interrupt_guarded_waiters",
+      "kind": "fixture-setup-changed",
+      "issue": 1250,
+      "reason": "The exact test runs in a fresh child with its marker set and --test-threads=1. The parent requires a successful exit and exactly one passing, non-ignored test, preserving the original assertions and process-local resource bounds."
+    },
+    {
+      "test": "rust:crates/opc-session-store::lib=lib::sqlite::consensus::tests::native::basis::rollover::native_generation_rollover_keeps_durable_checkpoints_bounded",
+      "kind": "fixture-setup-changed",
+      "issue": 1250,
+      "reason": "The exact test runs in a fresh child with its marker set and --test-threads=1. The parent requires a successful exit and exactly one passing, non-ignored test, preserving the original assertions and process-local resource bounds."
+    },
+    {
+      "test": "rust:crates/opc-session-store::lib=lib::sqlite::consensus::tests::native::basis::rollover::native_generation_rollover_keeps_async_checkpoints_bounded",
+      "kind": "fixture-setup-changed",
+      "issue": 1250,
+      "reason": "The exact test runs in a fresh child with its marker set and --test-threads=1. The parent requires a successful exit and exactly one passing, non-ignored test, preserving the original assertions and process-local resource bounds."
+    },
+    {
+      "test": "rust:crates/opc-session-store::lib=lib::sqlite::consensus::tests::native::basis::rollover::native_generation_rollover_keeps_a_pinned_receipt_reader_live",
+      "kind": "fixture-setup-changed",
+      "issue": 1250,
+      "reason": "The exact test runs in a fresh child with its marker set and --test-threads=1. The parent requires a successful exit and exactly one passing, non-ignored test, preserving the original assertions and process-local resource bounds."
+    },
+    {
+      "test": "rust:crates/opc-session-store::lib=lib::sqlite::consensus::tests::native::basis::rollover::native_generation_rollover_preserves_changes_after_the_captured_cut",
+      "kind": "fixture-setup-changed",
+      "issue": 1250,
+      "reason": "The exact test runs in a fresh child with its marker set and --test-threads=1. The parent requires a successful exit and exactly one passing, non-ignored test, preserving the original assertions and process-local resource bounds."
+    },
+    {
+      "test": "rust:crates/opc-session-store::lib=lib::sqlite::consensus::tests::native::basis::rollover::native_generation_rollover_reopens_at_every_publication_boundary",
+      "kind": "fixture-setup-changed",
+      "issue": 1250,
+      "reason": "The exact test runs in a fresh child with its marker set and --test-threads=1. The parent requires a successful exit and exactly one passing, non-ignored test, preserving the original assertions and process-local resource bounds."
+    },
+    {
+      "test": "rust:crates/opc-session-store::lib=lib::sqlite::consensus::tests::native::basis::rollover::native_generation_rollover_serializes_the_complete_capture_once",
+      "kind": "fixture-setup-changed",
+      "issue": 1250,
+      "reason": "The exact test runs in a fresh child with its marker set and --test-threads=1. The parent requires a successful exit and exactly one passing, non-ignored test, preserving the original assertions and process-local resource bounds."
+    },
+    {
+      "test": "rust:crates/opc-session-store::lib=lib::sqlite::consensus::tests::native::recovery_snapshot::retained_recovery_snapshot_preserves_physical_rows_through_install_and_cold_reopen",
+      "kind": "fixture-setup-changed",
+      "issue": 1250,
+      "reason": "The exact test runs in a fresh child with its marker set and --test-threads=1. The parent requires a successful exit and exactly one passing, non-ignored test, preserving the original assertions and process-local resource bounds."
+    },
+    {
+      "test": "rust:crates/opc-session-store::lib=lib::sqlite::consensus::tests::native::retained_snapshot::canonical_native_notification_history_round_trips_through_cold_native_catalog",
+      "kind": "fixture-setup-changed",
+      "issue": 1250,
+      "reason": "The exact test runs in a fresh child with its marker set and --test-threads=1. The parent requires a successful exit and exactly one passing, non-ignored test, preserving the original assertions and process-local resource bounds."
+    },
+    {
+      "test": "rust:crates/opc-session-store::lib=lib::sqlite::consensus::tests::native::retained_snapshot::retained_snapshot_key_fence_floor_keeps_a_live_older_lease",
+      "kind": "fixture-setup-changed",
+      "issue": 1250,
+      "reason": "The exact test runs in a fresh child with its marker set and --test-threads=1. The parent requires a successful exit and exactly one passing, non-ignored test, preserving the original assertions and process-local resource bounds."
+    },
+    {
+      "test": "rust:crates/opc-session-store::lib=lib::sqlite::consensus::tests::native::root_lock::native_root_lock_duplicate_does_not_outlive_durable_opening",
+      "kind": "fixture-setup-changed",
+      "issue": 1250,
+      "reason": "The exact test runs in a fresh child with its marker set and --test-threads=1. The parent requires a successful exit and exactly one passing, non-ignored test, preserving the original assertions and process-local resource bounds."
+    },
+    {
+      "test": "rust:crates/opc-session-store::lib=lib::sqlite::consensus::tests::native::root_lock::native_root_lock_duplicate_does_not_outlive_async_opening",
+      "kind": "fixture-setup-changed",
+      "issue": 1250,
+      "reason": "The exact test runs in a fresh child with its marker set and --test-threads=1. The parent requires a successful exit and exactly one passing, non-ignored test, preserving the original assertions and process-local resource bounds."
+    },
+    {
+      "test": "rust:crates/opc-session-store::lib=lib::sqlite::consensus::tests::native::root_lock::native_root_lock_duplicate_does_not_outlive_failed_durable_validation",
+      "kind": "fixture-setup-changed",
+      "issue": 1250,
+      "reason": "The exact test runs in a fresh child with its marker set and --test-threads=1. The parent requires a successful exit and exactly one passing, non-ignored test, preserving the original assertions and process-local resource bounds."
+    },
+    {
+      "test": "rust:crates/opc-session-store::lib=lib::sqlite::consensus::tests::native::root_lock::native_root_lock_duplicate_does_not_outlive_failed_async_validation",
+      "kind": "fixture-setup-changed",
+      "issue": 1250,
+      "reason": "The exact test runs in a fresh child with its marker set and --test-threads=1. The parent requires a successful exit and exactly one passing, non-ignored test, preserving the original assertions and process-local resource bounds."
+    },
+    {
+      "test": "rust:crates/opc-session-store::lib=lib::sqlite::consensus::tests::native::root_lock::native_root_lock_duplicate_does_not_outlive_durable_writer",
+      "kind": "fixture-setup-changed",
+      "issue": 1250,
+      "reason": "The exact test runs in a fresh child with its marker set and --test-threads=1. The parent requires a successful exit and exactly one passing, non-ignored test, preserving the original assertions and process-local resource bounds."
+    },
+    {
+      "test": "rust:crates/opc-session-store::lib=lib::sqlite::consensus::tests::native::root_lock::native_root_lock_duplicate_does_not_outlive_async_writer",
+      "kind": "fixture-setup-changed",
+      "issue": 1250,
+      "reason": "The exact test runs in a fresh child with its marker set and --test-threads=1. The parent requires a successful exit and exactly one passing, non-ignored test, preserving the original assertions and process-local resource bounds."
+    },
+    {
+      "test": "rust:crates/opc-session-store::lib=lib::sqlite::consensus::tests::native::round6_sqlite_batch_entries_declare_their_true_command_boundaries",
+      "kind": "fixture-setup-changed",
+      "issue": 1250,
+      "reason": "The exact test runs in a fresh child with its marker set and --test-threads=1. The parent requires a successful exit and exactly one passing, non-ignored test, preserving the original assertions and process-local resource bounds."
+    },
+    {
+      "test": "rust:crates/opc-session-store::lib=lib::test_process::tests::captured_readiness_timeout_reaps_child_and_releases_snapshot_gate",
+      "kind": "fixture-setup-changed",
+      "issue": 1250,
+      "reason": "The exact child test runs with its marker set and --test-threads=1. This negative control requires one selected test, the intentional process termination and the named timeout diagnostic; a zero-test success cannot satisfy it."
     }
   ]
 }

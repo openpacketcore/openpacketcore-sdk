@@ -368,6 +368,8 @@ fn consensus_history_heap_outage_is_retryable_without_changing_bytes() {
         String::from_utf8_lossy(&child.stdout),
         String::from_utf8_lossy(&child.stderr)
     );
+    assert!(String::from_utf8_lossy(&child.stdout)
+        .contains("test result: ok. 1 passed; 0 failed; 0 ignored;"));
     tokio::runtime::Runtime::new().unwrap().block_on(async {
         let repaired = backend(&directory.path().join("config.sqlite")).await;
         assert!(ConfigStore::load_latest(&repaired).await.unwrap().is_some());

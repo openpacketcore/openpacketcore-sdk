@@ -32,6 +32,8 @@ fn isolated(case: &str) -> bool {
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
     );
+    assert!(String::from_utf8_lossy(&output.stdout)
+        .contains("test result: ok. 1 passed; 0 failed; 0 ignored;"));
     for line in String::from_utf8_lossy(&output.stderr)
         .lines()
         .filter(|line| line.starts_with("native_mixed_journal_"))
@@ -291,6 +293,7 @@ fn native_journal_pressure_mixed_captured_and_live_crash_reopens() {
             String::from_utf8_lossy(&output.stdout),
             String::from_utf8_lossy(&output.stderr)
         );
+        assert!(String::from_utf8_lossy(&output.stdout).contains("running 1 test"));
         let report: CrashReport =
             serde_json::from_slice(&std::fs::read(report_path).unwrap()).unwrap();
         let signed = roster_v2_fresh_wal_persistence_fixture(Phase::Established);
