@@ -226,7 +226,8 @@ pub(crate) struct PersistenceProtocol {
         Arc<std::sync::OnceLock<Arc<super::protected_recovery::ProtectedAsyncRecovery>>>,
     recovery_limit: Arc<std::sync::atomic::AtomicU8>,
     pub progress: Arc<Notify>,
-    /// Bound cancellation-safe cold RPC supervisors. The original engine
+    /// Bound cancellation-safe asynchronous RPC and durable snapshot owners.
+    /// The original engine
     /// request/response remains intact; no synthetic acknowledgement is made.
     pub cold_rpc_admission: Arc<Semaphore>,
     #[cfg(test)]

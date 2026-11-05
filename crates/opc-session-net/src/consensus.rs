@@ -9673,6 +9673,96 @@ mod tests {
         handle.abort_and_wait().await;
     }
 
+    #[cfg(feature = "insecure-test")]
+    #[tokio::test]
+    async fn timed_out_snapshot_handler_keeps_its_scope_until_core_completion() {
+        let current = membership_manifest(1, &[1, 2, 3]);
+        let successor = membership_manifest(2, &[1, 2, 3, 4, 5]);
+        let client_binding = current
+            .bind_local(ReplicaId::new("replica-1").expect("client ID"))
+            .expect("client binding")
+            .bind_remote(ReplicaId::new("replica-3").expect("server ID"))
+            .expect("remote binding");
+        let server_binding = current
+            .bind_local(ReplicaId::new("replica-3").expect("server ID"))
+            .expect("server binding");
+        let membership = SessionMembershipAdmission::from_current_binding(server_binding);
+        let request = membership_transition_request(
+            SessionTopologyTransitionId::from_bytes([32; 16]),
+            1,
+            2,
+            &[1, 2, 3, 4, 5],
+        );
+        membership
+            .stage_successor(&request, successor)
+            .await
+            .expect("stage successor");
+        membership
+            .admit_successor_voting_after_catch_up_for_test(&request)
+            .await
+            .expect("admit successor voting");
+
+        let handler = Arc::new(CancellationUnsafeQueuedHandler::new());
+        let server = SessionConsensusServer::new_insecure_with_membership_admission(
+            handler.clone(),
+            membership.clone(),
+        )
+        .with_rpc_timeout(Duration::from_millis(20));
+        let (handle, addr) = server
+            .listen("127.0.0.1:0".parse().expect("listen address"))
+            .await
+            .expect("listen");
+        let peer = RemoteSessionConsensusPeer::new_insecure(
+            client_binding.clone(),
+            addr,
+            Some(Duration::from_secs(1)),
+        );
+        let wire_request = SessionConsensusWireRequest::try_new(
+            client_binding.consensus_identity(),
+            client_binding.local_consensus_node_id(),
+            SessionConsensusRpcFamily::InstallSnapshot,
+            b"queued-snapshot-call".to_vec(),
+        )
+        .expect("wire request");
+        let call = tokio::spawn(async move { peer.call(wire_request).await });
+        tokio::time::timeout(Duration::from_secs(1), handler.queued.notified())
+            .await
+            .expect("handler must queue its cancellation-unsafe core operation");
+        assert_eq!(
+            call.await.expect("call task"),
+            Ok(SessionConsensusWireResponse {
+                result: Err(SessionConsensusPeerError::Timeout),
+            })
+        );
+
+        let finalizer_membership = membership.clone();
+        let finalizer_request = request.clone();
+        let finalizer = tokio::spawn(async move {
+            finalizer_membership
+                .finalize_successor_for_test(&finalizer_request)
+                .await
+        });
+        tokio::task::yield_now().await;
+        assert!(
+            !finalizer.is_finished(),
+            "transport timeout must not release the old-scope lease while queued core work runs"
+        );
+
+        let core_completed = handler.core_completed.notified();
+        handler.release_core.notify_waiters();
+        tokio::time::timeout(Duration::from_secs(1), core_completed)
+            .await
+            .expect("queued core operation must complete after release");
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(1), finalizer)
+                .await
+                .expect("finalization must resume after actual core completion")
+                .expect("finalizer task"),
+            Ok(crate::membership::SessionMembershipTransitionResult::Finalized)
+        );
+        handle.abort_and_wait().await;
+    }
+
     #[tokio::test]
     async fn consensus_mode_rejects_raw_mutation_rebuild_and_malformed_frames() {
         let (server_binding, client_binding) = bindings();
