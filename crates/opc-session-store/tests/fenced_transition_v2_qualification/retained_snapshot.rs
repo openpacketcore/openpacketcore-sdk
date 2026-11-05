@@ -423,7 +423,7 @@ async fn round_trip(mode: SessionPersistenceMode) {
     // Observe the complete transfer, envelope verification and native import.
     // This observation does not extend any engine or transport RPC deadline.
     let install_started = std::time::Instant::now();
-    let installation = tokio::time::timeout(Duration::from_secs(1200), async {
+    let installation = tokio::time::timeout(Duration::from_secs(2400), async {
         while consensus_local_durable_progress_for_test(&stores[lagging]).snapshot_index
             < Some(purged)
         {

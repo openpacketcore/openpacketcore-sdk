@@ -424,8 +424,8 @@ jobs:
   # budget includes setup, reopen and variation. Other log proofs retain 75;
   # the 131,073-roster history and cold reconstruction have 240 minutes.
   # Complete retained snapshots keep checked O0 on separate runners: the
-  # observed 58-minute execution plus compilation and host variation uses
-  # a 120-minute allocation. Existing runner limits remain unchanged.
+  # observed hosted slowdown requires a 240-minute allocation, including
+  # compilation and complete transfer/import. Other runner limits are unchanged.
   host-native-log-proofs:
     name: Egress fence full-bound store proof (${{ matrix.shard }})
     needs: changes
@@ -433,7 +433,7 @@ jobs:
     runs-on: ubuntu-24.04
     env:
       CARGO_PROFILE_TEST_DEBUG: "0"
-    timeout-minutes: ${{ matrix.shard == 18 && 240 || ((matrix.shard == 4 || matrix.shard == 35 || matrix.shard == 36) && 120 || 75) }}
+    timeout-minutes: ${{ (matrix.shard == 18 || matrix.shard == 35 || matrix.shard == 36) && 240 || (matrix.shard == 4 && 120 || 75) }}
     strategy:
       fail-fast: false
       matrix:

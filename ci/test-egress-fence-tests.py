@@ -1018,7 +1018,7 @@ class WorkflowTests(unittest.TestCase):
         for name in FENCE.REQUIRED_JOBS:
             with self.subTest(job=name):
                 self.assertIn(condition, jobs[name])
-                timeout = ("${{ matrix.shard == 18 && 240 || ((matrix.shard == 4 || matrix.shard == 35 || matrix.shard == 36) && 120 || 75) }}"
+                timeout = ("${{ (matrix.shard == 18 || matrix.shard == 35 || matrix.shard == 36) && 240 || (matrix.shard == 4 && 120 || 75) }}"
                            if name == "host-native-log-proofs" else "45")
                 self.assertIn(f"timeout-minutes: {timeout}\n", jobs[name])
                 self.assertRegex(jobs[name], r"needs: (changes|\[changes, sources\])\n")
