@@ -3,7 +3,7 @@
 //! recovery markers, validate before publication, and automatically roll back
 //! expired commit-confirmed records on restart.
 
-use opc_alarm::SharedAlarmManager;
+use opc_alarm::{Severity, SharedAlarmManager};
 use opc_config_model::{
     CommitMode, ConfigImpactClassifier, ConfigOperation, HotConfigImpactClassifier, OpcConfig,
     RequestId, RequestSource, RollbackTarget, TransportType, TrustedPrincipal, ValidationContext,
@@ -12,13 +12,13 @@ use opc_config_model::{
 use opc_types::{redact, ConfigVersion, TenantId, Timestamp, TxId};
 use std::sync::{Arc, LazyLock};
 
-use crate::alarms::{clear_config_alarm_type, preserve_startup_error};
+use crate::alarms::{clear_config_alarm_type, preserve_startup_error, startup_error_alarm_spec};
 use crate::authorizer::{AllowAllAuthorizer, ConfigAuthorizer};
 use crate::commit::{ConfigBus, DEFAULT_COMMIT_QUEUE_CAPACITY};
 use crate::datastore::{CommittedRevisionSource, ManagedDatastore};
 use crate::types::{
-    AuthorityMode, CommitWrite, ConfirmedCommitResolution, StoreError, StoredConfig,
-    StoredRequestMode,
+    AuthorityMode, CommitWrite, ConfirmedCommitResolution, StoreError, StoreErrorCode,
+    StoredConfig, StoredRequestMode,
 };
 
 pub(crate) const RESTORE_SCHEMA_MISMATCH_MESSAGE: &str =
@@ -41,6 +41,16 @@ static STARTUP_BOOTSTRAP_PRINCIPAL: LazyLock<TrustedPrincipal> = LazyLock::new(|
 
 pub(crate) fn startup_bootstrap_principal() -> TrustedPrincipal {
     STARTUP_BOOTSTRAP_PRINCIPAL.clone()
+}
+
+// A failure while restoring an expired commit must retain its Critical fence.
+// Preserve a more specific source code only when it already has that severity.
+fn startup_rollback_error_code(code: StoreErrorCode, fence: StoreErrorCode) -> StoreErrorCode {
+    if startup_error_alarm_spec(code).0 == Severity::Critical {
+        code
+    } else {
+        fence
+    }
 }
 
 fn default_impact_classifier<C: OpcConfig>() -> Arc<dyn ConfigImpactClassifier<C>> {
@@ -588,7 +598,11 @@ impl<C: OpcConfig> ConfigBus<C> {
                                     "failed to load previous confirmed config during startup rollback",
                                     &err,
                                 );
-                                preserve_startup_error(&alarm_manager, StoreError::restore_confirmed_deadline("stored running config requires commit-confirmed recovery"))
+                                let code = startup_rollback_error_code(err.code, StoreErrorCode::RestoreConfirmedDeadline);
+                                preserve_startup_error(
+                                    &alarm_manager,
+                                    StoreError::new(code, RESTORE_CONFIRMED_DEADLINE_MESSAGE),
+                                )
                             })?;
                         validate_publishable_stored_config(&prev_stored)
                             .map_err(|err| preserve_startup_error(&alarm_manager, err))?;
@@ -634,11 +648,13 @@ impl<C: OpcConfig> ConfigBus<C> {
                                     "failed to append startup rollback commit",
                                     &err,
                                 );
+                                let code = startup_rollback_error_code(
+                                    err.code,
+                                    StoreErrorCode::RestoreRecoveryRequired,
+                                );
                                 preserve_startup_error(
                                     &alarm_manager,
-                                    StoreError::restore_recovery_required(
-                                        RESTORE_RECOVERY_REQUIRED_MESSAGE,
-                                    ),
+                                    StoreError::new(code, RESTORE_RECOVERY_REQUIRED_MESSAGE),
                                 )
                             })?;
 
@@ -651,11 +667,13 @@ impl<C: OpcConfig> ConfigBus<C> {
                                     "failed to clear recovery required on startup rollback commit",
                                     &err,
                                 );
+                                let code = startup_rollback_error_code(
+                                    err.code,
+                                    StoreErrorCode::RestoreRecoveryRequired,
+                                );
                                 preserve_startup_error(
                                     &alarm_manager,
-                                    StoreError::restore_recovery_required(
-                                        RESTORE_RECOVERY_REQUIRED_MESSAGE,
-                                    ),
+                                    StoreError::new(code, RESTORE_RECOVERY_REQUIRED_MESSAGE),
                                 )
                             })?;
 

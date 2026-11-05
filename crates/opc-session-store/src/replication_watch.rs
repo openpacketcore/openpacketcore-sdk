@@ -35,7 +35,7 @@ impl ReplicationWatcher {
         if entry.sequence < expected {
             return !self.sender.is_closed();
         }
-        if entry.sequence > expected {
+        if !entry.matches_watch_cursor(expected).unwrap_or(false) {
             let _ = self
                 .sender
                 .try_send(Err(StoreError::InvalidReplicationSequence));
@@ -44,7 +44,7 @@ impl ReplicationWatcher {
         if self.sender.try_send(Ok(entry.clone())).is_err() {
             return false;
         }
-        self.next_sequence = expected.checked_add(1);
+        self.next_sequence = entry.sequence.checked_add(1);
         self.next_sequence.is_some()
     }
 }
@@ -117,6 +117,7 @@ mod tests {
 
     fn entry(sequence: u64) -> ReplicationEntry {
         ReplicationEntry {
+            replay_policy: crate::ReplicationReplayPolicy::prune_expired(),
             sequence,
             tx_id: ReplicationTxId::new("watch-test").expect("transaction ID"),
             op: ReplicationOp::Batch { ops: Vec::new() },

@@ -396,7 +396,7 @@ fn apply_validated_replicated_op_sync(
             conn.execute(
                 r#"
                 UPDATE leases
-                SET active = 0
+                SET active = 0, guard_expires_at = ?6
                 WHERE tenant = ?1 AND nf_kind = ?2 AND key_type = ?3 AND stable_id = ?4 AND credential_id = ?5
                 "#,
                 params![
@@ -405,6 +405,7 @@ fn apply_validated_replicated_op_sync(
                     key.key_type.to_string(),
                     key.stable_id.as_ref(),
                     sqlite_u64(credential_id)?,
+                    format_rfc3339_normalized(now),
                 ],
             )
             .map_err(|e| StoreError::BackendUnavailable(e.to_string()))?;
@@ -745,6 +746,21 @@ pub(crate) fn validate_replication_payloads(
     root: &ReplicationOp,
     max_value_bytes: usize,
 ) -> Result<(), StoreError> {
+    validate_replication_payloads_for_profile(root, max_value_bytes, false)
+}
+
+pub(crate) fn validate_native_replication_payloads(
+    root: &ReplicationOp,
+    max_value_bytes: usize,
+) -> Result<(), StoreError> {
+    validate_replication_payloads_for_profile(root, max_value_bytes, true)
+}
+
+fn validate_replication_payloads_for_profile(
+    root: &ReplicationOp,
+    max_value_bytes: usize,
+    _native_retention: bool,
+) -> Result<(), StoreError> {
     // This preflight is shared by the public adapter, append/rebuild helpers,
     // and the replay defense above. Structure is checked first so walking an
     // untrusted tree stays bounded before we inspect every nested CAS.
@@ -795,13 +811,55 @@ pub(crate) fn validate_replication_payloads(
     Ok(())
 }
 
+pub(crate) fn validate_standalone_replay_policy(
+    entry: &ReplicationEntry,
+) -> Result<(), StoreError> {
+    let policy = entry.replay_policy;
+    policy.validate()?;
+    if policy.retire_dead_keys
+        || policy.capacity_rotations != 0
+        || policy.async_fence_floor != 0
+        || policy.internal_key_count != 0
+        || policy.recovery != crate::ReplicationRecoveryBoundary::None
+    {
+        return Err(StoreError::CapabilityNotSupported(
+            "replication_replay_policy".into(),
+        ));
+    }
+    Ok(())
+}
+
+pub(super) fn pending_replay_command_sync(
+    conn: &Connection,
+) -> Result<Option<crate::replay_policy::ReplayCommandCursor>, StoreError> {
+    let row = conn.query_row(
+        "SELECT sequence, tx_id, entry_json FROM session_replication_log ORDER BY sequence DESC LIMIT 1",
+        [], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, Option<String>>(1)?, r.get::<_, String>(2)?)),
+    ).optional().map_err(|e| StoreError::BackendUnavailable(e.to_string()))?;
+    row.map(|(sequence, tx_id, encoded)| {
+        hydrate_replication_entry(sequence, tx_id, &encoded)
+            .map(|entry| crate::replay_policy::ReplayCommandCursor::after(&entry))
+    })
+    .transpose()
+    .map(Option::flatten)
+}
+
+pub(super) fn require_complete_replay_command(conn: &Connection) -> Result<(), StoreError> {
+    if pending_replay_command_sync(conn)?.is_some() {
+        return Err(StoreError::Serialization(
+            "incomplete replication command".into(),
+        ));
+    }
+    Ok(())
+}
+
 pub(crate) fn replicate_entry_sync(
     conn: &Connection,
     entry: &ReplicationEntry,
     caps: &BackendCapabilities,
-    now: Timestamp,
 ) -> Result<bool, StoreError> {
     entry.validate()?;
+    validate_standalone_replay_policy(entry)?;
     validate_replication_payloads(&entry.op, caps.max_value_bytes)?;
     let sqlite_sequence = sqlite_replication_sequence(entry.sequence)?;
     let tx = super::standalone_transaction(conn)?;
@@ -862,8 +920,13 @@ pub(crate) fn replicate_entry_sync(
         ));
     }
 
-    // Apply mutation
-    apply_replicated_op_sync(&tx, entry.op.clone(), caps, now)?;
+    crate::replay_policy::ReplayCommandCursor::advance(pending_replay_command_sync(&tx)?, entry)?;
+
+    // Cleanup is a producer decision, independent of the mutation tree.
+    if entry.replay_policy.prune_expired {
+        super::ops::prune_sync(&tx, entry.timestamp)?;
+    }
+    apply_replicated_op_sync(&tx, entry.op.clone(), caps, entry.timestamp)?;
 
     // Append to replication log table
     let entry_json =
@@ -893,7 +956,10 @@ pub(crate) fn rebuild_replication_state_sync(
     caps: &BackendCapabilities,
 ) -> Result<(), StoreError> {
     validate_replication_prefix(entries)?;
+    let mut pending = None;
     for entry in entries {
+        pending = crate::replay_policy::ReplayCommandCursor::advance(pending, entry)?;
+        validate_standalone_replay_policy(entry)?;
         validate_replication_payloads(&entry.op, caps.max_value_bytes)?;
     }
     let tx = super::standalone_transaction(conn)?;
@@ -922,6 +988,9 @@ pub(crate) fn rebuild_replication_state_sync(
     .map_err(|e| StoreError::BackendUnavailable(e.to_string()))?;
 
     for entry in entries {
+        if entry.replay_policy.prune_expired {
+            super::ops::prune_sync(&tx, entry.timestamp)?;
+        }
         apply_replicated_op_sync(&tx, entry.op.clone(), caps, entry.timestamp)?;
 
         let entry_json =

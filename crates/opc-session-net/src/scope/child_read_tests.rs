@@ -111,6 +111,7 @@ fn child_read_revision_two_keeps_every_frame_kind_and_all_seventeen_methods() {
         &v["authority_startup"]["frames"],
         &v["authority_startup"]["startup_frames"],
         &v["authority_startup"]["notice_frames"],
+        &v["authority_startup"]["refusal_frames"],
         &v["child_read"]["frames"],
         &v["child_read"]["results"],
     ] {

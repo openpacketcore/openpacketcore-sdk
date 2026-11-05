@@ -613,7 +613,10 @@ impl<'a> Reader<'a> {
         self.bit = (self.input.len() - rest.len()) * 8;
         Ok(&tail[..tail.len() - rest.len()])
     }
-    pub(super) fn open_octets(&mut self, maximum: usize) -> Result<Cow<'a, [u8]>, DecodeError> {
+    pub(super) fn open_octets(
+        &mut self,
+        maximum: usize,
+    ) -> Result<SensitiveValue<'a>, DecodeError> {
         self.align()?;
         let start = self.bit / 8;
         let tail = self

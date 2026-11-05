@@ -430,23 +430,30 @@ async fn async_persistence_old_completion_cannot_certify_a_new_leader() {
                 .last_log_index
                 .unwrap();
             let hold = CompletionHold::new(&old_store);
-            let started = tokio::time::Instant::now();
             let pending = {
                 let cold = cold.clone();
                 let leader = fleet.peers[old].node;
-                tokio::spawn(async move {
-                    cold.call_peer::<_, ColdQuorumCut>(
-                        leader,
-                        SessionConsensusRpcFamily::ReadBarrier,
-                        &request,
-                        started + OPERATION_BOUND,
-                    )
-                    .await
-                })
+                tokio::spawn(clock::run(async move {
+                    let started = tokio::time::Instant::now();
+                    let result = cold
+                        .call_peer::<_, ColdQuorumCut>(
+                            leader,
+                            SessionConsensusRpcFamily::ReadBarrier,
+                            &request,
+                            started + OPERATION_BOUND,
+                        )
+                        .await;
+                    assert!(started.elapsed() < OPERATION_BOUND);
+                    result
+                }))
             };
-            tokio::time::timeout(OPERATION_BOUND, hold.0.entered.notified())
-                .await
-                .unwrap();
+            let entered = Arc::clone(&hold.0);
+            clock::run(async move {
+                tokio::time::timeout(OPERATION_BOUND, entered.entered.notified())
+                    .await
+                    .unwrap();
+            })
+            .await;
             until(
                 [
                     old_store.inner.raft.metrics(),
@@ -495,9 +502,13 @@ async fn async_persistence_old_completion_cannot_certify_a_new_leader() {
                 .unwrap());
             let inquiry = ReplyRelease::pre_vote(&fleet.peers[old], fleet.peers[next].node);
             next_store.inner.raft.trigger().elect().await.unwrap();
-            tokio::time::timeout(OPERATION_BOUND, inquiry.wait_started())
-                .await
-                .unwrap();
+            let entered = Arc::clone(&inquiry.0);
+            clock::run(async move {
+                tokio::time::timeout(OPERATION_BOUND, entered.entered.notified())
+                    .await
+                    .unwrap();
+            })
+            .await;
             let proposed = inquiry.0.pre_vote();
             assert!(proposed.vote.leader_id.term > vote.leader_id.term);
             assert_eq!(old_store.inner.raft.metrics().borrow().vote, vote);
@@ -526,7 +537,6 @@ async fn async_persistence_old_completion_cannot_certify_a_new_leader() {
                     SessionConsensusPeerError::Rejected
                 ))
             ));
-            assert!(started.elapsed() < OPERATION_BOUND);
             assert!(!cold.inner.persistence_protocol.is_active());
             until([old_store.inner.raft.metrics(), next_store.inner.raft.metrics()],
             || {

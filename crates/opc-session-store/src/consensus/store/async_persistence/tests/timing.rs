@@ -166,3 +166,68 @@ async fn functional_progress_wait_is_independent_of_the_callers_clock() {
     );
     assert!(!completed_before_release);
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn functional_fixture_drain_survives_host_delay() {
+    let _timing = crate::acquire_consensus_timing_test_permit().await;
+    let mut fleet = Fleet::new(3);
+    let result = AssertUnwindSafe(async {
+        let gate = Arc::new(SnapshotArtifactGate::new());
+        let release = Release(Arc::clone(&gate));
+        let held = Arc::clone(&gate);
+        fleet
+            .open_with_hook(
+                0,
+                SessionPersistenceMode::Async,
+                Some(Arc::new(move || {
+                    held.block_if_armed_blocking();
+                    Ok(())
+                })),
+            )
+            .await
+            .unwrap();
+        for index in [1, 2] {
+            fleet
+                .open(index, SessionPersistenceMode::Async)
+                .await
+                .unwrap();
+        }
+        fleet.form().await;
+        let store = fleet.store(0).clone();
+        clock::drain(&store).await.unwrap();
+        gate.arm();
+        let request = create_request(fleet.store(fleet.leader()), 1702, &provider()).await;
+        let outcome = create(fleet.store(fleet.leader()), &request).await;
+        assert_recorded(&store, &request, &outcome).await;
+        let cut = store
+            .inner
+            .private_wal
+            .as_ref()
+            .unwrap()
+            .request_async_persistence()
+            .unwrap();
+        clock::watchdog(gate.wait_started(), "held fixture drain writer").await;
+        clock::run(async move {
+            let drain = clock::drain(&store);
+            tokio::pin!(drain);
+            assert!(futures_util::poll!(drain.as_mut()).is_pending());
+            let delayed_release = tokio::task::spawn_blocking(move || {
+                // The disk event arrives after the wall-clock bound while
+                // this operation's protocol clock remains unchanged.
+                std::thread::sleep(Duration::from_millis(1_700));
+                gate.release();
+            });
+            let health = drain.await.unwrap();
+            delayed_release.await.unwrap();
+            let progress = health.asynchronous.unwrap();
+            assert!(progress.completed_generation >= cut.0);
+            assert!(progress.completed_sequence >= cut.1);
+        })
+        .await;
+        drop(release);
+    })
+    .catch_unwind()
+    .await;
+    fleet.close_all().await;
+    result.unwrap_or_else(|panic| std::panic::resume_unwind(panic));
+}

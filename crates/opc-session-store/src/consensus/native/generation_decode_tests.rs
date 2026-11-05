@@ -8,6 +8,103 @@ use crate::{EncryptedSessionPayload, FenceToken};
 mod roster;
 
 #[test]
+fn native_epoch_key_codec_requires_its_positional_vocabulary() {
+    let (storage, _, request) = fixture();
+    let key = request.lease().key();
+    let row = &**storage.business.keys.get(key).unwrap();
+    let old = key_codec::BeforeEpoch::from_current(row).unwrap();
+    let before = postcard::to_allocvec(&(key, Some(&old))).unwrap();
+    let current = postcard::to_allocvec(&(key, Some(row))).unwrap();
+    assert_eq!(
+        serde_json::to_vec(row).unwrap(),
+        serde_json::to_vec(&old).unwrap()
+    );
+    assert_eq!(current.len(), before.len() + 1);
+    assert_eq!(current.last(), Some(&0));
+    for format in [
+        Format::V2,
+        Format::V3,
+        Format::V4,
+        Format::V5,
+        Format::V6,
+        Format::V6_SLOTS,
+    ] {
+        key_scratch(&before, format).unwrap();
+        let (decoded_key, decoded) = decode_key(&before, format).unwrap();
+        assert_eq!(&decoded_key, key);
+        assert_eq!(decoded.unwrap().retired_epoch, None);
+        assert!(key_scratch(&current, format).is_err());
+        assert!(decode_key(&current, format).is_err());
+    }
+    assert!(key_scratch(&before, Format::V7).is_err());
+    assert!(decode_key(&before, Format::V7).is_err());
+    for tag in [None, Some(0), Some(1), Some(u64::MAX)] {
+        let mut tagged = row.clone();
+        tagged.retired_epoch = tag;
+        let bytes = postcard::to_allocvec(&(key, Some(&tagged))).unwrap();
+        for format in [Format::V7, Format::V7_SLOTS] {
+            key_scratch(&bytes, format).unwrap();
+            let (decoded_key, decoded) = decode_key(&bytes, format).unwrap();
+            assert_eq!(&decoded_key, key);
+            assert_eq!(decoded.unwrap().retired_epoch, tag);
+        }
+        if tag.is_some() {
+            assert!(key_codec::BeforeEpoch::from_current(&tagged).is_err());
+            assert_ne!(
+                serde_json::to_vec(&tagged).unwrap(),
+                serde_json::to_vec(&old).unwrap()
+            );
+        }
+    }
+}
+
+#[test]
+fn native_epoch_key_admission_rejects_live_and_out_of_window_tags() {
+    let (storage, _, request) = fixture();
+    let key = request.lease().key();
+    let mut frontiers = storage.business.frontiers.clone();
+    frontiers.retention.keys.epoch = 2;
+    frontiers.retention.keys.last_rotation = Some(crate::key_retention::RotationReason::Threshold);
+    frontiers.retention.keys.retired_count = 1;
+    let original = &**storage.business.keys.get(key).unwrap();
+    frontiers.retention.keys.retired_max = original.fence;
+    frontiers.retention.keys.floor_cur = original.fence + 1;
+    frontiers.next_fence = original.fence + 2;
+    let dead = NativeKeyState {
+        fence: original.fence,
+        retired_epoch: Some(2),
+        ..NativeKeyState::default()
+    };
+    for tag in [1, 2] {
+        let mut row = dead.clone();
+        row.retired_epoch = Some(tag);
+        let bytes = postcard::to_allocvec(&(key, Some(&row))).unwrap();
+        inspect_key_format(&bytes, Format::V7, &frontiers, &|| Ok(())).unwrap();
+    }
+    for case in 0..7 {
+        let mut row = dead.clone();
+        match case {
+            0 => row.retired_epoch = Some(0),
+            1 => row.retired_epoch = Some(3),
+            2 => row.record = original.record.clone(),
+            3 => row.lease = original.lease.clone(),
+            4 => row.reserved = true,
+            5 => row.fence = frontiers.retention.keys.retired_max + 1,
+            6 => {
+                row.retired_epoch = Some(1);
+                row.fence = frontiers.retention.keys.floor_cur;
+            }
+            _ => unreachable!(),
+        }
+        let bytes = postcard::to_allocvec(&(key, Some(&row))).unwrap();
+        assert!(
+            inspect_key_format(&bytes, Format::V7, &frontiers, &|| Ok(())).is_err(),
+            "case {case}"
+        );
+    }
+}
+
+#[test]
 fn native_previous_scope_format_cold_admission_requires_fresh_installation() {
     let (storage, _, _) = fixture();
     let certificate = crate::scope_authority::ScopeProfileActivation::new(
@@ -57,7 +154,7 @@ fn scope_authority_cold_checkpoint_preflight_validates_dedicated_rows_and_refuse
     let bytes = postcard::to_allocvec(&(&key, Some(&row))).unwrap();
     verify_key(&bytes, &storage.business.frontiers, &|| Ok(())).unwrap();
     for end in [0, 1, bytes.len() / 2, bytes.len() - 1] {
-        assert!(key_scratch(&bytes[..end]).is_err());
+        assert!(key_scratch(&bytes[..end], Format::V7).is_err());
     }
     let mut legacy = (**storage.business.generic_receipts.values().next().unwrap()).clone();
     let NativeGenericReceipt::Ordinary(receipt) = &mut legacy else {
@@ -273,7 +370,7 @@ fn native_generation_cold_key_preflight_matches_complete_postcard_and_original_p
         }
         let bytes = postcard::to_allocvec(&(key, Some(&row))).unwrap();
         assert_eq!(
-            key_scratch(&bytes).unwrap(),
+            key_scratch(&bytes, Format::V7).unwrap(),
             METADATA + 6 * row.record.as_ref().map_or(0, |record| record.payload.len())
         );
         verify_key(&bytes, &storage.business.frontiers, &|| Ok(())).unwrap();
@@ -281,19 +378,37 @@ fn native_generation_cold_key_preflight_matches_complete_postcard_and_original_p
         bad.fence = storage.business.frontiers.next_fence;
         let bad = postcard::to_allocvec(&(key, Some(&bad))).unwrap();
         assert!(
-            key_scratch(&bad).is_ok(),
+            key_scratch(&bad, Format::V7).is_ok(),
             "preflight is not semantic admission"
         );
         assert!(verify_key(&bad, &storage.business.frontiers, &|| Ok(())).is_err());
         for prefix in 0..bytes.len() {
-            assert!(key_scratch(&bytes[..prefix]).is_err());
+            assert!(key_scratch(&bytes[..prefix], Format::V7).is_err());
         }
         let mut trailing = bytes;
         trailing.push(0);
-        assert!(key_scratch(&trailing).is_err());
+        assert!(key_scratch(&trailing, Format::V7).is_err());
     }
     let absent = postcard::to_allocvec(&(key, None::<NativeKeyState>)).unwrap();
-    verify_key(&absent, &storage.business.frontiers, &|| Ok(())).unwrap();
+    assert!(verify_key(&absent, &storage.business.frontiers, &|| Ok(())).is_err());
+    let (retired, old) = crate::consensus::native::key_retention_tests::retired_key_fixture();
+    let absent = postcard::to_allocvec(&(old.key(), None::<NativeKeyState>)).unwrap();
+    assert!(verify_key(&absent, &retired.business.frontiers, &|| Ok(())).is_err());
+    // The isolated row decoder receives the selected post-window frontier.
+    // Catalog admission independently checks the removed row's original tag.
+    let mut forgotten = retired.business.frontiers.clone();
+    forgotten.retention.keys = crate::key_retention::KeyRetention {
+        epoch: 2,
+        floor_prev: old.fence().get() + 1,
+        floor_cur: old.fence().get() + 2,
+        retired_max: 0,
+        retired_count: 0,
+        last_rotation: Some(crate::key_retention::RotationReason::Threshold),
+    };
+    forgotten.next_fence = forgotten
+        .next_fence
+        .max(forgotten.retention.keys.floor_cur + 1);
+    verify_key(&absent, &forgotten, &|| Ok(())).unwrap();
 
     let mut row = (**row).clone();
     let record = row.record.as_mut().unwrap();
@@ -308,9 +423,13 @@ fn native_generation_cold_key_preflight_matches_complete_postcard_and_original_p
     envelope.ciphertext_and_tag.push(0);
     row.record.as_mut().unwrap().payload =
         EncryptedSessionPayload::try_envelope(envelope.encode().unwrap()).unwrap();
-    assert!(key_scratch(&postcard::to_allocvec(&(key, Some(&row))).unwrap()).is_err());
+    assert!(key_scratch(
+        &postcard::to_allocvec(&(key, Some(&row))).unwrap(),
+        Format::V7
+    )
+    .is_err());
     // A forged length is rejected while the cursor still borrows the input.
-    assert!(key_scratch(&postcard::to_allocvec(&usize::MAX).unwrap()).is_err());
+    assert!(key_scratch(&postcard::to_allocvec(&usize::MAX).unwrap(), Format::V7).is_err());
 }
 
 #[test]
@@ -349,7 +468,11 @@ fn native_generation_cold_key_preflight_bounds_scope_child_metadata_separately()
     verify_key(&bytes, &storage.business.frontiers, &|| Ok(())).unwrap();
     row.record.as_mut().unwrap().payload =
         EncryptedSessionPayload::new(vec![0; crate::scope_storage::MAX_SCOPE_ROW_BYTES + 1]);
-    assert!(key_scratch(&postcard::to_allocvec(&(&key, Some(&row))).unwrap()).is_err());
+    assert!(key_scratch(
+        &postcard::to_allocvec(&(&key, Some(&row))).unwrap(),
+        Format::V7
+    )
+    .is_err());
 }
 
 #[test]

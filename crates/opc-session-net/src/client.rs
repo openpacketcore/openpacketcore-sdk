@@ -970,7 +970,7 @@ fn discard_replication_payloads_from_response(response: Response) {
                 .for_each(discard_replication_entry_iteratively);
         }
         Response::WatchEntry(Ok(entry)) => {
-            discard_replication_entry_iteratively(entry);
+            discard_replication_entry_iteratively(*entry);
         }
         _ => {}
     }
@@ -3035,10 +3035,18 @@ async fn read_watch_stream(
         };
         match frame {
             Ok(Response::WatchEntry(Ok(entry))) => {
-                let entry = match entry.into_validated() {
-                    Ok(entry) if entry.sequence == expected_sequence => entry,
+                let entry = match (*entry).into_validated() {
+                    Ok(entry)
+                        if entry
+                            .matches_watch_cursor(expected_sequence)
+                            .unwrap_or(false) =>
+                    {
+                        entry
+                    }
                     Ok(entry) => {
-                        discard_replication_payloads_from_response(Response::WatchEntry(Ok(entry)));
+                        discard_replication_payloads_from_response(Response::watch_entry(Ok(
+                            entry,
+                        )));
                         set_watch_terminal(
                             &terminal_error,
                             StoreError::BackendUnavailable(
@@ -3057,7 +3065,8 @@ async fn read_watch_stream(
                         break;
                     }
                 };
-                let terminal_sequence = expected_sequence == u64::MAX;
+                let delivered_sequence = entry.sequence;
+                let terminal_sequence = delivered_sequence == u64::MAX;
                 match tx.try_send(Ok(entry)) {
                     Ok(()) => {}
                     Err(tokio::sync::mpsc::error::TrySendError::Closed(item)) => {
@@ -3088,7 +3097,7 @@ async fn read_watch_stream(
                 // Resume only after the item crossed the caller-visible
                 // delivery boundary. A disconnect before this point replays
                 // the item; one after it resumes at the checked successor.
-                expected_sequence = next_replication_sequence(expected_sequence)
+                expected_sequence = next_replication_sequence(delivered_sequence)
                     .map_err(|_| ProtocolError::InvalidWireValue)?;
             }
             Ok(Response::WatchEntry(Err(error))) => {
@@ -3173,6 +3182,7 @@ fn store_error_kind(err: &StoreError) -> &'static str {
         StoreError::BackendOperationOutcomeUnavailable => "backend_operation_outcome_unavailable",
         StoreError::TopologyAuthorityRevoked => "topology_authority_revoked",
         StoreError::CapabilityNotSupported(_) => "capability_not_supported",
+        StoreError::KeyProviderUnavailable(_) => "key_provider_unavailable",
         StoreError::BackendUnavailable(_)
         | StoreError::FencedTransitionRecoveryJournalUnavailable => "backend_unavailable",
         StoreError::InvalidKey(_) => "invalid_key",
@@ -3237,6 +3247,7 @@ fn set_watch_terminal(terminal: &Arc<std::sync::Mutex<Option<StoreError>>>, erro
 #[cfg(all(test, feature = "insecure-test"))]
 mod tests {
     use super::*;
+    use crate::controlled_clock as controlled_watch_clock;
     use crate::protocol::write_frame;
     use futures_util::{FutureExt, StreamExt};
     use opc_session_store::{
@@ -3332,6 +3343,7 @@ mod tests {
                 .expect("representable test deadline"),
         );
         ReplicationEntry {
+            replay_policy: opc_session_store::ReplicationReplayPolicy::prune_expired(),
             sequence: 1,
             tx_id: "forged-response-deadline"
                 .try_into()
@@ -3409,6 +3421,7 @@ mod tests {
 
     fn replication_entry_at_depth(depth: usize) -> ReplicationEntry {
         ReplicationEntry {
+            replay_policy: opc_session_store::ReplicationReplayPolicy::prune_expired(),
             sequence: 1,
             tx_id: "over-depth-response"
                 .try_into()
@@ -3423,6 +3436,7 @@ mod tests {
             .map(|_| opc_session_store::ReplicationOp::Batch { ops: Vec::new() })
             .collect();
         ReplicationEntry {
+            replay_policy: opc_session_store::ReplicationReplayPolicy::prune_expired(),
             sequence: 1,
             tx_id: "over-count-response"
                 .try_into()
@@ -6705,7 +6719,7 @@ mod tests {
             write_frame(&mut stream, &Response::WatchStream)
                 .await
                 .expect("write watch acknowledgement");
-            let response = serde_json::to_value(Response::WatchEntry(Ok(valid_deadline_entry())))
+            let response = serde_json::to_value(Response::watch_entry(Ok(valid_deadline_entry())))
                 .expect("serialize valid watch response");
             let response = forge_deadline_in_wire_response(response, "/WatchEntry/Ok");
             write_frame(&mut stream, &response)
@@ -6750,7 +6764,7 @@ mod tests {
                 .expect("write first watch ack");
             write_frame(
                 &mut first,
-                &Response::WatchEntry(Ok(valid_deadline_entry())),
+                &Response::watch_entry(Ok(valid_deadline_entry())),
             )
             .await
             .expect("write first watch entry");
@@ -6780,7 +6794,7 @@ mod tests {
             let mut second_entry = valid_deadline_entry();
             second_entry.sequence = 2;
             second_entry.tx_id = "watch-rotation-2".try_into().expect("valid transaction ID");
-            write_frame(&mut second, &Response::WatchEntry(Ok(second_entry)))
+            write_frame(&mut second, &Response::watch_entry(Ok(second_entry)))
                 .await
                 .expect("write replacement watch entry");
         });
@@ -6856,7 +6870,7 @@ mod tests {
                     entry.tx_id = "watch-setup-replacement"
                         .try_into()
                         .expect("valid transaction ID");
-                    write_frame(&mut stream, &Response::WatchEntry(Ok(entry)))
+                    write_frame(&mut stream, &Response::watch_entry(Ok(entry)))
                         .await
                         .expect("write replacement watch item");
                 }
@@ -6908,7 +6922,7 @@ mod tests {
             write_frame(&mut stream, &Response::WatchStream)
                 .await
                 .expect("write partial-watch ack");
-            let encoded = serde_json::to_vec(&Response::WatchEntry(Ok(valid_deadline_entry())))
+            let encoded = serde_json::to_vec(&Response::watch_entry(Ok(valid_deadline_entry())))
                 .expect("encode watch entry");
             stream
                 .write_all(
@@ -6959,7 +6973,7 @@ mod tests {
                 .expect("write replacement watch ack");
             write_frame(
                 &mut replacement,
-                &Response::WatchEntry(Ok(valid_deadline_entry())),
+                &Response::watch_entry(Ok(valid_deadline_entry())),
             )
             .await
             .expect("write complete replacement watch entry");
@@ -7027,6 +7041,90 @@ mod tests {
         assert_eq!(server.await.expect("cancelled-watch server"), 0);
     }
 
+    async fn observe_terminal_watch_connections(
+        listener: TcpListener,
+        stream: TcpStream,
+    ) -> (usize, Option<TcpStream>) {
+        let _stream = stream;
+        // The original socket may close before the watch attempts a reconnect.
+        // Keep the complete observation window even after that EOF.
+        match tokio::time::timeout(Duration::from_millis(250), listener.accept()).await {
+            Ok(Ok((retry, _))) => (2, Some(retry)),
+            _ => (1, None),
+        }
+    }
+
+    async fn assert_terminal_observer_sees_a_late_connection(watch_owned: bool) {
+        use std::future::Future;
+        use std::task::Poll;
+
+        controlled_watch_clock::run(async move {
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            let original = TcpStream::connect(addr).await.unwrap();
+            let (mut stream, _) = listener.accept().await.unwrap();
+            drop(original);
+            let mut byte = [0; 1];
+            assert_eq!(stream.read(&mut byte).await.unwrap(), 0);
+
+            // The original socket has closed, but this fixture still owns a
+            // later connection attempt. EOF must not end the accept window.
+            let started = tokio::time::Instant::now();
+            let mut observation = Box::pin(observe_terminal_watch_connections(listener, stream));
+            let early = std::future::poll_fn(|cx| Poll::Ready(observation.as_mut().poll(cx))).await;
+            let mut late = TcpStream::connect(addr).await;
+            if let Ok(connection) = &mut late {
+                let request = if watch_owned {
+                    Request::Watch {
+                        start_sequence: u64::MAX,
+                    }
+                } else {
+                    Request::Capabilities
+                };
+                write_frame(connection, &request).await.unwrap();
+            }
+            let (count, accepted) = match early {
+                Poll::Ready(result) => result,
+                Poll::Pending => observation.await,
+            };
+            assert_eq!(
+                count, 2,
+                "the observation must include an attempt after EOF"
+            );
+            let late = late.expect("the observation keeps its listener alive");
+            let mut accepted = accepted.expect("the counted connection was actually accepted");
+            assert_eq!(accepted.peer_addr().unwrap(), late.local_addr().unwrap());
+            let request: Request = read_frame(&mut accepted, DEFAULT_MAX_FRAME_SIZE)
+                .await
+                .unwrap();
+            assert_eq!(
+                matches!(
+                    request,
+                    Request::Watch {
+                        start_sequence: u64::MAX
+                    }
+                ),
+                watch_owned,
+                "the synthetic request distinguishes this watch attempt from the unrelated fixture"
+            );
+            if !watch_owned {
+                assert!(matches!(request, Request::Capabilities));
+            }
+            assert_eq!(started.elapsed(), Duration::ZERO);
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn terminal_observer_detects_a_watch_reconnect_after_socket_close() {
+        assert_terminal_observer_sees_a_late_connection(true).await;
+    }
+
+    #[tokio::test]
+    async fn terminal_observer_distinguishes_an_unrelated_connection_after_socket_close() {
+        assert_terminal_observer_sees_a_late_connection(false).await;
+    }
+
     #[tokio::test]
     async fn terminal_watch_sequence_is_delivered_once_without_reconnect() {
         let listener = TcpListener::bind("127.0.0.1:0")
@@ -7056,13 +7154,10 @@ mod tests {
             let mut entry = valid_deadline_entry();
             entry.sequence = u64::MAX;
             entry.tx_id = "terminal-watch".try_into().expect("valid transaction ID");
-            write_frame(&mut stream, &Response::WatchEntry(Ok(entry)))
+            write_frame(&mut stream, &Response::watch_entry(Ok(entry)))
                 .await
                 .expect("write terminal-watch entry");
-            match tokio::time::timeout(Duration::from_millis(250), listener.accept()).await {
-                Ok(Ok((_retry, _))) => 2,
-                _ => 1,
-            }
+            observe_terminal_watch_connections(listener, stream).await.0
         });
         let backend = RemoteSessionBackend::new_insecure(addr, Some(Duration::from_secs(1)));
         let mut watch = backend.watch(u64::MAX).await.expect("open terminal watch");
@@ -7102,7 +7197,7 @@ mod tests {
                 .expect("write permanent-watch ack");
             write_frame(
                 &mut stream,
-                &Response::WatchEntry(Err(StoreError::ReplicationWatchCatchUpRequired)),
+                &Response::watch_entry(Err(StoreError::ReplicationWatchCatchUpRequired)),
             )
             .await
             .expect("write permanent watch error");
@@ -7153,7 +7248,7 @@ mod tests {
                 entry.tx_id = format!("slow-watch-{sequence}")
                     .try_into()
                     .expect("valid transaction ID");
-                if write_frame(&mut stream, &Response::WatchEntry(Ok(entry)))
+                if write_frame(&mut stream, &Response::watch_entry(Ok(entry)))
                     .await
                     .is_err()
                 {
@@ -7221,7 +7316,7 @@ mod tests {
                 .expect("write watch acknowledgement");
             write_frame(
                 &mut stream,
-                &Response::WatchEntry(Ok(replication_entry_at_operation_limit())),
+                &Response::watch_entry(Ok(replication_entry_at_operation_limit())),
             )
             .await
             .expect("write lower watch entry");
@@ -7315,7 +7410,7 @@ mod tests {
                 .await
                 .expect("write watch acknowledgement");
 
-            let mut response = serde_json::to_value(Response::WatchEntry(Ok(
+            let mut response = serde_json::to_value(Response::watch_entry(Ok(
                 replication_entry_at_operation_limit(),
             )))
             .expect("serialize maximum-width watch response");
@@ -7466,6 +7561,7 @@ mod tests {
             .is_empty());
 
         let lightweight_entry = ReplicationEntry {
+            replay_policy: opc_session_store::ReplicationReplayPolicy::prune_expired(),
             sequence: 1,
             tx_id: "t".try_into().expect("valid transaction ID"),
             op: opc_session_store::ReplicationOp::Batch { ops: Vec::new() },

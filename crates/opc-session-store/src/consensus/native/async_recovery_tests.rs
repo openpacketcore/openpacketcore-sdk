@@ -1,5 +1,6 @@
 use super::*;
 use crate::consensus::native::changes::tests::{apply, request, time};
+use crate::consensus::native::test_journal::journal_page_for_test_sync;
 use crate::consensus::{
     SessionConsensusClusterId, SessionConsensusConfigurationEpoch, SessionConsensusConfigurationId,
 };
@@ -149,12 +150,11 @@ fn native_async_boundary_retires_unexpired_credentials_and_absent_key_fences() {
         storage.business.replication_log(old_tail, 1, &|| Ok(())),
         Err(StoreError::ReplicationLogCursorCompacted { .. })
     ));
-    assert!(storage
-        .business
-        .replication_log(floor + 1, 32, &|| Ok(()))
-        .unwrap()
-        .iter()
-        .all(|entry| entry.sequence > floor));
+    assert!(
+        journal_page_for_test_sync(|| storage.business.replication_log(floor + 1, 32, &|| Ok(())))
+            .iter()
+            .all(|entry| entry.sequence > floor)
+    );
     storage.validate_image().unwrap();
 }
 
@@ -416,23 +416,47 @@ fn native_async_boundary_coalesced_history_cannot_omit_transient_receipts() {
 fn native_async_boundary_watch_does_not_relabel_predecessor_effects() {
     let mut storage = fixture();
     acquire(&mut storage, 1, 1);
+    let predecessor =
+        journal_page_for_test_sync(|| storage.business.replication_log(1, 32, &|| Ok(())))
+            .remove(0);
     assert_eq!(storage.business.watch_sequence(), 1);
     let term = recover(&mut storage, 2);
     let floor = Reservation::initial().ceiling();
-    assert!(storage
-        .business
-        .replication_log(floor + 1, 32, &|| Ok(()))
-        .unwrap()
-        .is_empty());
-    assert_eq!(storage.business.watch_sequence(), floor);
-    acquire(&mut storage, term, 3);
-    let page = storage
-        .business
-        .replication_log(floor + 1, 32, &|| Ok(()))
-        .unwrap();
-    assert_eq!(page.len(), 1);
-    assert_eq!(page[0].sequence, floor + 1);
+    let context =
+        journal_page_for_test_sync(|| storage.business.replication_log(floor + 1, 32, &|| Ok(())));
+    assert_eq!(context.len(), 1);
+    assert_eq!(context[0].sequence, floor + 1);
+    assert!(matches!(&context[0].op, crate::ReplicationOp::Batch { ops } if ops.is_empty()));
+    let mut expected = crate::ReplicationReplayPolicy::preserve();
+    expected.async_fence_floor = floor;
+    expected.recovery = crate::ReplicationRecoveryBoundary::Recover {
+        previous_sequence: 1,
+    };
+    assert_eq!(context[0].replay_policy, expected);
     assert_eq!(storage.business.watch_sequence(), floor + 1);
+    let mut retained = Vec::new();
+    NativeNotification::visit_export(
+        &storage.business.notifications,
+        &storage.business.frontiers,
+        &|| Ok(()),
+        &mut |entry| {
+            retained.push(owned::notification(entry)?);
+            Ok(())
+        },
+    )
+    .unwrap();
+    assert_eq!(
+        retained[0], predecessor,
+        "the old effect keeps its original position and policy"
+    );
+    acquire(&mut storage, term, 3);
+    let page =
+        journal_page_for_test_sync(|| storage.business.replication_log(floor + 1, 32, &|| Ok(())));
+    assert_eq!(page.len(), 2);
+    assert_eq!(page[0], context[0]);
+    assert_eq!(page[1].sequence, floor + 2);
+    assert_eq!(page[1].replay_policy.async_fence_floor, floor);
+    assert_eq!(storage.business.watch_sequence(), floor + 2);
 }
 
 #[test]
@@ -444,4 +468,153 @@ fn native_async_boundary_history_generation_exceeds_lost_range() {
     let mut inactive = fixture();
     recover(&mut inactive, 1);
     assert!(inactive.business.history_state().unwrap().generation() > floor);
+}
+
+#[test]
+fn native_async_recovery_capacity_rotation_fences_absent_preparations() {
+    use crate::consensus::native::key_retention_tests::{ephemeral_request, retired_key_fixture};
+    let (mut storage, retired) = retired_key_fixture();
+    let term = recover(&mut storage, 5);
+    let recovery_floor = Reservation::initial().ceiling();
+    let mut absent = retired.key().clone();
+    absent.stable_id = bytes::Bytes::from_static(b"async-capacity-absent")
+        .try_into()
+        .unwrap();
+    let observed = storage.business.observe_at(&absent, time(2)).unwrap();
+    assert!(observed.record().is_none());
+    assert_eq!(observed.current_fence().get(), recovery_floor);
+    let prepared = ephemeral_request(
+        absent.clone(),
+        81,
+        recovery_floor,
+        storage
+            .business
+            .history_state()
+            .unwrap()
+            .active_epoch()
+            .unwrap(),
+        time(2),
+    );
+
+    // Even at a deliberately overfull test limit, rejected commands must not
+    // enter the production capacity finalizer or advance either floor.
+    let before = storage.business.frontiers.retention;
+    let rejected = command(
+        &storage,
+        term,
+        6,
+        SessionMutationIntent::ReleaseLease(retired.clone()),
+    );
+    let result =
+        retention::with_key_capacity_limit_for_test(1, || apply(&mut storage, &[rejected]));
+    assert_eq!(result.responses[0].result, Err(StoreError::StaleFence));
+    assert!(storage.business.frontiers.retention == before);
+    assert_eq!(storage.business.keys.len(), 2);
+
+    let mut replacement = absent.clone();
+    replacement.stable_id = bytes::Bytes::from_static(b"async-capacity-live")
+        .try_into()
+        .unwrap();
+    let acquire = command(
+        &storage,
+        term,
+        7,
+        SessionMutationIntent::AcquireLease {
+            key: replacement.clone(),
+            owner: crate::OwnerId::new("capacity-owner").unwrap(),
+            ttl: Duration::from_secs(60),
+        },
+    );
+    // This override is read inside NativeDelta::entry's actual successful
+    // command finalizer, before publication. The epoch threshold stays N.
+    let result = retention::with_key_capacity_limit_for_test(2, || apply(&mut storage, &[acquire]));
+    let Ok(SessionMutationOutcome::Lease(live)) = &result.responses[0].result else {
+        panic!(
+            "capacity acquisition must commit: {:?}",
+            result.responses[0].result
+        );
+    };
+    let keys = storage.business.frontiers.retention.keys;
+    assert_eq!(keys.epoch, 2);
+    assert_eq!(keys.floor_prev, recovery_floor + 1);
+    assert_eq!(keys.floor_cur, recovery_floor + 2);
+    assert_eq!(keys.retired_count, 0);
+    assert_eq!(
+        keys.last_rotation,
+        Some(crate::key_retention::RotationReason::Capacity)
+    );
+    assert_eq!(storage.business.keys.len(), 2);
+    assert!(!storage.business.keys.contains_key(retired.key()));
+    assert!(retired.fence().get() < keys.floor_prev);
+    assert!(live.fence().get() < keys.floor_cur);
+    assert_eq!(
+        storage
+            .business
+            .observe_at(&replacement, time(2))
+            .unwrap()
+            .current_fence(),
+        live.fence()
+    );
+
+    let next_fence = storage.business.frontiers.next_fence;
+    let next_credential = storage.business.frontiers.next_credential;
+    let watch = storage.business.watch_sequence();
+    let stale = command(
+        &storage,
+        term,
+        8,
+        SessionMutationIntent::FencedTransitionV2(Box::new(prepared)),
+    );
+    let rejected = apply(&mut storage, &[stale]);
+    assert_eq!(rejected.responses[0].result, Err(StoreError::StaleFence));
+    assert!(rejected.notifications.is_empty());
+    assert!(storage.business.frontiers.retention.keys == keys);
+    assert_eq!(storage.business.frontiers.next_fence, next_fence);
+    assert_eq!(storage.business.frontiers.next_credential, next_credential);
+    assert_eq!(storage.business.watch_sequence(), watch);
+    assert!(!storage.business.keys.contains_key(&absent));
+
+    let refreshed = storage.business.observe_at(&absent, time(2)).unwrap();
+    assert_eq!(refreshed.current_fence().get(), recovery_floor + 2);
+    let fresh = ephemeral_request(
+        absent.clone(),
+        82,
+        refreshed.current_fence().get(),
+        storage
+            .business
+            .history_state()
+            .unwrap()
+            .active_epoch()
+            .unwrap(),
+        time(2),
+    );
+    let fresh = command(
+        &storage,
+        term,
+        9,
+        SessionMutationIntent::FencedTransitionV2(Box::new(fresh)),
+    );
+    let created = apply(&mut storage, &[fresh]);
+    let Ok(SessionMutationOutcome::FencedTransition(outcome)) = &created.responses[0].result else {
+        panic!(
+            "reobserved current floor must create: {:?}",
+            created.responses[0].result
+        );
+    };
+    assert_eq!(outcome.lease().fence().get(), recovery_floor + 3);
+    let mut bytes = Vec::new();
+    storage.write_image(&mut bytes, [0xC3; 32], 19).unwrap();
+    let reopened = NativeStorage::read_image(
+        &mut bytes.as_slice(),
+        [0xC3; 32],
+        19,
+        storage.business.identity,
+    )
+    .unwrap();
+    reopened.validate_image().unwrap();
+    assert!(reopened.business.frontiers == storage.business.frontiers);
+    assert_eq!(
+        reopened.business.observe_at(&absent, time(2)).unwrap(),
+        storage.business.observe_at(&absent, time(2)).unwrap()
+    );
 }

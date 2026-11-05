@@ -375,10 +375,11 @@ impl Engine {
         // to have completed the handshake, a stale plaintext handshake is just
         // unauthenticated noise (or a replay/amplification attempt) and must not
         // drive a resend.
-        if let Some(dupe_seq) = maybe_dupe_seq {
-            if dupe_seq < self.peer_handshake_seq_no && !self.peer_handshake_confirmed {
-                self.flight_resend("dupe triggers resend")?;
-            }
+        if let Some(dupe_seq) = maybe_dupe_seq
+            && dupe_seq < self.peer_handshake_seq_no
+            && !self.peer_handshake_confirmed
+        {
+            self.flight_resend("dupe triggers resend")?;
         }
 
         // Drop old duplicates we've already processed - don't let them block newer messages.
@@ -484,10 +485,10 @@ impl Engine {
         }
 
         // The connect timeout is the overall timeout for establishing the connection
-        if let Timeout::Armed(connect_timeout) = self.connect_timeout {
-            if now >= connect_timeout {
-                return Err(Error::Timeout(crate::TimeoutError::Connect));
-            }
+        if let Timeout::Armed(connect_timeout) = self.connect_timeout
+            && now >= connect_timeout
+        {
+            return Err(Error::Timeout(crate::TimeoutError::Connect));
         }
 
         // If there is no flight timeout, we have already checked the global connect timeout.
@@ -547,12 +548,9 @@ impl Engine {
             .rfc6083_output_barrier
             .as_ref()
             .is_some_and(|barrier| barrier.preceding_datagrams == 0)
+            && let Some(barrier) = self.rfc6083_output_barrier.take()
         {
-            if let Some(barrier) = self.rfc6083_output_barrier.take() {
-                return Output::Rfc6083KeyingMaterial(KeyingMaterial::from_zeroizing(
-                    barrier.material,
-                ));
-            }
+            return Output::Rfc6083KeyingMaterial(KeyingMaterial::from_zeroizing(barrier.material));
         }
         if self.rfc6083_prepare_ccs_barrier == Some(0) {
             self.rfc6083_prepare_ccs_barrier = None;

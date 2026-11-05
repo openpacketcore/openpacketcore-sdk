@@ -17,7 +17,6 @@ import subprocess
 import tarfile
 import tempfile
 import time
-import urllib.request
 
 COMMIT = "fd73f4a6659897191fa0d40695fe370925dd3780"
 SOURCE_SHA = "1846a6d56bda7798cdff7b743d54975f1e96cbcf89cb48d5f92b2b863cdf262f"
@@ -43,15 +42,11 @@ def run(args, **kwargs):
     return subprocess.run([str(a) for a in args], check=True, **kwargs)
 
 
-def download(url, path, expected, *, image=False):
+def download(url, path, expected):
     if not path.exists() or digest(path) != expected:
         temporary = path.with_suffix(path.suffix + ".download")
         try:
-            if image:
-                run(["bash", Path(__file__).resolve().with_name("download-image.sh"), url, temporary])
-            else:
-                with urllib.request.urlopen(url, timeout=90) as source, temporary.open("wb") as target:
-                    shutil.copyfileobj(source, target)
+            run(["bash", Path(__file__).resolve().with_name("download-image.sh"), url, temporary])
             if digest(temporary) != expected:
                 raise RuntimeError("download digest mismatch")
             temporary.replace(path)
@@ -70,10 +65,10 @@ def kernel(cache, output, jobs):
                 and digest(config) == previous["config_sha256"]):
             (output / "kernel-build.json").write_text(json.dumps(previous, indent=2) + "\n")
             return image
+    archive = cache / "linux-n3-mobike.tar.gz"
+    download(f"https://codeload.github.com/torvalds/linux/tar.gz/{COMMIT}", archive, SOURCE_SHA)
     with tempfile.TemporaryDirectory(prefix="n3-kernel-build-", dir=cache) as temporary:
         root = Path(temporary)
-        archive = root / "source.tar.gz"
-        download(f"https://codeload.github.com/torvalds/linux/tar.gz/{COMMIT}", archive, SOURCE_SHA)
         with tarfile.open(archive) as source:
             source.extractall(root, filter="data")
         source = root / f"linux-{COMMIT}"
@@ -118,7 +113,7 @@ def main():
     output.mkdir(parents=True, exist_ok=True)
     kernel_image = kernel(cache, output, args.jobs)
     base = cache / "ubuntu-24.04.img"
-    download(IMAGE_URL, base, IMAGE_SHA, image=True)
+    download(IMAGE_URL, base, IMAGE_SHA)
     vm = Path(tempfile.mkdtemp(prefix="n3-mobike-vm-", dir=cache))
     pid = None
     try:

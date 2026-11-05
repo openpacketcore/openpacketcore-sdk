@@ -81,10 +81,12 @@ use crate::fenced_mutation_roster::{
     FencedMutationRosterExecutorAttestor, FencedMutationRosterMemberProvider,
     FencedMutationRosterProviderAdapter, ProtectedRosterTransportError,
 };
+use tracing::Instrument as _;
+
 use crate::lifecycle::{
     CertificateExpiryEvidence, ConnectionLifecycle, ConnectionLifecyclePolicy, ReconnectAdmission,
-    ReconnectAttempt, ReconnectGate, RetirementReason, SessionReauthenticationControl,
-    TlsCompletionTime,
+    ReconnectAttempt, ReconnectCooldownPolicy, ReconnectGate, RetirementReason,
+    SessionReauthenticationControl, TlsCompletionTime,
 };
 #[cfg(test)]
 use crate::protocol::read_frame_payload;
@@ -1004,6 +1006,21 @@ pub enum SessionConsumerClientError {
     /// authenticated tenant/NF scope.
     #[error("session consumer feature is unsupported for this scope")]
     Unsupported,
+    /// The routed peer is cooling down or already has a probe in flight. No
+    /// request byte was accepted, so a routing caller may select another peer
+    /// immediately instead of waiting for this peer's recovery.
+    #[error("session consumer peer is in reconnect cooldown")]
+    Cooldown {
+        /// Bounded remaining shared cooldown when the admission was refused.
+        ///
+        /// Rounded up to whole milliseconds, so an active cooldown never
+        /// reports `0`; zero means admission is held by an in-flight probe
+        /// without an active cooldown. The shared edge is a `Duration`.
+        remaining_cooldown_millis: u32,
+        /// Bounded time spent awaiting the shared reconnect gate, rounded up
+        /// to whole milliseconds (`0` means no measurable gate wait).
+        gate_wait_millis: u32,
+    },
     /// The quorum endpoint was unavailable.
     #[error("session consumer endpoint is unavailable")]
     Unavailable,
@@ -1260,6 +1277,7 @@ pub struct PersistentSessionConsumerConfig {
     connect_attempts: usize,
     reconnect_jitter: Duration,
     shutdown_drain: Duration,
+    cooldown_admission: ReconnectCooldownPolicy,
 }
 
 impl fmt::Debug for PersistentSessionConsumerConfig {
@@ -1274,6 +1292,7 @@ impl fmt::Debug for PersistentSessionConsumerConfig {
             .field("connect_attempts", &self.connect_attempts)
             .field("reconnect_jitter", &self.reconnect_jitter)
             .field("shutdown_drain", &self.shutdown_drain)
+            .field("cooldown_admission", &self.cooldown_admission)
             .finish()
     }
 }
@@ -1289,6 +1308,7 @@ impl Default for PersistentSessionConsumerConfig {
             connect_attempts: DEFAULT_PERSISTENT_SESSION_CONSUMER_CONNECT_ATTEMPTS,
             reconnect_jitter: DEFAULT_PERSISTENT_SESSION_CONSUMER_RECONNECT_JITTER,
             shutdown_drain: DEFAULT_PERSISTENT_SESSION_CONSUMER_SHUTDOWN_DRAIN,
+            cooldown_admission: crate::lifecycle::ReconnectCooldownPolicy::Wait,
         }
     }
 }
@@ -1315,6 +1335,7 @@ impl PersistentSessionConsumerConfig {
             connect_attempts,
             reconnect_jitter,
             shutdown_drain,
+            cooldown_admission: crate::lifecycle::ReconnectCooldownPolicy::Wait,
         };
         config.validate()?;
         Ok(config)
@@ -1383,6 +1404,27 @@ impl PersistentSessionConsumerConfig {
     /// Return the shutdown drain limit.
     pub const fn shutdown_drain(&self) -> Duration {
         self.shutdown_drain
+    }
+    /// Return the explicit reconnect-cooldown admission policy.
+    pub const fn cooldown_admission(&self) -> ReconnectCooldownPolicy {
+        self.cooldown_admission
+    }
+    /// Adopt an explicit reconnect-cooldown admission policy for this client.
+    ///
+    /// The default [`crate::lifecycle::ReconnectCooldownPolicy::Wait`] preserves the existing
+    /// single-peer behaviour: a caller waits for the coalesced cooldown edge
+    /// (bounded by its deadline) before the one serialized probe may run.
+    /// [`ReconnectCooldownPolicy::FailOver`] is the explicit routed-consumer
+    /// policy: a call that reaches this peer while its shared cooldown is
+    /// active returns the typed pre-write
+    /// [`SessionConsumerClientError::Cooldown`] immediately, so a routing loop
+    /// can select another peer without waiting. The shared exponential
+    /// back-off, the single serialized probe at cooldown expiry, the request
+    /// effect/write boundary and every retry/authority rule are unchanged.
+    #[must_use]
+    pub fn with_cooldown_admission(mut self, cooldown_admission: ReconnectCooldownPolicy) -> Self {
+        self.cooldown_admission = cooldown_admission;
+        self
     }
 }
 
@@ -2988,7 +3030,7 @@ fn exact_correlation_sequence(
     }
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ConsumerOperationKind {
     Capabilities,
     FencedTransitionCapability,
@@ -4839,10 +4881,16 @@ struct PersistentConsumerReconnectControl {
     maximum_jitter: Duration,
     minimum_backoff: Duration,
     maximum_backoff: Duration,
+    #[cfg(test)]
+    cooldown_admission: ReconnectCooldownPolicy,
 }
 
 impl PersistentConsumerReconnectControl {
-    fn new(policy: ConnectionLifecyclePolicy, maximum_jitter: Duration) -> Arc<Self> {
+    fn new(
+        policy: ConnectionLifecyclePolicy,
+        maximum_jitter: Duration,
+        _cooldown_admission: ReconnectCooldownPolicy,
+    ) -> Arc<Self> {
         let (high, low) = uuid::Uuid::new_v4().as_u64_pair();
         let minimum_backoff = policy.reconnect_backoff_min();
         let maximum_backoff = policy.reconnect_backoff_max();
@@ -4852,6 +4900,8 @@ impl PersistentConsumerReconnectControl {
             maximum_jitter,
             minimum_backoff,
             maximum_backoff,
+            #[cfg(test)]
+            cooldown_admission: _cooldown_admission,
         })
     }
 
@@ -4885,27 +4935,80 @@ impl PersistentConsumerReconnectControl {
             .publish_failure_cooldown(generation, material, self.next_jitter());
     }
 
+    fn cooldown_error(&self) -> SessionConsumerClientError {
+        let remaining = self.gate.remaining_cooldown();
+        tracing::Span::current().record("cooldown_micros", duration_micros(remaining));
+        SessionConsumerClientError::Cooldown {
+            remaining_cooldown_millis: bounded_millis(remaining),
+            gate_wait_millis: 0,
+        }
+    }
+
+    fn check_foreground_admission(
+        &self,
+        client: &StatelessSessionConsumerClient,
+        policy: ReconnectCooldownPolicy,
+    ) -> Result<(), SessionConsumerClientError> {
+        if policy == ReconnectCooldownPolicy::FailOver {
+            self.gate.observe_epoch(
+                client.reauthentication.generation(),
+                Some(client.tls_config.material_status().epoch()),
+            );
+            if !self.gate.can_probe_now() {
+                return Err(self.cooldown_error());
+            }
+        }
+        Ok(())
+    }
+
+    #[cfg(test)]
     async fn acquire(
         self: &Arc<Self>,
         deadline: tokio::time::Instant,
         generation: u64,
         material: opc_tls::TlsMaterialEpoch,
     ) -> Result<ReconnectAttempt, SessionConsumerClientError> {
+        self.acquire_with_policy(deadline, generation, material, self.cooldown_admission)
+            .await
+    }
+
+    async fn acquire_with_policy(
+        self: &Arc<Self>,
+        deadline: tokio::time::Instant,
+        generation: u64,
+        material: opc_tls::TlsMaterialEpoch,
+        policy: ReconnectCooldownPolicy,
+    ) -> Result<ReconnectAttempt, SessionConsumerClientError> {
+        let gate_span = ConsumerGateSpan {
+            span: tracing::Span::current(),
+            started: tokio::time::Instant::now(),
+        };
+        gate_span.span.record(
+            "cooldown_micros",
+            duration_micros(self.gate.remaining_cooldown()),
+        );
         match self
             .gate
-            .acquire_classified_with_jitter(
+            .acquire_classified_with_jitter_and_cooldown(
                 deadline,
                 generation,
                 Some(material),
                 self.next_jitter(),
+                policy,
             )
             .await
         {
             ReconnectAdmission::Admitted(attempt) => Ok(attempt),
-            ReconnectAdmission::Cooldown => {
-                tokio::time::sleep_until(deadline).await;
-                Err(SessionConsumerClientError::Unavailable)
-            }
+            ReconnectAdmission::Cooldown { remaining } => match policy {
+                ReconnectCooldownPolicy::Wait => {
+                    tokio::time::sleep_until(deadline).await;
+                    Err(SessionConsumerClientError::Unavailable)
+                }
+                ReconnectCooldownPolicy::FailOver => Err(SessionConsumerClientError::Cooldown {
+                    remaining_cooldown_millis: bounded_millis(remaining),
+                    gate_wait_millis: bounded_millis(gate_span.started.elapsed()),
+                }),
+            },
             ReconnectAdmission::Deadline | ReconnectAdmission::Superseded => {
                 Err(SessionConsumerClientError::Deadline)
             }
@@ -7003,6 +7106,14 @@ impl ConsumerVoterBinding {
         }
     }
 
+    fn ordinal(&self) -> usize {
+        match self {
+            Self::Authority(authority) => authority.ordinal(),
+            #[cfg(test)]
+            Self::Test { .. } => 0,
+        }
+    }
+
     const fn node_id(&self) -> SessionConsensusNodeId {
         match self {
             Self::Authority(authority) => authority.node_id(),
@@ -7478,6 +7589,7 @@ impl StatelessSessionConsumerClient {
             None,
             false,
             None,
+            ReconnectCooldownPolicy::Wait,
         )
         .await
         .map_err(ConsumerSetupError::into_client_error)
@@ -7496,6 +7608,7 @@ impl StatelessSessionConsumerClient {
         reconnect_control: Option<&Arc<PersistentConsumerReconnectControl>>,
         coordinate_recovery: bool,
         resolved_address: Option<SocketAddr>,
+        reconnect_policy: ReconnectCooldownPolicy,
     ) -> Result<ConsumerConnection, ConsumerSetupError> {
         if self.idle_timeout.is_zero()
             || !self.valid_peer_idle_timeout()
@@ -7525,7 +7638,12 @@ impl StatelessSessionConsumerClient {
         let (generation, material_epoch) = reconnect_setup.epoch();
         if let Some(control) = reconnect_control {
             let attempt = poll_persistent_reconnect_setup(
-                control.acquire(pre_request_deadline, generation, material_epoch),
+                control.acquire_with_policy(
+                    pre_request_deadline,
+                    generation,
+                    material_epoch,
+                    reconnect_policy,
+                ),
                 &mut reconnect_setup,
             )
             .await??;
@@ -9316,6 +9434,7 @@ impl StatelessSessionConsumerClient {
                 reconnect_control,
                 true,
                 None,
+                ReconnectCooldownPolicy::Wait,
             )
             .await
             .map_err(ConsumerSetupError::into_client_error)
@@ -10123,6 +10242,7 @@ struct PersistentV2LaneCall {
     deadline: tokio::time::Instant,
     completion: oneshot::Sender<Result<SessionConsumerV2Response, SessionConsumerClientError>>,
     write_progress: Arc<FrameWriteProgress>,
+    execution_progress: Option<Arc<prepared_fenced_v2::PreparedV2AttemptProgress>>,
     // The actor and caller both retain this reservation. Cancelling a caller
     // cannot release extended-read capacity while its wire read still runs.
     read_capacity: Option<Arc<PersistentReadReservation>>,
@@ -10601,8 +10721,12 @@ async fn run_persistent_v2_lane(actor: PersistentV2LaneActor) {
             deadline,
             mut completion,
             write_progress,
+            execution_progress,
             read_capacity,
         } = command;
+        if let Some(progress) = &execution_progress {
+            progress.observe(SessionConsumerFencedTransitionV2FailureStage::Send);
+        }
         #[cfg(test)]
         if let Some(hook) = &pre_call_test_hook {
             hook.entered.notify_one();
@@ -10834,6 +10958,9 @@ async fn run_persistent_v2_lane(actor: PersistentV2LaneActor) {
             return;
         }
 
+        if let Some(progress) = &execution_progress {
+            progress.observe(SessionConsumerFencedTransitionV2FailureStage::AwaitingReply);
+        }
         let response = if let Some(response) = early_response {
             Ok(response)
         } else {
@@ -11065,6 +11192,7 @@ struct PersistentV2CallAttempt<'a> {
     /// before acquiring any admission or setup capacity.
     read_response_deadline: Option<tokio::time::Instant>,
     status_write_accepted: Option<&'a AtomicBool>,
+    execution_progress: Option<&'a Arc<prepared_fenced_v2::PreparedV2AttemptProgress>>,
 }
 
 /// Cancellation-safe accounting for one complete revision-5 physical setup.
@@ -11484,14 +11612,18 @@ impl PersistentSessionConsumerV2Pool {
         self: &Arc<Self>,
         deadline: tokio::time::Instant,
     ) -> Result<PersistentV2Connection, SessionConsumerClientError> {
-        self.connect_once_classified(deadline, false).await
+        self.connect_once_classified(deadline, false, ReconnectCooldownPolicy::Wait)
+            .await
     }
 
     async fn connect_once_classified(
         self: &Arc<Self>,
         deadline: tokio::time::Instant,
         _read_only: bool,
+        reconnect_policy: ReconnectCooldownPolicy,
     ) -> Result<PersistentV2Connection, SessionConsumerClientError> {
+        self.reconnect_control
+            .check_foreground_admission(&self.client, reconnect_policy)?;
         // Physical admission is deliberately outside the reconnect gate. A
         // caller which cannot own an aggregate socket slot is only locally
         // overloaded; it must not serialize or cool down unrelated recovery.
@@ -11517,8 +11649,12 @@ impl PersistentSessionConsumerV2Pool {
             lifetime
         });
         let reconnect = poll_persistent_reconnect_setup(
-            self.reconnect_control
-                .acquire(deadline, generation, material_epoch),
+            self.reconnect_control.acquire_with_policy(
+                deadline,
+                generation,
+                material_epoch,
+                reconnect_policy,
+            ),
             &mut reconnect_setup,
         )
         .await??;
@@ -11840,10 +11976,7 @@ impl PersistentSessionConsumerV2Pool {
             pre_request_deadline,
             pre_request_budget_active,
             deadline,
-            matches!(
-                request.operation(),
-                SessionConsumerV2Operation::FencedTransitionV2Status { .. }
-            ),
+            None,
         )
         .await
         .and_then(|response| classify_v2_completed_response(request, response))
@@ -11860,6 +11993,7 @@ impl PersistentSessionConsumerV2Pool {
         self: &Arc<Self>,
         request: &SessionConsumerV2Request,
         caller_deadline: tokio::time::Instant,
+        execution_progress: Option<&Arc<prepared_fenced_v2::PreparedV2AttemptProgress>>,
     ) -> Result<SessionConsumerV2Response, PersistentSessionConsumerV2ExecuteError> {
         self.ensure_idle_reaper();
         if request.scope() != self.client.scope() || request.validate().is_err() {
@@ -11889,10 +12023,7 @@ impl PersistentSessionConsumerV2Pool {
             pre_request_deadline,
             pre_request_budget_active,
             deadline,
-            matches!(
-                request.operation(),
-                SessionConsumerV2Operation::FencedTransitionV2Status { .. }
-            ),
+            execution_progress,
         )
         .await
         .and_then(|response| classify_v2_completed_response(request, response))
@@ -11903,6 +12034,12 @@ impl PersistentSessionConsumerV2Pool {
     /// The outer attempt budget owns retries. This one attempt either checks
     /// out an already authenticated lane or performs exactly one cold setup;
     /// it never hides another `connect_attempts` loop below a caller retry.
+    #[tracing::instrument(
+        name = "session_consumer_attempt", level = "debug", skip_all,
+        fields(operation = ?request.operation(), voter_ordinal = self.client.voter.ordinal(),
+               gate_micros = 0_u64, cooldown_micros = 0_u64,
+               transmission = "pre_write", successor_ordinal = tracing::field::Empty)
+    )]
     async fn execute_classified_once(
         self: &Arc<Self>,
         request: &SessionConsumerV2Request,
@@ -11917,7 +12054,11 @@ impl PersistentSessionConsumerV2Pool {
             deadline,
             read_response_deadline,
             status_write_accepted,
+            execution_progress,
         } = attempt;
+        if let Some(progress) = execution_progress {
+            progress.start_attempt();
+        }
         if read_response_deadline.is_some()
             && !matches!(
                 request.operation(),
@@ -12003,6 +12144,7 @@ impl PersistentSessionConsumerV2Pool {
                             SessionConsumerV2Operation::FencedTransitionV2HistoryState
                                 | SessionConsumerV2Operation::FencedTransitionV2Status { .. }
                         ),
+                        self.config.cooldown_admission,
                     )
                     .await
                     .map_err(|cause| {
@@ -12061,6 +12203,10 @@ impl PersistentSessionConsumerV2Pool {
             )?;
         let (completion, completed) = oneshot::channel();
         let write_progress = Arc::new(crate::protocol::FrameWriteProgress::new());
+        let _attempt_span = ConsumerAttemptSpan {
+            span: tracing::Span::current(),
+            progress: &write_progress,
+        };
         connection
             .commands
             .try_send(PersistentV2LaneCall {
@@ -12072,6 +12218,7 @@ impl PersistentSessionConsumerV2Pool {
                 deadline,
                 completion,
                 write_progress: Arc::clone(&write_progress),
+                execution_progress: execution_progress.cloned(),
                 read_capacity: admission.read_capacity.clone(),
             })
             .map_err(
@@ -12080,6 +12227,12 @@ impl PersistentSessionConsumerV2Pool {
                 },
             )?;
         let completed = completed.await;
+        if let Some(progress) = execution_progress {
+            match &completed {
+                Ok(Ok(_)) | Ok(Err(SessionConsumerClientError::Deadline)) => {}
+                _ => progress.reply_lost(),
+            }
+        }
         if let Some(status_write_accepted) = status_write_accepted {
             if write_progress.accepted_any() {
                 status_write_accepted.store(true, Ordering::Release);
@@ -12165,8 +12318,12 @@ impl PersistentSessionConsumerV2Pool {
         pre_request_deadline: tokio::time::Instant,
         pre_request_budget_active: bool,
         deadline: tokio::time::Instant,
-        status_retry: bool,
+        execution_progress: Option<&Arc<prepared_fenced_v2::PreparedV2AttemptProgress>>,
     ) -> Result<SessionConsumerV2Response, PersistentSessionConsumerV2ExecuteError> {
+        let status_retry = matches!(
+            request.operation(),
+            SessionConsumerV2Operation::FencedTransitionV2Status { .. }
+        );
         let mut attempts = 0_usize;
         // A status recovery which has either accepted one of its own Call
         // bytes or received a valid retryable status response is absorbing:
@@ -12192,6 +12349,7 @@ impl PersistentSessionConsumerV2Pool {
                         deadline,
                         read_response_deadline: None,
                         status_write_accepted: status_retry.then_some(&status_write_accepted),
+                        execution_progress,
                     },
                 )
                 .await;
@@ -12911,6 +13069,59 @@ fn counter_max(counter: &AtomicU64, value: u64) {
     counter.fetch_max(value, Ordering::Relaxed);
 }
 
+fn bounded_millis(duration: Duration) -> u32 {
+    // Round an active edge up so a positive sub-millisecond cooldown is never
+    // reported as zero (which would be indistinguishable from "no cooldown").
+    let rounded = duration.as_nanos().div_ceil(1_000_000);
+    u32::try_from(rounded).unwrap_or(u32::MAX)
+}
+
+fn consumer_attempt_span(
+    operation: impl fmt::Debug,
+    voter: &ConsumerVoterBinding,
+) -> tracing::Span {
+    tracing::debug_span!(
+        "session_consumer_attempt",
+        operation = ?operation,
+        voter_ordinal = voter.ordinal(),
+        gate_micros = 0_u64,
+        cooldown_micros = 0_u64,
+        transmission = "pre_write",
+        successor_ordinal = tracing::field::Empty,
+    )
+}
+
+/// Observe the physical write even when the caller cancels its future.
+struct ConsumerAttemptSpan<'a> {
+    span: tracing::Span,
+    progress: &'a FrameWriteProgress,
+}
+
+/// Include both cooldown waits and cancellation in admission timing.
+struct ConsumerGateSpan {
+    span: tracing::Span,
+    started: tokio::time::Instant,
+}
+
+impl Drop for ConsumerGateSpan {
+    fn drop(&mut self) {
+        self.span
+            .record("gate_micros", duration_micros(self.started.elapsed()));
+    }
+}
+
+impl Drop for ConsumerAttemptSpan<'_> {
+    fn drop(&mut self) {
+        if self.progress.accepted_any() {
+            self.span.record("transmission", "possibly_written");
+        }
+    }
+}
+
+fn duration_micros(duration: Duration) -> u64 {
+    u64::try_from(duration.as_micros()).unwrap_or(u64::MAX)
+}
+
 fn duration_millis(duration: Duration) -> u64 {
     u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
 }
@@ -13299,6 +13510,7 @@ struct PersistentRetainedRequestLane {
     // after it hands the checkout to the opaque wrapper. It is the only
     // evidence that a cancelled inner future crossed the wire boundary.
     write_progress: Arc<FrameWriteProgress>,
+    attempt_span: tracing::Span,
 }
 
 /// Releases a logical admission before waking warm-capacity maintenance.
@@ -13815,6 +14027,7 @@ impl PersistentSessionConsumerPool {
 
     fn begin_warm_lane(
         self: &Arc<Self>,
+        reconnect_policy: ReconnectCooldownPolicy,
     ) -> Result<
         Result<PersistentWarmLaneLeader, Arc<PersistentWarmLaneFlight>>,
         SessionConsumerClientError,
@@ -13828,6 +14041,9 @@ impl PersistentSessionConsumerPool {
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         if let Some(existing) = flight.as_ref() {
             if existing.result().is_none() {
+                if reconnect_policy == ReconnectCooldownPolicy::FailOver {
+                    return Err(self.reconnect_control.cooldown_error());
+                }
                 return Ok(Err(Arc::clone(existing)));
             }
         }
@@ -13854,6 +14070,9 @@ impl PersistentSessionConsumerPool {
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         if let Some(existing) = flight.as_ref() {
             if existing.result().is_none() {
+                if self.config.cooldown_admission == ReconnectCooldownPolicy::FailOver {
+                    return Err(self.reconnect_control.cooldown_error());
+                }
                 return Ok(Err(Arc::clone(existing)));
             }
         }
@@ -13980,9 +14199,12 @@ impl PersistentSessionConsumerPool {
             SessionConsumerClientError::ShuttingDown => {
                 counter_increment(&self.counters.shutdown);
             }
-            // Unsupported is a local capability decision, not an
-            // authenticated transport failure. `failures` still records it.
-            SessionConsumerClientError::Unsupported | SessionConsumerClientError::Unavailable => {}
+            // Unsupported is a local capability decision and Cooldown is a
+            // bounded pre-write routing outcome, not an authenticated
+            // transport failure. `failures` still records them.
+            SessionConsumerClientError::Unsupported
+            | SessionConsumerClientError::Unavailable
+            | SessionConsumerClientError::Cooldown { .. } => {}
         }
     }
 
@@ -14457,8 +14679,15 @@ impl PersistentSessionConsumerPool {
         self: &Arc<Self>,
         operation_deadline: tokio::time::Instant,
     ) -> Result<ConsumerConnection, ConsumerSetupError> {
-        self.connect_with_physical_admission_classified(operation_deadline, None, None, true, None)
-            .await
+        self.connect_with_physical_admission_classified(
+            operation_deadline,
+            None,
+            None,
+            true,
+            None,
+            self.config.cooldown_admission,
+        )
+        .await
     }
 
     async fn connect_with_physical_admission(
@@ -14475,6 +14704,7 @@ impl PersistentSessionConsumerPool {
             persistent_physical_admission,
             coordinate_recovery,
             resolved_address,
+            ReconnectCooldownPolicy::Wait,
         )
         .await
         .map_err(ConsumerSetupError::into_client_error)
@@ -14487,7 +14717,10 @@ impl PersistentSessionConsumerPool {
         persistent_physical_admission: Option<OwnedSemaphorePermit>,
         coordinate_recovery: bool,
         resolved_address: Option<SocketAddr>,
+        reconnect_policy: ReconnectCooldownPolicy,
     ) -> Result<ConsumerConnection, ConsumerSetupError> {
+        self.reconnect_control
+            .check_foreground_admission(&self.client, reconnect_policy)?;
         let setup_started = tokio::time::Instant::now();
         // Capture before resolver/TCP so a normal cold connection that began
         // before a later ensure target publication cannot inherit the newer
@@ -14565,6 +14798,7 @@ impl PersistentSessionConsumerPool {
                 Some(&self.reconnect_control),
                 coordinate_recovery,
                 resolved_address,
+                reconnect_policy,
             )
             .await;
         // Tokio polls a timed inner future before its deadline future. Reject
@@ -14933,6 +15167,7 @@ impl PersistentSessionConsumerClient {
         let reconnect_control = PersistentConsumerReconnectControl::new(
             client.lifecycle_policy,
             config.reconnect_jitter,
+            config.cooldown_admission,
         );
         let request_lanes = Arc::new(Semaphore::new(config.request_connections));
         let persistent_physical_lanes = Arc::new(Semaphore::new(config.request_connections));
@@ -15415,12 +15650,24 @@ impl PersistentSessionConsumerClient {
         request: &SessionConsumerV2Request,
         deadline: tokio::time::Instant,
     ) -> Result<SessionConsumerV2Response, PersistentSessionConsumerV2ExecuteError> {
+        self.execute_v2_before_observed(request, deadline, None)
+            .await
+    }
+
+    async fn execute_v2_before_observed(
+        &self,
+        request: &SessionConsumerV2Request,
+        deadline: tokio::time::Instant,
+        execution_progress: Option<&Arc<prepared_fenced_v2::PreparedV2AttemptProgress>>,
+    ) -> Result<SessionConsumerV2Response, PersistentSessionConsumerV2ExecuteError> {
         if self.fenced_mutation_roster_transport_enabled() {
             return Err(PersistentSessionConsumerV2ExecuteError::NotTransmitted {
                 cause: SessionConsumerClientError::Protocol,
             });
         }
-        self.v2_pool.execute_before(request, deadline).await
+        self.v2_pool
+            .execute_before(request, deadline, execution_progress)
+            .await
     }
 
     /// Return the ALPN-specific V2 idle-pool diagnostics within the shared
@@ -15877,7 +16124,12 @@ impl PersistentSessionConsumerClient {
             deadline,
             status_response_deadline,
             write_progress,
+            attempt_span,
         } = retained;
+        let attempt_span = ConsumerAttemptSpan {
+            span: attempt_span,
+            progress: &write_progress,
+        };
         let started = tokio::time::Instant::now();
         if started >= deadline {
             drop(activity);
@@ -15943,6 +16195,7 @@ impl PersistentSessionConsumerClient {
                 Some((shutdown, &self.pool.shutdown_phase)),
                 &write_progress,
             )
+            .instrument(attempt_span.span.clone())
             .await;
         if matches!(
             &result,
@@ -16614,6 +16867,13 @@ impl PersistentSessionConsumerClient {
                 ));
             }
             attempt = attempt.saturating_add(1);
+            let attempt_span = ConsumerAttemptSpan {
+                span: consumer_attempt_span(
+                    ConsumerOperationKind::from_operation(request.operation()),
+                    &self.pool.client.voter,
+                ),
+                progress: write_progress,
+            };
             let connection = match self.pool.take_idle() {
                 Some(connection) => {
                     counter_increment(&self.pool.counters.reused);
@@ -16626,7 +16886,7 @@ impl PersistentSessionConsumerClient {
                             SessionConsumerClientError::ShuttingDown,
                         ))
                     }
-                    result = self.pool.connect(pre_request_deadline) => result.map(|connection| {
+                    result = self.pool.connect(pre_request_deadline).instrument(attempt_span.span.clone()) => result.map(|connection| {
                         PersistentCheckedOutConnection::new(Arc::clone(&self.pool), connection)
                     }),
                 },
@@ -16677,6 +16937,7 @@ impl PersistentSessionConsumerClient {
                     Some((shutdown.clone(), &self.pool.shutdown_phase)),
                     write_progress,
                 )
+                .instrument(attempt_span.span.clone())
                 .await;
             match result {
                 Ok(response) => {
@@ -16889,14 +17150,46 @@ impl PersistentSessionConsumerClient {
         }
     }
 
+    async fn acquire_prewarm_permit(
+        &self,
+        deadline: tokio::time::Instant,
+        shutdown: &mut watch::Receiver<PersistentShutdownPhase>,
+        reconnect_policy: ReconnectCooldownPolicy,
+    ) -> Result<OwnedSemaphorePermit, SessionConsumerClientError> {
+        if reconnect_policy == ReconnectCooldownPolicy::FailOver {
+            // A sibling warm flight may hold this permit while resolving or
+            // connecting, before it owns a reconnect probe. Foreground callers
+            // must be able to select another voter without joining that work.
+            Arc::clone(&self.pool.prewarm)
+                .try_acquire_owned()
+                .map_err(|_| {
+                    if self.pool.phase() != PersistentShutdownPhase::Running {
+                        SessionConsumerClientError::ShuttingDown
+                    } else {
+                        self.pool.reconnect_control.cooldown_error()
+                    }
+                })
+        } else {
+            self.acquire_warm_permit(&self.pool.prewarm, deadline, shutdown)
+                .await
+        }
+    }
+
     async fn establish_one_warm_request_lane(
         &self,
         deadline: tokio::time::Instant,
+        reconnect_policy: ReconnectCooldownPolicy,
     ) -> Result<(), SessionConsumerClientError> {
+        self.pool
+            .reconnect_control
+            .check_foreground_admission(&self.pool.client, reconnect_policy)?;
         let mut shutdown = self.pool.shutdown_tx.subscribe();
         let _gate = self
-            .acquire_warm_permit(&self.pool.prewarm, deadline, &mut shutdown)
+            .acquire_prewarm_permit(deadline, &mut shutdown, reconnect_policy)
             .await?;
+        self.pool
+            .reconnect_control
+            .check_foreground_admission(&self.pool.client, reconnect_policy)?;
         let _activity = self.pool.register_prewarm()?;
 
         // Bind a concrete resolver result into the proof before deciding
@@ -16992,13 +17285,14 @@ impl PersistentSessionConsumerClient {
             let connection = tokio::select! {
                 biased;
                 _ = wait_for_shutdown(&mut shutdown) => Err(SessionConsumerClientError::ShuttingDown),
-                result = self.pool.connect_with_physical_admission(
+                result = self.pool.connect_with_physical_admission_classified(
                     deadline,
                     None,
                     None,
                     true,
                     Some(target),
-                ) => result,
+                    reconnect_policy,
+                ) => result.map_err(ConsumerSetupError::into_client_error),
             };
             let connection = match connection {
                 Ok(connection) => connection,
@@ -17029,10 +17323,16 @@ impl PersistentSessionConsumerClient {
         &self,
         deadline: tokio::time::Instant,
     ) -> Result<(), SessionConsumerClientError> {
+        self.pool
+            .reconnect_control
+            .check_foreground_admission(&self.pool.client, self.pool.config.cooldown_admission)?;
         let mut shutdown = self.pool.shutdown_tx.subscribe();
         let _gate = self
-            .acquire_warm_permit(&self.pool.prewarm, deadline, &mut shutdown)
+            .acquire_prewarm_permit(deadline, &mut shutdown, self.pool.config.cooldown_admission)
             .await?;
+        self.pool
+            .reconnect_control
+            .check_foreground_admission(&self.pool.client, self.pool.config.cooldown_admission)?;
         let _activity = self.pool.register_prewarm()?;
 
         let resolve = (self.pool.client.resolve)();
@@ -17075,13 +17375,14 @@ impl PersistentSessionConsumerClient {
         let connection = tokio::select! {
             biased;
             _ = wait_for_shutdown(&mut shutdown) => Err(SessionConsumerClientError::ShuttingDown),
-            result = self.pool.connect_with_physical_admission(
+            result = self.pool.connect_with_physical_admission_classified(
                 deadline,
                 None,
                 None,
                 true,
                 Some(target),
-            ) => result,
+                self.pool.config.cooldown_admission,
+            ) => result.map_err(ConsumerSetupError::into_client_error),
         };
         let mut connection = connection?;
         connection.warm_target_generation = target_generation;
@@ -17121,6 +17422,18 @@ impl PersistentSessionConsumerClient {
         &self,
         caller_deadline: tokio::time::Instant,
     ) -> Result<(), SessionConsumerClientError> {
+        self.ensure_warm_request_capacity_with_policy(
+            caller_deadline,
+            self.pool.config.cooldown_admission,
+        )
+        .await
+    }
+
+    async fn ensure_warm_request_capacity_with_policy(
+        &self,
+        caller_deadline: tokio::time::Instant,
+        reconnect_policy: ReconnectCooldownPolicy,
+    ) -> Result<(), SessionConsumerClientError> {
         if self.pool.phase() != PersistentShutdownPhase::Running {
             return Err(SessionConsumerClientError::ShuttingDown);
         }
@@ -17141,8 +17454,14 @@ impl PersistentSessionConsumerClient {
         if deadline <= started {
             return Err(SessionConsumerClientError::Deadline);
         }
-        let result = match self.pool.begin_warm_lane()? {
-            Ok(leader) => leader.complete(self.establish_one_warm_request_lane(deadline).await),
+        self.pool
+            .reconnect_control
+            .check_foreground_admission(&self.pool.client, reconnect_policy)?;
+        let result = match self.pool.begin_warm_lane(reconnect_policy)? {
+            Ok(leader) => leader.complete(
+                self.establish_one_warm_request_lane(deadline, reconnect_policy)
+                    .await,
+            ),
             Err(flight) => self.join_warm_request_lane(flight, deadline).await,
         };
         #[cfg(test)]
@@ -17190,6 +17509,9 @@ impl PersistentSessionConsumerClient {
         if deadline <= started {
             return Err(SessionConsumerClientError::Deadline);
         }
+        self.pool
+            .reconnect_control
+            .check_foreground_admission(&self.pool.client, self.pool.config.cooldown_admission)?;
         match self.pool.begin_retained_warm_lane()? {
             Ok(leader) => leader.complete(self.establish_one_retained_request_lane(deadline).await),
             Err(flight) => self.join_warm_request_lane(flight, deadline).await,
@@ -17235,6 +17557,7 @@ impl PersistentSessionConsumerClient {
             deadline,
             status_response_deadline: None,
             write_progress: Arc::new(FrameWriteProgress::new()),
+            attempt_span: tracing::Span::current(),
         };
         #[cfg(test)]
         if self
@@ -17255,7 +17578,8 @@ impl PersistentSessionConsumerClient {
         let deadline = tokio::time::Instant::now()
             .checked_add(self.pool.config.setup_timeout)
             .ok_or(SessionConsumerClientError::Deadline)?;
-        self.ensure_warm_request_capacity_before(deadline).await
+        self.ensure_warm_request_capacity_with_policy(deadline, ReconnectCooldownPolicy::Wait)
+            .await
     }
 
     /// Return a conservative authenticated-idle-capacity snapshot.
@@ -17846,8 +18170,13 @@ impl PersistentPreparedFencedTransitionToken {
         SessionConsumerPreparedFencedTransitionStatusError,
     > {
         let voter = self.route.status_voter(self.voter_count);
+        let setup_span = consumer_attempt_span(
+            "FencedTransitionStatus",
+            &self.router.clients[voter].pool.client.voter,
+        );
         match self.router.clients[voter]
             .reserve_retained_request_lane_before(setup_deadline, true)
+            .instrument(setup_span.clone())
             .await
         {
             Ok(lane) => Ok((voter, lane)),
@@ -17866,6 +18195,11 @@ impl PersistentPreparedFencedTransitionToken {
             }
             Err(_) => {
                 self.route.rotate_after_status_setup_failure();
+                let successor = self.route.status_voter(self.voter_count);
+                setup_span.record(
+                    "successor_ordinal",
+                    self.router.clients[successor].pool.client.voter.ordinal(),
+                );
                 Err(if physical_cap_active {
                     SessionConsumerPreparedFencedTransitionStatusError::AttemptDeadline
                 } else {
@@ -17929,8 +18263,13 @@ impl PersistentPreparedFencedTransitionToken {
             // capped, so a generic failure may rotate without consuming an
             // affine mutation attempt.
             let voter = self.route.mutation_voter(self.voter_count);
+            let setup_span = consumer_attempt_span(
+                "FencedTransition",
+                &self.router.clients[voter].pool.client.voter,
+            );
             let retained = match self.router.clients[voter]
                 .reserve_retained_request_lane_before(attempt_deadline, false)
+                .instrument(setup_span.clone())
                 .await
             {
                 Ok(retained) => retained,
@@ -17949,6 +18288,11 @@ impl PersistentPreparedFencedTransitionToken {
                 Err(_) => {
                     self.state.not_transmitted();
                     self.route.rotate_after_not_transmitted();
+                    let successor = self.route.mutation_voter(self.voter_count);
+                    setup_span.record(
+                        "successor_ordinal",
+                        self.router.clients[successor].pool.client.voter.ordinal(),
+                    );
                     continue;
                 }
             };
@@ -17959,6 +18303,11 @@ impl PersistentPreparedFencedTransitionToken {
                 drop(retained);
                 self.state.not_transmitted();
                 self.route.rotate_after_not_transmitted();
+                let successor = self.route.mutation_voter(self.voter_count);
+                setup_span.record(
+                    "successor_ordinal",
+                    self.router.clients[successor].pool.client.voter.ordinal(),
+                );
                 continue;
             }
             let write_boundary = Arc::new(PreparedFencedTransitionWriteBoundary::new(
@@ -18018,6 +18367,11 @@ impl PersistentPreparedFencedTransitionToken {
                     }
                     self.state.not_transmitted();
                     self.route.rotate_after_not_transmitted();
+                    let successor = self.route.mutation_voter(self.voter_count);
+                    setup_span.record(
+                        "successor_ordinal",
+                        self.router.clients[successor].pool.client.voter.ordinal(),
+                    );
                 }
                 Ok(Err(FencedTransitionExecuteError::OutcomeUnknown { request_id })) => {
                     preparation
@@ -18049,6 +18403,11 @@ impl PersistentPreparedFencedTransitionToken {
                     // safe under the same immutable outer budget.
                     self.state.not_transmitted();
                     self.route.rotate_after_not_transmitted();
+                    let successor = self.route.mutation_voter(self.voter_count);
+                    setup_span.record(
+                        "successor_ordinal",
+                        self.router.clients[successor].pool.client.voter.ordinal(),
+                    );
                 }
             }
         }
@@ -18110,6 +18469,7 @@ impl PersistentPreparedFencedTransitionToken {
         let (voter, mut retained) = self
             .ensure_status_readiness(attempt_deadline, deadline, physical_cap_active)
             .await?;
+        let attempt_span = retained.attempt_span.clone();
         let now = tokio::time::Instant::now();
         if now >= attempt_deadline {
             drop(retained);
@@ -18119,6 +18479,11 @@ impl PersistentPreparedFencedTransitionToken {
             // exactly at the immutable cap pins every later status call to
             // the same cold voter and starves its deterministic successor.
             self.route.rotate_after_status_setup_failure();
+            let successor = self.route.status_voter(self.voter_count);
+            attempt_span.record(
+                "successor_ordinal",
+                self.router.clients[successor].pool.client.voter.ordinal(),
+            );
             return Err(if physical_cap_active {
                 SessionConsumerPreparedFencedTransitionStatusError::AttemptDeadline
             } else {
@@ -18162,7 +18527,16 @@ impl PersistentPreparedFencedTransitionToken {
         };
         match result {
             Ok(FencedTransitionStatus::NotFound)
-            | Err(SessionConsumerPreparedFencedTransitionStatusError::Unavailable) => result,
+            | Err(SessionConsumerPreparedFencedTransitionStatusError::Unavailable) => {
+                let successor = self.route.status_voter(self.voter_count);
+                if successor != voter {
+                    attempt_span.record(
+                        "successor_ordinal",
+                        self.router.clients[successor].pool.client.voter.ordinal(),
+                    );
+                }
+                result
+            }
             Ok(_)
             | Err(SessionConsumerPreparedFencedTransitionStatusError::TopologyAuthorityRevoked) => {
                 self.terminal_receipt(result)
@@ -22009,7 +22383,9 @@ mod prepared_fenced_v2;
 
 pub use prepared_fenced_v2::{
     ActivatedSessionConsumerFencedTransitionV2Voters,
-    SessionConsumerFencedTransitionV2AbandonError, SessionConsumerFencedTransitionV2ReclaimReport,
+    SessionConsumerFencedTransitionV2AbandonError,
+    SessionConsumerFencedTransitionV2FailureDiagnostics,
+    SessionConsumerFencedTransitionV2FailureStage, SessionConsumerFencedTransitionV2ReclaimReport,
     SessionConsumerFencedTransitionV2ReleaseError, SessionConsumerPreparedFencedTransitionV2,
     SessionConsumerPreparedFencedTransitionV2Backend,
     SessionConsumerPreparedFencedTransitionV2BackendError,
@@ -22021,6 +22397,7 @@ mod payload_profile;
 
 #[cfg(test)]
 mod tests {
+    mod cooldown_failover;
     mod lease_deferral_wire_tests;
     mod lease_status_budget;
     #[path = "prewarm_batch.rs"]
@@ -22685,6 +23062,7 @@ mod tests {
             deadline,
             status_response_deadline: None,
             write_progress: Arc::clone(&write_progress),
+            attempt_span: tracing::Span::none(),
         };
         let route = Arc::new(PreparedFencedTransitionRoute::new(
             FencedTransitionRequestId::from_bytes([0x5c; 16]),
@@ -25390,6 +25768,7 @@ mod tests {
     #[derive(Clone, Copy)]
     enum PublicProtectedFencedMutationBehavior {
         CommitThenLoseResponse,
+        CommitAndReply,
         Unauthorized,
         /// Withhold admission with the closed pre-dispatch rejection.
         Unavailable,
@@ -25479,6 +25858,17 @@ mod tests {
                             // The authenticated response is then lost after
                             // the write.
                             std::future::pending::<SessionConsumerResponse>().await
+                        }
+                        PublicProtectedFencedMutationBehavior::CommitAndReply => {
+                            let SessionConsumerOperation::FencedTransition { request } =
+                                request.operation()
+                            else {
+                                unreachable!("fenced mutation branch");
+                            };
+                            self.mutation_calls.fetch_add(1, Ordering::SeqCst);
+                            SessionConsumerResponse::FencedTransition(Ok(
+                                public_protected_fenced_recorded_outcome(request),
+                            ))
                         }
                         PublicProtectedFencedMutationBehavior::Unauthorized => {
                             SessionConsumerResponse::Rejected(
@@ -26347,6 +26737,25 @@ mod tests {
         idle_timeout: Option<Duration>,
         resolver_delays: [Option<Duration>; 3],
     ) -> PublicProtectedFencedAcceptanceFixture {
+        public_protected_fenced_acceptance_fixture_with_config(
+            statuses,
+            preflights,
+            idle_timeout,
+            resolver_delays,
+            PersistentSessionConsumerConfig::default(),
+            PublicProtectedFencedMutationBehavior::CommitThenLoseResponse,
+        )
+        .await
+    }
+
+    async fn public_protected_fenced_acceptance_fixture_with_config(
+        statuses: [PublicProtectedFencedStatusBehavior; 3],
+        preflights: [PublicProtectedFencedPreflightBehavior; 3],
+        idle_timeout: Option<Duration>,
+        resolver_delays: [Option<Duration>; 3],
+        config: PersistentSessionConsumerConfig,
+        mutation_behavior: PublicProtectedFencedMutationBehavior,
+    ) -> PublicProtectedFencedAcceptanceFixture {
         let client_identity = material_spiffe("public-protected-fenced-client");
         let voter_identities = [
             material_spiffe("public-protected-fenced-voter-a"),
@@ -26400,8 +26809,7 @@ mod tests {
                     recorded_outcome: Arc::clone(&recorded_outcome),
                     preflight_behavior: preflights[index],
                     status_behavior: statuses[index],
-                    mutation_behavior:
-                        PublicProtectedFencedMutationBehavior::CommitThenLoseResponse,
+                    mutation_behavior,
                 }),
                 client_material.trusted_server_config(identity.as_str()),
                 authorizer,
@@ -26449,7 +26857,7 @@ mod tests {
                     Some(timeout) => stateless.with_idle_timeout(timeout),
                     None => stateless,
                 };
-                PersistentSessionConsumerClient::from_stateless(stateless)
+                PersistentSessionConsumerClient::try_from_stateless(stateless, config)
                     .expect("public protected fenced persistent voter")
             })
             .collect::<Vec<_>>();
@@ -28931,6 +29339,7 @@ mod tests {
                 deadline,
                 completion,
                 write_progress: Arc::clone(&progress),
+                execution_progress: None,
                 read_capacity: None,
             })
             .expect("one V2 Call reaches the reused actor");
@@ -29025,8 +29434,11 @@ mod tests {
         for material_publication in [false, true] {
             let reauthentication = SessionReauthenticationControl::new();
             let (client, material) = stateless_test_client(reauthentication.clone());
-            let reconnect_control =
-                PersistentConsumerReconnectControl::new(client.lifecycle_policy, Duration::ZERO);
+            let reconnect_control = PersistentConsumerReconnectControl::new(
+                client.lifecycle_policy,
+                Duration::ZERO,
+                crate::lifecycle::ReconnectCooldownPolicy::Wait,
+            );
             let mut setup = PersistentReconnectSetup::new(
                 &reauthentication,
                 &client.tls_config,
@@ -29081,8 +29493,11 @@ mod tests {
     async fn current_setup_lifecycle_rejection_retains_reconnect_cooldown() {
         let reauthentication = SessionReauthenticationControl::new();
         let (client, _material) = stateless_test_client(reauthentication.clone());
-        let reconnect_control =
-            PersistentConsumerReconnectControl::new(client.lifecycle_policy, Duration::ZERO);
+        let reconnect_control = PersistentConsumerReconnectControl::new(
+            client.lifecycle_policy,
+            Duration::ZERO,
+            crate::lifecycle::ReconnectCooldownPolicy::Wait,
+        );
         let mut setup = PersistentReconnectSetup::new(
             &reauthentication,
             &client.tls_config,
@@ -29157,8 +29572,11 @@ mod tests {
 
         let reauthentication = SessionReauthenticationControl::new();
         let (client, material) = stateless_test_client(reauthentication.clone());
-        let reconnect_control =
-            PersistentConsumerReconnectControl::new(client.lifecycle_policy, Duration::ZERO);
+        let reconnect_control = PersistentConsumerReconnectControl::new(
+            client.lifecycle_policy,
+            Duration::ZERO,
+            crate::lifecycle::ReconnectCooldownPolicy::Wait,
+        );
         let old_generation = reauthentication.generation();
         let material_epoch = client.tls_config.material_status().epoch();
         let (installed_sender, installed_receiver) = tokio::sync::oneshot::channel();
@@ -37975,5 +38393,290 @@ mod tests {
             &response,
             MAX_NEGOTIATED_FRAME_SIZE
         ));
+    }
+
+    fn routed_failover_test_client(
+        resolver_calls: Arc<AtomicUsize>,
+        name: &str,
+    ) -> (PersistentSessionConsumerClient, SessionConsumerV2Request) {
+        let client_identity = material_spiffe(name);
+        let material = RotatableClientMaterial::new(client_identity.as_str());
+        let resolving = Arc::clone(&resolver_calls);
+        let stateless = StatelessSessionConsumerClient::new_with_resolver(
+            Arc::new(move || {
+                resolving.fetch_add(1, Ordering::SeqCst);
+                Box::pin(async {
+                    Err(io::Error::new(
+                        io::ErrorKind::ConnectionRefused,
+                        "controlled failover cooldown refusal",
+                    ))
+                })
+            }),
+            rustls_pki_types::ServerName::try_from("consumer.test").expect("test TLS server name"),
+            test_consumer_voter_authority(),
+            material.config(),
+        )
+        .with_operation_timeout(Duration::from_secs(1));
+        let config = PersistentSessionConsumerConfig::try_new(
+            1,
+            2,
+            DEFAULT_PERSISTENT_SESSION_CONSUMER_POOL_WAIT_TIMEOUT,
+            1,
+            DEFAULT_PERSISTENT_SESSION_CONSUMER_SETUP_TIMEOUT,
+            1,
+            Duration::ZERO,
+            DEFAULT_PERSISTENT_SESSION_CONSUMER_SHUTDOWN_DRAIN,
+        )
+        .expect("routed failover configuration")
+        .with_cooldown_admission(crate::lifecycle::ReconnectCooldownPolicy::FailOver);
+        let persistent = PersistentSessionConsumerClient::try_from_stateless(stateless, config)
+            .expect("valid routed failover client");
+        let request = SessionConsumerV2Request::new(
+            scope(),
+            SessionConsumerV2Operation::FencedTransitionV2Capability,
+        );
+        (persistent, request)
+    }
+
+    fn assert_typed_cooldown(
+        result: Result<SessionConsumerV2Response, PersistentSessionConsumerV2ExecuteError>,
+    ) -> (u32, u32) {
+        match result {
+            Err(PersistentSessionConsumerV2ExecuteError::NotTransmitted {
+                cause:
+                    SessionConsumerClientError::Cooldown {
+                        remaining_cooldown_millis,
+                        gate_wait_millis,
+                    },
+            }) => (remaining_cooldown_millis, gate_wait_millis),
+            other => panic!("expected the typed pre-write cooldown outcome, got {other:?}"),
+        }
+    }
+
+    /// A routed foreground call that reaches a cooling peer returns the typed
+    /// bounded pre-write cooldown outcome immediately: it never sleeps to the
+    /// caller deadline, never starts a probe, and every simultaneous caller
+    /// fails over at once. At the cooldown edge exactly one serialized probe
+    /// owns the endpoint attempt.
+    #[tokio::test(start_paused = true)]
+    async fn routed_failover_cooldown_is_immediate_bounded_and_never_starts_a_probe_storm() {
+        let _metrics_guard = crate::test_support::SESSION_CONNECTION_METRICS_TEST_LOCK
+            .lock()
+            .await;
+        let resolver_calls = Arc::new(AtomicUsize::new(0));
+        let (persistent, request) =
+            routed_failover_test_client(Arc::clone(&resolver_calls), "v2-cooldown-client");
+        // One bounded cold probe fails and publishes the shared 50 ms cooldown
+        // (the test configuration fixes reconnect jitter at zero).
+        let first = persistent.execute_v2(&request).await;
+        assert!(
+            matches!(
+                first,
+                Err(PersistentSessionConsumerV2ExecuteError::NotTransmitted {
+                    cause: SessionConsumerClientError::Unavailable
+                })
+            ),
+            "one bounded cold probe fails and publishes the shared cooldown: {first:?}"
+        );
+        assert_eq!(resolver_calls.load(Ordering::SeqCst), 1);
+
+        // The routed call observes the cooldown and returns at once, without
+        // advancing the controlled clock through the cooldown.
+        let before = tokio::time::Instant::now();
+        let routed = persistent.execute_v2(&request).await;
+        assert_eq!(
+            routed
+                .as_ref()
+                .err()
+                .and_then(|error| error.exact_retry_id()),
+            None,
+            "a cooldown outcome is pre-write and exposes no recovery identity"
+        );
+        let (remaining, gate_wait) = assert_typed_cooldown(routed);
+        assert_eq!(
+            tokio::time::Instant::now(),
+            before,
+            "a routed call must not wait through the cooldown"
+        );
+        assert!(
+            (1..=50).contains(&remaining),
+            "the reported remaining cooldown is bounded and positive: {remaining}"
+        );
+        assert_eq!(gate_wait, 0, "the fail-over path does not wait in the gate");
+        assert_eq!(
+            resolver_calls.load(Ordering::SeqCst),
+            1,
+            "no probe starts while the shared cooldown is active"
+        );
+
+        // Simultaneous routed callers all fail over immediately and still do
+        // not probe.
+        let mut callers = Vec::new();
+        for _ in 0..4 {
+            let persistent = persistent.clone();
+            let request = request.clone();
+            callers.push(tokio::spawn(async move {
+                persistent.execute_v2(&request).await
+            }));
+        }
+        for caller in callers {
+            let (remaining, _) = assert_typed_cooldown(caller.await.expect("join routed caller"));
+            assert!((1..=50).contains(&remaining));
+        }
+        assert_eq!(resolver_calls.load(Ordering::SeqCst), 1);
+
+        // At the exact cooldown edge one serialized probe runs; concurrent
+        // callers fail over instead of each opening their own probe.
+        tokio::time::advance(Duration::from_millis(50)).await;
+        let mut callers = Vec::new();
+        for _ in 0..4 {
+            let persistent = persistent.clone();
+            let request = request.clone();
+            callers.push(tokio::spawn(async move {
+                persistent.execute_v2(&request).await
+            }));
+        }
+        let mut unavailable = 0;
+        let mut cooldown = 0;
+        for caller in callers {
+            match caller.await.expect("join post-expiry caller") {
+                Err(PersistentSessionConsumerV2ExecuteError::NotTransmitted {
+                    cause: SessionConsumerClientError::Unavailable,
+                }) => unavailable += 1,
+                Err(PersistentSessionConsumerV2ExecuteError::NotTransmitted {
+                    cause: SessionConsumerClientError::Cooldown { .. },
+                }) => cooldown += 1,
+                other => panic!("unexpected post-expiry routed outcome: {other:?}"),
+            }
+        }
+        assert_eq!(
+            resolver_calls.load(Ordering::SeqCst),
+            2,
+            "exactly one bounded probe runs at the cooldown edge, not one per caller"
+        );
+        assert_eq!(
+            unavailable, 1,
+            "only the single serialized probe reaches the endpoint"
+        );
+        assert_eq!(cooldown, 3, "the remaining callers fail over at once");
+
+        // The prepared fenced-transition (effectful) path shares the same
+        // pre-write classification: a routed effectful call still fails over
+        // at once with no probe and no recovery identity.
+        let effectful = persistent_v2_effectful_test_request(0x9a).await;
+        let routed_effect = persistent.execute_v2(&effectful).await;
+        assert_eq!(
+            routed_effect
+                .as_ref()
+                .err()
+                .and_then(|error| error.exact_retry_id()),
+            None,
+            "an effectful cooldown outcome is pre-write and exposes no recovery identity"
+        );
+        let (remaining, gate_wait) = assert_typed_cooldown(routed_effect);
+        assert!(
+            (1..=1_000).contains(&remaining),
+            "the shared backoff may have advanced after the second endpoint failure"
+        );
+        assert_eq!(gate_wait, 0);
+        assert_eq!(
+            resolver_calls.load(Ordering::SeqCst),
+            2,
+            "an effectful routed call also fails over without starting a probe"
+        );
+        tokio::time::resume();
+        persistent.shutdown().await;
+    }
+
+    /// A routing caller that receives the typed cooldown outcome can complete
+    /// the same operation on a healthy peer without waiting for this peer's
+    /// recovery edge.
+    #[tokio::test]
+    async fn routed_failover_outcome_can_be_completed_on_a_healthy_peer() {
+        let _metrics_guard = crate::test_support::SESSION_CONNECTION_METRICS_TEST_LOCK
+            .lock()
+            .await;
+        let resolver_calls = Arc::new(AtomicUsize::new(0));
+        let (cooling, request) =
+            routed_failover_test_client(Arc::clone(&resolver_calls), "v2-cooldown-routed-client");
+        let first = cooling.execute_v2(&request).await;
+        assert!(matches!(
+            first,
+            Err(PersistentSessionConsumerV2ExecuteError::NotTransmitted {
+                cause: SessionConsumerClientError::Unavailable
+            })
+        ));
+        // The routed attempt fails over immediately with the typed outcome.
+        let before = std::time::Instant::now();
+        let (remaining, _) = assert_typed_cooldown(cooling.execute_v2(&request).await);
+        assert!(remaining > 0);
+        assert!(
+            before.elapsed() < Duration::from_secs(1),
+            "the routed caller does not wait for the cooldown edge"
+        );
+
+        // A healthy peer completes the operation the cooling peer refused.
+        let client_identity = material_spiffe("v2-cooldown-healthy-client");
+        let server_identity = material_spiffe("v2-cooldown-healthy-server");
+        let client_material = Arc::new(RotatableClientMaterial::new(client_identity.as_str()));
+        let dispatches = Arc::new(AtomicUsize::new(0));
+        let service = Arc::new(CountingV2CapabilityTestConsumer {
+            calls: Arc::clone(&dispatches),
+        });
+        let authorizer = SessionConsumerAuthorizer::from_authoritative_members(
+            scope(),
+            [client_identity],
+            std::iter::empty(),
+        )
+        .expect("healthy peer authorizer");
+        let (server, address) = SessionQuorumConsumerServer::new(
+            service,
+            client_material.trusted_server_config(server_identity.as_str()),
+            authorizer,
+        )
+        .listen("127.0.0.1:0".parse().expect("loopback address"))
+        .await
+        .expect("listen for healthy routed peer");
+        let stateless = StatelessSessionConsumerClient::new_unattested_for_test(
+            address,
+            rustls_pki_types::ServerName::IpAddress(address.ip().into()),
+            server_identity,
+            scope(),
+            client_material.config(),
+        );
+        let healthy = PersistentSessionConsumerClient::from_stateless(stateless)
+            .expect("valid healthy routed peer");
+        let completed = healthy.execute_v2(&request).await;
+        assert!(
+            matches!(
+                completed,
+                Ok(SessionConsumerV2Response::FencedTransitionV2Capability(Ok(
+                    FencedTransitionV2Capability::V2
+                )))
+            ),
+            "the healthy peer completes the routed operation: {completed:?}"
+        );
+        assert_eq!(dispatches.load(Ordering::SeqCst), 1);
+        cooling.shutdown().await;
+        healthy.shutdown().await;
+        server.abort_and_wait().await;
+    }
+
+    #[test]
+    fn bounded_millis_rounds_an_active_sub_millisecond_cooldown_up() {
+        assert_eq!(super::bounded_millis(Duration::ZERO), 0);
+        assert_eq!(
+            super::bounded_millis(Duration::from_nanos(1)),
+            1,
+            "a positive sub-millisecond edge is never reported as zero"
+        );
+        assert_eq!(super::bounded_millis(Duration::from_micros(999)), 1);
+        assert_eq!(super::bounded_millis(Duration::from_millis(1)), 1);
+        assert_eq!(super::bounded_millis(Duration::from_micros(1_500)), 2);
+        assert_eq!(
+            super::bounded_millis(Duration::from_secs(u64::MAX)),
+            u32::MAX,
+            "the public bound saturates instead of truncating"
+        );
     }
 }

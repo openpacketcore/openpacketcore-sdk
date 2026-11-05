@@ -344,7 +344,7 @@ fn singleton_policy_wrapper_metadata_and_nested_framing() {
         .unwrap();
     let pdu = read(row, context()).unwrap();
     for change in 0..3 {
-        let mut bad = pdu.clone();
+        let mut bad = opc_proto_ngap::decode(pdu.raw.as_bytes(), context()).unwrap();
         if let PduKind::Successful {
             procedure_code,
             criticality,

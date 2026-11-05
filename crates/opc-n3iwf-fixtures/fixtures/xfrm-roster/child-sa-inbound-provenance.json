@@ -4,7 +4,7 @@
   "context": {
     "source_vector": {
       "path": "crates/opc-n3iwf-fixtures/oracles/child-sa-profiles.json",
-      "sha256": "76fee6c1a58eb38aa89ff39bf8fd4e0a29f8048e40a294abbef8639e9c9bbd97",
+      "sha256": "95413a05dba9145e734f9cf3efeb39f9052b0741982ded2b89c06436384ab9b5",
       "case": "inbound-provenance"
     },
     "cases": 16,
@@ -56,7 +56,7 @@
   ],
   "wire": {
     "path": "wire/child-sa-inbound-provenance.hex",
-    "digest_sha256": "0034ea1f062e19aada5cef686ddf1c49d3b0baf69a5b0b28fc88f4804387d54f"
+    "digest_sha256": "a3197b64d2a0210c152029cced7d20d1d8a998a21a3e6a421368f66af41ca82f"
   },
   "semantic_assertions": [
     "family=inbound-provenance",

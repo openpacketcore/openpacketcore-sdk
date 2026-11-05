@@ -15,6 +15,9 @@ mod child_read_revocation;
 mod child_reads;
 #[path = "scope_transport/cross_slot.rs"]
 mod cross_slot;
+#[cfg(target_os = "linux")]
+#[path = "scope_transport/linux_clock.rs"]
+mod linux_clock;
 #[path = "scope_transport/scans.rs"]
 mod scans;
 
@@ -434,7 +437,7 @@ fn run_native(durable_recovery: bool, name: &str) {
                 let endpoint=Arc::new(ScopeServer::new(ScopeServerConfig{tls:server_tls(&pki,&three_voter_spiffe(follower),"scope-worker"),clock:Arc::new(ScopeClock),policy:policy.clone(),store:Arc::new(fleet.stores[survivor].clone()),scopes:vec![scope.clone()],boots:boots.clone(),closures:closures.clone(),scheduler:server_scheduler.scheduler(),proofs:ProofBudgets::default()}).unwrap());
                 let listener=reserved_listeners.serve(endpoint.clone());
                 fleet.isolate(leader).await;
-                fleet.wait_for_new_leader(leader,leader_id,term,tokio::time::Instant::now()+THREE_VOTER_READY_TIMEOUT).await;
+                fleet.wait_for_new_leader(leader,leader_id,term,THREE_VOTER_READY_TIMEOUT).await;
                 let after_loss=reconnect_current(&final_client).await;
                 assert_eq!(after_loss.stamp(),Some(last.stamp()));
                 listener.shutdown().await;drop(endpoint);

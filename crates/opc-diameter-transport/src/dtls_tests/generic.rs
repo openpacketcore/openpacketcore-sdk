@@ -578,7 +578,7 @@ async fn generic_raw_peer_validity_failures_use_shared_certificate_verifier() {
 }
 
 #[cfg(target_os = "linux")]
-async fn kernel_associations(
+pub(super) async fn kernel_associations(
     authenticated: bool,
     receive_budget: usize,
     deadline: Instant,

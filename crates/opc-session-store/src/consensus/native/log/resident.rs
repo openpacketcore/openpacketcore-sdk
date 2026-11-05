@@ -36,6 +36,13 @@ struct SelectedLog {
 }
 
 impl NativeLogEntry {
+    pub(in crate::consensus::native) fn selected_range(&self) -> Option<&SelectedRange> {
+        match &self.body {
+            Body::Resident(_) => None,
+            Body::Selected(row) => Some(&row.range),
+        }
+    }
+
     #[cfg(test)]
     pub(in crate::consensus::native) fn slot_projection_bytes_for_test(&self) -> usize {
         match &self.body {

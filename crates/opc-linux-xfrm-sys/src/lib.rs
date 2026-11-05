@@ -14,6 +14,8 @@ use std::path::{Path, PathBuf};
 
 #[cfg(all(target_os = "linux", not(opc_linux_xfrm_sys_force_unsupported)))]
 mod linux;
+#[cfg(all(target_os = "linux", not(opc_linux_xfrm_sys_force_unsupported)))]
+mod tfc;
 #[cfg_attr(
     all(target_os = "linux", not(opc_linux_xfrm_sys_force_unsupported)),
     allow(dead_code)
@@ -32,6 +34,47 @@ pub const NETLINK_XFRM: i32 = 6;
 #[derive(Debug)]
 pub struct NetlinkSocket {
     inner: platform::NetlinkSocket,
+}
+
+/// A namespace-pinned raw IP protocol-59 socket with a mandatory XFRM policy.
+/// For tunnel mode, the safe wrapper must verify the OPCTFC01 kernel capability.
+#[derive(Debug)]
+pub struct TfcDummySocket {
+    #[cfg(all(target_os = "linux", not(opc_linux_xfrm_sys_force_unsupported)))]
+    inner: tfc::TfcDummySocket,
+}
+
+impl TfcDummySocket {
+    /// Open, install the complete per-socket policy, bind and connect.
+    /// This low-level boundary does not validate the policy's dummy semantics.
+    pub fn open(
+        source: std::net::IpAddr,
+        destination: std::net::IpAddr,
+        policy: &[u8],
+    ) -> io::Result<Self> {
+        #[cfg(all(target_os = "linux", not(opc_linux_xfrm_sys_force_unsupported)))]
+        {
+            tfc::open(source, destination, policy).map(|inner| Self { inner })
+        }
+        #[cfg(any(not(target_os = "linux"), opc_linux_xfrm_sys_force_unsupported))]
+        {
+            let _ = (source, destination, policy);
+            Err(io::Error::from(io::ErrorKind::Unsupported))
+        }
+    }
+
+    /// Submit one datagram through the installed policy; success is local submission.
+    pub fn send(&self, payload: &[u8]) -> io::Result<usize> {
+        #[cfg(all(target_os = "linux", not(opc_linux_xfrm_sys_force_unsupported)))]
+        {
+            self.inner.send(payload)
+        }
+        #[cfg(any(not(target_os = "linux"), opc_linux_xfrm_sys_force_unsupported))]
+        {
+            let _ = payload;
+            Err(io::Error::from(io::ErrorKind::Unsupported))
+        }
+    }
 }
 
 /// An open directory anchored inside the verified Linux BPF filesystem.
@@ -304,6 +347,14 @@ pub const XFRMA_ALG_AEAD: u16 = 18;
 pub const XFRMA_ALG_AUTH_TRUNC: u16 = 20;
 /// XFRM optional packet mark attribute.
 pub const XFRMA_MARK: u16 = 21;
+/// XFRM Traffic Flow Confidentiality padding attribute (`__u32`).
+///
+/// Defined by `enum xfrm_attr_type_t` (`XFRMA_TFCPAD`) in
+/// `include/uapi/linux/xfrm.h`. The kernel stores it as the SA's target
+/// padding length, parses it with `NLA_U32`, emits it from `GETSA` only when
+/// the stored length is nonzero, and accepts it only for ESP SAs in tunnel
+/// mode (`verify_newsa_info` in `net/xfrm/xfrm_user.c`).
+pub const XFRMA_TFCPAD: u16 = 22;
 /// XFRM ESN replay sequence/bitmap attribute.
 pub const XFRMA_REPLAY_ESN_VAL: u16 = 23;
 /// Empty netlink alignment attribute.

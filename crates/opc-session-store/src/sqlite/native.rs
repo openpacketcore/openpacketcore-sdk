@@ -16,7 +16,7 @@ pub(crate) mod startup_pressure;
 /// timer expiries but each retains its own real-time minimum. The descriptor
 /// is prepared before storage opens and is disarmed when no caller is waiting.
 pub(crate) struct AuthorityBackoff {
-    timer: tokio::io::unix::AsyncFd<std::os::fd::OwnedFd>,
+    timer: opc_tokio_fd_sys::AsyncOwnedFd,
     waiters: std::sync::Mutex<usize>,
 }
 
@@ -47,7 +47,10 @@ impl AuthorityBackoff {
             rustix::time::TimerfdFlags::NONBLOCK | rustix::time::TimerfdFlags::CLOEXEC,
         )?;
         Ok(Self {
-            timer: tokio::io::unix::AsyncFd::with_interest(timer, tokio::io::Interest::READABLE)?,
+            timer: opc_tokio_fd_sys::AsyncOwnedFd::with_interest(
+                timer,
+                tokio::io::Interest::READABLE,
+            )?,
             waiters: std::sync::Mutex::new(0),
         })
     }

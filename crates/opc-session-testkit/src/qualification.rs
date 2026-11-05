@@ -56,6 +56,12 @@ pub use isolated_scale::{
     QUALIFICATION_ISOLATED_SCALE_UNIX_SECONDS,
 };
 
+/// Synthetic installation identity shared by qualification nodes and probes.
+///
+/// This fixed nonce belongs only to the deterministic qualification fixture.
+/// Production installations generate and persist their own non-zero nonce.
+pub const QUALIFICATION_INSTALLATION_NONCE: [u8; 32] = [0x5a; 32];
+
 const FROZEN_SESSION_HA_PROFILE_V2_JSON: &str =
     include_str!("../qualification/v2/session-ha-profile.json");
 
@@ -110,7 +116,7 @@ pub const SESSION_HA_PERSISTENT_CONSUMER_HEAD_EVIDENCE_V9_SCHEMA_JSON: &str =
     include_str!("../qualification/v9/session-ha-persistent-consumer-head-evidence.schema.json");
 /// SHA-256 binding for the exact tracked v9 evidence schema bytes.
 pub const SESSION_HA_PERSISTENT_CONSUMER_HEAD_EVIDENCE_V9_SCHEMA_SHA256: &str =
-    "sha256:65d456edc15359e9cbac25a6771822219797c53f03aa6ca5d8837e43a6dbc018";
+    "sha256:eb410e3be0c2260ebefc8567507941f9b08d06f5280a0ac43aebef9b7b60039e";
 
 /// SHA-256 binding for the exact current v9 evidence schema bytes.
 pub fn session_ha_persistent_consumer_head_evidence_v9_schema_sha256() -> String {
@@ -6751,6 +6757,11 @@ pub enum QualificationTrafficErrorClass {
     CasIdempotencyOutcomeUnavailable,
     BackendOperationOutcomeUnavailable,
     LeaseLostOrInvalid,
+    /// The authoritative restore scan exhausted its fixed witness/VM work
+    /// budget. This is terminal and distinct from slow progress (which reports
+    /// `BackendUnavailable` and is retryable within the bounded recovery
+    /// episode).
+    RestoreScanWorkBudgetExceeded,
     Other,
 }
 

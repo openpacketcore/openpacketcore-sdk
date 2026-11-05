@@ -159,7 +159,14 @@ pub fn run(root: &Path, stage: &str, provider: &Provider) {
                         write(
                             root,
                             &packet_name("unreleased-candidate", row.key.0),
-                            candidate.window.outbound.as_ref().unwrap().request(),
+                            candidate
+                                .window
+                                .outbound
+                                .as_ref()
+                                .unwrap()
+                                .request()
+                                .single_packet()
+                                .unwrap(),
                         );
                     }
                     Boundary::Released => {

@@ -250,6 +250,7 @@ impl PersistentSessionConsumerClient {
                     deadline: boundary,
                     read_response_deadline: Some(budget.original_deadline()),
                     status_write_accepted: None,
+                    execution_progress: None,
                 },
             )
             .await;

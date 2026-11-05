@@ -68,7 +68,7 @@ dispatch and trusted class retained internally.
 | Backend `rebuild_local_graph` / `rebuild_scoped_dscp` | Consume that reset receipt and publish fresh, empty current-image graphs. Abandoned partial builds retain their barrier through supervised exact retirement. Structural completion grants no session authority. |
 | `ScopeKernelAuthority::commit_activation` | Local adapter only: execute or recover the exact batch through the actual store, then verify current authority and the child's resulting birth/revision and sealed body. Return a private-constructor `CommittedScopeEffect`; unknown outcomes grant no effect authority. Preserve the pre-submission `current()` check; readback/recheck uses one `ScopeBatchStore::read_current` cut and also compares the batch revision. |
 | `ScopeKernelAuthority<NativeScopeAuthority>::readback_activation` | Consume native-authenticated completion provenance for the original full coordinator request before `ack`; one current-authority/child cut checks Applied, the exact operation, birth/generation, batch revision, bytes and claims. Carry the effect's trusted class into readback/recheck. No raw commit method or caller-created outcome can mint the concrete effect token. |
-| Backend `install_scoped` / `remove_scoped` / `read_scoped` | Bind actor-owned effects to the complete immutable activation request, child birth/revision, local epoch and backend object identity. Fresh installs recheck untimed currentness; receipt-bound undo removes only the exact local effect. |
+| Backend `install_scoped` / `install_scoped_successor` / `remove_scoped` / `read_scoped` / `scoped_successor_status` | Bind actor-owned effects to the complete immutable activation request, child birth/revision, local epoch and backend object identity. Fresh installs recheck untimed currentness; receipt-bound undo removes only the exact local effect. A successor install additionally keeps one live flow's policy identity and reports install/move/retire milestones. |
 | `LocalKernelLifecycle::open` | Recheck current execution and every declared graph before each containment removal. Publish `KernelCompletion` only after verified absence of all containment filters. An interrupted unpublished opening restores closure under retained supervision. |
 | `KernelCompletion::recheck` | Passively verify the same published opening and local graph identities. Dropping the completion or losing the store does not expire forwarding. Reset receipts report global object residue separately. |
 | `ScopeKernelAuthority::shutdown_local` | Close local effect admission, drain admitted work, then supervise the contained ordered reset after consumer disruption authorization. Caller cancellation does not abandon shutdown. This does not certify peer-control closure. |
@@ -393,6 +393,7 @@ admission probe under containment must detect lockdown/redacted key readback
 and return typed unsupported after its own verified cleanup. Admission cannot
 defer that failure to every later undo. Serialize unresolved operations at the
 actual kernel deletion key, not merely at child ID or interface ID.
+Ordinary scoped installs also wait on an overlapping outbound SA selection identity.
 
 This restriction addresses a specific race: Linux's
 [ACQUIRE path](https://github.com/torvalds/linux/blob/v6.12/net/xfrm/xfrm_state.c#L940)
@@ -407,6 +408,53 @@ The actor must compare the full held install request against fresh readback,
 including algorithms/keys in zeroizing buffers; missing/redacted key evidence,
 overlapping marks or an unproved producer exclusion refuse removal. Never
 enable generic deletion from a successful snapshot alone.
+
+### Child-SA rekey overlap (successor SA)
+
+A consumer rekeying one Child SA needs the old and the new SA side by side
+([RFC 7296 §2.8](https://www.rfc-editor.org/rfc/rfc7296.html#section-2.8)): the
+old SA stays usable until the peer deletes it, while traffic moves to the new
+one. The scoped actor admits one pending successor transition per live flow;
+each published successor can later be rekeyed again:
+
+- The successor request keeps the predecessor's complete policy lookup identity
+  (selector, direction, selector mark, interface ID), SA flow identity (outer
+  selector, destination/protocol/source, lookup mark, interface ID, mode) and
+  packet presentation (UDP encapsulation, output mark, fixed outer DSCP), plus
+  the policy priority/action and template selector/source/mode. Keys and
+  lifetimes may change, and every successor uses a fresh SPI. Outbound
+  successors use a distinct SA/policy request ID; inbound successors retain
+  it so both generations satisfy the same protective policy. A different
+  flow, direction or invalid SPI/request-ID relationship is a typed refusal.
+- A separate committed activation supplies the successor's own role use; one
+  activation still grants one use per backend role. The actor admits the
+  successor beside the predecessor's live reservation and keeps the unrelated
+  request refusal on a live policy key.
+- After installing the successor SA, the actor atomically repoints the
+  outbound policy through `UPDPOLICY`. The inbound policy remains unchanged.
+  No step removes protection while the flow can still be selected.
+  Publication requires fresh exact successor SA and policy readback.
+- The predecessor SA remains retained until explicit retirement or kernel
+  expiry. `read_scoped` verifies the receipt's complete SA/policy intent: it
+  returns `false` for a superseded outbound receipt while the SA still exists,
+  and can return `true` for both inbound receipts sharing the same policy.
+  Retiring an unselected live member requires the selected SA and policy to
+  remain exact, then deletes only that member's SA. Abandoning the selected
+  member first restores another retained live generation. Already-expired
+  groups can release their receipts in either order. Only the final member
+  removes the shared policy, after confirming its SA is absent.
+- Every step records progress before its first possible effect. Lost
+  acknowledgement, cancellation or panic resumes through readback; observer
+  loss never reverses an observed traffic move. Exact retries recover the same
+  receipt without consuming another activation. A local fence or definitive
+  refusal authorizes undo of unpublished work, with protection restored before
+  candidate removal; ambiguous readback retains the objects for retry.
+  `scoped_successor_status` freshly reads installed/selected/retired state for
+  pending and published transitions. Publication records the actor's decision
+  independently of whether the caller received its reply.
+- Rekey-trigger ownership, peer signalling, Child-SA policy iteration and
+  adoption decisions remain consumer policy; this primitive only executes the
+  already-decided replacement.
 
 The consumer's committed activation phase must precede installation of any
 candidate inbound SA or usable outbound SA. A closed tc filter is insufficient

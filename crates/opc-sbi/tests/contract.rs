@@ -443,3 +443,21 @@ fn sample_peer() -> SbiPeer {
         snssai: Some(Snssai::new(1, Some("010203")).unwrap()),
     }
 }
+
+#[test]
+fn message_priority_accepts_the_full_wire_domain() {
+    for priority in 0u8..=255 {
+        let mut headers = http::HeaderMap::new();
+        headers.insert(
+            "3gpp-sbi-message-priority",
+            priority.to_string().parse().unwrap(),
+        );
+        let decoded = opc_sbi::headers::SbiHeaders::parse(&headers);
+        if priority <= 31 {
+            let decoded = decoded.expect("TS 29.500 priority range");
+            assert_eq!(decoded.message_priority, Some(priority));
+        } else {
+            assert!(decoded.is_err());
+        }
+    }
+}

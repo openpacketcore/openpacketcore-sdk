@@ -678,6 +678,15 @@ fn dtls12_handshake_secp384r1_key_exchange() {
     let p384_only: &'static [&'static dyn dimpl::crypto::SupportedKxGroup] =
         Box::leak(p384_vec.into_boxed_slice());
     provider.kx_groups = p384_only;
+    provider.cipher_suites = Box::leak(
+        provider
+            .cipher_suites
+            .iter()
+            .copied()
+            .filter(|cs| !cs.suite().has_dhe())
+            .collect::<Vec<_>>()
+            .into_boxed_slice(),
+    );
 
     let config = Arc::new(
         Config::builder()

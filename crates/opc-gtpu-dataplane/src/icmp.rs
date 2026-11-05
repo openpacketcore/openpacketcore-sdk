@@ -10,8 +10,9 @@
 //! counted drop, and operators of that backend must size the inner MTU out
 //! of band (for example MSS clamping) unless they run a host component that
 //! consumes the signal. The eBPF backend's downlink tunnel-MTU enforcement
-//! uses the IPv4 builder for its opt-in in-tunnel RFC 1191 error; see
-//! [`GtpPdpContext::downlink_inner_mtu`](crate::GtpPdpContext::downlink_inner_mtu).
+//! uses the IPv4 builder for its opt-in in-tunnel RFC 1191 error and the
+//! IPv6 builder for the ordinary inner-IPv6 opt-in's RFC 4443 Packet Too Big;
+//! see [`GtpPdpContext::downlink_inner_mtu`](crate::GtpPdpContext::downlink_inner_mtu).
 
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
@@ -179,6 +180,29 @@ pub fn build_icmpv4_packet_too_big(
     Some(packet)
 }
 
+/// Return the wire addresses of the RFC 4443 Packet Too Big generated for this
+/// invoking IPv6 packet.
+///
+/// The error's source is the invoking packet's own destination: the subscriber
+/// address whose path is too small, and the only inner source the PGW's
+/// anti-spoofing admits. Its destination is the invoking packet's source, the
+/// originator whose path MTU must shrink. Failing to invert the invoking order
+/// would address the error from the originator to the subscriber.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+pub(crate) fn icmpv6_ptb_addresses(invoking: &[u8]) -> Option<(Ipv6Addr, Ipv6Addr)> {
+    if invoking.len() < 40 || invoking[0] >> 4 != 6 {
+        return None;
+    }
+    let mut error_source = [0_u8; 16];
+    error_source.copy_from_slice(&invoking[24..40]);
+    let mut error_destination = [0_u8; 16];
+    error_destination.copy_from_slice(&invoking[8..24]);
+    Some((
+        Ipv6Addr::from(error_source),
+        Ipv6Addr::from(error_destination),
+    ))
+}
+
 /// Build an ICMPv6 Packet Too Big message (RFC 8200 section 5, RFC 8201 type
 /// 2) quoting as much of the invoking packet as fits within the minimum IPv6
 /// MTU.
@@ -337,6 +361,43 @@ mod tests {
             u16::from_be_bytes([packet[4], packet[5]]),
             (1280 - 40) as u16
         );
+    }
+
+    #[test]
+    fn icmpv6_ptb_is_addressed_from_the_invoking_destination_to_its_source() {
+        let originator: Ipv6Addr = "2001:db8:ffff::8".parse().unwrap();
+        let subscriber: Ipv6Addr = "2001:db8:45:1::abcd".parse().unwrap();
+        let mut invoking = vec![0x60, 0, 0, 0];
+        let payload = vec![0x5a; 1_400 - 40];
+        invoking.extend_from_slice(&u16::try_from(payload.len()).unwrap().to_be_bytes());
+        invoking.extend_from_slice(&[17, 64]);
+        invoking.extend_from_slice(&originator.octets()); // invoking source
+        invoking.extend_from_slice(&subscriber.octets()); // invoking destination
+        invoking.extend_from_slice(&payload);
+
+        // The error reports from the subscriber (the invoking destination) to
+        // the originator (the invoking source), never the other way round.
+        let (error_source, error_destination) =
+            icmpv6_ptb_addresses(&invoking).expect("valid invoking IPv6 packet");
+        assert_eq!(error_source, subscriber);
+        assert_eq!(error_destination, originator);
+
+        let error = build_icmpv6_packet_too_big(
+            error_source,
+            error_destination,
+            GtpuPmtuSignal::Icmpv6PacketTooBig { inner_mtu: 1_300 },
+            &invoking,
+        )
+        .unwrap();
+        assert_eq!(&error[8..24], &subscriber.octets(), "outer IPv6 source");
+        assert_eq!(
+            &error[24..40],
+            &originator.octets(),
+            "outer IPv6 destination"
+        );
+
+        assert!(icmpv6_ptb_addresses(&[0x60; 39]).is_none());
+        assert!(icmpv6_ptb_addresses(&[0x45; 40]).is_none());
     }
 
     #[test]

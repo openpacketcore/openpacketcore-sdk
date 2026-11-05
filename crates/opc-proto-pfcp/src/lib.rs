@@ -18,24 +18,46 @@ pub mod profile;
 use bytes::{BufMut, Bytes, BytesMut};
 use opc_protocol::{
     BorrowDecode, DecodeContext, DecodeError, DecodeErrorCode, DecodeResult, Encode, EncodeContext,
-    EncodeError, EncodeErrorCode, OwnedDecode, SpecRef, ValidationLevel,
+    EncodeError, EncodeErrorCode, OwnedDecode, SpecRef,
 };
 
-/// PFCP message type constants (TS 29.244 Table 7.4.1).
+/// PFCP message type constants (TS 29.244 Table 7.3-1).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MessageType {
     /// Heartbeat Request
     HeartbeatRequest = 1,
     /// Heartbeat Response
     HeartbeatResponse = 2,
+    /// PFCP PfdManagementRequest.
+    PfdManagementRequest = 3,
+    /// PFCP PfdManagementResponse.
+    PfdManagementResponse = 4,
     /// Association Setup Request
     AssociationSetupRequest = 5,
     /// Association Setup Response
     AssociationSetupResponse = 6,
+    /// PFCP AssociationUpdateRequest.
+    AssociationUpdateRequest = 7,
+    /// PFCP AssociationUpdateResponse.
+    AssociationUpdateResponse = 8,
     /// Association Release Request
     AssociationReleaseRequest = 9,
     /// Association Release Response
     AssociationReleaseResponse = 10,
+    /// PFCP VersionNotSupportedResponse.
+    VersionNotSupportedResponse = 11,
+    /// PFCP NodeReportRequest.
+    NodeReportRequest = 12,
+    /// PFCP NodeReportResponse.
+    NodeReportResponse = 13,
+    /// PFCP SessionSetDeletionRequest.
+    SessionSetDeletionRequest = 14,
+    /// PFCP SessionSetDeletionResponse.
+    SessionSetDeletionResponse = 15,
+    /// PFCP SessionSetModificationRequest.
+    SessionSetModificationRequest = 16,
+    /// PFCP SessionSetModificationResponse.
+    SessionSetModificationResponse = 17,
     /// Session Establishment Request
     SessionEstablishmentRequest = 50,
     /// Session Establishment Response
@@ -54,22 +76,22 @@ pub enum MessageType {
     SessionReportResponse = 57,
 }
 
-/// PFCP message header (TS 29.244 Section 7.4.1).
+/// PFCP message header (TS 29.244 Section 7.2.2).
 ///
-/// Octet 1 bit layout per TS 29.244 §7.4.1.1: bits 8–6 carry the version,
+/// Octet 1 bit layout per TS 29.244 §7.2.2.1: bits 8–6 carry the version,
 /// bits 5–4 are spare, bit 3 is FO (Follow On), bit 2 is MP (message
 /// priority present), and bit 1 is S (SEID present).
 ///
-/// @spec 3GPP TS29244 R18 7.4.1
-/// @req REQ-3GPP-TS29244-R18-7.4.1-001
+/// @spec 3GPP TS29244 R18 7.2.2
+/// @req REQ-3GPP-TS29244-R18-7.2.2-001
 /// @conformance v0
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Header {
     /// Version (must be 1).
     pub version: u8,
-    /// Spare bits 5–4 of octet 1 (must be 0 in strict mode).
+    /// Received spare bits 5–4 of octet 1; ignored on receive, cleared on encode.
     pub spare: u8,
-    /// FO flag, octet 1 bit 3 (must be 0 in strict mode).
+    /// FO flag, octet 1 bit 3: another message follows in this datagram.
     pub fo: bool,
     /// MP flag, octet 1 bit 2 (message priority present).
     pub mp: bool,
@@ -87,7 +109,7 @@ pub struct Header {
     /// Encoded as `message_priority.unwrap_or(0)` if `mp` is true.
     pub message_priority: Option<u8>,
     /// Final header octet spare bits. When `mp` is set this holds only the
-    /// low nibble (bits 4–1); otherwise the entire octet.
+    /// low nibble (bits 4–1); otherwise the entire octet. Cleared on encode.
     pub spare_octet: u8,
 }
 
@@ -109,16 +131,16 @@ impl Header {
 
 /// Decode a PFCP header from a byte slice.
 ///
-/// @spec 3GPP TS29244 R18 7.4.1
-/// @req REQ-3GPP-TS29244-R18-7.4.1-002
+/// @spec 3GPP TS29244 R18 7.2.2
+/// @req REQ-3GPP-TS29244-R18-7.2.2-002
 /// @conformance v0
-fn decode_header(input: &[u8], ctx: DecodeContext) -> DecodeResult<'_, Header> {
-    let spec_ref = SpecRef::new("3gpp", "TS29244", "7.4.1");
+fn decode_header(input: &[u8], _ctx: DecodeContext) -> DecodeResult<'_, Header> {
+    let spec_ref = SpecRef::new("3gpp", "TS29244", "7.2.2");
     if input.len() < Header::SIZE_WITHOUT_SEID {
         return Err(DecodeError::new(DecodeErrorCode::Truncated, 0).with_spec_ref(spec_ref));
     }
 
-    // TS 29.244 §7.4.1.1: bits 8-6 version, 5-4 spare, 3 FO, 2 MP, 1 S.
+    // TS 29.244 §7.2.2.1: bits 8-6 version, 5-4 spare, 3 FO, 2 MP, 1 S.
     let b1 = input[0];
     let version = (b1 >> 5) & 0x07;
     let spare = (b1 >> 3) & 0x03;
@@ -135,29 +157,6 @@ fn decode_header(input: &[u8], ctx: DecodeContext) -> DecodeResult<'_, Header> {
             0,
         )
         .with_spec_ref(spec_ref.clone()));
-    }
-
-    if ctx.validation_level == ValidationLevel::Strict
-        || ctx.validation_level == ValidationLevel::ProcedureAware
-    {
-        if spare != 0 {
-            return Err(DecodeError::new(
-                DecodeErrorCode::Structural {
-                    reason: "spare bits must be zero",
-                },
-                0,
-            )
-            .with_spec_ref(spec_ref.clone()));
-        }
-        if fo {
-            return Err(DecodeError::new(
-                DecodeErrorCode::Structural {
-                    reason: "FO flag must be zero",
-                },
-                0,
-            )
-            .with_spec_ref(spec_ref.clone()));
-        }
     }
 
     let message_type = input[1];
@@ -211,17 +210,16 @@ fn decode_header(input: &[u8], ctx: DecodeContext) -> DecodeResult<'_, Header> {
 
 /// Encode a PFCP header into a buffer.
 ///
-/// @spec 3GPP TS29244 R18 7.4.1
-/// @req REQ-3GPP-TS29244-R18-7.4.1-003
+/// @spec 3GPP TS29244 R18 7.2.2
+/// @req REQ-3GPP-TS29244-R18-7.2.2-003
 /// @conformance v0
 fn encode_header(
     header: &Header,
     dst: &mut BytesMut,
     _ctx: EncodeContext,
 ) -> Result<(), EncodeError> {
-    // TS 29.244 §7.4.1.1: bits 8-6 version, 5-4 spare, 3 FO, 2 MP, 1 S.
+    // TS 29.244 §7.2.2.1: bits 8-6 version, 5-4 spare, 3 FO, 2 MP, 1 S.
     let mut b1 = (header.version & 0x07) << 5;
-    b1 |= (header.spare & 0x03) << 3;
     if header.fo {
         b1 |= 0x04;
     }
@@ -246,16 +244,16 @@ fn encode_header(
     dst.put_u8((seq & 0xFF) as u8);
 
     let last_octet = if header.mp {
-        ((header.message_priority.unwrap_or(0) & 0x0F) << 4) | (header.spare_octet & 0x0F)
+        (header.message_priority.unwrap_or(0) & 0x0F) << 4
     } else {
-        header.spare_octet
+        0
     };
     dst.put_u8(last_octet);
 
     Ok(())
 }
 
-/// PFCP Information Element type constants (TS 29.244 Table 7.4.2).
+/// PFCP Information Element type constants (TS 29.244 Table 8.1.2-1).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum IeType {
     /// Create PDR
@@ -348,18 +346,24 @@ pub enum IeType {
     OuterHeaderRemoval = 95,
     /// Recovery Time Stamp
     RecoveryTimeStamp = 96,
+    /// Node Report Type (§8.2.69).
+    NodeReportType = 101,
     /// UE IP Address
     UeIpAddress = 93,
     /// FAR ID
     FarId = 108,
     /// QER ID
     QerId = 109,
+    /// User Plane Inactivity Timer (§8.2.83).
+    UserPlaneInactivityTimer = 117,
     /// UR-SEQN
     UrSeqn = 104,
     /// Usage Report (Session Report Request)
     UsageReport = 80,
     /// QoS Flow Identifier
     Qfi = 124,
+    /// PFCP Session Change Info (Table 7.4.7.1-2).
+    PfcpSessionChangeInfo = 290,
 }
 
 /// A generic PFCP IE with type/length framing and raw byte preservation.
@@ -508,8 +512,8 @@ impl InformationElement {
 
 /// A borrowed PFCP message.
 ///
-/// @spec 3GPP TS29244 R18 7.4.1
-/// @req REQ-3GPP-TS29244-R18-7.4.1-004
+/// @spec 3GPP TS29244 R18 7.2.2
+/// @req REQ-3GPP-TS29244-R18-7.2.2-004
 /// @conformance v0
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Message<'a> {
@@ -531,11 +535,11 @@ impl<'a> BorrowDecode<'a> for Message<'a> {
     /// remainder (and mirrored in [`Message::tail`]). Inputs shorter than
     /// the declared length are rejected as truncated.
     ///
-    /// @spec 3GPP TS29244 R18 7.4.1
-    /// @req REQ-3GPP-TS29244-R18-7.4.1-005
+    /// @spec 3GPP TS29244 R18 7.2.2
+    /// @req REQ-3GPP-TS29244-R18-7.2.2-005
     /// @conformance v0
     fn decode(input: &'a [u8], ctx: DecodeContext) -> DecodeResult<'a, Self> {
-        let spec_ref = SpecRef::new("3gpp", "TS29244", "7.4.1");
+        let spec_ref = SpecRef::new("3gpp", "TS29244", "7.2.2");
         if input.len() > ctx.max_message_len {
             return Err(
                 DecodeError::new(DecodeErrorCode::MessageLengthExceeded, 0).with_spec_ref(spec_ref)
@@ -544,7 +548,7 @@ impl<'a> BorrowDecode<'a> for Message<'a> {
 
         let (_, header) = decode_header(input, ctx)?;
 
-        // The Length field excludes the first 4 octets (§7.4.1).
+        // The Length field excludes the first 4 octets (§7.2.2).
         let msg_end = match 4usize.checked_add(header.length as usize) {
             Some(l) => l,
             None => {
@@ -599,7 +603,7 @@ impl Message<'_> {
     }
 
     fn encoded_lens(&self) -> Result<(usize, u16), EncodeError> {
-        let spec_ref = SpecRef::new("3gpp", "TS29244", "7.4.1");
+        let spec_ref = SpecRef::new("3gpp", "TS29244", "7.2.2");
         let ie_len: usize = self.ies.iter().try_fold(0usize, |acc, ie| {
             acc.checked_add(ie.wire_len())
                 .ok_or_else(|| EncodeError::length_overflow().with_spec_ref(spec_ref.clone()))
@@ -625,8 +629,8 @@ impl Message<'_> {
 impl Encode for Message<'_> {
     /// Encode this message, recomputing the header Length field.
     ///
-    /// @spec 3GPP TS29244 R18 7.4.1
-    /// @req REQ-3GPP-TS29244-R18-7.4.1-006
+    /// @spec 3GPP TS29244 R18 7.2.2
+    /// @req REQ-3GPP-TS29244-R18-7.2.2-006
     /// @conformance v0
     fn encode(&self, dst: &mut BytesMut, ctx: EncodeContext) -> Result<(), EncodeError> {
         let (_, len_u16) = self.encoded_lens()?;
@@ -649,8 +653,8 @@ impl Encode for Message<'_> {
 
 /// An owned PFCP message.
 ///
-/// @spec 3GPP TS29244 R18 7.4.1
-/// @req REQ-3GPP-TS29244-R18-7.4.1-007
+/// @spec 3GPP TS29244 R18 7.2.2
+/// @req REQ-3GPP-TS29244-R18-7.2.2-007
 /// @conformance v0
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OwnedMessage {
@@ -712,8 +716,8 @@ fn build_production_v1_message(
 impl OwnedDecode for OwnedMessage {
     /// Decode an owned PFCP message.
     ///
-    /// @spec 3GPP TS29244 R18 7.4.1
-    /// @req REQ-3GPP-TS29244-R18-7.4.1-008
+    /// @spec 3GPP TS29244 R18 7.2.2
+    /// @req REQ-3GPP-TS29244-R18-7.2.2-008
     /// @conformance v0
     fn decode_owned(input: Bytes, ctx: DecodeContext) -> Result<Self, DecodeError> {
         let (_, msg) = Message::decode(&input, ctx)?;
@@ -845,25 +849,29 @@ pub fn association_setup_response(
 }
 
 /// Build a Production Profile v1 Association Release Request message.
-pub fn association_release_request(seq: u32) -> profile::ProfileBuildResult<OwnedMessage> {
+pub fn association_release_request(
+    seq: u32,
+    node_id: ie::NodeId,
+) -> profile::ProfileBuildResult<OwnedMessage> {
     build_production_v1_message(
         MessageType::AssociationReleaseRequest,
         seq,
         None,
-        Vec::new(),
+        vec![ie::TypedIe::NodeId(node_id)],
     )
 }
 
 /// Build a Production Profile v1 Association Release Response message.
 pub fn association_release_response(
     seq: u32,
+    node_id: ie::NodeId,
     cause: ie::Cause,
 ) -> profile::ProfileBuildResult<OwnedMessage> {
     build_production_v1_message(
         MessageType::AssociationReleaseResponse,
         seq,
         None,
-        vec![ie::TypedIe::Cause(cause)],
+        vec![ie::TypedIe::NodeId(node_id), ie::TypedIe::Cause(cause)],
     )
 }
 
@@ -871,6 +879,7 @@ pub fn association_release_response(
 pub fn session_establishment_request(
     seq: u32,
     seid: u64,
+    node_id: ie::NodeId,
     cp_fseid: ie::FSeid,
     create_pdr: ie::CreatePdr,
     create_far: ie::CreateFar,
@@ -880,6 +889,7 @@ pub fn session_establishment_request(
         seq,
         Some(seid),
         vec![
+            ie::TypedIe::NodeId(node_id),
             ie::TypedIe::FSeid(cp_fseid),
             ie::TypedIe::CreatePdr(create_pdr),
             ie::TypedIe::CreateFar(create_far),
@@ -891,13 +901,19 @@ pub fn session_establishment_request(
 pub fn session_establishment_response(
     seq: u32,
     seid: u64,
+    node_id: ie::NodeId,
+    up_fseid: Option<ie::FSeid>,
     cause: ie::Cause,
 ) -> profile::ProfileBuildResult<OwnedMessage> {
+    let mut ies = vec![ie::TypedIe::NodeId(node_id), ie::TypedIe::Cause(cause)];
+    if let Some(fseid) = up_fseid {
+        ies.push(ie::TypedIe::FSeid(fseid));
+    }
     build_production_v1_message(
         MessageType::SessionEstablishmentResponse,
         seq,
         Some(seid),
-        vec![ie::TypedIe::Cause(cause)],
+        ies,
     )
 }
 
@@ -1116,6 +1132,8 @@ mod tests {
             edrt: false,
             bdpn: false,
             ddpn: false,
+            fssm: false,
+            mbsu: false,
             spare: 0,
         }
     }
@@ -1218,6 +1236,7 @@ mod tests {
         let msg = session_establishment_request(
             42,
             10,
+            node_id(),
             cp_fseid(),
             create_pdr_with_far(7),
             create_far(7),
@@ -1236,6 +1255,7 @@ mod tests {
         let msg = session_establishment_request(
             42,
             10,
+            node_id(),
             cp_fseid(),
             create_pdr_with_far(7),
             create_far(8),
@@ -1258,6 +1278,7 @@ mod tests {
         let msg = OwnedMessage {
             header: production_header(MessageType::SessionEstablishmentRequest, 42, Some(10)),
             ies: vec![
+                InformationElement::from_typed(&TypedIe::NodeId(node_id())).unwrap(),
                 InformationElement::from_typed(&TypedIe::FSeid(cp_fseid())).unwrap(),
                 InformationElement::from_typed(&TypedIe::FSeid(cp_fseid())).unwrap(),
                 InformationElement::from_typed(&TypedIe::CreatePdr(create_pdr_with_far(7)))
@@ -1341,7 +1362,7 @@ mod tests {
         assert_eq!(encode_owned(&decoded), bytes);
     }
 
-    /// Octet-1 flag layout per TS 29.244 §7.4.1.1, asserted against
+    /// Octet-1 flag layout per TS 29.244 §7.2.2.1, asserted against
     /// hand-authored spec bytes (NOT against this codec's own encoder):
     /// 0x21 = version 1 | S; SEID-bearing 16-octet header.
     #[test]
@@ -1364,7 +1385,7 @@ mod tests {
     }
 
     /// 0x23 = version 1 | MP | S; message priority lives in the high nibble
-    /// of the final header octet (TS 29.244 §7.4.1).
+    /// of the final header octet (TS 29.244 §7.2.2).
     #[test]
     fn test_spec_byte_layout_message_priority() {
         let bytes: &[u8] = &[

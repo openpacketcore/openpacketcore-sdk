@@ -385,9 +385,19 @@ fn build_smf_profile(config: &SmfConfig) -> NfProfile {
         nf_status: NfStatus::Registered,
         ipv4_addresses: vec![config.n4_addr.ip().to_string()],
         fqdn: None,
-        plmn_list: vec![config.plmn.clone()],
-        s_nssais: vec![config.s_nssai.clone()],
-        nf_services: vec![opc_sbi::nrf::services::NSMF_PDUSESSION.to_string()],
+        plmn_list: vec![config.plmn.clone().into()],
+        s_nssais: vec![config.s_nssai.clone().into()],
+        nf_services: vec![opc_sbi::nrf::NfService::new(
+            format!("{}-pdusession", config.instance_id.as_str()),
+            opc_sbi::nrf::services::NSMF_PDUSESSION.into(),
+            vec![opc_sbi::nrf::NfServiceVersion {
+                api_version_in_uri: "v1".into(),
+                api_full_version: "1.0.0".into(),
+                expiry: None,
+            }],
+            "https".into(),
+            opc_sbi::nrf::NfServiceStatus::Registered,
+        )],
         priority: 10,
         capacity: 100,
     }
@@ -664,9 +674,15 @@ fn association_release_response(seq: u32) -> Result<OwnedMessage, SmfError> {
             message_priority: None,
             spare_octet: 0,
         },
-        ies: vec![InformationElement::from_typed(&TypedIe::Cause(Cause {
-            value: CauseValue::RequestAccepted,
-        }))?],
+        ies: vec![
+            InformationElement::from_typed(&TypedIe::NodeId(NodeId {
+                node_id_type: NodeIdType::Fqdn,
+                value: b"ref".to_vec(),
+            }))?,
+            InformationElement::from_typed(&TypedIe::Cause(Cause {
+                value: CauseValue::RequestAccepted,
+            }))?,
+        ],
     })
 }
 
@@ -817,6 +833,8 @@ pub fn build_create_far(
             edrt: false,
             bdpn: false,
             ddpn: false,
+            fssm: false,
+            mbsu: false,
             spare: 0,
         }),
     ];
@@ -912,6 +930,8 @@ pub fn build_update_far(far_id: u32, dst_interface: u8) -> Result<TypedIe, SmfEr
                 edrt: false,
                 bdpn: false,
                 ddpn: false,
+                fssm: false,
+                mbsu: false,
                 spare: 0,
             }),
             TypedIe::UpdateForwardingParameters(update_fwd),

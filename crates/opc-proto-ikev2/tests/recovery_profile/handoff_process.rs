@@ -190,6 +190,8 @@ pub fn run(root: &Path, stage: &str, selection: &str, provider: &Provider) {
                                 .as_ref()
                                 .unwrap()
                                 .response()
+                                .unwrap()
+                                .single_packet()
                                 .unwrap(),
                         );
                     }

@@ -115,7 +115,12 @@ fn psc_prefix_validation_agrees_with_independent_downlink_packet_oracle() {
         while next != 0 {
             let end = cursor + usize::from(bytes[cursor]) * 4;
             if next == 0x85 {
-                let prefix = [bytes[cursor], bytes[cursor + 1], bytes[cursor + 2]];
+                let prefix = [
+                    bytes[cursor],
+                    bytes[cursor + 1],
+                    bytes[cursor + 2],
+                    bytes[cursor + 3],
+                ];
                 let qfi: u8 = row[3].parse().unwrap();
                 assert!(n3_downlink_psc_matches(prefix, qfi));
                 assert!(!n3_downlink_psc_matches(prefix, (qfi + 1) % 64));
@@ -137,4 +142,44 @@ fn psc_prefix_validation_agrees_with_independent_downlink_packet_oracle() {
         }
     }
     assert!(count >= 64);
+}
+
+#[test]
+fn review_native_psc_rejects_burst_fields_from_independent_oracle() {
+    let mut count = 0;
+    for line in include_str!("n3_reference.tsv")
+        .lines()
+        .filter(|l| !l.starts_with('#'))
+    {
+        let row: Vec<_> = line.split('\t').collect();
+        if row[1] != "dl" || row[2] != "reject" {
+            continue;
+        }
+        let bytes: Vec<_> = row[7]
+            .as_bytes()
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .map(|b| u8::from_str_radix(std::str::from_utf8(b).unwrap(), 16).unwrap())
+            .collect();
+        if bytes.len() < 20
+            || bytes[11] != 0x85
+            || bytes[12] != 2
+            || bytes[14] & 0x80 == 0
+            || bytes[15] & 3 == 0
+        {
+            continue;
+        }
+        let prefix = [bytes[12], bytes[13], bytes[14], bytes[15]];
+        assert!(
+            !n3_downlink_psc_matches(prefix, bytes[14] & 0x3f),
+            "{}",
+            row[0]
+        );
+        count += 1;
+    }
+    assert!(
+        count >= 24,
+        "every burst-field reference row must be covered: {count}"
+    );
 }

@@ -37,6 +37,8 @@ pub(crate) mod native;
 mod native_basis;
 pub(crate) mod owner;
 mod record;
+#[cfg(test)]
+mod rollover_wait_test_support;
 pub(crate) mod snapshot;
 #[cfg(feature = "test-control")]
 mod volatile_experiment;
@@ -138,7 +140,7 @@ impl Binding {
                 return Err(invalid_data("asynchronous storage requires a native root"));
             }
             hash.update(if self.async_recovery_format && self.async_closed_format {
-                &b"opc-session-native-async-v4"[..]
+                &b"opc-session-native-async-v5"[..]
             } else if self.async_recovery_format {
                 return Err(invalid_data("asynchronous recovery root format differs"));
             } else if self.async_closed_format {
@@ -152,7 +154,7 @@ impl Binding {
                     "durable root cannot carry asynchronous close proof",
                 ));
             }
-            hash.update(b"opc-session-native-wal-v2");
+            hash.update(b"opc-session-native-wal-v3");
         } else {
             hash.update(b"opc-session-wal-private-v3");
         }
@@ -325,16 +327,78 @@ pub(crate) enum Point {
     BeforeNativeRetirementPlan,
     #[cfg(test)]
     NativeRetirementWaitStarted,
+    #[cfg(test)]
+    NativeJournalWaitStarted,
+    #[cfg(test)]
+    NativeFileGuardWaitStarted,
+    #[cfg(test)]
+    NativeShutdownWaitStarted,
+    #[cfg(test)]
+    NativeInstallWaitStarted,
+    #[cfg(test)]
+    NativeInstallCapacityWaitStarted,
+    #[cfg(test)]
+    NativeInstallOwnershipWaitStarted,
+    #[cfg(test)]
+    NativeRetentionWaitStarted,
     BeforeNativeApplyPublish,
     BeforeNativeReceiptRead,
     BeforeNativeLogRead,
     BeforeNativeSnapshotRead,
     BeforeNativeSnapshotWriteback,
     BeforeNativePublicRead,
+    #[cfg(test)]
+    AfterNativeVoterRead,
     BeforeNativeGenerationAppend,
     AfterNativeGenerationCapture,
     AfterNativeGenerationAppend,
+    BeforeNativeFrameRebase,
+    AfterNativeFrameRebase,
+    #[cfg(test)]
+    NativeCompactorCaughtUp,
+    #[cfg(test)]
+    NativeCompactorWaitTake,
+    #[cfg(test)]
+    NativeCompactorOwnerTake,
+    #[cfg(test)]
+    NativeCompactorQueueWait,
+    #[cfg(test)]
+    NativeCompactorBaseBlock,
+    #[cfg(test)]
+    NativeCompactorExtentRead,
+    #[cfg(test)]
+    NativeCompactorCancelled,
+    #[cfg(test)]
+    BeforeNativeAsyncCapacityRequest,
+    #[cfg(test)]
+    NativeAsyncPersistenceFailed,
+    NativeGenerationCeilingWait,
+    NativeGenerationHeadroomWarning,
+    BeforeNativeCandidateDiscard,
+    AfterNativeCandidateDiscard,
+    NativeCandidateCapacityRestart,
+    NativeLiveDataCapacity,
+    BeforeNativePendingCapture,
+    BeforeNativePendingBaseBuild,
+    AfterNativePendingBaseBuild,
+    BeforeNativePendingBaseSelect,
+    AfterNativePendingBaseSelect,
+    NativePendingCapacityWait,
+    #[cfg(test)]
+    AfterNativePendingWorkerStart,
+    #[cfg(test)]
+    NativePendingJournalDrained,
+    #[cfg(test)]
+    NativePendingIdle,
+    #[cfg(test)]
+    NativePendingSelectedCaptureReady(bool),
+    AfterNativeSwitchSelection,
     AfterNativeRelocationStep,
+    AfterNativeBackgroundRelocationPublish,
+    #[cfg(test)]
+    AfterNativeBackgroundPoll,
+    #[cfg(test)]
+    NativeBackgroundRelocationIdle,
     BeforeAsyncClosedWrite,
     AfterAsyncClosedFileSync,
     AfterAsyncClosedRename,
@@ -379,6 +443,9 @@ pub(crate) enum Point {
     AfterSnapshotProofRetireSync,
 }
 
+#[cfg(test)]
+type NativePressureClock = Arc<dyn Fn(&mut native_basis::PressureProgress) + Send + Sync>;
+
 #[derive(Clone)]
 pub(super) struct IoControl {
     pub(super) hook: Arc<dyn Fn(Point) -> io::Result<()> + Send + Sync>,
@@ -386,6 +453,17 @@ pub(super) struct IoControl {
     pub(super) fail_after_bytes: Option<usize>,
     pub(super) intent_fail_after_bytes: Option<usize>,
     pub(super) cut_fail_after_bytes: Option<usize>,
+    #[cfg(test)]
+    pub(super) native_rollover_bytes: Option<u64>,
+    #[cfg(test)]
+    pub(super) native_rollover_maximum: Option<u64>,
+    #[cfg(test)]
+    pub(super) native_rebase_capacity_abort: Option<Arc<std::sync::atomic::AtomicBool>>,
+    #[cfg(test)]
+    pub(super) native_pressure_clock: Option<NativePressureClock>,
+    #[cfg(test)]
+    pub(super) native_rollover_costs:
+        Option<Arc<Mutex<Vec<crate::consensus::native::rollover_costs::Costs>>>>,
 }
 
 impl Default for IoControl {
@@ -396,6 +474,16 @@ impl Default for IoControl {
             fail_after_bytes: None,
             intent_fail_after_bytes: None,
             cut_fail_after_bytes: None,
+            #[cfg(test)]
+            native_rollover_bytes: None,
+            #[cfg(test)]
+            native_rollover_maximum: None,
+            #[cfg(test)]
+            native_rebase_capacity_abort: None,
+            #[cfg(test)]
+            native_pressure_clock: None,
+            #[cfg(test)]
+            native_rollover_costs: None,
         }
     }
 }
@@ -455,8 +543,16 @@ impl Ticket {
     #[cfg(test)]
     pub(super) fn wait(self) -> io::Result<u64> {
         self.0
-            .recv()
-            .map_err(|_| io::Error::other("private WAL writer lost completion"))?
+            .recv_timeout(Duration::from_secs(180))
+            .map_err(|error| match error {
+                mpsc::RecvTimeoutError::Timeout => io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "private WAL ticket still waiting for writer completion after 180s",
+                ),
+                mpsc::RecvTimeoutError::Disconnected => {
+                    io::Error::other("private WAL writer lost completion")
+                }
+            })?
     }
 
     #[cfg(test)]
@@ -559,6 +655,14 @@ struct State {
     native_checkpoint_target: Option<native_basis::Target>,
     native_basis_active: bool,
     native_basis_ready: bool,
+    native_ceiling_wait: bool,
+    native_live_capacity: bool,
+    native_pending_base: bool,
+    native_pending_ready: bool,
+    native_pending_journal_pressure: bool,
+    native_rollover_ready: bool,
+    native_background_ready: bool,
+    native_background_pending: bool,
     native_relocations_pending: bool,
     native_install_pending: bool,
     native_operations: usize,
@@ -595,6 +699,7 @@ struct State {
 }
 
 struct Shared {
+    coordination: Arc<native_basis::Coordinator>,
     voter_admission: std::sync::OnceLock<std::sync::Weak<super::voter_slots::Admission>>,
     voter_publication: tokio::sync::watch::Sender<()>,
     state: Mutex<State>,
@@ -692,6 +797,14 @@ impl State {
             native_snapshot_pending: None,
             native_checkpoint_target: None,
             native_basis_active: false,
+            native_ceiling_wait: false,
+            native_live_capacity: false,
+            native_pending_base: false,
+            native_pending_ready: false,
+            native_pending_journal_pressure: false,
+            native_rollover_ready: false,
+            native_background_ready: false,
+            native_background_pending: false,
             native_basis_ready: false,
             native_relocations_pending: false,
             native_install_pending: false,
@@ -811,9 +924,8 @@ impl Wal {
         let directory_pin = owner::pin_directory(directory)?;
         let pinned_path = owner::directory_path(&directory_pin);
         let directory = pinned_path.as_path();
-        let lock = file_create(&directory.join("LOCK"))?;
-        rustix::fs::flock(&lock, rustix::fs::FlockOperation::NonBlockingLockExclusive)?;
-        lock.sync_all()?;
+        let lock = RootLock::acquire(file_create(&directory.join("LOCK"))?)?;
+        lock.file.sync_all()?;
         let basis_path = directory.join("basis.sqlite");
         file_create(&basis_path)?.sync_all()?;
         let mut frozen = Connection::open(&basis_path).map_err(db_error)?;
@@ -886,8 +998,7 @@ impl Wal {
         if !fs::symlink_metadata(directory)?.is_dir() {
             return Err(invalid_data("private WAL directory is invalid"));
         }
-        let lock = file_read(&directory.join("LOCK"))?;
-        rustix::fs::flock(&lock, rustix::fs::FlockOperation::NonBlockingLockExclusive)?;
+        let lock = RootLock::acquire(file_read(&directory.join("LOCK"))?)?;
         let anchor = checkpoint::read(directory, binding, limits)?;
         let conn = match &anchor {
             Some(anchor) => anchor.load_basis(directory, binding)?,
@@ -991,8 +1102,17 @@ impl Wal {
             .native
             .as_ref()
             .and_then(|native| native.business.roster_root().cloned());
+        if let Some(selected) = &selected {
+            native_basis::record_generation_size(
+                &mut state,
+                selected,
+                binding.persistence,
+                &control,
+            )?;
+        }
         let terminal_failure = state.terminal_failure.clone();
         let shared = Arc::new(Shared {
+            coordination: native_basis::Coordinator::new(),
             voter_admission: std::sync::OnceLock::new(),
             voter_publication: tokio::sync::watch::channel(()).0,
             state: Mutex::new(state),
@@ -1151,6 +1271,15 @@ impl Wal {
         checkpoint_on_retention: bool,
     ) -> io::Result<()> {
         let submitted = Instant::now();
+        if self.binding.native {
+            let state = lock_state(&self.shared)?;
+            let waiting = state.native_ceiling_wait
+                && (state.asynchronous.is_some() || state.native_live_capacity);
+            drop(state);
+            if waiting {
+                self.wait_for_native_file_guard()?;
+            }
+        }
         let entries = match &operation {
             Operation::Append(entries) => entries.len(),
             _ => 0,
@@ -1168,148 +1297,191 @@ impl Wal {
         let charge = record.charge(self.limits.fragment_bytes())?;
         #[cfg(test)]
         let encode = submitted.elapsed();
-        let lock_started = Instant::now();
-        let mut state = lock_state(&self.shared)?;
-        #[cfg(feature = "test-control")]
-        if state.volatile_experiment.is_some() {
-            return volatile_experiment::admit(self, &mut state, &operation, completion, charge);
-        }
-        loop {
-            while ((!self.binding.native && state.checkpoint_requested)
-                || state.snapshot.is_some()
-                || state.native_install_pending)
-                && state.status == Status::Running
-            {
-                state = self
-                    .shared
-                    .ready
-                    .wait(state)
-                    .map_err(|_| io::Error::other("private WAL checkpoint wait poisoned"))?;
+        let mut completion = completion;
+        let mut journal_progress: Option<native_basis::PressureProgress> = None;
+        'admission: loop {
+            let lock_started = Instant::now();
+            let mut state = lock_state(&self.shared)?;
+            #[cfg(feature = "test-control")]
+            if state.volatile_experiment.is_some() {
+                return volatile_experiment::admit(
+                    self, &mut state, &operation, completion, charge,
+                );
             }
+            loop {
+                if (state.asynchronous.is_some() || state.native_live_capacity)
+                    && state.native_ceiling_wait
+                {
+                    drop(state);
+                    if let Some(progress) = &mut journal_progress {
+                        progress.pause_for_file_guard();
+                    }
+                    self.wait_for_native_file_guard()?;
+                    if let Some(progress) = &mut journal_progress {
+                        progress.resume_after_file_guard();
+                    }
+                    state = lock_state(&self.shared)?;
+                    continue;
+                }
+                while ((!self.binding.native && state.checkpoint_requested)
+                    || state.snapshot.is_some()
+                    || state.native_install_pending)
+                    && state.status == Status::Running
+                {
+                    state =
+                        self.shared.ready.wait(state).map_err(|_| {
+                            io::Error::other("private WAL checkpoint wait poisoned")
+                        })?;
+                }
+                if state.status != Status::Running {
+                    return Err(io::Error::other("private WAL writer is fenced"));
+                }
+                if state.asynchronous.is_some() {
+                    match async_persistence::admit(self, &mut state, &operation, &mut completion) {
+                        Err(error) => {
+                            if let Some(bytes) = crate::consensus::verified_snapshot::VerificationMemory::journal_pressure(&error) {
+                                drop(state);
+                                self.wait_for_journal_memory(&mut journal_progress, bytes)?;
+                                continue 'admission;
+                            }
+                            return Err(error);
+                        }
+                        result => return result,
+                    }
+                }
+                let retained_capacity_exhausted =
+                    state.sequence.saturating_sub(state.base_sequence)
+                        >= self.limits.history_count as u64
+                        || state
+                            .history_bytes
+                            .checked_add(charge)
+                            .is_none_or(|total| total > self.limits.history_bytes);
+                // These two bounds cannot be repaired by moving a basis. Keep
+                // the original bounded rejection instead of an endless handoff.
+                if !checkpoint_on_retention
+                    || !retained_capacity_exhausted
+                    || charge > self.limits.history_bytes
+                    || state.sequence == u64::MAX
+                {
+                    break;
+                }
+                state.checkpoint_requested = true;
+                state.checkpoint_costs.automatic_requests += 1;
+                self.shared.ready.notify_all();
+                // This operation has not changed the projection, sequence or
+                // queue. Its callback stays here while earlier accepted owners
+                // drain, and is admitted exactly once after the selected basis.
+                if self.binding.native {
+                    // Preparation does not stop admission. At the unchanged hard
+                    // bound, wait for real publication progress instead of spinning
+                    // on an already requested or running background capture.
+                    #[cfg(test)]
+                    (self.control.hook)(Point::NativeRetentionWaitStarted)?;
+                    state = self
+                        .shared
+                        .ready
+                        .wait(state)
+                        .map_err(|_| io::Error::other("native WAL retention wait poisoned"))?;
+                }
+            }
+            let lock_wait = lock_started.elapsed();
             if state.status != Status::Running {
                 return Err(io::Error::other("private WAL writer is fenced"));
             }
-            if state.asynchronous.is_some() {
-                return async_persistence::admit(self, &mut state, &operation, completion);
-            }
-            let retained_capacity_exhausted = state.sequence.saturating_sub(state.base_sequence)
-                >= self.limits.history_count as u64
+            // A maximum legal append may exceed the ordinary queue/group budget.
+            // It is admitted alone, with its own fixed format bound. No second
+            // request can consume bytes until that whole operation completes.
+            if state.outstanding >= self.limits.outstanding
+                || (state.outstanding != 0
+                    && state.outstanding_bytes.saturating_add(charge)
+                        > self.limits.outstanding_bytes)
+                || state.sequence.saturating_sub(state.base_sequence)
+                    >= self.limits.history_count as u64
+                || state.sequence == u64::MAX
                 || state
                     .history_bytes
                     .checked_add(charge)
-                    .is_none_or(|total| total > self.limits.history_bytes);
-            // These two bounds cannot be repaired by moving a basis. Keep
-            // the original bounded rejection instead of an endless handoff.
-            if !checkpoint_on_retention
-                || !retained_capacity_exhausted
-                || charge > self.limits.history_bytes
-                || state.sequence == u64::MAX
+                    .is_none_or(|total| total > self.limits.history_bytes)
             {
-                break;
+                return Err(io::Error::new(
+                    io::ErrorKind::WouldBlock,
+                    "private WAL admission limit",
+                ));
             }
-            state.checkpoint_requested = true;
-            state.checkpoint_costs.automatic_requests += 1;
-            self.shared.ready.notify_all();
-            // This operation has not changed the projection, sequence or
-            // queue. Its callback stays here while earlier accepted owners
-            // drain, and is admitted exactly once after the selected basis.
-            if self.binding.native {
-                // Preparation does not stop admission. At the unchanged hard
-                // bound, wait for real publication progress instead of spinning
-                // on an already requested or running background capture.
-                state = self
-                    .shared
-                    .ready
-                    .wait(state)
-                    .map_err(|_| io::Error::other("native WAL retention wait poisoned"))?;
-            }
-        }
-        let lock_wait = lock_started.elapsed();
-        if state.status != Status::Running {
-            return Err(io::Error::other("private WAL writer is fenced"));
-        }
-        // A maximum legal append may exceed the ordinary queue/group budget.
-        // It is admitted alone, with its own fixed format bound. No second
-        // request can consume bytes until that whole operation completes.
-        if state.outstanding >= self.limits.outstanding
-            || (state.outstanding != 0
-                && state.outstanding_bytes.saturating_add(charge) > self.limits.outstanding_bytes)
-            || state.sequence.saturating_sub(state.base_sequence)
-                >= self.limits.history_count as u64
-            || state.sequence == u64::MAX
-            || state
-                .history_bytes
-                .checked_add(charge)
-                .is_none_or(|total| total > self.limits.history_bytes)
-        {
-            return Err(io::Error::new(
-                io::ErrorKind::WouldBlock,
-                "private WAL admission limit",
-            ));
-        }
-        let projection_started = Instant::now();
-        let runtime = self
-            .shared
-            .voter_admission
-            .get()
-            .and_then(std::sync::Weak::upgrade);
-        let check = |request: &opc_consensus::voter_slots::VoterReplacementRequest| {
-            runtime
-                .as_ref()
-                .is_some_and(|runtime| runtime.intent_fence_acknowledged(request))
-        };
-        // The test-only raw writer admits format/replay fixtures directly. All
-        // production adapter admissions require the exact live engine receipt.
-        let fence: Option<&dyn Fn(&opc_consensus::voter_slots::VoterReplacementRequest) -> bool> =
-            checkpoint_on_retention.then_some(&check);
-        let committed_after = match application::project_operation_guarded(
-            &mut state,
-            self.binding,
-            &operation,
-            fence,
-        ) {
-            Ok(committed) => committed,
-            Err(error) => {
-                if state.status == Status::Failed {
-                    self.shared.ready.notify_all();
+            let projection_started = Instant::now();
+            let runtime = self
+                .shared
+                .voter_admission
+                .get()
+                .and_then(std::sync::Weak::upgrade);
+            let check = |request: &opc_consensus::voter_slots::VoterReplacementRequest| {
+                runtime
+                    .as_ref()
+                    .is_some_and(|runtime| runtime.intent_fence_acknowledged(request))
+            };
+            // The test-only raw writer admits format/replay fixtures directly. All
+            // production adapter admissions require the exact live engine receipt.
+            let fence: Option<
+                &dyn Fn(&opc_consensus::voter_slots::VoterReplacementRequest) -> bool,
+            > = checkpoint_on_retention.then_some(&check);
+            let committed_after = match application::project_operation_guarded(
+                &mut state,
+                self.binding,
+                &operation,
+                fence,
+            ) {
+                Ok(committed) => committed,
+                Err(error) => {
+                    if let Some(bytes) =
+                        crate::consensus::verified_snapshot::VerificationMemory::journal_pressure(
+                            &error,
+                        )
+                    {
+                        drop(state);
+                        self.wait_for_journal_memory(&mut journal_progress, bytes)?;
+                        continue 'admission;
+                    }
+                    if state.status == Status::Failed {
+                        self.shared.ready.notify_all();
+                    }
+                    return Err(error);
                 }
-                return Err(error);
+            };
+            let projection = projection_started.elapsed();
+            state.sequence += 1;
+            let sequence = state.sequence;
+            state.history_bytes += charge;
+            state.outstanding += 1;
+            state.outstanding_bytes += charge;
+            state.queue.push_back(Request {
+                sequence,
+                record,
+                charge,
+                admitted: Instant::now(),
+                submitted,
+                admission: AdmissionObservation {
+                    #[cfg(any(test, feature = "test-control"))]
+                    operation: operation_name,
+                    entries,
+                    #[cfg(test)]
+                    encode,
+                    lock_wait,
+                    projection,
+                    total: submitted.elapsed(),
+                },
+                committed_after,
+                completion,
+            });
+            // Native checkpoint/snapshot publishers can wait concurrently with
+            // admission. notify_one could wake only one of those publishers and
+            // strand the writer despite queued work. Every predicate uses State.
+            if self.binding.native {
+                self.shared.ready.notify_all();
+            } else {
+                self.shared.ready.notify_one();
             }
-        };
-        let projection = projection_started.elapsed();
-        state.sequence += 1;
-        let sequence = state.sequence;
-        state.history_bytes += charge;
-        state.outstanding += 1;
-        state.outstanding_bytes += charge;
-        state.queue.push_back(Request {
-            sequence,
-            record,
-            charge,
-            admitted: Instant::now(),
-            submitted,
-            admission: AdmissionObservation {
-                #[cfg(any(test, feature = "test-control"))]
-                operation: operation_name,
-                entries,
-                #[cfg(test)]
-                encode,
-                lock_wait,
-                projection,
-                total: submitted.elapsed(),
-            },
-            committed_after,
-            completion,
-        });
-        // Native checkpoint/snapshot publishers can wait concurrently with
-        // admission. notify_one could wake only one of those publishers and
-        // strand the writer despite queued work. Every predicate uses State.
-        if self.binding.native {
-            self.shared.ready.notify_all();
-        } else {
-            self.shared.ready.notify_one();
+            return Ok(());
         }
-        Ok(())
     }
 
     #[cfg(test)]
@@ -1430,6 +1602,11 @@ impl Wal {
             }
             self.shared.ready.notify_all();
         }
+        // Persistent predicate plus the queue's own mutex closes the race
+        // between the outside-State check and Condvar sleep registration.
+        self.shared.coordination.close();
+        #[cfg(test)]
+        (self.control.hook)(Point::NativeShutdownWaitStarted)?;
         let mut writer = self
             .writer
             .lock()
@@ -1450,6 +1627,8 @@ impl Drop for Wal {
 }
 
 fn lock_state(shared: &Shared) -> io::Result<MutexGuard<'_, State>> {
+    #[cfg(test)]
+    crate::consensus::native::rollover_costs::record(|costs| costs.state_locks += 1);
     shared
         .state
         .lock()
@@ -1503,9 +1682,38 @@ impl Drop for Group {
     }
 }
 
+/// Exclusive root ownership follows this guard, including failed opening and
+/// writer teardown. Closing a file alone does not release a flock while a
+/// duplicated or inherited descriptor retains the same open-file description.
+struct RootLock {
+    file: File,
+}
+
+impl RootLock {
+    fn acquire(file: File) -> io::Result<Self> {
+        rustix::fs::flock(&file, rustix::fs::FlockOperation::NonBlockingLockExclusive)?;
+        Ok(Self { file })
+    }
+}
+
+impl Drop for RootLock {
+    fn drop(&mut self) {
+        loop {
+            match rustix::fs::flock(&self.file, rustix::fs::FlockOperation::Unlock) {
+                Ok(()) => break,
+                Err(rustix::io::Errno::INTR) => continue,
+                Err(error) => {
+                    tracing::error!(%error, "failed to release WAL root lock");
+                    break;
+                }
+            }
+        }
+    }
+}
+
 struct Disk {
     directory: PathBuf,
-    _lock: File,
+    _lock: RootLock,
     file: File,
     binding: [u8; 32],
     segment: u64,
@@ -1730,7 +1938,7 @@ fn write_loop(
 ) -> io::Result<()> {
     // Catch the body while Disk (including directory LOCK) and the worker
     // owner stay in this frame. Unwind drops every State guard before join.
-    let mut basis = native_basis::Owner::new(selected);
+    let mut basis = native_basis::Owner::new(selected, Arc::clone(&shared.coordination));
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         write_loop_body(
             Arc::clone(&shared),
@@ -1747,16 +1955,32 @@ fn write_loop(
             Ok(state) => state,
             Err(poison) => poison.into_inner(),
         };
-        application::record_failure(
-            &mut state,
-            SessionStorageFailure::from_io(SessionStorageFailureStage::Persistence, error),
-        );
-        application::fence(&mut state);
+        if native_basis::pending::is_stopped(error) {
+            state.status = Status::Closed;
+        } else {
+            application::record_failure(
+                &mut state,
+                SessionStorageFailure::from_io(SessionStorageFailureStage::Persistence, error),
+            );
+            application::fence(&mut state);
+        }
         shared.ready.notify_all();
     }
     let joined = basis.join();
-    // No return can release directory ownership before this join completes.
-    result.and(joined.map(|_| ()))
+    let optional = basis.stop_optional(&shared, &disk.directory, &control);
+    // No return can release directory ownership before all workers join.
+    result
+        .and(joined.map(|_| ()))
+        .and(optional)
+        .map_err(|error| {
+            // Preserve the existing public shutdown classification only AFTER all
+            // adapters and joined owners unwind. It never enters an I/O retry loop.
+            if native_basis::pending::is_stopped(&error) {
+                io::Error::new(io::ErrorKind::Interrupted, error)
+            } else {
+                error
+            }
+        })
 }
 
 fn write_loop_body(
@@ -1771,12 +1995,20 @@ fn write_loop_body(
         // Fault gates are outside the admission mutex and have no production
         // timer: singleton work flushes as soon as the writer can execute it.
         (control.hook)(Point::BeforeGroup)?;
+        basis.poll_pending(&shared, disk, binding, limits, control)?;
+        basis.poll_background(&shared, disk, control)?;
+        basis.poll_compactor(&shared, disk, binding, control)?;
         let mut state = lock_state(&shared)?;
         while state.queue.is_empty()
             && !state.volatile_mode()
             && (if binding.native {
                 !basis.has_relocations()
+                    && !basis.pending_actionable(&state, disk)
                     && !state.native_basis_ready
+                    && !basis.background_actionable(&state)
+                    && !state.native_rollover_ready
+                    && !basis.compactor_restart_ready()
+                    && !basis.guard_compactor_needed(&state)
                     && !native_basis::needed(&state, disk, limits)
             } else {
                 !state.checkpoint_requested
@@ -1787,6 +2019,10 @@ fn write_loop_body(
                 .is_some_and(snapshot::Handoff::writer_ready)
             && state.status == Status::Running
         {
+            #[cfg(test)]
+            if basis.pending_active() {
+                (control.hook)(Point::NativePendingIdle)?;
+            }
             state = shared
                 .ready
                 .wait(state)
@@ -1807,6 +2043,10 @@ fn write_loop_body(
             drop(state);
             return volatile_experiment::write_loop(&shared, basis, binding, control);
         }
+        if binding.native && basis.pending_actionable(&state, disk) {
+            drop(state);
+            continue;
+        }
         if binding.native && state.native_basis_ready {
             drop(state);
             let prepared = basis
@@ -1821,6 +2061,35 @@ fn write_loop_body(
             }
             shared.ready.notify_all();
             continue;
+        }
+        if binding.native && basis.guard_compactor_needed(&state) {
+            drop(state);
+            basis.poll_compactor(&shared, disk, binding, control)?;
+            continue;
+        }
+        if binding.native && basis.background_actionable(&state) {
+            drop(state);
+            continue;
+        }
+        // Service a completed restart even while a checkpoint owns the slot.
+        // With that checkpoint active, one readiness poll is followed by WAL
+        // group processing or its worker wait, so optional readiness cannot
+        // spin before queued callbacks or strand the worker awaiting restart.
+        if binding.native && (state.native_rollover_ready || basis.compactor_restart_ready()) {
+            drop(state);
+            basis.poll_compactor(&shared, disk, binding, control)?;
+            state = lock_state(&shared)?;
+            ensure_readable(&state)?;
+            // These completions may have arrived while polling outside State;
+            // consume their predicates before registering another worker wait.
+            if !state.native_basis_active
+                || state.native_basis_ready
+                || basis.background_actionable(&state)
+                || basis.compactor_restart_ready()
+                || basis.pending_actionable(&state, disk)
+            {
+                continue;
+            }
         }
         if binding.native && basis.has_relocations() {
             drop(state);
@@ -1841,6 +2110,10 @@ fn write_loop_body(
                 continue;
             }
             if state.native_basis_active {
+                if basis.compactor_restart_ready() {
+                    drop(state);
+                    continue;
+                }
                 // Closing drains an active job as well as accepted WAL work.
                 // The worker reports completion under State, preventing a
                 // lost wakeup even when shutdown raced its final notification.
@@ -2581,7 +2854,7 @@ fn recover(
     binding: Binding,
     limits: Limits,
     conn: &Connection,
-    lock: File,
+    lock: RootLock,
     control: &IoControl,
     anchor: Option<checkpoint::Anchor>,
 ) -> io::Result<(Disk, usize)> {
@@ -3052,7 +3325,7 @@ impl RecoveryAudit {
     fn finish(
         self,
         directory: &Path,
-        lock: File,
+        lock: RootLock,
         control: &IoControl,
     ) -> io::Result<(Disk, usize)> {
         let Self {
@@ -3140,5 +3413,32 @@ impl RecoveryAudit {
             },
             history_bytes,
         ))
+    }
+}
+
+#[cfg(test)]
+mod root_lock_tests {
+    use super::*;
+
+    #[test]
+    fn explicit_release_releases_root_lock_despite_duplicated_descriptor() {
+        let directory = tempfile::tempdir().expect("root lock workspace");
+        let path = directory.path().join("LOCK");
+        let lock = RootLock::acquire(file_create(&path).expect("create root lock file"))
+            .expect("acquire root lock");
+        let duplicate = lock
+            .file
+            .try_clone()
+            .expect("duplicate root lock descriptor");
+
+        // Without an explicit unlock, flock would stay held through the
+        // duplicate open file description after the owner closes its handle.
+        drop(lock);
+
+        let probe = file_read(&path).expect("probe root lock file");
+        rustix::fs::flock(&probe, rustix::fs::FlockOperation::NonBlockingLockExclusive)
+            .expect("successor must acquire the root lock after a clean release");
+
+        drop(duplicate);
     }
 }

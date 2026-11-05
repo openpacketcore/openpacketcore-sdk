@@ -200,11 +200,11 @@ fn scan_response(
     let mut value = ModifyResponseTransfer::default();
     if flags & 32 != 0 {
         let (address, teid) = read_transport(&mut reader)?;
-        value.downlink = Some(DownlinkTransport::new(address, teid));
+        value.downlink = Some(DownlinkTransport::with_address(address, teid));
     }
     if flags & 16 != 0 {
         let (address, teid) = read_transport(&mut reader)?;
-        value.uplink = Some(UplinkTransport::new(address, teid));
+        value.uplink = Some(UplinkTransport::with_address(address, teid));
     }
     let mut seen = 0;
     if flags & 8 != 0 {

@@ -1,0 +1,22 @@
+[package]
+name = "opc-linux-clock-sys"
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "Narrow Linux clock-adjustment UAPI boundary for OpenPacketCore"
+readme = "README.md"
+documentation = "https://docs.rs/opc-linux-clock-sys"
+keywords = ["5g", "clock", "ntp", "linux", "packet-core"]
+categories = ["os::linux-apis"]
+publish = false
+
+[target.'cfg(target_os = "linux")'.dependencies]
+libc = "0.2"
+
+[lints.rust]
+unsafe_code = "allow"
+unsafe_op_in_unsafe_fn = "deny"
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(opc_linux_clock_sys_force_unsupported)'] }

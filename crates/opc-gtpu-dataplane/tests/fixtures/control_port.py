@@ -3,7 +3,7 @@
 
 Clauses 5.1, 5.2.1, 7.2, 7.3 and 8.2; no SDK imports or encoder calls.
 C=typed control, G=framed G-PDU, R=required unknown extension,
-U=unmodelled message, M=malformed. '-' means no Echo response plan.
+T=ignorable Tunnel Status, U=unmodelled message, M=malformed. '-' means no Echo response plan.
 """
 import argparse
 import hashlib
@@ -36,6 +36,9 @@ def corpus():
     marker = frame(254, flags=0x30, teid=0x01020304)
     add("error", "C", error)
     add("end-marker", "C", marker)
+    for spoc in [0, 1]:
+        add(f"tunnel-status-{spoc}", "T", frame(253, bytes([230, 0, 1, spoc]), flags=0x30, teid=0x01020304))
+    add("malformed-tunnel-status", "M", frame(253, b"\x45", flags=0x30, teid=0x01020304))
     notifications = []
     for count in [0, 1, 2, 255]:
         wire = frame(31, bytes([141, count]) + bytes(range(1, count + 1)))
@@ -44,12 +47,19 @@ def corpus():
     gpdu = frame(255, b"\x45", flags=0x30, teid=0x01020304)
     add("gpdu", "G", gpdu)
     for kind in range(256):
-        if kind not in [1, 2, 26, 31, 254, 255]:
+        if kind not in [1, 2, 26, 31, 253, 254, 255]:
             add(f"unmodelled-{kind}", "U", frame(kind, b"\x45", flags=0x30, teid=0x01020304))
     for extension in range(1, 256):
         wire = bytearray(frame(255, b"\x01\x00\x00\x00\x45", flags=0x34, teid=0x01020304))
         wire[11] = extension
-        add(f"extension-{extension}", "R" if extension >= 128 and extension != 0x85 else "G", wire)
+        # Two-octet content is malformed for either Long PDCP assignment.
+        disposition = "M" if extension in [0x03, 0x82] else (
+            "R" if extension >= 128 and extension != 0x85 else "G")
+        add(f"extension-{extension}", disposition, wire)
+    for extension, disposition in [(0x03, "G"), (0x82, "R")]:
+        wire = bytearray(frame(255, bytes.fromhex("020001020000000045"), flags=0x34, teid=0x01020304))
+        wire[11] = extension
+        add(f"long-pdcp-{extension}", disposition, wire)
     for index, seed in enumerate([echo, reply, error, marker, gpdu, *notifications]):
         for length in range(len(seed)):
             add(f"trunc-{index}-{length}", "M", seed[:length])

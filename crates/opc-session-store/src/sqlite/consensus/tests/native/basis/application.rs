@@ -135,10 +135,7 @@ fn native_detached_application_allows_queue_snapshot_and_relocation_then_retries
             encode_json(&applied.responses).unwrap(),
             encode_json(&oracle.responses).unwrap()
         );
-        assert_eq!(
-            encode_json(&applied.notifications).unwrap(),
-            encode_json(&oracle.notifications).unwrap()
-        );
+        policy_oracle::notifications(&applied.notifications, &oracle.notifications, &entries);
         assert_eq!(
             applied.notifications.len(),
             1,

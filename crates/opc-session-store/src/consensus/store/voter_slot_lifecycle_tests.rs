@@ -1,6 +1,87 @@
 use super::*;
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn retained_store_owner_refuses_reopen_until_its_release() {
+    let mut fleet = Fleet::open_pristine_with_io_hook(3, None).await;
+    let node = member(2, 1).identity.node_id();
+    let owner = fleet.nodes.remove(1);
+    fleet.network.disconnect_and_shutdown(&owner).await;
+    let reopen = || async {
+        let directory = fleet.directories[1].path();
+        ConsensusSessionStore::open_with_voter_slots_and_integrity(
+            fleet.topology(2),
+            fleet.genesis(),
+            node,
+            SqliteSessionBackend::open(directory.join("session.sqlite")).unwrap(),
+            directory.join("snapshots"),
+            Arc::new(Resolver(fleet.network.clone())),
+            super::super::super::SnapshotIntegrityPolicy::PortableVerified,
+        )
+        .await
+    };
+    let refused = matches!(
+        reopen().await,
+        Err(ConsensusSessionStoreOpenError::StorageUnavailable)
+    );
+    drop(owner);
+    let reopened = reopen().await.unwrap();
+    fleet.nodes.insert(1, reopened);
+    fleet.close().await;
+    assert!(
+        refused,
+        "shutdown must not release a retained owner's exclusion"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn incompatible_reopen_preserves_the_retained_voter_identity() {
+    let mut fleet = Fleet::open_pristine_with_io_hook(3, None).await;
+    let node = member(2, 1).identity.node_id();
+    let owner = fleet.nodes.remove(1);
+    fleet.network.disconnect_and_shutdown(&owner).await;
+    drop(owner);
+    let directory = fleet.directories[1].path();
+    let mut incompatible = fleet.genesis();
+    incompatible.slots[1].member.key_digest[0] ^= 1;
+    incompatible.manifest_digest =
+        Sha256::digest(encode_voter_slot_table(&incompatible).unwrap()).into();
+    let refused = matches!(
+        ConsensusSessionStore::open_with_voter_slots_and_integrity(
+            topology_from_table(incompatible.clone(), 2),
+            incompatible,
+            node,
+            SqliteSessionBackend::open(directory.join("session.sqlite")).unwrap(),
+            directory.join("snapshots"),
+            Arc::new(Resolver(fleet.network.clone())),
+            super::super::super::SnapshotIntegrityPolicy::PortableVerified,
+        )
+        .await,
+        Err(ConsensusSessionStoreOpenError::VoterIdentityReplacementRequired)
+    );
+    let reopened = ConsensusSessionStore::open_with_voter_slots_and_integrity(
+        fleet.topology(2),
+        fleet.genesis(),
+        node,
+        SqliteSessionBackend::open(directory.join("session.sqlite")).unwrap(),
+        directory.join("snapshots"),
+        Arc::new(Resolver(fleet.network.clone())),
+        super::super::super::SnapshotIntegrityPolicy::PortableVerified,
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        reopened.voter_slot_state().await.unwrap().table(),
+        &fleet.genesis()
+    );
+    fleet.nodes.insert(1, reopened);
+    fleet.close().await;
+    assert!(
+        refused,
+        "a different enrollment key must require identity replacement"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn disconnect_drains_an_rpc_handler_before_the_store_reopens() {
     let mut fleet = Fleet::open().await;
     let node = member(2, 1).identity.node_id();

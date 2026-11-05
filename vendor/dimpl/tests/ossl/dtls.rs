@@ -39,7 +39,15 @@ impl OsslDtlsImpl {
         cert: OsslDtlsCert,
         groups_list: Option<&str>,
     ) -> Result<Self, CryptoError> {
-        let context = dtls_create_ctx_with_groups(&cert, groups_list)?;
+        Self::new_with_algorithms(cert, groups_list, None)
+    }
+
+    pub fn new_with_algorithms(
+        cert: OsslDtlsCert,
+        groups_list: Option<&str>,
+        sigalgs: Option<&str>,
+    ) -> Result<Self, CryptoError> {
+        let context = dtls_create_ctx_with_algorithms(&cert, groups_list, sigalgs)?;
         let ssl = dtls_ssl_create(&context)?;
         Ok(OsslDtlsImpl {
             _cert: cert,
@@ -87,10 +95,10 @@ impl OsslDtlsImpl {
 
     pub fn poll_datagram(&mut self) -> Option<super::DatagramSend> {
         let x = self.tls.inner_mut().pop_outgoing();
-        if let Some(x) = &x {
-            if x.len() > DATAGRAM_MTU_WARN {
-                eprintln!("DTLS above MTU {}: {}", DATAGRAM_MTU_WARN, x.len());
-            }
+        if let Some(x) = &x
+            && x.len() > DATAGRAM_MTU_WARN
+        {
+            eprintln!("DTLS above MTU {}: {}", DATAGRAM_MTU_WARN, x.len());
         }
         x
     }
@@ -148,6 +156,14 @@ pub fn dtls_create_ctx_with_groups(
     cert: &OsslDtlsCert,
     groups_list: Option<&str>,
 ) -> Result<SslContext, CryptoError> {
+    dtls_create_ctx_with_algorithms(cert, groups_list, None)
+}
+
+fn dtls_create_ctx_with_algorithms(
+    cert: &OsslDtlsCert,
+    groups_list: Option<&str>,
+    sigalgs: Option<&str>,
+) -> Result<SslContext, CryptoError> {
     // TODO: Technically we want to disallow DTLS < 1.2, but that requires
     // us to use this commented out unsafe. We depend on browsers disallowing
     // it instead.
@@ -155,6 +171,9 @@ pub fn dtls_create_ctx_with_groups(
     let mut ctx = SslContextBuilder::new(SslMethod::dtls())?;
 
     ctx.set_cipher_list(DTLS_CIPHERS)?;
+    if let Some(sigalgs) = sigalgs {
+        ctx.set_sigalgs_list(sigalgs)?;
+    }
     if let Some(groups) = groups_list {
         ctx.set_groups_list(groups)?;
     }
@@ -181,9 +200,13 @@ pub fn dtls_create_ctx_with_groups(
     ctx.set_options(options);
 
     // Enable DHE cipher suites by setting temporary DH parameters
-    if let Ok(dh) = Dh::get_2048_256() {
-        ctx.set_tmp_dh(dh.as_ref())?;
-    }
+    let params = if groups_list == Some("ffdhe2048") {
+        include_bytes!("ffdhe2048.pem").as_slice()
+    } else {
+        include_bytes!("ffdhe4096.pem").as_slice()
+    };
+    let dh = Dh::params_from_pem(params)?;
+    ctx.set_tmp_dh(dh.as_ref())?;
 
     let ctx = ctx.build();
 

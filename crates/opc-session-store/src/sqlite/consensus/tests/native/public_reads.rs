@@ -1,5 +1,9 @@
 //! Original SQL reads are the oracle for the detached native adapter.
 
+use crate::consensus::native::test_journal::{
+    journal_page_for_test_sync, journal_page_result_for_test,
+};
+
 use super::*;
 use crate::restore::{RestoreScanPage, RestoreScanRequest, RestoreScanScope};
 use std::time::Instant;
@@ -67,19 +71,20 @@ fn native_public_record_journal_and_restore_pages_preserve_sql_cursors_across_co
         .enable_all()
         .build()
         .unwrap();
-    let expected_journal = runtime
-        .block_on(fixture.oracle.consensus_get_replication_log(0, 64))
-        .unwrap();
+    let expected_journal = journal_page_for_test_sync(|| {
+        runtime.block_on(fixture.oracle.consensus_get_replication_log(0, 64))
+    });
     let journal = fixture
         .wal
         .native_public_read(&|| Ok(()), |state, check| {
-            state.replication_log(0, 64, check)
+            journal_page_result_for_test(|| state.replication_log(0, 64, check))
         })
         .unwrap()
         .unwrap();
-    assert_eq!(
-        encode_json(&journal).unwrap(),
-        encode_json(&expected_journal).unwrap()
+    policy_oracle::page(
+        &journal,
+        &expected_journal,
+        &fixture.oracle.conn.blocking_lock(),
     );
     let first_page = scan(&fixture.wal, RestoreScanRequest::all(2), timestamp(3)).unwrap();
     assert_eq!(
@@ -93,13 +98,14 @@ fn native_public_record_journal_and_restore_pages_preserve_sql_cursors_across_co
     assert!(reopened.native_cold_counts_for_test().unwrap()[1] > 0);
     let cold_journal = reopened
         .native_public_read(&|| Ok(()), |state, check| {
-            state.replication_log(0, 64, check)
+            journal_page_result_for_test(|| state.replication_log(0, 64, check))
         })
         .unwrap()
         .unwrap();
-    assert_eq!(
-        encode_json(&cold_journal).unwrap(),
-        encode_json(&expected_journal).unwrap()
+    policy_oracle::page(
+        &cold_journal,
+        &expected_journal,
+        &fixture.oracle.conn.blocking_lock(),
     );
     let mut cursor = first_page.next_cursor;
     let mut total = 2;
@@ -220,19 +226,16 @@ fn native_public_selected_journal_ranges_preserve_sql_bytes_and_cancellation() {
         (193, 2),
         (194, 65),
     ] {
-        let expected = runtime
-            .block_on(fixture.oracle.consensus_get_replication_log(start, limit))
-            .unwrap();
+        let expected = journal_page_for_test_sync(|| {
+            runtime.block_on(fixture.oracle.consensus_get_replication_log(start, limit))
+        });
         let actual = reopened
             .native_public_read(&|| Ok(()), |state, check| {
-                state.replication_log(start, limit, check)
+                journal_page_result_for_test(|| state.replication_log(start, limit, check))
             })
             .unwrap()
             .unwrap();
-        assert_eq!(
-            encode_json(&actual).unwrap(),
-            encode_json(&expected).unwrap()
-        );
+        policy_oracle::page(&actual, &expected, &fixture.oracle.conn.blocking_lock());
         retained.push((actual, expected));
     }
     // Cancellation at different checked-work boundaries must discard the
@@ -263,9 +266,6 @@ fn native_public_selected_journal_ranges_preserve_sql_bytes_and_cancellation() {
     // Completed public pages own their exact payloads after the native owner
     // and all decoder workers have stopped.
     for (actual, expected) in retained {
-        assert_eq!(
-            encode_json(&actual).unwrap(),
-            encode_json(&expected).unwrap()
-        );
+        policy_oracle::page(&actual, &expected, &fixture.oracle.conn.blocking_lock());
     }
 }

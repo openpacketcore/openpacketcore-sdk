@@ -390,3 +390,498 @@ async fn test_production_server_rejects_missing_tls_and_auth() {
     let err = server.run_with_listener(listener, app).await.unwrap_err();
     assert!(err.contains("requires TLS"));
 }
+
+#[tokio::test]
+async fn client_errors_do_not_trip_the_circuit_breaker() {
+    let producer = MockProducer::start().await;
+    producer.set_override(
+        "/nnrf-disc/missing",
+        StatusCode::NOT_FOUND,
+        HashMap::new(),
+        Vec::new(),
+    );
+    let breakers = Arc::new(opc_sbi::client::circuit_breaker::CircuitBreakers::new(
+        1,
+        Duration::from_secs(30),
+        1,
+    ));
+    let client = SbiClientBuilder::new()
+        .with_http2_only(false)
+        .with_circuit_breakers(breakers.clone())
+        .build()
+        .unwrap();
+    let consumer = MockConsumer::with_client(client);
+    for _ in 0..3 {
+        let (status, _, _) = consumer
+            .send_get(
+                &format!("{}/nnrf-disc/missing", producer.url()),
+                HashMap::new(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(status, StatusCode::NOT_FOUND);
+    }
+    assert_eq!(
+        breakers
+            .get("127.0.0.1", "nnrf-disc")
+            .lock()
+            .unwrap()
+            .state(),
+        CircuitState::Closed
+    );
+}
+
+struct RejectAuth(opc_sbi::auth::SbiAuthError);
+
+#[async_trait::async_trait]
+impl SbiAuth for RejectAuth {
+    async fn authorize(
+        &self,
+        _: &SbiAuthRequest,
+    ) -> Result<opc_sbi::auth::SbiAuthContext, opc_sbi::auth::SbiAuthError> {
+        Err(self.0.clone())
+    }
+}
+
+#[tokio::test]
+async fn auth_failures_include_safe_bearer_challenges_and_problem_media_type() {
+    use opc_sbi::auth::SbiAuthError;
+    for (error, expected_status, challenge) in [
+        (
+            SbiAuthError::MissingBearerToken,
+            StatusCode::UNAUTHORIZED,
+            Some("Bearer realm=\"https://nrf.example.test/nnrf-disc/v1\""),
+        ),
+        (
+            SbiAuthError::Denied {
+                reason: "private-token-detail".into(),
+            },
+            StatusCode::UNAUTHORIZED,
+            Some("Bearer realm=\"https://nrf.example.test/nnrf-disc/v1\", error=\"invalid_token\""),
+        ),
+        (
+            SbiAuthError::TokenBindingMismatch,
+            StatusCode::UNAUTHORIZED,
+            Some("Bearer realm=\"https://nrf.example.test/nnrf-disc/v1\", error=\"invalid_token\""),
+        ),
+        (
+            SbiAuthError::MissingPeerBinding,
+            StatusCode::UNAUTHORIZED,
+            Some("Bearer realm=\"https://nrf.example.test/nnrf-disc/v1\", error=\"invalid_token\""),
+        ),
+        (
+            SbiAuthError::InsufficientScope,
+            StatusCode::FORBIDDEN,
+            Some("Bearer realm=\"https://nrf.example.test/nnrf-disc/v1\", error=\"insufficient_scope\", scope=\"nnrf-disc\""),
+        ),
+        (
+            SbiAuthError::Internal {
+                reason: "private-key-fetch-detail".into(),
+            },
+            StatusCode::SERVICE_UNAVAILABLE,
+            None,
+        ),
+    ] {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = SbiServerBuilder::new(addr)
+            .with_auth_policy(Arc::new(RejectAuth(error)))
+            .with_auth_service(
+                "https://nrf.example.test/nnrf-disc/v1".parse().unwrap(),
+                vec!["nnrf-disc".into()],
+            );
+        let app = axum::Router::new().route(
+            "/nnrf-disc/v1/test",
+            axum::routing::get(|| async { "unexpected admission" }),
+        );
+        let task = tokio::spawn(async move { server.run_with_listener(listener, app).await });
+        let client = SbiClientBuilder::new()
+            .with_http2_only(false)
+            .with_retry_policy(RetryPolicy::new(
+                1,
+                Duration::ZERO,
+                Duration::ZERO,
+                Jitter::None,
+            ))
+            .build()
+            .unwrap();
+        let consumer = MockConsumer::with_client(client);
+        let response = consumer
+            .send_get(&format!("http://{addr}/nnrf-disc/v1/test"), HashMap::from([("host".into(), "untrusted.example".into())]))
+            .await;
+        task.abort();
+        let _ = task.await;
+        let (status, headers, body) = response.unwrap();
+        assert_eq!(status, expected_status);
+        assert_eq!(
+            headers.get("www-authenticate").map(String::as_str),
+            challenge
+        );
+        assert_eq!(
+            headers.get("content-type").map(String::as_str),
+            Some("application/problem+json")
+        );
+        assert!(!String::from_utf8_lossy(&body).contains("private-"));
+    }
+}
+
+#[tokio::test]
+async fn auth_challenges_omit_error_for_empty_and_non_bearer_credentials() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let validator = SbiJwtValidator::new(
+        Arc::new(MockJwksResolver::new()),
+        Duration::from_secs(60),
+        "test-audience".into(),
+        "test-issuer".into(),
+        false,
+        false,
+    );
+    let server = SbiServerBuilder::new(addr)
+        .with_auth_policy(Arc::new(validator))
+        .with_auth_service(
+            "https://nrf.example.test/nnrf-disc/v1".parse().unwrap(),
+            vec!["nnrf-disc".into()],
+        );
+    let app = axum::Router::new().fallback(|| async { "unexpected admission" });
+    let task = tokio::spawn(server.run_with_listener(listener, app));
+    let client = SbiClientBuilder::new()
+        .with_http2_only(false)
+        .with_retry_policy(RetryPolicy::new(
+            1,
+            Duration::ZERO,
+            Duration::ZERO,
+            Jitter::None,
+        ))
+        .build()
+        .unwrap();
+    let mut responses = Vec::new();
+    let mut expected = Vec::new();
+    for (value, challenge) in [
+        (
+            "Negotiate",
+            "Bearer realm=\"https://nrf.example.test/nnrf-disc/v1\"",
+        ),
+        (
+            "Digest username=\"u\", realm=\"r\"",
+            "Bearer realm=\"https://nrf.example.test/nnrf-disc/v1\"",
+        ),
+        ("", "Bearer realm=\"https://nrf.example.test/nnrf-disc/v1\""),
+        (
+            "Basic dXNlcjpwYXNz",
+            "Bearer realm=\"https://nrf.example.test/nnrf-disc/v1\"",
+        ),
+        (
+            "Bearer",
+            "Bearer realm=\"https://nrf.example.test/nnrf-disc/v1\"",
+        ),
+        (
+            "Bearer ",
+            "Bearer realm=\"https://nrf.example.test/nnrf-disc/v1\"",
+        ),
+        (
+            "Bearer\t",
+            "Bearer realm=\"https://nrf.example.test/nnrf-disc/v1\"",
+        ),
+        (
+            " Bearer",
+            "Bearer realm=\"https://nrf.example.test/nnrf-disc/v1\"",
+        ),
+        (
+            "\tBearer",
+            "Bearer realm=\"https://nrf.example.test/nnrf-disc/v1\"",
+        ),
+        (
+            " \tbEaReR \t",
+            "Bearer realm=\"https://nrf.example.test/nnrf-disc/v1\"",
+        ),
+        (
+            "bEaReR private-token!",
+            "Bearer realm=\"https://nrf.example.test/nnrf-disc/v1\", error=\"invalid_token\"",
+        ),
+    ] {
+        let response = client
+            .send(
+                http::Request::builder()
+                    .uri(format!("http://{addr}/nnrf-disc/v1/test"))
+                    .header("authorization", value)
+                    .body(Vec::new())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        responses.push((
+            response.status(),
+            response.headers()["www-authenticate"]
+                .to_str()
+                .unwrap()
+                .to_owned(),
+            response.headers()["content-type"]
+                .to_str()
+                .unwrap()
+                .to_owned(),
+        ));
+        expected.push((
+            StatusCode::UNAUTHORIZED,
+            challenge.to_owned(),
+            "application/problem+json".to_owned(),
+        ));
+    }
+    task.abort();
+    let _ = task.await;
+    assert_eq!(responses, expected);
+}
+
+#[tokio::test]
+async fn auth_challenges_select_trusted_api_and_scope_without_reflecting_request_headers() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let server = SbiServerBuilder::new(addr)
+        .with_auth_policy(Arc::new(RejectAuth(
+            opc_sbi::auth::SbiAuthError::InsufficientScope,
+        )))
+        .with_auth_service(
+            "https://nrf.example.test/nnrf-disc/v1".parse().unwrap(),
+            vec!["nnrf-disc".into()],
+        )
+        .with_auth_service(
+            "https://nrf.example.test/nnrf-nfm/v1".parse().unwrap(),
+            vec!["nnrf-nfm".into(), "nnrf-nfm:read".into()],
+        );
+    let app = axum::Router::new().fallback(|| async { "unexpected admission" });
+    let task = tokio::spawn(server.run_with_listener(listener, app));
+    let client = SbiClientBuilder::new()
+        .with_http2_only(false)
+        .with_retry_policy(RetryPolicy::new(
+            1,
+            Duration::ZERO,
+            Duration::ZERO,
+            Jitter::None,
+        ))
+        .build()
+        .unwrap();
+    for (path, scope) in [
+        ("/nnrf-disc/v1", Some("nnrf-disc")),
+        ("/nnrf-nfm/v1", Some("nnrf-nfm nnrf-nfm:read")),
+        ("/nnrf-disc/v10", None),
+    ] {
+        let response = client
+            .send(
+                http::Request::builder()
+                    .uri(format!("http://{addr}{path}/test"))
+                    .header("host", "untrusted.example")
+                    .body(Vec::new())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        if let Some(scope) = scope {
+            assert_eq!(response.status(), StatusCode::FORBIDDEN);
+            assert_eq!(response.headers()["www-authenticate"],
+                format!("Bearer realm=\"https://nrf.example.test{path}\", error=\"insufficient_scope\", scope=\"{scope}\""));
+        } else {
+            assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+            assert!(!response.headers().contains_key("www-authenticate"));
+        }
+    }
+    let mut responses = Vec::new();
+    let mut expected = Vec::new();
+    for path in ["/nnrf-disc/v1", "/nnrf-nfm/v1"] {
+        for (values, status, error) in [
+            (vec!["Bearer"], StatusCode::UNAUTHORIZED, None),
+            (
+                vec!["Bearer private-token!"],
+                StatusCode::UNAUTHORIZED,
+                Some("invalid_token"),
+            ),
+            (
+                vec!["Bearer private-token extra"],
+                StatusCode::UNAUTHORIZED,
+                Some("invalid_token"),
+            ),
+            (
+                vec!["Bearer one", "Bearer two"],
+                StatusCode::BAD_REQUEST,
+                Some("invalid_request"),
+            ),
+            (
+                vec!["Bearer", "Bearer private-token", "Bearer three"],
+                StatusCode::BAD_REQUEST,
+                Some("invalid_request"),
+            ),
+        ] {
+            let mut request = http::Request::builder()
+                .uri(format!("http://{addr}{path}/test"))
+                .header("host", "untrusted.example");
+            for value in values {
+                request = request.header("authorization", value);
+            }
+            let response = client
+                .send(request.body(Vec::new()).unwrap())
+                .await
+                .unwrap();
+            responses.push((
+                response.status(),
+                response
+                    .headers()
+                    .get("www-authenticate")
+                    .map(|value| value.to_str().unwrap().to_owned()),
+            ));
+            expected.push((
+                status,
+                Some(match error {
+                    Some(error) => format!(
+                        "Bearer realm=\"https://nrf.example.test{path}\", error=\"{error}\""
+                    ),
+                    None => format!("Bearer realm=\"https://nrf.example.test{path}\""),
+                }),
+            ));
+            assert_eq!(
+                response.headers()["content-type"],
+                "application/problem+json"
+            );
+            assert!(!String::from_utf8_lossy(response.body()).contains("private-token"));
+        }
+    }
+    task.abort();
+    let _ = task.await;
+    assert_eq!(
+        responses
+            .iter()
+            .map(|(_, challenge)| challenge)
+            .collect::<Vec<_>>(),
+        expected
+            .iter()
+            .map(|(_, challenge)| challenge)
+            .collect::<Vec<_>>(),
+        "authentication replies: {responses:?}"
+    );
+    assert_eq!(
+        responses
+            .iter()
+            .map(|(status, _)| status)
+            .collect::<Vec<_>>(),
+        expected
+            .iter()
+            .map(|(status, _)| status)
+            .collect::<Vec<_>>()
+    );
+}
+
+#[tokio::test]
+async fn unprotected_paths_do_not_interpret_authorization_headers() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let server = SbiServerBuilder::new(addr);
+    let app = axum::Router::new().fallback(|| async { "public response" });
+    let task = tokio::spawn(server.run_with_listener(listener, app));
+    let client = SbiClientBuilder::new()
+        .with_http2_only(false)
+        .build()
+        .unwrap();
+    for values in [vec!["Bearer"], vec!["Bearer one", "Bearer two"]] {
+        let mut request = http::Request::builder().uri(format!("http://{addr}/public"));
+        for value in values {
+            request = request.header("authorization", value);
+        }
+        let response = client
+            .send(request.body(Vec::new()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert!(!response.headers().contains_key("www-authenticate"));
+        assert_eq!(response.body().as_ref(), b"public response");
+    }
+    task.abort();
+    let _ = task.await;
+}
+
+#[tokio::test]
+async fn tls_client_requires_negotiated_h2_before_sending_requests() {
+    use bytes::Bytes;
+    use http_body_util::Full;
+    use hyper_util::rt::{TokioExecutor, TokioIo};
+    use rustls::pki_types::PrivatePkcs8KeyDer;
+
+    let key = rcgen::KeyPair::generate().unwrap();
+    let cert = rcgen::CertificateParams::new(vec!["127.0.0.1".into(), "::1".into()])
+        .unwrap()
+        .self_signed(&key)
+        .unwrap();
+    let mut roots = rustls::RootCertStore::empty();
+    roots.add(cert.der().clone()).unwrap();
+    let config = Arc::new(
+        rustls::ClientConfig::builder()
+            .with_root_certificates(roots)
+            .with_no_client_auth(),
+    );
+    for (host, alpn) in ["127.0.0.1", "::1"].into_iter().flat_map(|host| {
+        [Some(b"h2".as_slice()), None, Some(b"http/1.1".as_slice())]
+            .into_iter()
+            .map(move |alpn| (host, alpn))
+    }) {
+        let mut server_config = rustls::ServerConfig::builder()
+            .with_no_client_auth()
+            .with_single_cert(
+                vec![cert.der().clone()],
+                PrivatePkcs8KeyDer::from(key.serialize_der()).into(),
+            )
+            .unwrap();
+        server_config.alpn_protocols = alpn.into_iter().map(<[u8]>::to_vec).collect();
+        let acceptor = tokio_rustls::TlsAcceptor::from(Arc::new(server_config));
+        let listener = TcpListener::bind((host, 0)).await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let received = Arc::new(AtomicUsize::new(0));
+        let server_received = received.clone();
+        let task = tokio::spawn(async move {
+            let (tcp, _) = listener.accept().await.unwrap();
+            if let Ok(tls) = acceptor.accept(tcp).await {
+                let handler = hyper::service::service_fn(move |_| {
+                    server_received.fetch_add(1, Ordering::SeqCst);
+                    async {
+                        Ok::<_, std::convert::Infallible>(http::Response::new(Full::new(
+                            Bytes::new(),
+                        )))
+                    }
+                });
+                let _ = hyper::server::conn::http2::Builder::new(TokioExecutor::new())
+                    .serve_connection(TokioIo::new(tls), handler)
+                    .await;
+            }
+        });
+        let client = SbiClientBuilder::new()
+            .with_tls(config.clone())
+            .with_retry_policy(RetryPolicy::new(
+                1,
+                Duration::ZERO,
+                Duration::ZERO,
+                Jitter::None,
+            ))
+            .build()
+            .unwrap();
+        let response = tokio::time::timeout(
+            Duration::from_secs(5),
+            client.send(
+                http::Request::builder()
+                    .uri(format!("https://{addr}/nnrf-disc/test"))
+                    .body(Vec::new())
+                    .unwrap(),
+            ),
+        )
+        .await;
+        task.abort();
+        let _ = task.await;
+        let response = response.expect("TLS negotiation must be bounded");
+        if alpn == Some(b"h2") {
+            assert_eq!(response.unwrap().status(), StatusCode::OK);
+            assert_eq!(received.load(Ordering::SeqCst), 1);
+        } else {
+            assert!(response.is_err());
+            assert_eq!(received.load(Ordering::SeqCst), 0);
+        }
+    }
+    assert!(
+        config.alpn_protocols.is_empty(),
+        "caller TLS config remains unchanged"
+    );
+}

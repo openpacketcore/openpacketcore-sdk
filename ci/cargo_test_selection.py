@@ -50,8 +50,8 @@ def option_value(args: list[str], index: int) -> tuple[str, int]:
 
 @dataclass(frozen=True)
 class Selection:
-    # Only library unit-test harnesses: binaries, integration targets and
-    # doctests cannot execute the library tests protected by these guards.
+    # Library harnesses by default; integration ownership opts in explicitly.
+    # Doctests never execute these compiled harnesses.
     targets: frozenset[tuple[str, str, tuple[str, ...]]]
     filters: tuple[str, ...]
     skips: tuple[str, ...]
@@ -73,8 +73,8 @@ class Selection:
         )
 
 
-def resolve(argv: list[str], metadata: dict) -> Selection:
-    """Resolve the selected libraries against the workspace's Cargo metadata.
+def resolve(argv: list[str], metadata: dict, *, include_integration: bool = False) -> Selection:
+    """Resolve libraries, and optionally integration tests, against Cargo metadata.
 
     The plans run from the workspace root. Foreign manifests, Cargo config
     overrides and unsupported flags are refused instead of guessed. Cargo
@@ -198,6 +198,13 @@ def resolve(argv: list[str], metadata: dict) -> Selection:
                 if library and (
                     "--all-targets" in flags
                     or "--lib" in flags
+                    or ("--tests" in flags or not flags and not named) and target["test"]
+                ):
+                    targets.add((package["name"], target["name"], kind))
+                if include_integration and kind == ("test",) and (
+                    "--all-targets" in flags
+                    or any(selected_kind == "test" and fnmatchcase(target["name"], pattern)
+                           for selected_kind, pattern in named)
                     or ("--tests" in flags or not flags and not named) and target["test"]
                 ):
                     targets.add((package["name"], target["name"], kind))

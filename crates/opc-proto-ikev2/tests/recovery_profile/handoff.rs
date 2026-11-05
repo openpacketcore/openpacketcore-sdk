@@ -74,6 +74,7 @@ fn new_epoch(old: &Row, operation: &Operation, key: RowKey, stamp: u64) -> Resul
     if let Some(sync) = &mut row.window.sync {
         sync.agreement = row.agreement;
     }
+    row.window.fragmentation = old.window.fragmentation;
     row.identity = old.identity;
     row.namespace = old.namespace;
     row.endpoint = old.endpoint;

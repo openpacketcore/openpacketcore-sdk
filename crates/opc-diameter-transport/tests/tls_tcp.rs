@@ -47,6 +47,9 @@ use opc_diameter_transport::{
     ExpectedPeerIdentity, ExpectedPeerIdentityError,
 };
 
+#[path = "tls_tcp/tls12.rs"]
+mod tls12;
+
 const CLIENT_ID: &str =
     "spiffe://example.test/tenant/tenant-a/ns/core/sa/diameter/nf/smf/instance/client-0";
 const OTHER_CLIENT_ID: &str =
@@ -1939,12 +1942,23 @@ async fn cancelling_send_after_a_partial_frame_terminally_poisons_connection() {
 
 #[tokio::test]
 async fn inband_typestate_exchanges_only_cer_cea_then_upgrades_same_stream() {
-    let material = tls_material();
+    exercise_inband_upgrade(
+        tls_material(),
+        DiameterTlsPolicy::default(),
+        opc_diameter_transport::DiameterTlsVersion::Tls13,
+    )
+    .await;
+}
+
+async fn exercise_inband_upgrade(
+    material: TestTlsMaterial,
+    policy: DiameterTlsPolicy,
+    version: opc_diameter_transport::DiameterTlsVersion,
+) {
     let listener = TcpListener::bind("127.0.0.1:0")
         .await
         .expect("bind listener");
     let address = listener.local_addr().expect("listener address");
-    let policy = DiameterTlsPolicy::default();
     let acceptor = DiameterTlsAcceptor::new(material.server, expected(CLIENT_ID), policy);
     let connector = DiameterTlsConnector::new(material.client, expected(SERVER_ID), policy);
     let server_capabilities = capabilities("server.example.test", true);
@@ -1999,6 +2013,8 @@ async fn inband_typestate_exchanges_only_cer_cea_then_upgrades_same_stream() {
     let mut server = server.await.expect("join server");
 
     assert_eq!(answer.capabilities, server_capabilities);
+    assert_eq!(client.evidence().version(), version);
+    assert_eq!(server.evidence().version(), version);
     assert_eq!(
         client.evidence().protection().sequence(),
         PeerProtectionSequence::InbandAfterCapabilities
@@ -2921,12 +2937,21 @@ async fn negotiated_direct_connections() -> (
     DiameterTlsConnection,
     DiameterTlsConnection,
 ) {
-    let material = tls_material();
+    negotiated_direct_connections_with(tls_material(), DiameterTlsPolicy::default()).await
+}
+
+async fn negotiated_direct_connections_with(
+    material: TestTlsMaterial,
+    policy: DiameterTlsPolicy,
+) -> (
+    TestTlsMaterial,
+    DiameterTlsConnection,
+    DiameterTlsConnection,
+) {
     let listener = TcpListener::bind("127.0.0.1:0")
         .await
         .expect("bind runtime listener");
     let address = listener.local_addr().expect("runtime listener address");
-    let policy = DiameterTlsPolicy::default();
     let acceptor = DiameterTlsAcceptor::new(material.server.clone(), expected(CLIENT_ID), policy);
     let connector = DiameterTlsConnector::new(material.client.clone(), expected(SERVER_ID), policy);
     let deadline = Instant::now() + Duration::from_secs(5);

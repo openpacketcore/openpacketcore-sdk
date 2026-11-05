@@ -57,28 +57,21 @@ pub(super) async fn drain(
     store: &ConsensusSessionStore,
 ) -> Result<SessionPersistenceHealth, SessionPersistenceDrainError> {
     assert_eq!(store.inner.operation_timeout, OPERATION_BOUND);
-    let started = std::time::Instant::now();
-    let result = store.drain_async_persistence().await;
-    if result.is_ok() {
-        assert!(
-            started.elapsed() < store.inner.operation_timeout,
-            "successful fixture drain must retain its real-time operation bound"
-        );
-    }
-    result
+    let store = store.clone();
+    complete(OPERATION_BOUND, async move {
+        store.drain_async_persistence().await
+    })
+    .await
 }
 
 pub(super) async fn initialize(
     store: &ConsensusSessionStore,
 ) -> Result<(), ConsensusSessionStoreOpenError> {
     assert_eq!(store.inner.operation_timeout, OPERATION_BOUND);
-    let started = std::time::Instant::now();
-    let result = store.initialize_cluster().await;
-    if result.is_ok() {
-        assert!(
-            started.elapsed() < store.inner.operation_timeout,
-            "successful fixture initialization must retain its real-time operation bound"
-        );
-    }
-    result
+    let store = store.clone();
+    complete(
+        OPERATION_BOUND,
+        async move { store.initialize_cluster().await },
+    )
+    .await
 }

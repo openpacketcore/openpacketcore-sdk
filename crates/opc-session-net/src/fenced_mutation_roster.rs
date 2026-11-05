@@ -292,6 +292,7 @@ pub fn fenced_mutation_roster_compact_terminal_member_signing_digest_v2(
 
 pub use canonical::{
     AbsentAdmissionProposal as FencedMutationRosterAbsentAdmissionProposal,
+    AdmissionClass as FencedMutationRosterAdmissionClass,
     AdmissionProposal as FencedMutationRosterAdmissionProposal,
     EstablishedMutation as FencedMutationRosterEstablishedMutation,
     EstablishedPublicationCall as FencedMutationRosterEstablishedPublicationCall,

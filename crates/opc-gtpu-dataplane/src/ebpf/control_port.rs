@@ -1,4 +1,4 @@
-//! Backend-owned IPv4 control socket, serialized with attachment mutation.
+//! Backend-owned control sockets, serialized with attachment mutation.
 
 use std::sync::Weak;
 
@@ -122,6 +122,8 @@ impl DownlinkServiceOrder {
 #[derive(Default)]
 pub(super) struct ControlSocketState {
     socket: Option<crate::GtpuReassemblySocket>,
+    ipv6_socket: Option<crate::GtpuReassemblySocket>,
+    prefer_ipv6: bool,
     /// Dedicated queue for tc-steered over-MTU G-PDUs; see
     /// [`opc_gtpu_ebpf_common::GTPU_PACKET_TOO_BIG_QUEUE_PORT`].
     too_big_socket: Option<crate::GtpuReassemblySocket>,
@@ -141,20 +143,23 @@ pub(super) struct ControlSocketState {
     /// Per-destination inner fragmentation budgets and Identification
     /// sequences of this registration.
     inner_fragment_budget: crate::reassembly::InnerFragmentBudget,
+    /// Readiness sources opened for this registration's queues. Weak: the
+    /// consumer owns its source; the port only revokes it when the queues are
+    /// withdrawn, so a late open cannot revive an old one.
+    readiness: Vec<Weak<crate::control_port::ReadinessInner>>,
 }
 
 impl ControlSocketState {
     #[cfg(test)]
     pub(super) fn is_unopened(&self) -> bool {
-        self.socket.is_none()
+        self.socket.is_none() && self.ipv6_socket.is_none()
     }
 
     #[cfg(test)]
     pub(super) fn with_inner_fragment_limit(limit: crate::GtpuInnerFragmentRateLimit) -> Self {
-        Self {
-            inner_fragment_budget: crate::reassembly::InnerFragmentBudget::new(limit),
-            ..Self::default()
-        }
+        let mut state = Self::default();
+        state.inner_fragment_budget = crate::reassembly::InnerFragmentBudget::new(limit);
+        state
     }
 
     #[cfg(test)]
@@ -172,12 +177,55 @@ impl ControlSocketState {
     /// Keep counters, rate limits and fragment Identification sequences: a
     /// transient read failure must not reset their per-registration scope.
     fn invalidate_queues(&mut self) {
+        // Revoke before the sockets close: a wait that already returned events
+        // must observe the revocation, not a stale registration.
+        self.revoke_readiness();
         self.socket = None;
+        self.ipv6_socket = None;
+        self.prefer_ipv6 = false;
         self.too_big_socket = None;
         self.inner_fragment_socket = None;
         self.generation = Arc::new(());
         self.service_order = DownlinkServiceOrder::default();
     }
+}
+
+impl ControlSocketState {
+    fn revoke_readiness(&mut self) {
+        for readiness in self.readiness.drain(..) {
+            if let Some(readiness) = readiness.upgrade() {
+                readiness.revoke();
+            }
+        }
+    }
+}
+
+impl Drop for ControlSocketState {
+    fn drop(&mut self) {
+        self.revoke_readiness();
+    }
+}
+
+/// Alternate shared families; a failing or busy IPv6 queue cannot starve IPv4.
+fn receive_shared(
+    ipv4: Option<&crate::GtpuReassemblySocket>,
+    ipv6: Option<&crate::GtpuReassemblySocket>,
+    prefer_ipv6: &mut bool,
+    maximum_bytes: usize,
+) -> Result<Option<GtpuControlDatagram>, GtpuControlPortError> {
+    for v6 in [*prefer_ipv6, !*prefer_ipv6] {
+        let socket = if v6 { ipv6 } else { ipv4 };
+        match socket.map_or(Ok(None), |socket| {
+            socket.try_receive_datagram(maximum_bytes)
+        }) {
+            Ok(None) => {}
+            result => {
+                *prefer_ipv6 = !v6;
+                return result;
+            }
+        }
+    }
+    Ok(None)
 }
 
 type SocketSlot = Mutex<ControlSocketState>;
@@ -198,14 +246,16 @@ impl fmt::Debug for BackendControlPort {
 impl BackendControlPort {
     fn with_socket<T>(
         &self,
+        source: std::net::SocketAddr,
         operation: impl FnOnce(&crate::GtpuReassemblySocket) -> Result<T, GtpuControlPortError>,
     ) -> Result<T, GtpuControlPortError> {
         self.with_attachment(|_, state, _| {
-            let socket = state
-                .socket
-                .as_ref()
-                .ok_or(GtpuControlPortError::Unavailable)?;
-            operation(socket)
+            let socket = if source.is_ipv4() {
+                &state.socket
+            } else {
+                &state.ipv6_socket
+            };
+            operation(socket.as_ref().ok_or(GtpuControlPortError::InvalidTuple)?)
         })
     }
 
@@ -253,7 +303,7 @@ impl BackendControlPort {
         }
         let mut state = slot.lock().map_err(|_| unavailable())?;
         if state.retired
-            || state.socket.is_none()
+            || (state.socket.is_none() && state.ipv6_socket.is_none())
             || !Arc::ptr_eq(&self.generation, &state.generation)
         {
             return Err(unavailable());
@@ -297,18 +347,36 @@ impl BackendControlPort {
 }
 
 impl GtpuControlPort for BackendControlPort {
+    fn send_echo_request(
+        &self,
+        source: std::net::SocketAddr,
+        peer: std::net::SocketAddr,
+        sequence: u16,
+    ) -> Result<usize, GtpuControlPortError> {
+        self.with_socket(source, |socket| {
+            socket.send_echo_request(source, peer, sequence)
+        })
+    }
+
     fn try_receive_datagram(
         &self,
         maximum_bytes: usize,
     ) -> Result<Option<GtpuControlDatagram>, GtpuControlPortError> {
-        self.with_socket(|socket| socket.try_receive_datagram(maximum_bytes))
+        self.with_attachment(|_, state, _| {
+            receive_shared(
+                state.socket.as_ref(),
+                state.ipv6_socket.as_ref(),
+                &mut state.prefer_ipv6,
+                maximum_bytes,
+            )
+        })
     }
 
     fn send_control_response(
         &self,
         plan: GtpuControlSendPlan,
     ) -> Result<usize, GtpuControlPortError> {
-        self.with_socket(|socket| socket.send_control_response(plan))
+        self.with_socket(plan.source, |socket| socket.send_control_response(plan))
     }
 
     fn try_receive_downlink(
@@ -316,10 +384,8 @@ impl GtpuControlPort for BackendControlPort {
         maximum_bytes: usize,
     ) -> Result<Option<crate::GtpuDownlinkEvent>, GtpuControlPortError> {
         self.with_attachment(|backend, state, scope| {
-            let socket = state
-                .socket
-                .as_ref()
-                .ok_or(GtpuControlPortError::Unavailable)?;
+            let socket = state.socket.as_ref();
+            let ipv6_socket = state.ipv6_socket.as_ref();
             // The shared queue (Echo, reassembled G-PDUs) is served first;
             // tc-steered G-PDUs wait in their own queues and can never crowd
             // it out. Its priority holds for a bounded run, after which the
@@ -332,7 +398,7 @@ impl GtpuControlPort for BackendControlPort {
                 state.inner_fragment_socket.as_ref(),
             );
             let received = state.service_order.receive(
-                || socket.try_receive_datagram(maximum_bytes),
+                || receive_shared(socket, ipv6_socket, &mut state.prefer_ipv6, maximum_bytes),
                 |queue| {
                     let queue = match queue {
                         HandOffQueue::PacketTooBig => too_big,
@@ -382,17 +448,26 @@ impl GtpuControlPort for BackendControlPort {
             // default-bearer uplink G-PDU; nothing is ever sent unencapsulated.
             let signal = match plan.build_uplink_gpdu() {
                 None => crate::GtpuPacketTooBigSignal::Unsendable,
-                Some(_)
-                    if !state
-                        .too_big_limiter
-                        .admit(plan.session(), std::time::Instant::now()) =>
-                {
-                    crate::GtpuPacketTooBigSignal::RateLimited
-                }
                 Some((gpdu, local, peer)) => {
-                    match socket.send_in_tunnel_error(local, peer, &gpdu) {
-                        Ok(_) => crate::GtpuPacketTooBigSignal::Sent,
-                        Err(_) => crate::GtpuPacketTooBigSignal::Unsendable,
+                    match state
+                        .too_big_limiter
+                        .admit(plan.session(), std::time::Instant::now())
+                    {
+                        crate::reassembly::PacketTooBigAdmission::Admitted => {
+                            match socket
+                                .ok_or(GtpuControlPortError::InvalidTuple)
+                                .and_then(|socket| socket.send_in_tunnel_error(local, peer, &gpdu))
+                            {
+                                Ok(_) => crate::GtpuPacketTooBigSignal::Sent,
+                                Err(_) => crate::GtpuPacketTooBigSignal::Unsendable,
+                            }
+                        }
+                        crate::reassembly::PacketTooBigAdmission::RateLimited => {
+                            crate::GtpuPacketTooBigSignal::RateLimited
+                        }
+                        crate::reassembly::PacketTooBigAdmission::CapacityExhausted => {
+                            crate::GtpuPacketTooBigSignal::CapacityExhausted
+                        }
                     }
                 }
             };
@@ -402,17 +477,16 @@ impl GtpuControlPort for BackendControlPort {
                 crate::GtpuPacketTooBigSignal::RateLimited => {
                     &mut counters.packet_too_big_rate_limited
                 }
+                crate::GtpuPacketTooBigSignal::CapacityExhausted => {
+                    &mut counters.packet_too_big_capacity_exhausted
+                }
                 crate::GtpuPacketTooBigSignal::Unsendable => {
                     &mut counters.packet_too_big_unsendable
                 }
             };
             *slot = slot.saturating_add(1);
             Ok(Some(crate::GtpuDownlinkEvent::PacketTooBig(
-                crate::GtpuDownlinkPacketTooBig::new(
-                    crate::GtpAddressFamily::Ipv4,
-                    plan.mtu(),
-                    signal,
-                ),
+                crate::GtpuDownlinkPacketTooBig::new(plan.family(), plan.mtu(), signal),
             )))
         })
     }
@@ -422,7 +496,9 @@ impl GtpuControlPort for BackendControlPort {
         limit: crate::GtpuPacketTooBigRateLimit,
     ) -> Result<(), GtpuControlPortError> {
         self.with_attachment(|_, state, _| {
-            state.too_big_limiter = crate::reassembly::PacketTooBigLimiter::new(limit);
+            state
+                .too_big_limiter
+                .set_limit(limit, std::time::Instant::now());
             Ok(())
         })
     }
@@ -432,8 +508,11 @@ impl GtpuControlPort for BackendControlPort {
         limit: crate::GtpuInnerFragmentRateLimit,
     ) -> Result<(), GtpuControlPortError> {
         self.with_attachment(|_, state, _| {
-            state.inner_fragment_budget.set_limit(limit);
-            Ok(())
+            state
+                .inner_fragment_budget
+                .set_limit(limit, std::time::Instant::now())
+                .then_some(())
+                .ok_or(GtpuControlPortError::InvalidLimits)
         })
     }
 
@@ -444,6 +523,12 @@ impl GtpuControlPort for BackendControlPort {
                 .socket
                 .as_ref()
                 .map_or(0, |socket| u64::from(socket.queue_drops()));
+            counters.shared_queue_drops = counters.shared_queue_drops.saturating_add(
+                state
+                    .ipv6_socket
+                    .as_ref()
+                    .map_or(0, |socket| u64::from(socket.queue_drops())),
+            );
             counters.packet_too_big_queue_drops = state
                 .too_big_socket
                 .as_ref()
@@ -453,6 +538,51 @@ impl GtpuControlPort for BackendControlPort {
                 .as_ref()
                 .map_or(0, |socket| u64::from(socket.queue_drops()));
             Ok(counters)
+        })
+    }
+
+    fn downlink_readiness(
+        &self,
+    ) -> Result<crate::control_port::GtpuControlReadiness, GtpuControlPortError> {
+        self.with_attachment(|_, state, _| {
+            use crate::control_port::{GtpuControlQueue, GtpuControlReadiness};
+
+            // Shared traffic may use IPv4, IPv6 or both. The IPv4-only
+            // hand-off queues exist exactly when the IPv4 shared socket does.
+            let mut queues = Vec::with_capacity(4);
+            if let Some(shared) = &state.socket {
+                let packet_too_big = state
+                    .too_big_socket
+                    .as_ref()
+                    .ok_or(GtpuControlPortError::Unavailable)?;
+                let inner_fragment = state
+                    .inner_fragment_socket
+                    .as_ref()
+                    .ok_or(GtpuControlPortError::Unavailable)?;
+                queues.extend([
+                    (GtpuControlQueue::Shared, shared.readiness_fd()),
+                    (
+                        GtpuControlQueue::PacketTooBig,
+                        packet_too_big.readiness_fd(),
+                    ),
+                    (
+                        GtpuControlQueue::InnerFragment,
+                        inner_fragment.readiness_fd(),
+                    ),
+                ]);
+            }
+            if let Some(shared) = &state.ipv6_socket {
+                queues.push((GtpuControlQueue::Shared, shared.readiness_fd()));
+            }
+            if queues.is_empty() {
+                return Err(GtpuControlPortError::Unavailable);
+            }
+            let readiness = GtpuControlReadiness::new(queues, None)?;
+            state
+                .readiness
+                .retain(|readiness| readiness.upgrade().is_some());
+            state.readiness.push(readiness.weak_inner());
+            Ok(readiness)
         })
     }
 }
@@ -480,12 +610,21 @@ pub(super) fn fragment_inner(
             return drop(state, crate::GtpuDownlinkDrop::Malformed);
         }
     };
-    let Some(assigned) = state.inner_fragment_budget.admit(
+    let assigned = match state.inner_fragment_budget.admit(
         plan.destination(),
         std::time::Instant::now(),
         source.is_atomic(),
-    ) else {
-        return drop(state, crate::GtpuDownlinkDrop::InnerFragmentRateLimited);
+    ) {
+        crate::reassembly::InnerFragmentAdmission::Admitted(assigned) => assigned,
+        crate::reassembly::InnerFragmentAdmission::RateLimited => {
+            return drop(state, crate::GtpuDownlinkDrop::InnerFragmentRateLimited);
+        }
+        crate::reassembly::InnerFragmentAdmission::CapacityExhausted => {
+            return drop(
+                state,
+                crate::GtpuDownlinkDrop::InnerFragmentCapacityExhausted,
+            );
+        }
     };
     let identification = assigned.unwrap_or_else(|| source.identification());
     let Some(fragments) = source.fragment(plan.mtu(), identification) else {
@@ -511,7 +650,7 @@ impl EbpfGtpuDataplaneBackend {
         device: &GtpDevice,
         local: Ipv4Addr,
         peer: Ipv4Addr,
-        teid: crate::Teid,
+        teid: crate::PeerTeid,
         current: impl Fn() -> bool,
     ) -> Result<(), GtpuError> {
         let unavailable = || state_indeterminate("ebpf_n3_end_marker_socket");
@@ -585,16 +724,17 @@ impl EbpfGtpuDataplaneBackend {
         if managed.cleanup_only || managed.successor_pending {
             return Err(unavailable());
         }
-        let local_ip = managed
-            .local_ip
-            .or_else(|| {
-                managed
-                    .grouped
-                    .and_then(|grouped| grouped.local_endpoints.ipv4())
-            })
-            .ok_or(GtpuError::UnsupportedFeature {
-                feature: "gtpu_control_port_ipv6",
-            })?;
+        let local_ip = managed.local_ip.or_else(|| {
+            managed
+                .grouped
+                .and_then(|grouped| grouped.local_endpoints.ipv4())
+        });
+        let local_ipv6 = managed
+            .grouped
+            .and_then(|grouped| grouped.local_endpoints.ipv6());
+        if local_ip.is_none() && local_ipv6.is_none() {
+            return Err(unavailable());
+        }
         let slot = Arc::clone(&managed.control_socket);
         drop(devices);
         let current_ifindex = self.inner.runtime.ifindex_by_name(&device.name);
@@ -622,33 +762,43 @@ impl EbpfGtpuDataplaneBackend {
         if socket.retired {
             return Err(unavailable());
         }
-        if socket.socket.is_none() {
-            // This is the sole backend-owned queue. An existing external
-            // listener produces a normal bind error, never SO_REUSEPORT.
-            socket.socket = Some(
-                crate::GtpuReassemblySocket::bind(local_ip, &device.name)
-                    .map_err(|error| GtpuError::io("ebpf_control_port_bind", error))?,
-            );
+        if let Some(local_ip) = local_ip {
+            if socket.socket.is_none() {
+                // This is the sole backend-owned queue. An existing external
+                // listener produces a normal bind error, never SO_REUSEPORT.
+                socket.socket = Some(
+                    crate::GtpuReassemblySocket::bind(local_ip, &device.name)
+                        .map_err(|error| GtpuError::io("ebpf_control_port_bind", error))?,
+                );
+            }
+            if socket.too_big_socket.is_none() {
+                // Without this queue tc would drop every over-MTU G-PDU for
+                // want of a consumer; refuse instead.
+                socket.too_big_socket = Some(
+                    crate::GtpuReassemblySocket::bind_packet_too_big_queue(local_ip, &device.name)
+                        .map_err(|error| {
+                            GtpuError::io("ebpf_control_port_packet_too_big_bind", error)
+                        })?,
+                );
+            }
+            if socket.inner_fragment_socket.is_none() {
+                // Likewise for tc-steered inner fragments: no port is published
+                // unless their queue is bound too.
+                socket.inner_fragment_socket = Some(
+                    crate::GtpuReassemblySocket::bind_inner_fragment_queue(local_ip, &device.name)
+                        .map_err(|error| {
+                            GtpuError::io("ebpf_control_port_inner_fragment_bind", error)
+                        })?,
+                );
+            }
         }
-        if socket.too_big_socket.is_none() {
-            // Without this queue tc would drop every over-MTU G-PDU for
-            // want of a consumer; refuse instead.
-            socket.too_big_socket = Some(
-                crate::GtpuReassemblySocket::bind_packet_too_big_queue(local_ip, &device.name)
-                    .map_err(|error| {
-                        GtpuError::io("ebpf_control_port_packet_too_big_bind", error)
-                    })?,
-            );
-        }
-        if socket.inner_fragment_socket.is_none() {
-            // Likewise for tc-steered inner fragments: no port is published
-            // unless their queue is bound too.
-            socket.inner_fragment_socket = Some(
-                crate::GtpuReassemblySocket::bind_inner_fragment_queue(local_ip, &device.name)
-                    .map_err(|error| {
-                        GtpuError::io("ebpf_control_port_inner_fragment_bind", error)
-                    })?,
-            );
+        if let Some(local_ipv6) = local_ipv6 {
+            if socket.ipv6_socket.is_none() {
+                socket.ipv6_socket = Some(
+                    crate::GtpuReassemblySocket::bind_control(local_ipv6.into(), &device.name)
+                        .map_err(|error| GtpuError::io("ebpf_control_port_ipv6_bind", error))?,
+                );
+            }
         }
         Ok(Arc::new(BackendControlPort {
             backend: Arc::downgrade(&self.inner),
@@ -909,6 +1059,40 @@ mod tests {
         assert_eq!(
             port.try_receive_datagram(8).unwrap_err(),
             GtpuControlPortError::Unavailable
+        );
+    }
+
+    /// The readiness source names exactly the three queues of the bounded
+    /// downlink service order and cannot change it: the shared queue keeps its
+    /// eight-datagram run ahead of both hand-off queues, which alternate.
+    #[test]
+    fn readiness_queue_classes_follow_the_bounded_downlink_service_order() {
+        use crate::control_port::GtpuControlQueue;
+
+        assert_eq!(SHARED_QUEUE_RUN, 8);
+        assert_eq!(
+            GtpuControlQueue::ALL,
+            [
+                GtpuControlQueue::Shared,
+                GtpuControlQueue::PacketTooBig,
+                GtpuControlQueue::InnerFragment,
+            ],
+            "readiness queues keep the downlink priority order"
+        );
+        // The default hand-off turn starts with the over-MTU queue and
+        // alternates; readiness reports the same two classes.
+        assert_eq!(HandOffQueue::default(), HandOffQueue::PacketTooBig);
+        assert_eq!(
+            HandOffQueue::PacketTooBig.other(),
+            HandOffQueue::InnerFragment
+        );
+        // A mask that reports every queue ready is advisory: the service order
+        // still serves a full shared run first.
+        let mut queues = ThreeQueues::new(1_000, 3, 3);
+        let served = queues.drain(usize::from(SHARED_QUEUE_RUN));
+        assert!(
+            served.iter().all(|(_, steered)| !steered),
+            "shared queue keeps its bounded run whatever readiness reports"
         );
     }
 

@@ -330,6 +330,11 @@ pub(super) async fn qualify() -> Result<(), Box<dyn std::error::Error>> {
                 b[13] |= bit;
                 bad.push(b);
             }
+            for burst in [1, 2, 3] {
+                let mut packet = ppi.clone();
+                packet[15] |= burst; // TS 38.415 BSSI/TTNBI are conditionals, not padding.
+                bad.push(packet);
+            }
             let mut duplicate = valid.clone();
             duplicate[15] = 0x85;
             duplicate.splice(16..16, [1, 0, qfi, 0]);

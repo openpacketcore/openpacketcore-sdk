@@ -22,8 +22,8 @@ fn make_profile(id: &str, nf_type: &str, priority: u16, capacity: u16) -> NfProf
         nf_status: NfStatus::Registered,
         ipv4_addresses: vec!["10.0.0.1".into()],
         fqdn: None,
-        plmn_list: vec![PlmnId::new("001", "01").unwrap()],
-        s_nssais: vec![Snssai::new(1, Some("010203")).unwrap()],
+        plmn_list: vec![PlmnId::new("001", "01").unwrap().into()],
+        s_nssais: vec![Snssai::new(1, Some("010203")).unwrap().into()],
         nf_services: vec![],
         priority,
         capacity,
@@ -37,9 +37,12 @@ fn profile_with_services(id: &str, nf_type: &str, services: &[&str]) -> NfProfil
         nf_status: NfStatus::Registered,
         ipv4_addresses: vec!["10.0.0.1".into()],
         fqdn: None,
-        plmn_list: vec![PlmnId::new("001", "01").unwrap()],
-        s_nssais: vec![Snssai::new(1, Some("010203")).unwrap()],
-        nf_services: services.iter().map(|s| s.to_string()).collect(),
+        plmn_list: vec![PlmnId::new("001", "01").unwrap().into()],
+        s_nssais: vec![Snssai::new(1, Some("010203")).unwrap().into()],
+        nf_services: services
+            .iter()
+            .map(|s| opc_sbi::testkit::nrf::test_service(s))
+            .collect(),
         priority: 10,
         capacity: 100,
     }
@@ -48,6 +51,7 @@ fn profile_with_services(id: &str, nf_type: &str, services: &[&str]) -> NfProfil
 fn make_key(tag: &str) -> CacheKey {
     CacheKey {
         target_nf_type: NfType::new(tag).unwrap(),
+        requester_nf_type: NfType::new("smf").unwrap(),
         requester_nf_instance_id: None,
         plmn: None,
         s_nssai: None,
@@ -250,13 +254,14 @@ fn nrf_integration_stale_if_error_with_mock_nrf_down() {
     nrf.register(profile.clone()).unwrap();
     let query = DiscoveryQuery {
         target_nf_type: NfType::new("ausf").unwrap(),
+        requester_nf_type: NfType::new("smf").unwrap(),
         requester_nf_instance_id: None,
         plmn: Some(PlmnId::new("001", "01").unwrap()),
         s_nssai: None,
         service_names: vec![],
     };
     let result = nrf.discover(&query);
-    if let DiscoveryResult::Found(ref profiles) = result {
+    if let DiscoveryResult::Found { ref profiles, .. } = result {
         cache.insert(query.to_cache_key(), profiles.clone());
     }
 
@@ -292,6 +297,7 @@ fn nrf_integration_mock_register_discover_round_trip() {
 
     let query = DiscoveryQuery {
         target_nf_type: NfType::new("amf").unwrap(),
+        requester_nf_type: NfType::new("smf").unwrap(),
         requester_nf_instance_id: None,
         plmn: Some(PlmnId::new("001", "01").unwrap()),
         s_nssai: None,
@@ -300,7 +306,7 @@ fn nrf_integration_mock_register_discover_round_trip() {
 
     let result = nrf.discover(&query);
     match result {
-        DiscoveryResult::Found(profiles) => {
+        DiscoveryResult::Found { profiles, .. } => {
             assert_eq!(profiles.len(), 2);
             // Sorted by priority ascending.
             assert_eq!(profiles[0].nf_instance_id.as_str(), "amf-02");
@@ -331,13 +337,14 @@ fn nrf_integration_discovery_filters_by_service_name() {
     // Query for NAMF-COMM should return both AMFs.
     let query_comm = DiscoveryQuery {
         target_nf_type: NfType::new("amf").unwrap(),
+        requester_nf_type: NfType::new("smf").unwrap(),
         requester_nf_instance_id: None,
         plmn: Some(PlmnId::new("001", "01").unwrap()),
         s_nssai: None,
         service_names: vec!["namf-comm".into()],
     };
     match nrf.discover(&query_comm) {
-        DiscoveryResult::Found(profiles) => {
+        DiscoveryResult::Found { profiles, .. } => {
             assert_eq!(profiles.len(), 2);
         }
         other => panic!("expected Found 2 AMFs, got {other:?}"),
@@ -346,13 +353,14 @@ fn nrf_integration_discovery_filters_by_service_name() {
     // Query for NAMF-MT should return only amf-01.
     let query_mt = DiscoveryQuery {
         target_nf_type: NfType::new("amf").unwrap(),
+        requester_nf_type: NfType::new("smf").unwrap(),
         requester_nf_instance_id: None,
         plmn: Some(PlmnId::new("001", "01").unwrap()),
         s_nssai: None,
         service_names: vec!["namf-mt".into()],
     };
     match nrf.discover(&query_mt) {
-        DiscoveryResult::Found(profiles) => {
+        DiscoveryResult::Found { profiles, .. } => {
             assert_eq!(profiles.len(), 1);
             assert_eq!(profiles[0].nf_instance_id.as_str(), "amf-01");
         }
@@ -362,12 +370,18 @@ fn nrf_integration_discovery_filters_by_service_name() {
     // Query for a non-existent service should return NotFound.
     let query_missing = DiscoveryQuery {
         target_nf_type: NfType::new("amf").unwrap(),
+        requester_nf_type: NfType::new("smf").unwrap(),
         requester_nf_instance_id: None,
         plmn: Some(PlmnId::new("001", "01").unwrap()),
         s_nssai: None,
         service_names: vec!["nbsf-management".into()],
     };
-    assert_eq!(nrf.discover(&query_missing), DiscoveryResult::NotFound);
+    assert_eq!(
+        nrf.discover(&query_missing),
+        DiscoveryResult::NotFound {
+            valid_for: Duration::MAX
+        }
+    );
 }
 
 #[test]
@@ -375,6 +389,7 @@ fn nrf_integration_cache_key_collisions_are_impossible() {
     // Regression test: distinct query shapes must never collide.
     let q1 = DiscoveryQuery {
         target_nf_type: NfType::new("amf").unwrap(),
+        requester_nf_type: NfType::new("smf").unwrap(),
         requester_nf_instance_id: Some(NfInstanceId::new("req1").unwrap()),
         plmn: None,
         s_nssai: None,
@@ -382,6 +397,7 @@ fn nrf_integration_cache_key_collisions_are_impossible() {
     };
     let q2 = DiscoveryQuery {
         target_nf_type: NfType::new("amf").unwrap(),
+        requester_nf_type: NfType::new("smf").unwrap(),
         requester_nf_instance_id: None,
         plmn: None,
         s_nssai: None,
@@ -423,6 +439,7 @@ fn nrf_integration_cache_max_entries_evicts_oldest() {
 
     let key_a = CacheKey {
         target_nf_type: NfType::new("amf").unwrap(),
+        requester_nf_type: NfType::new("smf").unwrap(),
         requester_nf_instance_id: None,
         plmn: None,
         s_nssai: None,
@@ -430,6 +447,7 @@ fn nrf_integration_cache_max_entries_evicts_oldest() {
     };
     let key_b = CacheKey {
         target_nf_type: NfType::smf(),
+        requester_nf_type: NfType::new("smf").unwrap(),
         requester_nf_instance_id: None,
         plmn: None,
         s_nssai: None,
@@ -437,6 +455,7 @@ fn nrf_integration_cache_max_entries_evicts_oldest() {
     };
     let key_c = CacheKey {
         target_nf_type: NfType::new("pcf").unwrap(),
+        requester_nf_type: NfType::new("smf").unwrap(),
         requester_nf_instance_id: None,
         plmn: None,
         s_nssai: None,

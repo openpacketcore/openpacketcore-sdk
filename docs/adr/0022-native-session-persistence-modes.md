@@ -4,6 +4,8 @@
 
 Accepted feature contract. Correctness, performance, and consumer qualification
 are separate executed evidence; this decision does not declare their completion.
+Generation-file rollover (SDK #1253) is implemented for Durable and Async;
+its selection contract and component qualification are recorded below.
 This supersedes ADR 0021's private-only activation, SQLite application
 composition, and proposed migration scope. Its durable WAL implementation and
 regressions remain part of the SDK.
@@ -165,20 +167,132 @@ compares exact local rows when present; below P, where rows are now absent,
 it uses the existing ordering rule against the full purge LogId. At P itself,
 an equal index still requires the exact LogId.
 
-This boundary creates Durable `OPCNR002` and Async `OPCNA004` roots with distinct
-binding hash domains. `OPCNR001` and `OPCNA001` through `OPCNA003` are refused
+The current boundary creates Durable `OPCNR003` and Async `OPCNA005` roots with
+distinct binding hash domains. Durable `OPCNR001` and `OPCNR002`, and Async
+`OPCNA001` through `OPCNA004`, are refused
 with typed `PersistenceFormatMismatch`, exposed by the public store as
 `FreshInstallationRequired`. No in-place migration or silent legacy behavior
 is supported. A pre-boundary reader also refuses the new root discriminator.
 Root markers are written only at creation. Generation magic is an eight-byte
 record: the six ASCII bytes `OPCNJB` for a base or `OPCNJD` for a delta, followed
 by a vocabulary byte and an independent voter-profile byte. The current
-vocabulary is `0x06`; profile `0x00` is fixed membership and profile `0x01`
+vocabulary is `0x07`; profile `0x00` is fixed membership and profile `0x01`
 carries voter slots. Readers compare only the vocabulary level for monotonic
 format order and validate the profile separately against each context.
 Unknown levels and profiles are refused. A new root refuses older generation
-vocabularies and full-image fallbacks. Portable snapshots, the Raft wire and
-WAL operation records retain their existing formats.
+vocabularies and full-image fallbacks. Portable native snapshots carry canonical
+retention frontiers alongside their existing tables. Vocabulary 7 adds an
+optional retirement epoch to each positional key row; historical vocabularies
+keep their explicit four-field decoder. A vocabulary-7 key deletion also carries
+the fence and retirement epoch of the final dead row. This bounded witness
+survives captures that start with live authority and end after its retirement
+window. Admission checks its age and fence against both the original predecessor and
+committed window; the witness cannot claim retirement before the live predecessor's
+epoch. An untagged deletion
+without that witness is refused. The epoch fields, tags and deletion witnesses are folded
+into the still-unreleased `OPCNR003`/`OPCNA005` boundary. They cannot be written
+under an older generation discriminator. Portable snapshots preserve tags in
+`consensus_native_retired_keys`, keyed by the complete session key, with a
+canonical unsigned epoch and an epoch index. The tag namespace is required
+when epoch metadata is nondefault, including when no tags remain; an image
+without epoch history preserves the original SQL schema. Admission checks the
+schema, retained window, dead-row membership and counter bounds. The Raft wire and WAL
+operation records retain their existing formats.
+
+Fresh creation runs on the existing blocking opener pool. SQL identity has
+already been initialized when creation is queued, so caller cancellation retains
+both queued and running construction, with its owned connection, descriptor
+owner and verified snapshots, until ROOT writing completes. This preserves a
+complete initial root for reopening and keeps cold authentication off the
+asynchronous caller's stack. Ordinary namespace and fixed-state admission still
+precede exposure of the live owner.
+
+Native replay retains the latest 65,536 committed notifications. A persisted,
+monotone retirement frontier selects the retained suffix in admission,
+checkpoint capture, portable snapshots and restart. Cursors at or below it
+receive `ReplicationLogCursorCompacted` and the first retained sequence.
+Live delivery keeps all committed notifications and sequence numbers continue
+across retirement. Crossing this stored-format boundary is a fresh install.
+Portable snapshots validate the committed retention frontier against the raw
+watch head; operator recovery invalidation is independent. Pre-format snapshots
+are refused. Every native store written by an earlier build requires a fresh
+installation and cannot reopen in place, regardless of its notification count.
+
+Ordinary dead-key retirement shares this pre-release format boundary. Committed
+metadata records the key epoch, previous and current absent-key floors, and the
+current epoch's retirement count and maximum fence. Successful ordinary
+commands tag unreserved keys that have neither a record nor a lease after
+pruning. A tagged row stays exact through its retirement epoch and the next;
+re-creation clears the tag. Release retains its inactive lease row until a
+later successful pruning mutation, preserving the ordinary savepoint contract.
+A per-epoch index selects the oldest retained rows at rotation. It is rebuilt
+from admitted row tags, never from a local clock.
+
+The threshold is fixed at 32,768 retirements in native and memory-only fake
+profiles. The lab's default 100,000-key resident limit accommodates the full
+65,536-row exact window; it does not require a smaller threshold. A command
+also rotates below that count when dead history would
+otherwise exhaust resident key capacity. The latest rotation's threshold or
+capacity trigger is committed alongside the epoch. Each rotation strictly
+raises the published floor to `max(floor_cur + 1, retired_max + 1)`, applying
+any Async recovery floor first, and advances the allocator beyond it. It moves
+the previous current floor to `floor_prev` and resets the current counters.
+This preserves the exact two-epoch window while allowing capacity-driven
+reclamation without a lifetime key ceiling. At most 65,536 exact dead rows
+remain retained.
+
+A missing-key observation returns the current absent-key floor after the Async
+recovery floor. Deterministic V1/V2 acquisition of an absent row accepts exactly
+the previous or current floor, each raised by Async recovery; retained rows
+still require their exact fence. Arbitrary greater values are rejected. Both
+floors initially equal zero, so fresh-zero remains accepted through epoch 1
+unless Async recovery raises the floor. Callers observe before preparation and
+re-observe after a create-time `StaleFence`. The target fence remains
+`expected_fence + 1`; credential format and record AAD binding do not change.
+An absent-key preparation survives one rotation and is rejected with a
+no-effect `StaleFence` after two rotations, including capacity-triggered ones.
+
+Rotation is a committing-command effect. It cannot occur on reads, snapshots,
+delivery batches or between `Batch` children. Forgotten keys have fences below
+the previous floor, so either accepted absent floor produces a strictly newer
+fence for a forgotten key. Live and recently retired keys retain exact answers.
+Native consensus and the memory-only fake carry capacity decisions in the
+application journal. Every entry explicitly selects expiry cleanup, dead-key
+retirement, recovery floor, capacity rotations, internal resident capacity and
+bounded command framing. The mutation tree has no implicit replay policy. Native
+ordinary writes and V1 transitions request cleanup; V2 and control commands
+preserve unrelated rows. Metadata-only commands publish an empty batch when
+replication context changes. Multi-entry commands publish decided floors on the
+first entry and retain the earlier exact fence view only for their explicitly
+identified continuations. Refused entries roll back data and replay metadata;
+local writes refuse incomplete commands. The original 256-node entry and
+256-request command bounds remain. Portable snapshots, conversion and reopen
+preserve the required policy. Portable images identify the native policy profile
+even before the first retirement, so unsupported policy cannot enter ordinary
+SQLite replay through a snapshot. Missing policy is an incompatible encoding;
+JSON mutations use `effects`, requiring matching readers.
+Native generations and portable snapshots carry both floors, epoch counters and
+row tags through delta admission, base rewriting and reopen. Scope authority
+checkpoints and child/claim history retain their separate lifecycle predicates.
+Global expiry reclamation during pure V2 traffic remains open. V2 commands
+preserve unrelated expired rows, and resident capacity can therefore be exhausted
+without an ordinary cleanup command. This replay-policy change preserves that
+native behavior and makes replicas agree with it; it does not close that item.
+
+The notification window bounds 65,536 retained replay rows, never cumulative
+notifications or live delivery. The retired-key window is also bounded without
+a cumulative key limit. Portable snapshots bound canonical retirement metadata
+to 4 KiB; six unsigned counter fields occupy 48 bytes before serialization,
+alongside the latest rotation's trigger.
+Exact retired rows and their index have a separate bounded footprint and count
+against existing key admission limits. Existing image, concurrent verification
+and journal memory limits remain unchanged.
+
+Ordinary and in-memory lab request outcomes retain their existing safe
+behavior. Their independent receipt limits are not removed here: safe deletion
+requires a caller-bound retry epoch or absolute expiry that survives retries.
+Leader-assigned proposal time cannot provide that distinction. #1251 and the
+receipt part of #1257 remain open.
 
 The root contract reserves future generation vocabularies in place. A later
 format may be appended monotonically within a file; a new state-machine
@@ -191,9 +305,11 @@ Unknown generation vocabulary returns typed `CorruptState`; an unknown image
 schema returns typed `SchemaVersionMismatch`. Read-only schema inspection
 uses pinned snapshot descriptors and immutable SQLite readers.
 Format preflight does not grant storage or consensus authority: full selected
-state, scope, membership and snapshot admission still run afterward. Later
-log-file rollover and sibling-table retirement need no second fresh-install
-boundary under this contract.
+state, scope, membership and snapshot admission still run afterward. The current
+fresh-install boundary explicitly includes notification and ordinary-key
+retirement. Generation-file rollover preserves that vocabulary and introduces
+no further boundary. Future retirement semantics require their own compatible
+committed activation or an explicitly declared format boundary.
 
 Both compatibility preflight paths and full generation admission run on
 blocking workers. Full admission includes selected-state reconstruction,
@@ -248,29 +364,129 @@ A generation file may be replaced by another file epoch carrying the same contex
 A rowless delta may preserve the same context and operation sequence. A higher
 checkpoint epoch may reselect the same logical cut in another file. Recovery
 admits the selected generation before removing one unselected next file and
-up to two previous native generation files. This namespace capacity reserves
-the rollover/install handoff; it does not itself switch generation files.
+up to two previous native generation files. This namespace capacity covers
+the rollover/install handoff.
 
 Physical row reclamation removes the accumulated-row lifetime limit. The
 1,048,576-row cap remains a last defense against an unbounded live suffix.
-File extent still grows until generation-file rollover (SDK #1253): current
-ceilings are 32 GiB Durable and 8 GiB Async. A Durable ceiling failure fences
-the writer. An Async ceiling failure latches a failed background writer; the
-next snapshot publication fails and stops the engine, within one snapshot
-interval. A restart does not make additional file space available. Stalled
-snapshot work and failed local builds are different cases; any failed local
-build still stops the engine (SDK #1254). Separate key, ordinary-receipt and
-notification caps are unchanged.
+The selected generation retains the 32 GiB Durable and 8 GiB Async per-file
+validation limits. Size-triggered rollover below replaces accumulated append
+history with a compact base before those limits are reached.
+Stalled snapshot work and failed local builds are different cases; any failed
+local build still stops the engine. Build/install recovery remains deferred
+until retained-log admission exists and is qualified. Generation-file rollover
+does not change ordinary-receipt retention
+or live-state limits. The key-retirement and notification-window policies are
+specified in the retention sections above.
+
+## Generation-file rollover (SDK #1253)
+
+Resident row retirement alone has the following limitation:
+
+This is its own stage of the #1249 work: #1250/#1251/#1307/#1377 bound and
+reclaim resident native state, but no row retirement shrinks an append-only
+generation extent, so the lifetime stop remains.
+
+Generation rollover removes that append-history lifetime stop by reclaiming
+the file extents occupied by retired rows and prior append history.
+
+Ordinary checkpoints append and select deltas while a background compactor
+builds from an immutable, already-selected cut. The unchanged trigger is
+`min(max(2 * compact_base_bytes, 64 MiB), ceiling / 2)`; ceilings remain
+32 GiB Durable and 8 GiB Async. Compaction reads the old source through the
+ordinary authenticated path, without an exclusive read section. It encodes
+one complete base per attempt, then rebases selected suffix frames by
+canonically re-encoding their physical predecessor headers and comparing
+every copied body byte against a second authenticated read. Cold reopen
+retains full existing format and continuity validation.
+
+A caught-up candidate switches at an ordinary checkpoint. Its file epoch is
+bound before preparing that checkpoint's delta; sync, no-replacement rename,
+directory sync and named-descriptor confirmation precede durable CURRENT.
+Only then may the old file be retired and unlinked. Base and suffix relocation
+run independently of checkpoint start, in units of at most 64 logical rows,
+with revision-matched publication. Existing readers keep their authenticated
+old descriptors. Only the live Durable compactor's exact owned preparation
+is exempt from ordinary selection reclaim; cold reopen still removes crash
+leftovers after full selected-state admission.
+
+Admission does not depend on build time. Writes can exhaust the old file's
+remaining headroom: the ceiling minus the selected cut's extent. Selection
+can cross the trigger by one padded frame before scheduling the build, so the
+trigger does not guarantee half a ceiling of headroom. Exhausting this room
+causes designed, recoverable backpressure, warned at three quarters of the
+ceiling. Async checks the guard before projection and reservation; Durable
+uses its existing history_count admission wait at the file guard. Guard-only
+wait time is excluded from journal-pressure episodes. A genuine journal-memory
+stall without the file guard retains the existing #1130 fence behavior and
+all deadlines and memory bounds. Resource waiters retry their own reservation
+on each notification while the file guard remains active. The pending owner
+can detach and authenticate a pressure journal without an advanced cut or a
+new base serialization; only a genuinely advanced, changed capture may start
+a new base attempt. Cancellation is nonretryable inside I/O adapters, and
+Closing wakes owners without aborting an admissible checkpoint drain.
+
+Every candidate frame is checked before append. Intermediate replay consumes
+only its own padded extent. A switch checks its captured delta's encoded size
+plus the maximum re-encoded physical-header growth derived from the field
+types, padded to a block boundary; it consumes that space, with no second or
+static reserve. A failed check discards only the owned candidate, leaving old
+CURRENT and the retained WAL authoritative, and restarts from a genuinely
+newer selected cut.
+
+Capacity recovery has one limited exception: when the old file cannot append
+the next padded frame and a fresh latest-selected base plus the checked switch
+delta cannot fit, admission is already held. A background worker may build a
+complete base from a newer pending checkpoint capture. Durable validates the
+exact retained WAL cut and full native version; Async validates the captured
+resident generation/sequence and full native version. The base uses the pending
+checkpoint epoch, file_epoch e+1 and that cut's binding, with the existing
+authentication, byte comparison and descriptor/namespace checks. An ordinary
+checkpoint selects it without another switch delta, because it covers the
+complete pending cut. Old CURRENT and WAL remain authoritative until selection
+is durable. Retries require actual captured operation/applied-cut or Async
+generation progress; unchanged state is never relabeled to restart a build.
+
+If even that pending-cut base cannot fit, live data is at capacity. Admission
+stays held with a diagnostic, without a capacity fence or poisoned source, and
+resumes when internal retirement makes the complete base fit. Installation
+waits before claiming its application gate while this live-capacity guard is
+active, and yields an unarmed claim if capacity appears during predecessor
+drain, so already committed internal retirement remains able to complete.
+Concurrent installers retain the same exclusive handoff ownership.
+Closing interrupts that pre-ownership wait without selecting a partial base
+or manufacturing an Async closed certificate. Admission of client deletes while
+live data is at capacity remains an open resident-state policy decision.
+This is strictly more capable than backlog, which stops at the append ceiling
+regardless of live-data size. Live-data, key, receipt and notification caps,
+acknowledgement contracts and the stored generation vocabulary are unchanged.
+
+### Qualification
+
+Durable and Async component regressions drive repeated checkpoints through
+several file epochs with a smaller test-only rollover trigger; the production
+validation limits and stored vocabulary remain unchanged. They compare exact
+receipt and log state on reopen, keep a pinned reader live after the old file
+is unlinked, and preserve mutations made after capture. Fault injection covers
+twenty ordinary creation, synchronization, admission, frame-rebase, selector
+and reclamation boundaries, plus seven candidate-discard/pending-base
+boundaries in both modes. Each reopens, validates the selected state and
+completes two further rollovers. Release-only hooks also prove headroom and
+live-capacity shutdown/install handoffs without duration assertions.
+These component results do not establish power-loss, whole-process memory or
+deployment throughput qualification.
 
 ## Async writer and local observations
 
 Foreground admission applies the original validators to resident state and
 owns no per-operation disk request, disk-queue capacity permit, checkpoint
 drain, or retention I/O. Real engine/proposal admission and finite native
-memory bounds remain. Encoding, generation append/verification, file sync,
-selector replacement, and relocation work belong to one storage writer.
-At most one detached generation is being persisted per voter while later
-resident changes coalesce.
+memory bounds remain. Ordinary delta encoding, append/verification, file sync
+and selector replacement belong to one storage writer while later resident
+changes coalesce. One independent compactor may own a disjoint, unselected
+preparing file; its build and bounded post-switch relocation do not gate the
+next ordinary checkpoint. At most one ordinary capture and one compactor
+build are active per voter.
 
 The ordinary capture schedule is 250 ms; explicit drain, shutdown, and
 snapshot/install work can request an earlier capture. The schedule is not a
@@ -390,9 +606,9 @@ Async can lose acknowledged results if the live volatile quorum is lost.
 ### Completed consensus shutdown
 
 Completed-shutdown evidence was introduced with `OPCNA002`; the durable
-authority reservation followed in `OPCNA003`. Current `OPCNA004` roots retain
-both contracts and add physical log reclamation under a new binding hash
-domain. Readers without this vocabulary reject the root before participating.
+authority reservation followed in `OPCNA003`. Current `OPCNA005` roots retain
+both contracts, physical log reclamation and notification retention under a
+new binding hash domain. Readers without this vocabulary reject the root before participating.
 Old roots are refused by this binary; there is no implicit migration or
 retrospective certification.
 
@@ -404,6 +620,13 @@ operation budget. Failure retains a typed fallback reason and proceeds to the
 same drain; cancellation of an observer never cancels the owned operation.
 An explicit prior preparation retains its original deadline and outcome.
 Handoff neither changes persistence mode nor certifies a storage close.
+
+An unplanned loss (for example a failed replication listener) uses
+`shutdown_unplanned()` instead: it fences local admission, suppresses new
+handoff preparation, and cancels and joins an outstanding preparation before the
+same owned drain. RPCs already dispatched cannot be retracted, so a successor
+may already be campaigning; the retained report uses
+`PlannedShutdownFallback::Unplanned` and does not certify a successor.
 
 The coordinator then joins maintenance lanes, Raft and every actual
 storage/snapshot owner. Only an incarnation that was Active and
@@ -438,7 +661,7 @@ acknowledgements retain their resident replication/application boundary.
 
 ### Reserved authority and replicated retirement
 
-An `OPCNA004` owner syncs its root-bound `ASYNC-AUTHORITY` reservation before
+An `OPCNA005` owner syncs its root-bound `ASYNC-AUTHORITY` reservation before
 starting volatile consensus. Its finite range bounds terms, indices and
 authority allocators independently of completed session generations. Ordinary
 operations compare resident counters against the reservation without writing
@@ -455,7 +678,7 @@ roots and retained protected authority are outside this retirement vocabulary.
 
 ### Unanimous retained-owner recovery (SDK #908)
 
-Normal Async acknowledgements remain independent of disk. An `OPCNA004` root
+Normal Async acknowledgements remain independent of disk. An `OPCNA005` root
 reserves a finite range **before** any volatile issuance. The initial ceiling
 is `2^40 - 1`; each recovery era advances by `2^40`. Eras and all reserved
 frontiers are bounded below the signed-counter limit. Exhaustion rejects work;
@@ -553,7 +776,7 @@ provider inventory reports `ProtectedAuthorityRequired`, including when its
 volatile activation was lost.
 These are availability limits, never successful fence-only recovery outcomes.
 
-This requirement also applies to newly provisioned `OPCNA004` roots;
+This requirement also applies to newly provisioned `OPCNA005` roots;
 it is independent of older deployment migration. The member provider contract fences
 one immutable admission/member binding. Issuing a larger consensus fence for
 a different admission does not advance that old provider row. A local permit

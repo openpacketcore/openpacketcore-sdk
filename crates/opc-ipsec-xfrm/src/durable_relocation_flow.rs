@@ -818,6 +818,7 @@ mod tests {
             output_mark: None,
             if_id: Some(9),
             egress_dscp: None,
+            tfc_pad: None,
         }
     }
 

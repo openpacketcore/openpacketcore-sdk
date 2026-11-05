@@ -91,9 +91,13 @@ impl ScopeId {
     /// Bind the configured consensus cluster and an opaque nonzero slot.
     ///
     /// The replication manifest derives the cluster from its configured name
-    /// with [`opc_consensus::ConsensusClusterId::new`]. Obtain this identity from
-    /// the immutable topology, without a live authority probe. Membership epochs
-    /// are deliberately excluded; reusing a cluster name reuses its identity.
+    /// and persisted installation nonce with
+    /// [`opc_consensus::ConsensusClusterId::for_installation`]. Obtain this
+    /// identity from the immutable topology, without a live authority probe.
+    /// Membership epochs are deliberately excluded. Reusing the cluster name
+    /// together with the persisted installation nonce reuses the identity; a
+    /// fresh installation nonce with the same name is a distinct authority
+    /// domain (the #1187 fresh-install boundary).
     pub fn new(
         store: SessionConsensusIdentity,
         tenant: TenantId,

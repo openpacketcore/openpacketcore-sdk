@@ -10,6 +10,18 @@ pub(super) fn validate_key(
     value: &NativeKeyState,
     frontiers: &NativeFrontiers,
 ) -> io::Result<()> {
+    if value.retired_epoch.is_some_and(|epoch| {
+        !frontiers
+            .retention
+            .keys
+            .valid_retired_fence(epoch, value.fence)
+            || value.record.is_some()
+            || value.lease.is_some()
+            || value.reserved
+            || crate::scope_storage::is_scope_record_key(key)
+    }) {
+        return Err(invalid("native retired key tag or authority invalid"));
+    }
     if crate::scope_storage::is_scope_record_key(key)
         && (value.record.is_none() || value.lease.is_some() || value.reserved || value.fence != 0)
     {
@@ -295,7 +307,11 @@ pub(super) fn validate_frontiers(
     if let Some(boundary) = &frontiers.async_recovery {
         boundary.validate_protected_scope(identity, members, root)?;
     }
-    if notifications as u64 != frontiers.watch_sequence {
+    frontiers
+        .retention
+        .validate(frontiers.watch_sequence, frontiers.next_fence)?;
+    if notifications as u64 != frontiers.watch_sequence - frontiers.retention.watch_retired_through
+    {
         return Err(invalid("native image watch count differs"));
     }
     if let Some(snapshot) = &frontiers.current_snapshot {
@@ -441,7 +457,10 @@ impl NativeState {
             return Err(invalid("native V1 receipt count exceeds lifetime bound"));
         }
         for (ordinal, row) in self.notifications.iter().enumerate() {
-            row.validate(ordinal as u64 + 1, frontiers)?;
+            row.validate(
+                frontiers.retention.watch_retired_through + ordinal as u64 + 1,
+                frontiers,
+            )?;
         }
         Ok(receipt_order)
     }

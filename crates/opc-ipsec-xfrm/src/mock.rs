@@ -522,6 +522,7 @@ fn sa_record_from_parameters(parameters: &crate::model::SaParameters) -> MockSaR
         },
         output_mark: parameters.output_mark,
         egress_dscp: None,
+        tfc_pad: parameters.tfc_pad,
     };
     let identity = SaRelocationIdentity {
         selector: SaRelocationSelector::from_selector(&state.selector),
@@ -1148,6 +1149,7 @@ mod tests {
             output_mark: None,
             if_id: None,
             egress_dscp: None,
+            tfc_pad: None,
         }
     }
 
@@ -1553,6 +1555,21 @@ mod tests {
             backend.query_sa(query).await.unwrap().output_mark,
             params.output_mark
         );
+    }
+
+    #[tokio::test]
+    async fn mock_round_trips_tfc_padding_on_install_and_query() {
+        let backend = MockXfrmBackend::new();
+        let mut params = sample_sa_parameters();
+        params.tfc_pad = Some(256);
+        backend
+            .install_sa(InstallSaRequest {
+                parameters: params.clone(),
+            })
+            .await
+            .unwrap();
+        let query = QuerySaRequest::new(params.id.destination, params.id.protocol, params.id.spi);
+        assert_eq!(backend.query_sa(query).await.unwrap().tfc_pad, Some(256));
     }
 
     #[tokio::test]

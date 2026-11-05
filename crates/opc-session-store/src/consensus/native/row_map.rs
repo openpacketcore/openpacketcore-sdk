@@ -119,7 +119,26 @@ impl<K, V> RowMap<K, V> {
     }
 }
 
+pub(super) struct OwnedIter<K: Hash + Eq, V> {
+    inner: imbl::hashmap::ConsumingIter<(Stored<K, V>, ()), imbl::shared_ptr::DefaultSharedPtr>,
+}
+
+impl<K: Hash + Eq, V> Iterator for OwnedIter<K, V> {
+    type Item = CapturedRow<K, V>;
+    fn next(&mut self) -> Option<Self::Item> {
+        self.inner.next().map(|(row, ())| CapturedRow(row.0))
+    }
+}
+
 impl<K: Hash + Eq, V> RowMap<K, V> {
+    /// An owning cursor shares the immutable trie. Advancing it copies at
+    /// most a trie path; it never clones or materializes the complete index.
+    pub(super) fn owning_iter(&self) -> OwnedIter<K, V> {
+        OwnedIter {
+            inner: self.rows.clone().into_iter(),
+        }
+    }
+
     pub(super) fn capture_row(&self, key: &K) -> Option<CapturedRow<K, V>> {
         self.rows
             .get_key_value(key)

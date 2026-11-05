@@ -109,9 +109,16 @@ pub trait GtpuDataplaneBackend: Send + Sync + std::fmt::Debug {
     /// The eBPF backend also invalidates ports on failed attachment readback.
     /// Retry this open to bind fresh queues once the same live registration
     /// passes all checks; old handles and response plans remain invalid.
-    /// The current eBPF implementation supports concrete IPv4 endpoints only.
-    /// Linux kernel, mock and unsupported adapters return the exact unsupported
-    /// feature below; they do not bind a competing socket or simulate parity.
+    /// The eBPF implementation supports concrete IPv4 endpoints only. The
+    /// Linux kernel-GTP implementation exposes the retained userspace socket
+    /// of an ordinary (non-recoverable) creation: the kernel passes
+    /// non-G-PDUs and declined G-PDUs back to that socket. Stable PDP absence
+    /// is required for `UnknownTunnel`; declined known-TEID traffic is dropped.
+    /// Receipt does not authorize a tunnel or peer. A kernel-owned recoverable
+    /// attachment (no userspace descriptor) returns
+    /// `UnsupportedFeature { feature: "gtpu_control_port_kernel_owned" }`.
+    /// Mock and unsupported adapters return the exact unsupported feature
+    /// below; no adapter binds a competing socket or simulates parity.
     async fn open_gtpu_control_port(
         &self,
         _device: &GtpDevice,
@@ -1484,10 +1491,11 @@ mod tests {
         ));
         let context = GtpPdpContext {
             local_teid: crate::Teid::new(1).unwrap(),
-            peer_teid: crate::Teid::new(2).unwrap(),
+            peer_teid: crate::Teid::new(2).unwrap().into(),
             ms_address: std::net::IpAddr::V4(std::net::Ipv4Addr::new(10, 0, 0, 1)),
             peer_address: std::net::IpAddr::V4(std::net::Ipv4Addr::new(192, 0, 2, 2)),
             link_ifindex: 7,
+            downlink_peer_source_policy: crate::GtpuPeerSourcePolicy::BackendDefault,
             downlink_source_port_policy: crate::GtpuSourcePortPolicy::Any,
             gtp_version: crate::GtpVersion::V1,
             bearer_mark: None,

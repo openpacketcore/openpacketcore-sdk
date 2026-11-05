@@ -225,6 +225,8 @@ fn field_diagnostics_never_format_values() {
     let location = N3iwfLocation::new("192.0.2.1".parse().unwrap(), Some(4500), Some(tai.clone()));
     let key = SecurityKey::new(&key);
     let encoded = key.encode(encode_context()).unwrap();
+    let handoff = SecurityKey::new(&[0x53; 32]).to_zeroizing();
+    assert_eq!(handoff.as_slice(), &[0x53; 32]);
     for text in [
         format!("{:?}", RanUeId::new(123456)),
         format!("{:?}", AmfUeId::new(123456789).unwrap()),

@@ -46,7 +46,7 @@ use opc_protocol::{
 };
 use thiserror::Error;
 
-use crate::{GtpBearerMark, Teid};
+use crate::{GtpBearerMark, PeerTeid, Teid};
 
 /// N3 function role, distinct from the Linux `GtpRole` netdevice setting.
 #[non_exhaustive]
@@ -163,12 +163,15 @@ fn check_address(address: IpAddr) -> Result<(), N3PacketError> {
 
 /// UPF destination TNL received by the caller through N2 signalling.
 ///
-/// Construction checks only a concrete unicast IP and the existing nonzero
-/// [`Teid`] type. It does not authenticate the signalling or test reachability.
+/// Construction checks only a concrete unicast IP and admits the reserved
+/// all-zero peer TEID of TS 29.281 section 5.1, which a legacy peer may assign
+/// and which subsequent G-PDUs must carry unchanged. It does not authenticate
+/// the signalling or test reachability; locally allocated and received TEIDs
+/// remain [`Teid`] and reject zero.
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub struct ReceivedN3UplinkTnl {
     address: IpAddr,
-    teid: Teid,
+    teid: PeerTeid,
 }
 
 impl ReceivedN3UplinkTnl {
@@ -176,9 +179,12 @@ impl ReceivedN3UplinkTnl {
     ///
     /// # Errors
     /// Returns [`N3PacketError::InvalidAddress`] for an unsuitable address.
-    pub fn new(address: IpAddr, teid: Teid) -> Result<Self, N3PacketError> {
+    pub fn new(address: IpAddr, teid: impl Into<PeerTeid>) -> Result<Self, N3PacketError> {
         check_address(address)?;
-        Ok(Self { address, teid })
+        Ok(Self {
+            address,
+            teid: teid.into(),
+        })
     }
 
     /// Destination IP for uplink traffic; sensitive, never log it.
@@ -187,9 +193,9 @@ impl ReceivedN3UplinkTnl {
         self.address
     }
 
-    /// Destination TEID for uplink traffic.
+    /// Destination TEID for uplink traffic; zero is the admitted legacy value.
     #[must_use]
-    pub const fn teid(self) -> Teid {
+    pub const fn teid(self) -> PeerTeid {
         self.teid
     }
 }
@@ -435,6 +441,13 @@ impl<'a> N3PacketView<'a> {
         let mut psc = None;
         for extension in message.extensions() {
             let extension = extension.map_err(map_decode_error)?;
+            // This endpoint implements PSC semantics only. Additional generic
+            // typed headers do not expand its comprehension claim.
+            if extension.ext_type != GTPU_EXT_PDU_SESSION_CONTAINER
+                && extension.ext_type & 0x80 != 0
+            {
+                return Err(N3PacketError::UnsupportedExtension);
+            }
             if extension.ext_type == GTPU_EXT_PDU_SESSION_CONTAINER {
                 if psc.is_some() {
                     return Err(N3PacketError::DuplicatePsc);

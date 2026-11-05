@@ -28,6 +28,8 @@ pub struct RecordedRequest {
     pub method: String,
     /// Request path only (no scheme/authority/query).
     pub path: String,
+    /// Raw URI query string, without the leading question mark.
+    pub query: Option<String>,
     /// Request headers; values that are not valid UTF-8 are silently
     /// dropped. Duplicate header names keep only the last value.
     pub headers: HashMap<String, String>,
@@ -142,6 +144,7 @@ impl MockProducer {
 async fn handle_request(State(state): State<MockState>, req: Request) -> Response {
     let method = req.method().to_string();
     let path = req.uri().path().to_string();
+    let query = req.uri().query().map(str::to_string);
     let mut headers = HashMap::new();
     for (k, v) in req.headers() {
         if let Ok(val) = v.to_str() {
@@ -166,6 +169,7 @@ async fn handle_request(State(state): State<MockState>, req: Request) -> Respons
         lock.requests.push(RecordedRequest {
             method,
             path: path.clone(),
+            query,
             headers,
             body: body_bytes,
         });

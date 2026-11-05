@@ -46,6 +46,12 @@ pub(super) fn cloned_key_value(
 
 /// Whether the emitted scalar type is Copy, including resolved leafrefs.
 pub(super) fn is_copy_type(node: &SchemaNode, nodes_by_path: &NodeIndex<'_>) -> bool {
+    if matches!(
+        nodes_by_path.scalar_node(node).type_ref,
+        Some(TypeRef::Decimal64 { .. })
+    ) {
+        return true;
+    }
     matches!(
         get_raw_type(node, nodes_by_path).to_string().as_str(),
         "bool"
@@ -93,7 +99,7 @@ fn get_raw_type_internal(
         Some(TypeRef::Uint32) => quote! { u32 },
         Some(TypeRef::Uint64) => quote! { YangUint64 },
         Some(TypeRef::Int64) => quote! { YangInt64 },
-        Some(TypeRef::Decimal64) => quote! { YangDecimal64 },
+        Some(TypeRef::Decimal64 { fraction_digits }) => quote! { YangDecimal64<#fraction_digits> },
         Some(TypeRef::Empty) => quote! { YangEmpty },
         Some(TypeRef::IdentityRef { .. }) => quote! { String },
         Some(TypeRef::LeafRef { target_path }) => {
@@ -333,20 +339,6 @@ pub fn generate(input: &CanonicalInput) -> Result<String, RustGenerationError> {
     } else {
         quote! {}
     };
-    let decimal_hash = if super::has_user_ordered_collections(input) {
-        quote! {
-            impl std::hash::Hash for YangDecimal64 {
-                fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
-                    // Typed equality considers the two signed zeroes equal.
-                    let bits = if self.0 == 0.0 { 0_u64 } else { self.0.to_bits() };
-                    std::hash::Hash::hash(&bits, state);
-                }
-            }
-        }
-    } else {
-        quote! {}
-    };
-
     let uint64_wrapper = if super::has_extended_integers(input) {
         quote! {
             #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
@@ -556,27 +548,7 @@ pub fn generate(input: &CanonicalInput) -> Result<String, RustGenerationError> {
 
         #int64_display
 
-        #[derive(Clone, Copy, Debug, PartialEq, Default)]
-        pub struct YangDecimal64(pub f64);
-        #decimal_hash
-        impl Serialize for YangDecimal64 {
-            fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
-            where
-                S: serde::Serializer,
-            {
-                serializer.serialize_str(&self.0.to_string())
-            }
-        }
-        impl<'de> Deserialize<'de> for YangDecimal64 {
-            fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-            where
-                D: serde::Deserializer<'de>,
-            {
-                let s = String::deserialize(deserializer)?;
-                let val = s.parse::<f64>().map_err(serde::de::Error::custom)?;
-                Ok(YangDecimal64(val))
-            }
-        }
+        pub use opc_mgmt_schema::FixedDecimal64 as YangDecimal64;
 
         #hash_derive
         #[derive(Clone, Copy, Debug, PartialEq, Default, Eq)]
@@ -689,7 +661,9 @@ pub fn generate(input: &CanonicalInput) -> Result<String, RustGenerationError> {
                                 Some(TypeRef::Uint32) => quote! { u32 },
                                 Some(TypeRef::Uint64) => quote! { YangUint64 },
                                 Some(TypeRef::Int64) => quote! { YangInt64 },
-                                Some(TypeRef::Decimal64) => quote! { YangDecimal64 },
+                                Some(TypeRef::Decimal64 { fraction_digits }) => {
+                                    quote! { YangDecimal64<#fraction_digits> }
+                                }
                                 Some(TypeRef::Empty) => quote! { YangEmpty },
                                 Some(TypeRef::IdentityRef { .. }) => quote! { String },
                                 Some(TypeRef::Custom { name }) => {
@@ -840,7 +814,7 @@ pub fn generate(input: &CanonicalInput) -> Result<String, RustGenerationError> {
                     });
 
                     // Build default expression
-                    let def_expr = get_field_default_expr(child, &nodes_by_path);
+                    let def_expr = get_field_default_expr(child, &nodes_by_path)?;
                     if child.config && child.default.is_some() {
                         has_defaults = true;
                     }
@@ -1122,17 +1096,20 @@ pub(super) fn numeric_range_check(
     }
 }
 
-fn get_field_default_expr(child: &SchemaNode, nodes_by_path: &NodeIndex<'_>) -> TokenStream {
+fn get_field_default_expr(
+    child: &SchemaNode,
+    nodes_by_path: &NodeIndex<'_>,
+) -> Result<TokenStream, RustGenerationError> {
     // Operational values represent observations, not configuration defaults.
     // Keep their optional field representation even when the schema has a default.
     if !child.config && child.kind == SchemaNodeKind::Leaf {
-        return if is_sensitive_node(child) {
+        return Ok(if is_sensitive_node(child) {
             quote! { SecretLeaf::new(None) }
         } else {
             quote! { None }
-        };
+        });
     }
-    if let Some(ref def_str) = child.default {
+    Ok(if let Some(ref def_str) = child.default {
         let resolved_type = nodes_by_path.legacy_or_resolved(child).type_ref.as_ref();
         let val_expr = match resolved_type {
             Some(TypeRef::Boolean) => {
@@ -1187,9 +1164,16 @@ fn get_field_default_expr(child: &SchemaNode, nodes_by_path: &NodeIndex<'_>) -> 
                     .unwrap_or(0);
                 quote! { YangInt64(#val) }
             }
-            Some(TypeRef::Decimal64) => {
-                let val = def_str.parse::<f64>().unwrap_or(0.0);
-                quote! { YangDecimal64(#val) }
+            Some(TypeRef::Decimal64 { fraction_digits }) => {
+                let val = opc_mgmt_schema::Decimal64::parse(def_str, *fraction_digits)
+                    .map_err(|_| {
+                        RustGenerationError::new(format!(
+                            "invalid decimal64 default at {}",
+                            child.path
+                        ))
+                    })?
+                    .scaled();
+                quote! { YangDecimal64::<#fraction_digits>::from_scaled(#val) }
             }
             Some(TypeRef::Empty) => {
                 quote! { YangEmpty }
@@ -1223,5 +1207,5 @@ fn get_field_default_expr(child: &SchemaNode, nodes_by_path: &NodeIndex<'_>) -> 
                 quote! { Default::default() }
             }
         }
-    }
+    })
 }

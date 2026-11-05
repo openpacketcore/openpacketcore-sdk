@@ -183,16 +183,17 @@ fn native_durable_install_original_transaction_preserves_vote_suffix_and_every_c
             &fixed_members(),
             &test_member_bindings(&fixed_members()),
             FIXED_TEST_PLACEMENT_POLICY,
-            vec![suffix],
+            vec![suffix.clone()],
         )
         .unwrap();
         assert_eq!(
             encode_json(&applied.responses).unwrap(),
             encode_json(&sql.responses).unwrap()
         );
-        assert_eq!(
-            encode_json(&applied.notifications).unwrap(),
-            encode_json(&sql.notifications).unwrap()
+        policy_oracle::notifications(
+            &applied.notifications,
+            &sql.notifications,
+            std::slice::from_ref(&suffix),
         );
         exact(&reopened, &expected, &signed);
         reopened.checkpoint().unwrap();

@@ -1,4 +1,4 @@
-//! Bounded, fail-fast provider work admission shared by roster executors.
+//! Ordinary provider-work shares and emergency bypass shared by roster executors.
 //!
 //! The scheduler is deliberately not an async queue.  A caller supplies an
 //! already-redacted exact tenant-and-scope digest and receives both permits at
@@ -18,7 +18,7 @@ pub(crate) type ProviderSchedulingDigest = [u8; 32];
 /// The registry is intentionally a fixed power-of-two shard set, not a
 /// process-wide queue or mutex.
 const PROVIDER_SCHEDULER_SHARDS: usize = 16;
-/// No provider scheduler can outlive the durable live-roster capacity.
+/// Maximum ordinary provider-work share configured at startup.
 const MAX_PROVIDER_WORK: usize = opc_session_store::FENCED_MUTATION_ROSTER_MAX_LIVE_ROSTERS;
 
 type ScopeRegistry = HashMap<ProviderSchedulingDigest, Weak<Semaphore>>;
@@ -28,7 +28,7 @@ type ScopeRegistry = HashMap<ProviderSchedulingDigest, Weak<Semaphore>>;
 pub(crate) enum ProviderWorkSchedulerConfigError {
     /// Zero provider-work capacity cannot admit any operation.
     ZeroCapacity,
-    /// Provider-work capacity exceeds the fixed durable live-roster ceiling.
+    /// Ordinary provider-work share exceeds the configured live-admission threshold.
     CapacityExceedsLiveRosterLimit,
 }
 
@@ -58,7 +58,8 @@ impl fmt::Display for ProviderWorkSchedulerAcquireError {
 
 impl std::error::Error for ProviderWorkSchedulerAcquireError {}
 
-/// Fixed-capacity, sharded admission for provider effects.
+/// Sharded ordinary admission shares for provider effects.
+/// Emergency bypass preserves per-member effect ownership in the caller.
 ///
 /// For global capacity greater than one, each exact scope receives at most
 /// `ceil(global / 2)` permits.  Therefore a saturated scope leaves at least
@@ -133,8 +134,29 @@ impl ProviderWorkScheduler {
             scope_permit: Some(scope_permit),
             global_permit: Some(global_permit),
             digest,
-            registry,
+            registry: Some(registry),
         })
+    }
+
+    /// Acquire provider work for the immutable admission class.
+    pub(crate) fn try_acquire_for_class(
+        &self,
+        digest: ProviderSchedulingDigest,
+        class: super::canonical::AdmissionClass,
+    ) -> Result<ProviderWorkPermit, ProviderWorkSchedulerAcquireError> {
+        if class == super::canonical::AdmissionClass::Emergency {
+            // The caller retains the existing per-member effect ownership and
+            // deadline. This skips only ordinary admission shares, without
+            // creating a queue or releasing an ordinary caller's permits.
+            Ok(ProviderWorkPermit {
+                scope_permit: None,
+                global_permit: None,
+                digest,
+                registry: None,
+            })
+        } else {
+            self.try_acquire(digest)
+        }
     }
 
     fn shard_index(&self, digest: &ProviderSchedulingDigest) -> usize {
@@ -159,7 +181,7 @@ pub(crate) struct ProviderWorkPermit {
     scope_permit: Option<OwnedSemaphorePermit>,
     global_permit: Option<OwnedSemaphorePermit>,
     digest: ProviderSchedulingDigest,
-    registry: Arc<Mutex<ScopeRegistry>>,
+    registry: Option<Arc<Mutex<ScopeRegistry>>>,
 }
 
 impl fmt::Debug for ProviderWorkPermit {
@@ -172,7 +194,9 @@ impl Drop for ProviderWorkPermit {
     fn drop(&mut self) {
         self.global_permit.take();
         self.scope_permit.take();
-        remove_if_inactive(&self.registry, &self.digest);
+        if let Some(registry) = &self.registry {
+            remove_if_inactive(registry, &self.digest);
+        }
     }
 }
 
@@ -328,5 +352,44 @@ mod tests {
             scheduler.try_acquire([20; 32]),
             Err(ProviderWorkSchedulerAcquireError::Busy)
         ));
+    }
+}
+
+#[cfg(test)]
+mod admission_capacity_tests {
+    use super::*;
+    use crate::fenced_mutation_roster::canonical::AdmissionClass;
+
+    #[test]
+    fn roster_capacity_emergency_bypasses_provider_scope_share() {
+        let scheduler = ProviderWorkScheduler::new(2).unwrap();
+        let ordinary = scheduler.try_acquire([1; 32]).unwrap();
+        assert!(scheduler.try_acquire([1; 32]).is_err());
+        let emergency = scheduler.try_acquire_for_class([1; 32], AdmissionClass::Emergency);
+        assert!(
+            emergency.is_ok(),
+            "the ordinary scope share must not refuse emergency work"
+        );
+        drop(emergency);
+        assert!(scheduler.try_acquire([1; 32]).is_err());
+        drop(ordinary);
+        assert_eq!(scheduler.registry_entries(), 0);
+    }
+
+    #[test]
+    fn roster_capacity_emergency_bypasses_provider_global_share() {
+        let scheduler = ProviderWorkScheduler::new(2).unwrap();
+        let first = scheduler.try_acquire([1; 32]).unwrap();
+        let second = scheduler.try_acquire([2; 32]).unwrap();
+        assert!(scheduler.try_acquire([3; 32]).is_err());
+        let emergency = scheduler.try_acquire_for_class([3; 32], AdmissionClass::Emergency);
+        assert!(
+            emergency.is_ok(),
+            "ordinary clients must not consume emergency provider capacity"
+        );
+        drop(emergency);
+        assert!(scheduler.try_acquire([3; 32]).is_err());
+        drop((first, second));
+        assert_eq!(scheduler.registry_entries(), 0);
     }
 }

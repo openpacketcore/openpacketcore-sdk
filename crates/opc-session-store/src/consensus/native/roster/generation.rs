@@ -69,11 +69,17 @@ fn row(
     if let Some(row) = row {
         let root =
             root.ok_or_else(|| invalid("native roster generation configured root absent"))?;
-        let length = frame::write_row_detached(&mut io::sink(), row, root, scope, check)?;
+        // Keep one fully authenticated hydration for sizing and writing this
+        // frame. A second selected read here repeats all signature checks and
+        // can observe a different source after the first exact validation.
+        let hydrated = row.hydrate_detached(root, scope, check)?;
+        let length = frame::write_hydrated(&mut io::sink(), &hydrated)?;
+        check()?;
         writer.write_all(&length.to_le_bytes())?;
-        if frame::write_row_detached(writer, row, root, scope, check)? != length {
+        if frame::write_hydrated(writer, &hydrated)? != length {
             return Err(invalid("native roster generation carrier extent changed"));
         }
+        check()?;
     }
     Ok(())
 }

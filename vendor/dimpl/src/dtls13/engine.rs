@@ -390,10 +390,10 @@ impl Engine {
             .filter_map(|h| h.dupe_triggers_resend())
             .next();
 
-        if let Some(dupe_seq) = maybe_dupe_seq {
-            if dupe_seq < self.peer_handshake_seq_no {
-                self.flight_resend("dupe triggers resend")?;
-            }
+        if let Some(dupe_seq) = maybe_dupe_seq
+            && dupe_seq < self.peer_handshake_seq_no
+        {
+            self.flight_resend("dupe triggers resend")?;
         }
 
         // Drop old duplicates we've already processed
@@ -510,10 +510,10 @@ impl Engine {
             self.flight_timeout = Timeout::Armed(timeout);
         }
 
-        if let Timeout::Armed(connect_timeout) = self.connect_timeout {
-            if now >= connect_timeout {
-                return Err(Error::Timeout(crate::TimeoutError::Connect));
-            }
+        if let Timeout::Armed(connect_timeout) = self.connect_timeout
+            && now >= connect_timeout
+        {
+            return Err(Error::Timeout(crate::TimeoutError::Connect));
         }
 
         let Timeout::Armed(flight_timeout) = self.flight_timeout else {
@@ -660,10 +660,10 @@ impl Engine {
             _ => now + Duration::from_secs(10 * 365 * 24 * 60 * 60),
         };
 
-        if let Some(deadline) = self.handshake_ack_deadline {
-            if deadline < timeout {
-                timeout = deadline;
-            }
+        if let Some(deadline) = self.handshake_ack_deadline
+            && deadline < timeout
+        {
+            timeout = deadline;
         }
 
         timeout
@@ -1356,7 +1356,7 @@ impl Engine {
         let record_numbers_len = u16::from_be_bytes([ack_data[0], ack_data[1]]) as usize;
         let entries_data = &ack_data[2..];
 
-        if entries_data.len() != record_numbers_len || record_numbers_len % 16 != 0 {
+        if entries_data.len() != record_numbers_len || !record_numbers_len.is_multiple_of(16) {
             return Ok(());
         }
 
@@ -2189,7 +2189,7 @@ impl Engine {
         &self,
         group: crate::types::NamedGroup,
     ) -> Option<&'static dyn SupportedKxGroup> {
-        self.config.kx_groups().find(|g| g.name() == group)
+        self.config.dtls13_kx_groups().find(|g| g.name() == group)
     }
 
     // =========================================================================
@@ -2337,11 +2337,11 @@ fn reconstruct_sequence(partial: u64, expected: u64, bits: u32) -> u64 {
 
 impl RecordHandler for Engine {
     fn classify_record(&mut self, record: Record) -> Result<Option<Record>, Error> {
-        if let Some(cn_seq) = self.close_notify_sequence {
-            if record.record().sequence > cn_seq {
-                self.push_buffer(record.into_buffer());
-                return Ok(None);
-            }
+        if let Some(cn_seq) = self.close_notify_sequence
+            && record.record().sequence > cn_seq
+        {
+            self.push_buffer(record.into_buffer());
+            return Ok(None);
         }
 
         let epoch = record.record().sequence.epoch;

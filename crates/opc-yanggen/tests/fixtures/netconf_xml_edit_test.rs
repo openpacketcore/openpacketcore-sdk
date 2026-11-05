@@ -157,8 +157,7 @@ fn scalar_leaf_create_fails_when_present() {
     assert!(
         matches!(
             err,
-            NetconfEditError::OperationNotSupported {
-                operation: EditOperation::Create,
+            NetconfEditError::DataExists {
                 kind: NodeKind::Leaf,
                 ..
             }
@@ -192,8 +191,7 @@ fn scalar_leaf_delete_fails_when_absent() {
     assert!(
         matches!(
             err,
-            NetconfEditError::OperationNotSupported {
-                operation: EditOperation::Delete,
+            NetconfEditError::DataMissing {
                 ..
             }
         ),
@@ -319,6 +317,22 @@ fn nested_container_delete_removes_container() {
     );
     let candidate = applicator().apply_edit_config(&running, &edit).unwrap();
     assert!(candidate.dns.is_none());
+}
+
+#[test]
+fn review_presence_container_delete_requires_existence_but_remove_is_idempotent() {
+    let running = empty_system();
+    let mut edit = container("/ex:system", EditOperation::Merge,
+        vec![container("/ex:system/ex:dns", EditOperation::Delete, Vec::new())]);
+    assert!(applicator().apply_edit_config(&running, &edit).is_err(),
+        "delete of an absent presence container must fail");
+    edit.children[0].operation = EditOperation::Remove;
+    let removed = applicator().apply_edit_config(&running, &edit).unwrap();
+    assert!(removed.dns.is_none());
+    edit.children[0].operation = EditOperation::Create;
+    let present = applicator().apply_edit_config(&running, &edit).unwrap();
+    assert!(present.dns.is_some());
+    assert!(applicator().apply_edit_config(&present, &edit).is_err());
 }
 
 #[test]
@@ -465,8 +479,7 @@ fn keyed_list_create_fails_when_entry_exists() {
     assert!(
         matches!(
             err,
-            NetconfEditError::OperationNotSupported {
-                operation: EditOperation::Create,
+            NetconfEditError::DataExists {
                 kind: NodeKind::List,
                 ..
             }
@@ -499,8 +512,7 @@ fn keyed_list_delete_and_remove() {
     assert!(
         matches!(
             err,
-            NetconfEditError::OperationNotSupported {
-                operation: EditOperation::Delete,
+            NetconfEditError::DataMissing {
                 ..
             }
         ),
@@ -883,8 +895,7 @@ fn real_xml_leaf_list_operations_are_schema_typed_and_ordered() {
     .expect_err("create must reject an existing leaf-list value");
     assert!(matches!(
         err,
-        NetconfEditError::OperationNotSupported {
-            operation: EditOperation::Create,
+        NetconfEditError::DataExists {
             kind: NodeKind::LeafList,
             ..
         }

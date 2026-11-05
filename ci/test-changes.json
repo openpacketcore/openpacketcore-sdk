@@ -340,6 +340,2206 @@
       "kind": "assertions-decreased",
       "reason": "Remove the redundant admitted assertion after the bounded receipt loop already requires that same captured status to be admitted before it can exit. A missing admission still fails within the original 30-second bound, now naming the last store, receipt and status. Exact receipt-index, leader and readiness assertions remain; no timeout, poll interval or production behavior changes.",
       "issue": 1407
+    },
+    {
+      "test": "rust:crates/opc-gtpu-dataplane::test=ebpf_gtpu_privileged::ebpf_gtpu_n3_end_marker_retirement_ordering",
+      "kind": "assertions-decreased",
+      "reason": "Replace the ad-hoc redirect-IT timeout eprintln block (which called `ip -6 addr/neigh show` with an expect) with the shared DatapathTimeoutDiagnostics formatter. The timeout assertion and every behavioral assertion are unchanged; the removed diagnostic `expect` is now a failure-safe bounded renderer, so the static helper resolver attributes fewer assertions while failures report strictly more datapath state (redirect delta, shared-peer iteration, counter values, tentative addresses, neighbours, routes).",
+      "issue": 1188
+    },
+    {
+      "test": "rust:crates/opc-persist::lib=lib::consensus::store::voter_slots::tests::snapshot_tests::shutdown_discards_partial_snapshot_and_reopens_with_old_handles_alive",
+      "kind": "assertions-decreased",
+      "reason": "The incoming receiver now distinguishes Receiving from Accepted. Replace incoming.as_ref().unwrap() with an explicit Receiving pattern whose else branch panics; this drops one counted unwrap (35 -> 34) while checking the state more precisely. File existence, bounded shutdown, receiver disposal, file removal, post-shutdown refusal and reopen with old handles all remain asserted.",
+      "issue": 1339
+    },
+    {
+      "test": "rust:crates/opc-gtpu-dataplane::test=ebpf_gtpu_privileged::ebpf_gtpu_peer_teid_zero_is_transmitted_for_both_inner_families",
+      "kind": "disabled",
+      "reason": "New native tc regression requires CAP_BPF/CAP_NET_ADMIN and private network/bpffs namespaces, so it uses the existing privileged suite's ordinary-test ignore. The full privileged suite explicitly executes it and proves zero-peer G-PDU transmission for both inner families. No existing test or assertion is removed or disabled.",
+      "issue": 1346
+    },
+    {
+      "test": "rust:crates/opc-ipsec-xfrm::lib=lib::linux::tests::tfc_tests::native_tfc_install_readback_and_ignored_update_are_reported_exactly",
+      "kind": "disabled",
+      "reason": "New native GETSA/UPDSA TFC regression requires CAP_NET_ADMIN in a private network namespace. It is explicitly required by ci/local-kernel-lifecycle-cases.json and executed with --ignored by the local-kernel-lifecycle qualification runner. No pre-existing executable coverage is gated or removed.",
+      "issue": 1344
+    },
+    {
+      "test": "rust:crates/opc-ipsec-xfrm::lib=lib::local_scope::tests::native_scoped_successor_moves_policy_and_retires_only_the_predecessor",
+      "kind": "disabled",
+      "reason": "The existing native scoped rekey test was nested inside another test and could not execute. It is now a top-level native test with its original privileged requirements. It is explicitly required by ci/local-kernel-lifecycle-cases.json and executed with --ignored by the local-kernel-lifecycle qualification runner. No pre-existing executable coverage is gated or removed.",
+      "issue": 1239
+    },
+    {
+      "test": "rust:crates/opc-ipsec-xfrm::lib=lib::local_scope::tests::successor_tests::native_scoped_successor_abandonment_restores_traffic",
+      "kind": "disabled",
+      "reason": "New native scoped rekey regression requires CAP_NET_ADMIN, private network and mount namespaces, and the scoped lifecycle fixture. It is explicitly required by ci/local-kernel-lifecycle-cases.json and executed with --ignored by the local-kernel-lifecycle qualification runner. No pre-existing executable coverage is gated or removed.",
+      "issue": 1239
+    },
+    {
+      "test": "rust:crates/opc-ipsec-xfrm::lib=lib::local_scope::tests::successor_tests::native_scoped_successor_cancel_after_policy",
+      "kind": "disabled",
+      "reason": "New native scoped rekey regression requires CAP_NET_ADMIN, private network and mount namespaces, and the scoped lifecycle fixture. It is explicitly required by ci/local-kernel-lifecycle-cases.json and executed with --ignored by the local-kernel-lifecycle qualification runner. No pre-existing executable coverage is gated or removed.",
+      "issue": 1239
+    },
+    {
+      "test": "rust:crates/opc-ipsec-xfrm::lib=lib::local_scope::tests::successor_tests::native_scoped_successor_cancel_after_sa",
+      "kind": "disabled",
+      "reason": "New native scoped rekey regression requires CAP_NET_ADMIN, private network and mount namespaces, and the scoped lifecycle fixture. It is explicitly required by ci/local-kernel-lifecycle-cases.json and executed with --ignored by the local-kernel-lifecycle qualification runner. No pre-existing executable coverage is gated or removed.",
+      "issue": 1239
+    },
+    {
+      "test": "rust:crates/opc-ipsec-xfrm::lib=lib::local_scope::tests::successor_tests::native_scoped_successor_exact_retry",
+      "kind": "disabled",
+      "reason": "New native scoped rekey regression requires CAP_NET_ADMIN, private network and mount namespaces, and the scoped lifecycle fixture. It is explicitly required by ci/local-kernel-lifecycle-cases.json and executed with --ignored by the local-kernel-lifecycle qualification runner. No pre-existing executable coverage is gated or removed.",
+      "issue": 1239
+    },
+    {
+      "test": "rust:crates/opc-ipsec-xfrm::lib=lib::local_scope::tests::successor_tests::native_scoped_successor_expired_group_cleans_up_in_both_orders",
+      "kind": "disabled",
+      "reason": "New native scoped rekey regression requires CAP_NET_ADMIN, private network and mount namespaces, and the scoped lifecycle fixture. It is explicitly required by ci/local-kernel-lifecycle-cases.json and executed with --ignored by the local-kernel-lifecycle qualification runner. No pre-existing executable coverage is gated or removed.",
+      "issue": 1239
+    },
+    {
+      "test": "rust:crates/opc-ipsec-xfrm::lib=lib::local_scope::tests::successor_tests::native_scoped_successor_fresh_status",
+      "kind": "disabled",
+      "reason": "New native scoped rekey regression requires CAP_NET_ADMIN, private network and mount namespaces, and the scoped lifecycle fixture. It is explicitly required by ci/local-kernel-lifecycle-cases.json and executed with --ignored by the local-kernel-lifecycle qualification runner. No pre-existing executable coverage is gated or removed.",
+      "issue": 1239
+    },
+    {
+      "test": "rust:crates/opc-ipsec-xfrm::lib=lib::local_scope::tests::successor_tests::native_scoped_successor_inbound_overlap",
+      "kind": "disabled",
+      "reason": "New native scoped rekey regression requires CAP_NET_ADMIN, private network and mount namespaces, and the scoped lifecycle fixture. It is explicitly required by ci/local-kernel-lifecycle-cases.json and executed with --ignored by the local-kernel-lifecycle qualification runner. No pre-existing executable coverage is gated or removed.",
+      "issue": 1239
+    },
+    {
+      "test": "rust:crates/opc-ipsec-xfrm::lib=lib::local_scope::tests::successor_tests::native_scoped_successor_outbound_atomic_selection",
+      "kind": "disabled",
+      "reason": "New native scoped rekey regression requires CAP_NET_ADMIN, private network and mount namespaces, and the scoped lifecycle fixture. It is explicitly required by ci/local-kernel-lifecycle-cases.json and executed with --ignored by the local-kernel-lifecycle qualification runner. No pre-existing executable coverage is gated or removed.",
+      "issue": 1239
+    },
+    {
+      "test": "rust:crates/opc-ipsec-xfrm::lib=lib::local_scope::tests::successor_tests::native_scoped_successor_panic_forward_completion",
+      "kind": "disabled",
+      "reason": "New native scoped rekey regression requires CAP_NET_ADMIN, private network and mount namespaces, and the scoped lifecycle fixture. It is explicitly required by ci/local-kernel-lifecycle-cases.json and executed with --ignored by the local-kernel-lifecycle qualification runner. No pre-existing executable coverage is gated or removed.",
+      "issue": 1239
+    },
+    {
+      "test": "rust:crates/opc-ipsec-xfrm::lib=lib::local_scope::tests::successor_tests::native_scoped_successor_repeated_generations",
+      "kind": "disabled",
+      "reason": "New native scoped rekey regression requires CAP_NET_ADMIN, private network and mount namespaces, and the scoped lifecycle fixture. It is explicitly required by ci/local-kernel-lifecycle-cases.json and executed with --ignored by the local-kernel-lifecycle qualification runner. No pre-existing executable coverage is gated or removed.",
+      "issue": 1239
+    },
+    {
+      "test": "rust:crates/opc-ipsec-xfrm::lib=lib::local_scope::tests::successor_tests::native_transport_scoped_successor_abandonment_restores_traffic",
+      "kind": "disabled",
+      "reason": "New native scoped rekey regression requires CAP_NET_ADMIN, private network and mount namespaces, and the scoped lifecycle fixture. It is explicitly required by ci/local-kernel-lifecycle-cases.json and executed with --ignored by the local-kernel-lifecycle qualification runner. No pre-existing executable coverage is gated or removed.",
+      "issue": 1239
+    },
+    {
+      "test": "rust:crates/opc-ipsec-xfrm::lib=lib::local_scope::tests::successor_tests::native_transport_scoped_successor_cancel_after_policy",
+      "kind": "disabled",
+      "reason": "New native scoped rekey regression requires CAP_NET_ADMIN, private network and mount namespaces, and the scoped lifecycle fixture. It is explicitly required by ci/local-kernel-lifecycle-cases.json and executed with --ignored by the local-kernel-lifecycle qualification runner. No pre-existing executable coverage is gated or removed.",
+      "issue": 1239
+    },
+    {
+      "test": "rust:crates/opc-ipsec-xfrm::lib=lib::local_scope::tests::successor_tests::native_transport_scoped_successor_cancel_after_sa",
+      "kind": "disabled",
+      "reason": "New native scoped rekey regression requires CAP_NET_ADMIN, private network and mount namespaces, and the scoped lifecycle fixture. It is explicitly required by ci/local-kernel-lifecycle-cases.json and executed with --ignored by the local-kernel-lifecycle qualification runner. No pre-existing executable coverage is gated or removed.",
+      "issue": 1239
+    },
+    {
+      "test": "rust:crates/opc-ipsec-xfrm::lib=lib::local_scope::tests::successor_tests::native_transport_scoped_successor_exact_retry",
+      "kind": "disabled",
+      "reason": "New native scoped rekey regression requires CAP_NET_ADMIN, private network and mount namespaces, and the scoped lifecycle fixture. It is explicitly required by ci/local-kernel-lifecycle-cases.json and executed with --ignored by the local-kernel-lifecycle qualification runner. No pre-existing executable coverage is gated or removed.",
+      "issue": 1239
+    },
+    {
+      "test": "rust:crates/opc-ipsec-xfrm::lib=lib::local_scope::tests::successor_tests::native_transport_scoped_successor_expired_group_cleans_up_in_both_orders",
+      "kind": "disabled",
+      "reason": "New native scoped rekey regression requires CAP_NET_ADMIN, private network and mount namespaces, and the scoped lifecycle fixture. It is explicitly required by ci/local-kernel-lifecycle-cases.json and executed with --ignored by the local-kernel-lifecycle qualification runner. No pre-existing executable coverage is gated or removed.",
+      "issue": 1239
+    },
+    {
+      "test": "rust:crates/opc-ipsec-xfrm::lib=lib::local_scope::tests::successor_tests::native_transport_scoped_successor_fresh_status",
+      "kind": "disabled",
+      "reason": "New native scoped rekey regression requires CAP_NET_ADMIN, private network and mount namespaces, and the scoped lifecycle fixture. It is explicitly required by ci/local-kernel-lifecycle-cases.json and executed with --ignored by the local-kernel-lifecycle qualification runner. No pre-existing executable coverage is gated or removed.",
+      "issue": 1239
+    },
+    {
+      "test": "rust:crates/opc-ipsec-xfrm::lib=lib::local_scope::tests::successor_tests::native_transport_scoped_successor_inbound_overlap",
+      "kind": "disabled",
+      "reason": "New native scoped rekey regression requires CAP_NET_ADMIN, private network and mount namespaces, and the scoped lifecycle fixture. It is explicitly required by ci/local-kernel-lifecycle-cases.json and executed with --ignored by the local-kernel-lifecycle qualification runner. No pre-existing executable coverage is gated or removed.",
+      "issue": 1239
+    },
+    {
+      "test": "rust:crates/opc-ipsec-xfrm::lib=lib::local_scope::tests::successor_tests::native_transport_scoped_successor_outbound_atomic_selection",
+      "kind": "disabled",
+      "reason": "New native scoped rekey regression requires CAP_NET_ADMIN, private network and mount namespaces, and the scoped lifecycle fixture. It is explicitly required by ci/local-kernel-lifecycle-cases.json and executed with --ignored by the local-kernel-lifecycle qualification runner. No pre-existing executable coverage is gated or removed.",
+      "issue": 1239
+    },
+    {
+      "test": "rust:crates/opc-ipsec-xfrm::lib=lib::local_scope::tests::successor_tests::native_transport_scoped_successor_panic_forward_completion",
+      "kind": "disabled",
+      "reason": "New native scoped rekey regression requires CAP_NET_ADMIN, private network and mount namespaces, and the scoped lifecycle fixture. It is explicitly required by ci/local-kernel-lifecycle-cases.json and executed with --ignored by the local-kernel-lifecycle qualification runner. No pre-existing executable coverage is gated or removed.",
+      "issue": 1239
+    },
+    {
+      "test": "rust:crates/opc-ipsec-xfrm::lib=lib::local_scope::tests::successor_tests::native_transport_scoped_successor_repeated_generations",
+      "kind": "disabled",
+      "reason": "New native scoped rekey regression requires CAP_NET_ADMIN, private network and mount namespaces, and the scoped lifecycle fixture. It is explicitly required by ci/local-kernel-lifecycle-cases.json and executed with --ignored by the local-kernel-lifecycle qualification runner. No pre-existing executable coverage is gated or removed.",
+      "issue": 1239
+    },
+    {
+      "test": "rust:crates/opc-ipsec-xfrm::lib=lib::local_scope::tests::successor_tests::native_scoped_successor_expiry_refusal_releases_reset",
+      "kind": "disabled",
+      "reason": "New native hard-expiry and reset-barrier regression requires CAP_NET_ADMIN in private network and mount namespaces. It verifies real kernel expiry, typed retirement refusal, retained predecessor SA, and immediate execution drain/reset without receipt cleanup masking a leaked guard. It is required by ci/local-kernel-lifecycle-cases.json and executed with --ignored by the native qualification runner; no existing executable coverage is gated.",
+      "issue": 1239
+    },
+    {
+      "test": "rust:crates/opc-ipsec-xfrm::lib=lib::local_scope::tests::successor_tests::native_transport_scoped_successor_expiry_refusal_releases_reset",
+      "kind": "disabled",
+      "reason": "New native hard-expiry and reset-barrier regression requires CAP_NET_ADMIN in private network and mount namespaces. It verifies real kernel expiry, typed retirement refusal, retained predecessor SA, and immediate execution drain/reset without receipt cleanup masking a leaked guard. It is required by ci/local-kernel-lifecycle-cases.json and executed with --ignored by the native qualification runner; no existing executable coverage is gated.",
+      "issue": 1239
+    },
+    {
+      "test": "rust:crates/opc-persist::lib=lib::consumer_checkpoint::tests::maximum_payload_fits_the_minimum_accepted_storage_budget",
+      "kind": "clock-source-changed",
+      "reason": "Use a scoped controlled clock for the capacity property while waiting for actual SQLite I/O completion. Keep the original payload sizes, minimum storage budget, operation timeout, replacement sequence, reopen checks and assertions. Separate held-worker regressions verify deadline expiry before mutation and before readback, and the existing real-time cancellation test retains its bound.",
+      "issue": 1336
+    },
+    {
+      "test": "rust:crates/opc-persist::lib=lib::consumer_checkpoint::tests::slow_post_commit_checkpoint_settlement_reports_known_success",
+      "kind": "clock-source-changed",
+      "reason": "Replace the real post-commit sleep with a held fully validated readback and controlled observer delay. Preserve the 200 ms budget, 400 ms delay, payload, generation and diagnostic assertions. Commit alone cannot authorize unbounded unfinished verification; committed_checkpoint_expiring_before_readback_requires_recovery covers that boundary, while the original real-time cancellation control remains unchanged.",
+      "issue": 1336
+    },
+    {
+      "test": "rust:crates/opc-session-net::lib=lib::stateless_quorum_consumer::prepared_cas_binding_reply_loss_fails_over_and_applies_exactly_once",
+      "kind": "clock-source-changed",
+      "reason": "Run the consumer on the shared controlled clock while voters, disk I/O and the delayed observer retain real time. Keep the 250 ms physical attempt, three-second caller deadline and all ordering, exactly-once, replay and conflict assertions. A 300 ms origin-reply hold fails before the clock change. The existing prepared_cas_three_voter_receipt_converges_after_real_commit_and_lost_response retains real-time physical-attempt expiry and durable receipt recovery.",
+      "issue": 1147
+    },
+    {
+      "test": "rust:crates/opc-session-net::lib=lib::stateless_quorum_consumer::prepared_cas_binding_reply_loss_survives_slow_reply_observation",
+      "kind": "clock-source-changed",
+      "reason": "Run the consumer on the shared controlled clock while voters, disk I/O and the delayed observer retain real time. Keep the 250 ms physical attempt, three-second caller deadline and all ordering, exactly-once, replay and conflict assertions. A 300 ms origin-reply hold fails before the clock change. The existing prepared_cas_three_voter_receipt_converges_after_real_commit_and_lost_response retains real-time physical-attempt expiry and durable receipt recovery.",
+      "issue": 1147
+    },
+    {
+      "test": "rust:crates/opc-session-net::test=stateless_quorum_consumer::prepared_cas_binding_reply_loss_fails_over_and_applies_exactly_once",
+      "kind": "assertions-decreased",
+      "reason": "Extract the body into prepared_cas_binding_reply_loss_case in crates/opc-session-net/tests/stateless_quorum_consumer.rs, moving the fleet through the controlled-clock closure. All original assertions and calls to application_sequences, quiesce, voter_authority, wait_for_observed_leader and withhold_next_forward_mutation_reply remain; their helper bodies are unchanged. Static receiver resolution loses their eight setup/cleanup expectations after fleet is rebound, while two clock assertions are added (116 -> 110). Cargo disables automatic integration targets and includes this file in the library; its actual lib=lib target also resolves the shared clock helper and grows 116 -> 117. No runtime coverage is removed.",
+      "issue": 1147
+    },
+    {
+      "test": "rust:crates/opc-session-store::lib=lib::consensus::native::roster::store::tests::native_roster_maintenance_streams_atomic_reclaim_and_stops_at_the_next_partition_epoch",
+      "kind": "removed",
+      "renamed_to": "rust:crates/opc-session-store::lib=lib::consensus::native::roster::store::tests::native_roster_maintenance_streams_atomic_reclaim_and_retires_across_partition_epochs",
+      "reason": "One bounded terminal-prefix retirement now spans admission epochs in a partition. The test retains corrupted-second-row atomicity and canonical ledger validation, then requires both eligible epochs and their shared floor to disappear in the same command. The former second retirement turn is obsolete; both-engine sustained-load and 1024-row boundary regressions cover progress and the unchanged bound.",
+      "issue": 1307
+    },
+    {
+      "test": "rust:crates/opc-session-store::lib=lib::consensus::native::roster::store::tests::native_roster_maintenance_streams_atomic_reclaim_and_retires_across_partition_epochs",
+      "kind": "assertions-decreased",
+      "reason": "One bounded terminal-prefix retirement now spans admission epochs in a partition. The test retains corrupted-second-row atomicity and canonical ledger validation, then requires both eligible epochs and their shared floor to disappear in the same command. The former second retirement turn is obsolete; both-engine sustained-load and 1024-row boundary regressions cover progress and the unchanged bound. Assertion count changes because the obsolete single-epoch rejection/extra-turn assertions are replaced by the multi-epoch closure assertions. No authority, corruption, retention or batch-limit assertion is relaxed.",
+      "issue": 1307
+    },
+    {
+      "test": "rust:crates/opc-session-store::lib=lib::sqlite::consensus::tests::protected_roster_retirement_batches_one_epoch_per_floor_without_collapsing_same_epoch_rows",
+      "kind": "removed",
+      "renamed_to": "rust:crates/opc-session-store::lib=lib::sqlite::consensus::tests::protected_roster_retirement_folds_all_selected_epochs_into_one_floor_action",
+      "reason": "Replace the obsolete stop-at-second-epoch helper contract with one maximum epoch and exact selected count per shared floor. All original same-epoch, next-epoch and other-partition rows remain, now in out-of-order epoch order; the test requires one floor action and counts every selected row. Separate real-engine tests retain the 1024-row bound and lower-survivor floor protection.",
+      "issue": 1307
+    },
+    {
+      "test": "rust:crates/opc-session-store::lib=lib::sqlite::consensus::tests::protected_roster_retirement_folds_all_selected_epochs_into_one_floor_action",
+      "kind": "assertions-decreased",
+      "reason": "Replace the obsolete stop-at-second-epoch helper contract with one maximum epoch and exact selected count per shared floor. All original same-epoch, next-epoch and other-partition rows remain, now in out-of-order epoch order; the test requires one floor action and counts every selected row. Separate real-engine tests retain the 1024-row bound and lower-survivor floor protection. Assertion count changes because the obsolete single-epoch rejection/extra-turn assertions are replaced by the multi-epoch closure assertions. No authority, corruption, retention or batch-limit assertion is relaxed.",
+      "issue": 1307
+    },
+    {
+      "test": "rust:crates/opc-session-store::lib=lib::recovery::tests::format5_protected_roster_v2_replica_is_recoverable",
+      "kind": "fixture-setup-changed",
+      "reason": "The format-five invariant requires the roster witness from initialization. The old inactive-namespace setup omitted it; provision the same canonical initial witness as production. Every test assertion is retained. Missing-witness rejection, legacy format-four compatibility, atomic initialization and upgrade are covered separately.",
+      "issue": 1307
+    },
+    {
+      "test": "rust:crates/opc-session-store::lib=lib::recovery::tests::format5_protected_roster_v2_partial_or_extra_namespace_is_corrupt",
+      "kind": "fixture-setup-changed",
+      "reason": "The shared inactive format-five setup now provisions the mandatory initial roster witness before each namespace corruption mutation. Every corruption assertion remains unchanged and now isolates the intended malformed table or index instead of an already-missing witness.",
+      "issue": 1307
+    },
+    {
+      "test": "rust:crates/opc-session-store::lib=lib::sqlite::consensus::tests::native::roster::export::native_roster_snapshot_signed_v1_and_v2_share_exact_history_across_cold_reopen",
+      "kind": "fixture-setup-changed",
+      "reason": "Update the intermediate retirement checkpoint to the bounded multi-epoch contract: both eligible profiles retire in one command, their shared floor and cursor are released, and the canonical witness covers the exact terminal prefix. Keep all shared-history, native/SQLite parity, mutation combinations and cold-reopen assertions, including the following idle maintenance command.",
+      "issue": 1307
+    },
+    {
+      "test": "rust:crates/opc-session-store::test=dynamic_membership::root_preserving_three_to_five_reactivates_profile_and_accepts_successor_signed_roster",
+      "kind": "fixture-setup-changed",
+      "reason": "Keep autonomous maintenance enabled and wait within the existing operation budget for durable retirement of the expired D5 terminal. Require its canonical witness frontier and original admission fence before accepting row absence. Observe retirement on both the leader and snapshot target before isolating the target, so the snapshot tests retired-to-retired history. The separately tracked lagging-follower recovery design is outside this fixture. After real snapshot installation and cold reopen, require the same retirement authority and authenticated non-definitive status/terminal refusal. Preserve predecessor and successor scope checks, stale ingress rejection, all topology assertions, and fresh successor signed-roster acceptance.",
+      "issue": 1307
+    },
+    {
+      "test": "rust:crates/opc-proto-pfcp::lib=lib::ie::tests::test_ue_ip_address_v4_prefix_spec_bytes",
+      "kind": "removed",
+      "renamed_to": "rust:crates/opc-proto-pfcp::lib=lib::ie::tests::test_ue_ip_address_v6_delegation_spec_bytes",
+      "reason": "Correct the golden vector for TS 29.244 section 8.2.62: the IE defines IPv6 prefix delegation, not an IPv4 prefix-length field. Retain the flag, prefix-field and round-trip assertions using the normative IPv6 layout; independent IPv4, IPv6, dual-stack and allocation vectors are added separately.",
+      "issue": 1513
+    },
+    {
+      "test": "rust:crates/opc-proto-nas::test=nas_optional_elements::every_table_length_bound_is_enforced_under_strict_and_procedure_aware",
+      "kind": "removed",
+      "renamed_to": "rust:crates/opc-proto-nas::test=nas_optional_elements::table_minima_are_enforced_and_extensions_ignored_under_strict_and_procedure_aware",
+      "reason": "Correct receiver expectations per TS 24.501 7.6.3 and TS 24.007 11.4.2: first duplicate wins and extra octets are ignored; retain minimum-length, raw preservation and per-table assertions.",
+      "issue": 1255
+    },
+    {
+      "test": "rust:crates/opc-proto-nas::test=nas_optional_elements::half_octet_duplicate_first_and_last_policies_preserve_the_selected_wire_value",
+      "kind": "removed",
+      "renamed_to": "rust:crates/opc-proto-nas::test=nas_optional_elements::half_octet_duplicates_preserve_the_first_wire_value_for_both_receiver_policies",
+      "reason": "Correct receiver expectations per TS 24.501 7.6.3 and TS 24.007 11.4.2: first duplicate wins and extra octets are ignored; retain minimum-length, raw preservation and per-table assertions.",
+      "issue": 1255
+    },
+    {
+      "test": "rust:crates/opc-proto-gtpu::test=control_messages::unknown_tlv_policy_preserves_drops_or_rejects_without_exposing_value",
+      "kind": "removed",
+      "renamed_to": "rust:crates/opc-proto-gtpu::test=control_messages::unknown_tlv_policy_preserves_or_skips_without_exposing_value",
+      "reason": "Correct GTP-U receiver expectations per TS 29.281 9.1 and TS 29.060 11.1.9, 11.1.11 and 11.1.12: skip unknown TLVs and unexpected IEs; first singleton wins. Retain canonical bytes, mandatory fields, extension and malformed-framing checks.",
+      "issue": 1532
+    },
+    {
+      "test": "rust:crates/opc-proto-gtpu::test=control_messages::duplicate_timestamp_and_supported_type_list_fail_at_datagram_offsets",
+      "kind": "removed",
+      "renamed_to": "rust:crates/opc-proto-gtpu::test=control_messages::duplicate_timestamp_and_supported_type_list_use_first_occurrence",
+      "reason": "Correct GTP-U receiver expectations per TS 29.281 9.1 and TS 29.060 11.1.9, 11.1.11 and 11.1.12: skip unknown TLVs and unexpected IEs; first singleton wins. Retain canonical bytes, mandatory fields, extension and malformed-framing checks.",
+      "issue": 1532
+    },
+    {
+      "test": "rust:crates/opc-proto-gtpu::test=control_messages::unexpected_ie_offset_is_datagram_relative",
+      "kind": "removed",
+      "renamed_to": "rust:crates/opc-proto-gtpu::test=control_messages::unexpected_ie_is_skipped",
+      "reason": "Correct GTP-U receiver expectations per TS 29.281 9.1 and TS 29.060 11.1.9, 11.1.11 and 11.1.12: skip unknown TLVs and unexpected IEs; first singleton wins. Retain canonical bytes, mandatory fields, extension and malformed-framing checks.",
+      "issue": 1532
+    },
+    {
+      "test": "rust:crates/opc-proto-gtpu::test=control_messages::duplicate_udp_extension_and_wrong_procedure_ie_fail_closed",
+      "kind": "removed",
+      "renamed_to": "rust:crates/opc-proto-gtpu::test=control_messages::duplicate_udp_extension_fails_and_wrong_procedure_ie_is_skipped",
+      "reason": "Correct GTP-U receiver expectations per TS 29.281 9.1 and TS 29.060 11.1.9, 11.1.11 and 11.1.12: skip unknown TLVs and unexpected IEs; first singleton wins. Retain canonical bytes, mandatory fields, extension and malformed-framing checks.",
+      "issue": 1532
+    },
+    {
+      "test": "rust:crates/opc-gtpu-dataplane::test=linux_gtpu_privileged::zero_peer_teid_is_installed_and_sent_on_the_wire",
+      "kind": "disabled",
+      "reason": "New privileged packet test needs an isolated Linux network namespace and kernel capabilities, matching this harness. Executed by the privileged native suite with OPC_GTPU_RUN_PRIVILEGED=1: installation/readback and a captured outgoing G-PDU prove peer TEID zero reaches the wire. Shared unit tests retain nonzero local-TEID and exact-authority checks.",
+      "issue": 1346
+    },
+    {
+      "test": "rust:crates/opc-gtpu-dataplane::test=ebpf_gtpu_privileged::ebpf_gtpu_zero_peer_teid_is_sent_on_the_wire",
+      "kind": "disabled",
+      "reason": "New privileged packet test needs an isolated Linux network namespace and kernel capabilities, matching this harness. Executed by the privileged native suite with OPC_GTPU_RUN_PRIVILEGED=1: installation/readback and a captured outgoing G-PDU prove peer TEID zero reaches the wire. Shared unit tests retain nonzero local-TEID and exact-authority checks.",
+      "issue": 1346
+    },
+    {
+      "test": "rust:crates/opc-gtpu-dataplane::test=linux_gtpu_privileged::control_port_refuses_a_removed_kernel_attachment",
+      "kind": "disabled",
+      "reason": "New Linux kernel-GTP proof requires CAP_NET_ADMIN, the GTP module, and an isolated network namespace. The privileged GTP-U workflow runs this entire ignored harness with explicit opt-in. Covers a real retained-socket response and stale-device refusal; ordinary unit tests cover tuple, budget, classification and registration boundaries.",
+      "issue": 1084
+    },
+    {
+      "test": "rust:crates/opc-gtpu-dataplane::test=linux_gtpu_privileged::wildcard_control_reply_preserves_the_original_local_destination",
+      "kind": "disabled",
+      "reason": "New privileged kernel-GTP test requires an isolated network namespace and CAP_NET_ADMIN. The privileged workflow runs the complete ignored harness. Actual loopback receive verifies the wildcard socket preserves the original destination in the response source and Peer Address IE.",
+      "issue": 1084
+    },
+    {
+      "test": "rust:crates/opc-gtpu-dataplane::test=ebpf_gtpu_privileged::ebpf_gtpu_multihoming_is_opt_in_and_survives_restart",
+      "kind": "disabled",
+      "reason": "New privileged packet proof requires CAP_BPF/CAP_NET_ADMIN and an isolated network namespace. Executed by the privileged native suite with OPC_GTPU_RUN_PRIVILEGED=1: strict alternate-source rejection, opt-in delivery before and after backend restart, and rejection of wrong local address, UDP port, TEID and inner PAA. The complete ignored harness runs in privileged CI; host tests cover codecs, ownership and reassembly parity.",
+      "issue": 1347
+    },
+    {
+      "test": "rust:crates/opc-gtpu-dataplane::test=linux_gtpu_privileged::ipv6_control_preserves_tuples_and_rejects_retired_ports",
+      "kind": "disabled",
+      "issue": 341,
+      "reason": "New native IPv6 kernel-GTP control test requires CAP_NET_ADMIN and a private network namespace. Required GTP CI runs every ignored Linux GTP integration case explicitly. Independent wire bytes cover Echo, Error Indication, extension notification, budgets and retired handles."
+    },
+    {
+      "test": "rust:crates/opc-proto-gtpv2c::lib=lib::ie::typed::tests::bearer_qos_decode_rejects_arp_spare_bits",
+      "kind": "removed",
+      "renamed_to": "rust:crates/opc-proto-gtpv2c::lib=lib::ie::typed::tests::bearer_qos_decode_ignores_arp_spare_bits_and_sender_rejects_them",
+      "reason": "TS 29.274 7.7.8 requires receivers to ignore ARP spare bits. Replace the non-conformant whole-IE rejection with all three spare-bit combinations, canonical receive/send equivalence and sender-side rejection; Create/Update Bearer tests also preserve the raw received octet at every validation level.",
+      "issue": 1354
+    },
+    {
+      "test": "rust:crates/opc-gtpu-dataplane::test=linux_gtpu_privileged::unknown_tunnel_wire_capture_and_echo_share_reopened_socket",
+      "kind": "disabled",
+      "reason": "Port the independent Linux wire-capture and outgoing Echo scenario alongside the existing wildcard/known-TEID regression, under a distinct name. It requires a privileged private network namespace and runs in the complete native Linux suite. Reopening preserves the backlog shared generation; attachment removal still revokes both handles.",
+      "issue": 1084
+    },
+    {
+      "test": "rust:crates/opc-gtpu-dataplane::test=n3_contract::generic_typed_extensions_do_not_expand_n3_endpoint_comprehension",
+      "kind": "fixture-setup-changed",
+      "reason": "Previously generic Reject accepted parseable required 0x81-0x84 and 0xC0; it now returns UnknownCriticalIe because Endpoint comprehension is separate from wire-format recognition. N3PacketView continues to report UnsupportedExtension, including the valid two-unit Long PDCP form. Preserve/Drop and typed-format coverage remain intact.",
+      "issue": 1529
+    },
+    {
+      "test": "rust:crates/opc-proto-gtpu::test=typed_extensions::short_pdcp_followed_by_psc_decodes_but_unknown_required_still_fails",
+      "kind": "fixture-setup-changed",
+      "reason": "Previously generic Reject decoded the Short PDCP and PSC extensions; it now returns UnknownCriticalIe for Short PDCP. Preserve continues to decode both and retains every typed-content assertion. The existing unknown comprehension-required rejection remains; recognizing a wire format does not imply Endpoint comprehension.",
+      "issue": 1529
+    },
+    {
+      "test": "rust:crates/opc-sctp::lib=lib::tests::loopback_dual_stack_multihoming_selects_both_families",
+      "kind": "disabled",
+      "reason": "New native Linux SCTP test requires SCTP and IPv6 loopback. The required SCTP workflow executes it explicitly and checks one passing test. It exercises mixed bindx/connectx in both family orders, address readback, primary-path selection and payload delivery over IPv4 and IPv6. Portable configuration and path-identity tests run normally.",
+      "issue": 1351
+    },
+    {
+      "test": "rust:crates/opc-sctp::lib=lib::tests::loopback_wire_abort_closes_with_live_handles_and_pending_receive",
+      "kind": "disabled",
+      "reason": "New native Linux SCTP abort test needs kernel SCTP. Required SCTP workflow executes it through qualify-sctp-close-wire.py and independently captures a User-Initiated ABORT. It retains handles and a pending receive to prove synchronous closure.",
+      "issue": 1351
+    },
+    {
+      "test": "rust:crates/opc-diameter-transport::lib=lib::dtls_tests::wire_abort::kernel_malformed_diameter_frames_abort_sequential_and_runtime_associations",
+      "kind": "disabled",
+      "reason": "New native SCTP-AUTH test sends three malformed authenticated Diameter frames through each of the sequential receiver, concurrent receiver, client cleartext prelude and server cleartext prelude. Required SCTP workflow runs it through qualify-sctp-close-wire.py and requires twelve actual ABORT associations plus separate graceful-close controls.",
+      "issue": 1351
+    },
+    {
+      "test": "rust:vendor/dimpl::lib=lib::dtls12::message::certificate_request::test::filters_unsupported_rsa_signature_algorithm",
+      "kind": "removed",
+      "issue": 1353,
+      "reason": "Renamed to retains_supported_rsa_and_ecdsa_signature_algorithms for implemented DTLS RSA support. The parser and serializer now preserve modern RSA schemes. The separate unsupported-type test retains DSA and MD5 refusal.",
+      "renamed_to": "rust:vendor/dimpl::lib=lib::dtls12::message::certificate_request::test::retains_supported_rsa_and_ecdsa_signature_algorithms"
+    },
+    {
+      "test": "rust:vendor/dimpl::lib=lib::dtls12::message::extensions::signature_algorithms::tests::default_does_not_advertise_rsa",
+      "kind": "removed",
+      "issue": 1353,
+      "reason": "Renamed to default_advertises_modern_rsa_and_ecdsa_schemes for implemented DTLS RSA support. The wire advertisement now includes only ECDSA and RSA-PSS/PKCS1 SHA-256/384; assertions retain the exact supported set and modern-hash restriction.",
+      "renamed_to": "rust:vendor/dimpl::lib=lib::dtls12::message::extensions::signature_algorithms::tests::default_advertises_modern_rsa_and_ecdsa_schemes"
+    },
+    {
+      "test": "rust:vendor/dimpl::lib=lib::dtls12::message::tests::rsa_signature_algorithms_are_recognized_but_not_supported",
+      "kind": "removed",
+      "issue": 1353,
+      "reason": "Renamed to modern_rsa_signatures_are_supported_but_legacy_hashes_are_not for implemented DTLS RSA support. The former unsupported RSA capability is implemented; explicit SHA-1 and MD5 refusal replaces the obsolete RSA rejection.",
+      "renamed_to": "rust:vendor/dimpl::lib=lib::dtls12::message::tests::modern_rsa_signatures_are_supported_but_legacy_hashes_are_not"
+    },
+    {
+      "test": "rust:vendor/dimpl::lib=lib::dtls12::server::tests::certificate_request_does_not_select_rsa_signatures",
+      "kind": "removed",
+      "issue": 1353,
+      "reason": "Renamed to certificate_request_selects_rsa_and_ecdsa_signatures for implemented DTLS RSA support. Exact intersection assertions now retain RSA and ECDSA; ECDSA selection assertions remain.",
+      "renamed_to": "rust:vendor/dimpl::lib=lib::dtls12::server::tests::certificate_request_selects_rsa_and_ecdsa_signatures"
+    },
+    {
+      "test": "rust:vendor/dimpl::lib=lib::dtls12::server::tests::certificate_request_rejects_rsa_only_signatures",
+      "kind": "removed",
+      "issue": 1353,
+      "reason": "Renamed to certificate_request_accepts_rsa_only_signatures for implemented DTLS RSA support. RSA-only modern offers now work. New CertificateRequest and CertificateVerify tests reject mismatched certificate types and unoffered schemes; independent OpenSSL handshakes exercise both roles with every supported RSA scheme.",
+      "renamed_to": "rust:vendor/dimpl::lib=lib::dtls12::server::tests::certificate_request_accepts_rsa_only_signatures"
+    },
+    {
+      "test": "python:ci/test-test-inventory.py::AdvisoryWorkflowTests.test_additional_legacy_consumer_is_rejected_at_every_boundary",
+      "kind": "fixture-setup-changed",
+      "reason": "Removing the RUSTSEC-2026-0387 legacy exception (#1532) changes the rejection diagnostic. Replace self.assertIn(f'unaccepted legacy crypto dependency: extra -> {target}', result.stderr) with self.assertIn('is not accepted for crypto-bigint 0.5.5', result.stderr). The version floor now refuses every 0.5.5 graph before the former consumer-confinement diagnostics. Preserve the same invalid graph fixtures and every other assertion; no vulnerable graph becomes accepted. The migrated-stack regression separately requires both advisory ignores to be absent.",
+      "issue": 1532
+    },
+    {
+      "test": "python:ci/test-test-inventory.py::AdvisoryWorkflowTests.test_optional_locked_consumer_cannot_hide_outside_enabled_metadata",
+      "kind": "fixture-setup-changed",
+      "reason": "Removing the RUSTSEC-2026-0387 legacy exception (#1532) changes the rejection diagnostic. Replace self.assertIn('unaccepted legacy crypto dependency: optional -> crypto-bigint', result.stderr) with self.assertIn('is not accepted for crypto-bigint 0.5.5', result.stderr). The version floor now refuses every 0.5.5 graph before the former consumer-confinement diagnostics. Preserve the same invalid graph fixtures and every other assertion; no vulnerable graph becomes accepted. The migrated-stack regression separately requires both advisory ignores to be absent.",
+      "issue": 1532
+    },
+    {
+      "test": "python:ci/test-test-inventory.py::AdvisoryWorkflowTests.test_similarly_named_registry_or_unvendored_fork_is_rejected",
+      "kind": "fixture-setup-changed",
+      "reason": "Removing the RUSTSEC-2026-0387 legacy exception (#1532) changes the rejection diagnostic. Replace self.assertIn(f'must use the checked-in {name}', result.stderr) with self.assertIn('is not accepted for crypto-bigint 0.5.5', result.stderr). The version floor now refuses every 0.5.5 graph before the former consumer-confinement diagnostics. Preserve the same invalid graph fixtures and every other assertion; no vulnerable graph becomes accepted. The migrated-stack regression separately requires both advisory ignores to be absent.",
+      "issue": 1532
+    },
+    {
+      "test": "python:ci/test-test-inventory.py::AdvisoryWorkflowTests.test_unresolved_or_disconnected_legacy_copy_is_rejected",
+      "kind": "fixture-setup-changed",
+      "reason": "Removing the RUSTSEC-2026-0387 legacy exception (#1532) changes the rejection diagnostic. Replace self.assertIn('cannot verify the locked crypto-bigint 0.5.5 dependency path', result.stderr); self.assertIn('legacy crypto path ends before the vendored DTLS consumer', result.stderr) with self.assertIn('is not accepted for crypto-bigint 0.5.5', result.stderr). The version floor now refuses every 0.5.5 graph before the former consumer-confinement diagnostics. Preserve the same invalid graph fixtures and every other assertion; no vulnerable graph becomes accepted. The migrated-stack regression separately requires both advisory ignores to be absent.",
+      "issue": 1532
+    },
+    {
+      "test": "rust:crates/opc-peer-discovery::test=dns_contracts::every_failure_preserves_last_good_without_time_cutoff",
+      "kind": "removed",
+      "renamed_to": "rust:crates/opc-peer-discovery::test=dns_contracts::transient_failures_preserve_last_good_only_within_stale_limit",
+      "reason": "RFC 8767 requires a maximum stale timer and authoritative refreshes replace prior data. Retain transient-error last-good assertions within the timer, add expiry assertions, and separately test authoritative negatives with and without SOA TTLs.",
+      "issue": 1355
+    },
+    {
+      "test": "rust:crates/opc-api-nnrf::test=compat_sbi::sbi_nf_profile_deserializes_into_generated_type",
+      "kind": "assertions-decreased",
+      "reason": "Remove sbi_value_to_generated, whose assertion-bearing normalization helper concealed invalid NRF wire JSON. Both tests now deserialize the actual serialized SBI payload directly into the generated TS 29.510 schema; existing identity, PLMN, slice and service field assertions remain. Literal wire-format regressions in opc-sbi cover the corrected representation.",
+      "issue": 1362
+    },
+    {
+      "test": "rust:crates/opc-api-nnrf::test=compat_sbi::sbi_nf_profile_round_trip_preserves_identity",
+      "kind": "assertions-decreased",
+      "reason": "Remove sbi_value_to_generated, whose assertion-bearing normalization helper concealed invalid NRF wire JSON. Both tests now deserialize the actual serialized SBI payload directly into the generated TS 29.510 schema; existing identity, PLMN, slice and service field assertions remain. Literal wire-format regressions in opc-sbi cover the corrected representation.",
+      "issue": 1362
+    },
+    {
+      "test": "rust:crates/opc-proto-diameter::test=app_dictionaries::rf_grouped_mscc_rejects_excessive_nesting_depth",
+      "kind": "removed",
+      "renamed_to": "rust:crates/opc-proto-diameter::test=app_dictionaries::rf_grouped_service_data_rejects_excessive_nesting_depth",
+      "reason": "Replace the nonconforming online MSCC shape in Rf with Service-Information / PS-Information / Service-Data-Container. Retains the nesting-limit assertion and checks the exact DepthExceeded category at the offline container boundary.",
+      "issue": 1361
+    },
+    {
+      "test": "rust:crates/opc-libsctp-sys::lib=lib::linux::tests::packed_address_sets_are_contiguous_and_bounded",
+      "kind": "fixture-setup-changed",
+      "reason": "Replace refusal of a mixed IPv4/IPv6 address set with successful packing and exact 16-byte/28-byte concatenation checks in both family orders. Keep empty, mixed-port, wildcard and count-limit refusals. Mixed-family static multihoming is now supported.",
+      "issue": 1351
+    },
+    {
+      "test": "rust:crates/opc-sctp::lib=lib::tests::endpoint_config_accepts_bounded_same_family_multihoming",
+      "kind": "fixture-setup-changed",
+      "reason": "Replace InvalidConfig(address_family) for adding [::1]:38412 to bounded IPv4 local addresses with successful validation of the mixed-family set. Retain successful same-family admission and the separate port, wildcard and count-limit refusal tests.",
+      "issue": 1351
+    },
+    {
+      "test": "rust:crates/opc-sctp::lib=lib::tests::connect_config_validates_every_local_and_remote_address",
+      "kind": "fixture-setup-changed",
+      "reason": "Replace the invalid-input setup that added [::1]:38412 and expected InvalidConfig(address_family) with [::1]:38413 and InvalidConfig(remote_addrs). Mixed-family peers are now valid; the new port deliberately differs from the existing remote port. Keep successful local/remote validation and the separate no-common-family refusal.",
+      "issue": 1351
+    },
+    {
+      "test": "rust:vendor/dimpl::lib=lib::crypto::validation::tests_aws_lc_rs::test_default_provider_has_cipher_suites",
+      "kind": "fixture-setup-changed",
+      "reason": "Replace the exact default-provider supported cipher-suite count of 4 with 7 after enabling modern ECDHE-RSA and DHE-RSA suites. Retain the ECDSA-specific suite membership assertions and executable-provider validation.",
+      "issue": 1353
+    },
+    {
+      "test": "rust:vendor/dimpl::lib=lib::crypto::validation::tests_aws_lc_rs::test_default_provider_has_kx_groups",
+      "kind": "fixture-setup-changed",
+      "reason": "Replace the exact default-provider key-exchange group count of 3 with 5: retain X25519, P-256 and P-384 and add FFDHE4096 and FFDHE2048. Retain provider validation and independent public/shared-secret vector checks.",
+      "issue": 1353
+    },
+    {
+      "test": "rust:vendor/dimpl::lib=lib::crypto::validation::tests_rust_crypto::test_default_provider_has_cipher_suites",
+      "kind": "fixture-setup-changed",
+      "reason": "Replace the exact default-provider supported cipher-suite count of 4 with 7 after enabling modern ECDHE-RSA and DHE-RSA suites. Retain the ECDSA-specific suite membership assertions and executable-provider validation.",
+      "issue": 1353
+    },
+    {
+      "test": "rust:vendor/dimpl::lib=lib::crypto::validation::tests_rust_crypto::test_default_provider_has_kx_groups",
+      "kind": "fixture-setup-changed",
+      "reason": "Replace the exact default-provider key-exchange group count of 3 with 5: retain X25519, P-256 and P-384 and add FFDHE4096 and FFDHE2048. Retain provider validation and independent public/shared-secret vector checks.",
+      "issue": 1353
+    },
+    {
+      "test": "rust:vendor/dimpl::lib=lib::dtls12::message::certificate_request::test::filters_unsupported_types",
+      "kind": "fixture-setup-changed",
+      "reason": "Replace the expectation that RSA_SIGN is filtered and only ECDSA_SIGN remains (length 1, ECDSA at index 0) with length 2, RSA_SIGN at index 0 and ECDSA_SIGN at index 1. Keep DSS_SIGN and unsupported MD5/RSA and SHA384/DSA input and refusal coverage; modern RSA certificate types are now supported.",
+      "issue": 1353
+    },
+    {
+      "test": "rust:vendor/dimpl::lib=lib::dtls12::message::extensions::signature_algorithms::tests::test_signature_algorithms_extension",
+      "kind": "fixture-setup-changed",
+      "reason": "Replace parsing only one ECDSA entry from the serialized ECDSA/SHA256 and RSA/SHA256 extension with parsing both entries and equality with the original algorithm list. Keep the exact serialized wire bytes and the ECDSA-first assertion; modern RSA algorithms are now supported.",
+      "issue": 1353
+    },
+    {
+      "test": "rust:vendor/dimpl::lib=lib::dtls12::message::extensions::supported_groups::tests::test_supported_groups_parse_provided_bytes",
+      "kind": "fixture-setup-changed",
+      "reason": "Replace the parsed group list [X25519, P-256, P-384] with [X25519, P-256, P-384, FFDHE2048] for the unchanged literal wire vector. The formerly filtered 0x0100 is now supported; unsupported 0x0101 remains filtered, with ordering and empty remainder checks retained.",
+      "issue": 1353
+    },
+    {
+      "test": "rust:crates/opc-session-store::lib=lib::consensus::store::membership_tests::consumer_scan_restore_records_fence_deadline_is_retryable_availability",
+      "kind": "fixture-setup-changed",
+      "reason": "Issue #1160 requires slow consumer-fence progress to remain retryable availability, distinct from terminal fixed-work exhaustion. Backlog expected BackendUnavailable(\"session restore scan deadline exceeded\") after arming a primary-scan-only delay that the consumer never consumed, so it actually returned a successful page without exercising the fence. Hold the real logical-time admission wait through the original single 10 ms absolute caller deadline, release it after the original 100 ms delay, and require LogicalPermit/DeadlineElapsed in the bounded scoped-read trace plus exact BackendUnavailable(\"session consensus quorum is unavailable\"). Join release before the unchanged later recovery scan, complete-page assertion and shutdown. Replace the unconsumed/synthetic-hook premise with proof the real fence entered and timed out; preserve all fixed-work terminal assertions. No production error policy, work bound, timeout or retry changes.",
+      "issue": 1160
+    },
+    {
+      "test": "rust:crates/opc-session-store::lib=lib::sqlite::consensus::tests::native::basis::public_reads::native_public_active_cancellation_and_restore_deadline_retire_without_fencing",
+      "kind": "fixture-setup-changed",
+      "reason": "Issue #1160 makes a wall-clock restore deadline retryable availability, while true fixed-work exhaustion remains terminal. Replace only the stale expected Err(RestoreScanWorkBudgetExceeded) in the wall-deadline branch with exact Err(BackendUnavailable(\"session restore scan deadline exceeded\")). Retain the original 100 ms absolute deadline, active-cancellation branch, detached-State assertion, worker-reservation retention and retirement checks, later authoritative read, barrier and shutdown. Fixed-work exhaustion expectations are unchanged.",
+      "issue": 1160
+    },
+    {
+      "test": "rust:crates/opc-security-testkit::test=security_tests::test_kms_fault_responses_return_unavailable",
+      "kind": "removed",
+      "renamed_to": "rust:crates/opc-security-testkit::test=security_tests::test_kms_fault_responses_preserve_failure_class",
+      "reason": "Name the explicit classification contract: truncated transport remains Unavailable; oversized responses and malformed key hex require provider repair (ProviderUnusable). All three original cases and exact equality assertions remain.",
+      "issue": 1197
+    },
+    {
+      "test": "rust:crates/opc-session-store::lib=lib::sqlite::consensus::tests::native::basis::rollover::background::native_rollover_install_claim_before_capacity_detection_yields_for_retirement",
+      "kind": "fixture-setup-changed",
+      "reason": "Rename the opt-in pre-fix hang-escape environment marker by behaviour. The same diagnostic-only ten-second escape and all recovery, shutdown, retirement, ownership and cold-reopen assertions remain; normal execution still uses ordered hooks without that escape.",
+      "issue": 1253
+    },
+    {
+      "test": "rust:crates/opc-session-store::lib=lib::sqlite::consensus::tests::native::basis::rollover::background::native_rollover_live_capacity_install_leaves_a_retirement_progress_path",
+      "kind": "fixture-setup-changed",
+      "reason": "Rename the opt-in pre-fix hang-escape environment marker by behaviour. The same diagnostic-only ten-second escape and all recovery, shutdown, retirement, ownership and cold-reopen assertions remain; normal execution still uses ordered hooks without that escape.",
+      "issue": 1253
+    },
+    {
+      "test": "rust:crates/opc-session-store::lib=lib::sqlite::consensus::tests::native::basis::rollover::concurrency::native_rollover_compactor_queue_poison_notifies_even_with_owner_parked",
+      "kind": "fixture-setup-changed",
+      "reason": "Rename the subprocess recursion and I/O-case environment markers by behaviour. Every existing Durable/Async and applicable I/O, install or shutdown child case still runs. Each parent now requires the exact named child and a one-test success summary as well as successful exit; no case, bound, deadline or assertion is removed.",
+      "issue": 1253
+    },
+    {
+      "test": "rust:crates/opc-session-store::lib=lib::sqlite::consensus::tests::native::basis::rollover::concurrency::native_rollover_guarded_resource_wait_obeys_the_shutdown_stop",
+      "kind": "fixture-setup-changed",
+      "reason": "Rename the subprocess recursion and I/O-case environment markers by behaviour. Every existing Durable/Async and applicable I/O, install or shutdown child case still runs. Each parent now requires the exact named child and a one-test success summary as well as successful exit; no case, bound, deadline or assertion is removed.",
+      "issue": 1253
+    },
+    {
+      "test": "rust:crates/opc-session-store::lib=lib::sqlite::consensus::tests::native::basis::rollover::concurrency::native_rollover_guarded_resource_wait_rechecks_relief_before_the_file_guard_clears",
+      "kind": "fixture-setup-changed",
+      "reason": "Rename the subprocess recursion and I/O-case environment markers by behaviour. Every existing Durable/Async and applicable I/O, install or shutdown child case still runs. Each parent now requires the exact named child and a one-test success summary as well as successful exit; no case, bound, deadline or assertion is removed.",
+      "issue": 1253
+    },
+    {
+      "test": "rust:crates/opc-session-store::lib=lib::sqlite::consensus::tests::native::basis::rollover::concurrency::native_rollover_installers_during_capacity_restart_preserve_ownership_and_close",
+      "kind": "fixture-setup-changed",
+      "reason": "Rename the subprocess recursion and I/O-case environment markers by behaviour. Every existing Durable/Async and applicable I/O, install or shutdown child case still runs. Each parent now requires the exact named child and a one-test success summary as well as successful exit; no case, bound, deadline or assertion is removed.",
+      "issue": 1253
+    },
+    {
+      "test": "rust:crates/opc-session-store::lib=lib::sqlite::consensus::tests::native::basis::rollover::concurrency::native_rollover_live_capacity_at_journal_stop_drains_and_retires_once",
+      "kind": "fixture-setup-changed",
+      "reason": "Rename the subprocess recursion and I/O-case environment markers by behaviour. Every existing Durable/Async and applicable I/O, install or shutdown child case still runs. Each parent now requires the exact named child and a one-test success summary as well as successful exit; no case, bound, deadline or assertion is removed.",
+      "issue": 1253
+    },
+    {
+      "test": "rust:crates/opc-session-store::lib=lib::sqlite::consensus::tests::native::basis::rollover::concurrency::native_rollover_pending_pressure_drains_without_token_advance_or_serialization",
+      "kind": "fixture-setup-changed",
+      "reason": "Rename the subprocess recursion and I/O-case environment markers by behaviour. Every existing Durable/Async and applicable I/O, install or shutdown child case still runs. Each parent now requires the exact named child and a one-test success summary as well as successful exit; no case, bound, deadline or assertion is removed.",
+      "issue": 1253
+    },
+    {
+      "test": "rust:crates/opc-session-store::lib=lib::sqlite::consensus::tests::native::basis::rollover::concurrency::native_rollover_pending_pressure_flushes_an_already_admitted_durable_cut",
+      "kind": "fixture-setup-changed",
+      "reason": "Rename the subprocess recursion and I/O-case environment markers by behaviour. Every existing Durable/Async and applicable I/O, install or shutdown child case still runs. Each parent now requires the exact named child and a one-test success summary as well as successful exit; no case, bound, deadline or assertion is removed.",
+      "issue": 1253
+    },
+    {
+      "test": "rust:crates/opc-session-store::lib=lib::sqlite::consensus::tests::native::basis::rollover::concurrency::native_rollover_rebase_abort_inside_guard_wait_restarts_and_completes_once",
+      "kind": "fixture-setup-changed",
+      "reason": "Rename the subprocess recursion and I/O-case environment markers by behaviour. Every existing Durable/Async and applicable I/O, install or shutdown child case still runs. Each parent now requires the exact named child and a one-test success summary as well as successful exit; no case, bound, deadline or assertion is removed.",
+      "issue": 1253
+    },
+    {
+      "test": "rust:crates/opc-session-store::lib=lib::sqlite::consensus::tests::native::basis::rollover::concurrency::native_rollover_shutdown_and_install_cancel_inside_real_io_adapters",
+      "kind": "fixture-setup-changed",
+      "reason": "Rename the subprocess recursion and I/O-case environment markers by behaviour. Every existing Durable/Async and applicable I/O, install or shutdown child case still runs. Each parent now requires the exact named child and a one-test success summary as well as successful exit; no case, bound, deadline or assertion is removed. During reopen, hold any background generation append until the adapter and comparison witnesses are armed; then release it before requesting the checkpoint. This preserves all existing cancellation, source-health and reopen checks.",
+      "issue": 1253
+    },
+    {
+      "test": "rust:crates/opc-session-store::lib=lib::sqlite::consensus::tests::native::basis::rollover::background::native_rollover_ceiling_wait_wakes_for_shutdown_and_install",
+      "kind": "fixture-setup-changed",
+      "reason": "Align the install case with the unarmed-claim contract: instead of requiring Async interruption while the unarmed installer and builder are parked, require the waiting admission cut to stay unchanged, then release the predecessor and handoff and require all nine operations to complete once without an error. The suspended Async shutdown case still requires Interrupted before releasing the builder. Every source-health, journal-timer exclusion, installed applied-cut and cold-reopen assertion remains, with unchanged limits and deadlines.",
+      "issue": 1253
+    },
+    {
+      "test": "rust:crates/opc-session-store::lib=lib::consensus::native::generation::decode::tests::native_generation_cold_key_preflight_matches_complete_postcard_and_original_payload_bound",
+      "kind": "fixture-setup-changed",
+      "issue": 1252,
+      "reason": "The declared epoch-retirement format keeps recently dead rows exact. Reject deletion at the zero floor and after real ordinary-command retirement while its exact window remains active; admit the isolated deletion codec only under an explicit post-window previous floor. Cold catalog admission independently verifies the final dead-row retirement witness, its predecessor epoch and committed epoch counts (ADR 0022). Preserve the full postcard serializer comparison, exact payload limit, invalid-fence, truncation and trailing-byte checks."
+    },
+    {
+      "test": "rust:crates/opc-session-store::lib=lib::consensus::store::async_persistence::tests::bootstrap::async_persistence_public_root_interruption_never_reseeds_or_admits",
+      "kind": "fixture-setup-changed",
+      "issue": 1250,
+      "reason": "Fresh native creation now dispatches to the existing blocking opener pool before the original ROOT publication cuts. Require the dispatch hook followed by the exact original cut prefix; retain all eight injected durable cut cases and every typed refusal, no-admission, namespace, selection and reopen assertion."
+    },
+    {
+      "test": "rust:crates/opc-session-net::lib=lib::consumer::tests::cooldown_failover::cooldown_failover_attempt_spans_have_only_fixed_fields_across_lost_replies",
+      "kind": "fixture-setup-changed",
+      "issue": 1250,
+      "reason": "Order first registration of the real attempt callsite on an unobserved joined thread, then retain both observed and unobserved tracing dispatchers so the process-wide interest cache represents both contexts. Preserve the original paused-clock failover and lost-reply scenarios and every exact field, transmission, successor and business assertion."
+    },
+    {
+      "test": "rust:crates/opc-session-store::lib=lib::fake::tests::expired_retired_lease_mutations_preserve_the_expiry_answer",
+      "kind": "fixture-setup-changed",
+      "issue": 1257,
+      "reason": "Commit expiry cleanup through an ordinary acquire/release before observation. The exact epoch window in RFC 004 \u00a79.2 retains the exact expired key fence instead of immediately raising the absent floor. Preserve every LeaseExpired refusal and complete before/after state equality; reads and delayed replay retain their separate non-mutating regressions."
+    },
+    {
+      "test": "rust:crates/opc-session-store::lib=lib::fake::lab::tests::fake_key_retention_stages_lab_requests_with_the_absent_floor",
+      "kind": "fixture-setup-changed",
+      "issue": 1257,
+      "reason": "The exact retirement window in RFC 004 \u00a79.2 preserves the retained key fence through expiry. Replace immediate absent-floor advancement with equality to that exact fence. Retain observation without publication, stale-request refusal, first-attempt acquisition and exact replay checks; separate expiry-to-acquire regressions still prohibit intervening maintenance or retries."
+    },
+    {
+      "test": "rust:crates/opc-session-store::lib=lib::consensus::native::key_retention_tests::native_key_retention_retires_dead_keys_without_reviving_stale_credentials",
+      "kind": "fixture-setup-changed",
+      "issue": 1252,
+      "reason": "The epoch-retirement contract in RFC 004 \u00a79.2 retains an exact recently dead row instead of immediately deleting it and raising the absent floor. Assert the exact two-row count and unchanged retired fence; preserve every stale-credential refusal, increasing recreation fence and live-authority check."
+    },
+    {
+      "test": "rust:crates/opc-session-store::lib=lib::consensus::native::generation::catalog::tests::retention_tests::native_key_retention_survives_delta_reopen_and_base_rewrite",
+      "kind": "fixture-setup-changed",
+      "issue": 1252,
+      "reason": "The epoch-retirement contract in RFC 004 \u00a79.2 keeps the dead row exact in the initial epoch. Require both rows, the exact old fence, epoch tag zero, one retirement and floor zero after delivery, delta reopening and base rewriting. Preserve captured-state, replica equality and stale-credential checks."
+    },
+    {
+      "test": "rust:crates/opc-session-store::lib=lib::consensus::native::generation::catalog::tests::retention_tests::native_key_retention_passes_original_lifetime_limit_and_reopens",
+      "kind": "fixture-setup-changed",
+      "issue": 1252,
+      "reason": "Preserve all 1,048,577 distinct creations, 32,768-operation checkpoint spans, 16,384-entry deliveries and full catalog reopening. Replace immediate-deletion counts with the exact committed two-epoch count at every boundary. Check every dropped retained fence against floor_prev, the 2N bound, prepared-create success after one rotation, no-effect StaleFence after two, exact recent-key recreation and fresh authority after re-observing a forgotten key."
+    },
+    {
+      "test": "rust:crates/opc-session-store::lib=lib::fake::tests::fake_key_retention_retires_dead_keys_without_reviving_stale_credentials",
+      "kind": "fixture-setup-changed",
+      "issue": 1257,
+      "reason": "The exact retirement window in RFC 004 \u00a79.2 retains the released key fence alongside live authority. Assert two retained rows and exact equality instead of immediate deletion and an increased absent floor. Preserve every stale-credential refusal, newer recreation fence and live-lease check."
+    },
+    {
+      "test": "rust:crates/opc-session-store::lib=lib::fake::tests::fake_key_retention_passes_original_distinct_key_limit",
+      "kind": "fixture-setup-changed",
+      "issue": 1257,
+      "reason": "Preserve all 100,001 distinct acquire/create/delete/release cycles. Assert the exact two-epoch dead-row formula, epoch and retirement counters, 2N bound and the current inactive lease pending the next committing cleanup. Preserve record emptiness, bounded replay history, no lab receipts, forgotten-key observation, stale authority refusal and live authority."
+    },
+    {
+      "test": "rust:crates/opc-session-store::lib=lib::fake::tests::fake_key_retention_replays_and_rebuilds_the_same_absent_floor",
+      "kind": "fixture-setup-changed",
+      "issue": 1257,
+      "reason": "The current released lease remains inactive until the next committing command, matching native pruning. Require two exact resident rows at the final cut instead of immediate removal. Preserve the full ten-key stream, capacity-driven rotation, complete source/replay/rebuild equality and old/live authority checks."
+    },
+    {
+      "test": "rust:crates/opc-session-store::lib=lib::fake::tests::fake_key_retention_reclaims_imported_delete_floors",
+      "kind": "fixture-setup-changed",
+      "issue": 1257,
+      "reason": "A replicated delete cannot create authority for an unknown key. Keep all three distinct key/fence inputs, each at the still-next sequence after the preceding rejection, and require StaleFence with an identical state snapshot, no retained rows, zero absent floor and untouched allocator. The previous acceptance expectation contradicted the explicit retired/forgotten-authority rule; successful create/delete/release churn remains covered by the full 100,001-key proof and source/replay/rebuild test."
+    },
+    {
+      "test": "rust:crates/opc-session-store::lib=lib::fake::tests::late_capacity_failure_after_dead_child_rolls_back_batch_and_preserves_watcher",
+      "kind": "fixture-setup-changed",
+      "issue": 1257,
+      "reason": "Use valid acquire/release children to leave the first key without a record or active authority, followed by an acquire for a second key at the one-key limit. Unknown-key deletes are now correctly refused before capacity checks. Preserve the late capacity error, complete rollback, no watcher output, successful reuse of the unconsumed sequence and exactly one watcher notification. Add an explicit inactive-lease and unchanged-epoch check; this still detects cleanup or rotation between Batch children."
+    },
+    {
+      "test": "rust:crates/opc-session-store::lib=lib::fake::tests::late_capacity_failure_rolls_back_batch_and_preserves_watcher",
+      "kind": "fixture-setup-changed",
+      "issue": 1257,
+      "reason": "Replace unknown-key deletes with valid lease acquisitions so the second child still reaches resident-capacity refusal after staging a live first child. Preserve the exact late capacity error, whole-state rollback, absent watcher events, reuse of the unconsumed sequence and single successful notification. The separate dead-first-child case retains its inactive-lease scenario."
+    },
+    {
+      "test": "rust:crates/opc-session-store::lib=lib::fake::tests::failed_rebuild_preserves_every_internal_state_dimension",
+      "kind": "fixture-setup-changed",
+      "issue": 1257,
+      "reason": "Give the replacement stream valid lease authority before its final refresh of a missing record. The first entry changes staged lease/fence/allocator state; the final entry acquires its own lease then fails with the original NotFound. Preserve the two-entry rebuild, original exact error, full state-snapshot equality and watcher silence; do not allow an earlier StaleFence to replace the late failure."
+    },
+    {
+      "test": "rust:crates/opc-session-store::lib=lib::fake::tests::staging_preserves_and_advances_nonzero_compaction_state",
+      "kind": "fixture-setup-changed",
+      "issue": 1257,
+      "reason": "Use authorized acquisitions for the first, second and third replication entries, and acquire authority before the deliberately missing-record refresh. Preserve both late NotFound failures in append and rebuild, every complete-state equality, duplicate idempotency, watcher assertion, and exact compaction sequence/log contents before and after a successful append. Unknown-key delete authority is now explicitly refused in its own three-case regression."
+    },
+    {
+      "test": "rust:crates/opc-session-store::lib=lib::consensus::native::changes::tests::retention_capture::native_key_retirement_capture_records_exact_predecessors_and_eliminates_transients",
+      "kind": "fixture-setup-changed",
+      "issue": 1252,
+      "reason": "The exact epoch window in RFC 004 \u00a79.2 requires rotation before a dead row disappears. Preserve both retained/absent predecessors and batched/separate delivery, all predecessor pointer/hash, removal, transient elimination and captured-proof assertions. Add a real final acquire that exercises the production capacity finalizer at a two-row resident limit, with unchanged N; account exactly for that additional live row and assert its captured creation. Earlier commands fit the same resident limit, so rotation belongs to the final command regardless of delivery grouping."
+    },
+    {
+      "test": "rust:crates/opc-session-store::lib=lib::consensus::native::v1::tests::native_v1_full_image_four_preserves_tombstones_and_explicit_legacy_readers",
+      "kind": "fixture-setup-changed",
+      "issue": 1252,
+      "reason": "The epoch-tagged positional row requires the new full-image discriminator 06. Keep explicit version-4 coverage through its own four-field writer and run tombstone/replay/context checks for both 04 and 06; retain all legacy 01/02/03 reader and mislabeled-context refusal cases."
+    },
+    {
+      "test": "rust:crates/opc-session-store::lib=lib::consensus::native::voter_slot_tests::native_slot_intent_cannot_be_missing_displaced_or_smuggled_into_an_old_format",
+      "kind": "fixture-setup-changed",
+      "issue": 1252,
+      "reason": "The epoch-tagged slot profile uses full-image discriminator 07. Exercise both explicit legacy 05 and current 07 writers, and reject each when mislabeled as either fixed-membership 04 or 06. Keep every missing/displaced intent and truncate/engine-fence assertion."
+    },
+    {
+      "test": "rust:crates/opc-session-store::lib=lib::consensus::storage::tests::native_reopen_formats::native_unknown_frontier_public_reopen_refuses_before_backend_or_snapshot_writes",
+      "kind": "fixture-setup-changed",
+      "issue": 1252,
+      "reason": "Update the fixture current-generation header from vocabulary 6 to epoch vocabulary 7 specified by ADR 0022. Preserve the unknown-field mutation, both persistence modes, both expected identities, exact corruption refusal, byte-for-byte no-write proof and restored-file successful reopen."
+    },
+    {
+      "test": "rust:crates/opc-session-store::lib=lib::consensus::storage::tests::native_reopen_formats::native_future_generation_public_reopen_refuses_before_backend_or_snapshot_writes",
+      "kind": "fixture-setup-changed",
+      "issue": 1252,
+      "reason": "The epoch format in ADR 0022 makes vocabulary 7 current, so the unknown future fixture is vocabulary 8. Preserve both persistence modes, both identity cases, the exact corruption result, all no-write assertions and successful reopen after restoring the original bytes."
+    },
+    {
+      "test": "rust:crates/opc-session-store::lib=lib::sqlite::consensus::tests::native::ordinary::native_ordinary_pruning_savepoint_and_same_apply_index_match_sql",
+      "kind": "fixture-setup-changed",
+      "reason": "RFC 004 section 9.2 requires non-mutating native CAS conflicts to preserve canonical expiry state. Keep complete response parity and compare every notification effect, identity, sequence and timestamp while independently checking the explicit native and SQLite replay policies. Preserve the SQL row-count, revision and watch assertions and every other physical table. Separately require exact native pre-conflict records and restore revision, physical convergence after the next successful write, same-delivery expiry-index checks, cold reopening and cold admission cleanup.",
+      "issue": 1252
+    },
+    {
+      "test": "rust:crates/opc-session-store::lib=lib::consensus::native::ordinary_retention_tests::native_notification_retention_survives_full_image_round_trip",
+      "kind": "fixture-setup-changed",
+      "issue": 1250,
+      "reason": "Execute the complete notification-window round trip in a checked same-test child process so unrelated parallel fixtures cannot consume its process-wide verification budget. Preserve all 65,536 retained entries, exact retired frontier, full-image validation, stale-cursor refusal and ordered replay through 128-entry pages. The parent requires a successful child exit and exactly one passing, non-ignored test; all production memory caps and assertions remain unchanged."
+    },
+    {
+      "test": "rust:crates/opc-session-store::lib=lib::fake::lab::tests::restore_expiry_tests::lab_restore_expired_rows_still_consume_the_scan_work_budget",
+      "kind": "fixture-setup-changed",
+      "issue": 1252,
+      "reason": "Expired records are absent from the live restore source and must not exhaust the 4,096 live-row allowance. Both 4,096 and 4,097 expired-only fixtures now require a complete empty page under the separate 2,000,000 physical-visit bound. Preserve public page validation, zero scope exclusions, absent continuation and exact unchanged canonical records. Live-row, metadata, payload and retained-page limits remain unchanged."
+    },
+    {
+      "test": "rust:crates/opc-session-store::lib=lib::consensus::native::key_retention_tests::native_new_internal_capacity_requires_a_journal_position_even_without_key_pressure",
+      "kind": "fixture-setup-changed",
+      "issue": 1252,
+      "reason": "Required replay policy accounts for new internal resident rows before any capacity rotation. An insertion therefore needs a context entry even below pressure and must refuse an exhausted watch counter before publication. Rename the former no-entry control to assert atomic refusal, exact original resident rows and unchanged retention. Preserve the complete retained notification window, signed counter horizon and original production limits."
+    },
+    {
+      "test": "rust:crates/opc-session-store::lib=lib::backend::key_retention_replication_tests::key_retention_boundary_record_transform_preserves_all_command_metadata",
+      "kind": "fixture-setup-changed",
+      "issue": 1252,
+      "reason": "Replace separate assertions about metadata embedded in an operation variant with equality of the complete required entry policy. That equality covers every former capacity, continuation, floor and pruning value plus retirement, command identity, recovery and internal capacity. Preserve effect count, exact transformed record and all non-payload record fields."
+    },
+    {
+      "test": "rust:crates/opc-session-store::test=replication_structure_bounds::key_retention_batch_preserves_replication_shape_bounds_and_encoding",
+      "kind": "fixture-setup-changed",
+      "issue": 1252,
+      "reason": "Move replay metadata from removed operation variants into the required entry field. Zero rotations and empty metadata-only batches are valid; policy cannot nest inside an operation tree. Preserve exact node and depth limits and their one-past-limit refusals, round-trip every legal rotation count, and reject malformed scalar policy values."
+    },
+    {
+      "test": "rust:crates/opc-session-store::test=replication_structure_bounds::key_retention_boundary_keeps_original_tree_bounds_and_bounded_continuations",
+      "kind": "fixture-setup-changed",
+      "issue": 1252,
+      "reason": "Use the single entry policy instead of operation-specific boundary containers. Exercise exact first and continuation counts, refuse repeated capacity decisions on continuations, preserve typed round trips and require every policy field. The shared entry shape test retains exact depth and node limits; separate encoding checks prove both missing-policy refusal and refusal by earlier readers."
+    },
+    {
+      "test": "rust:crates/opc-session-net::lib=lib::protocol::tests::key_retention_batches_round_trip_with_bounded_flat_wire_nodes",
+      "kind": "fixture-setup-changed",
+      "issue": 1252,
+      "reason": "Carry capacity policy beside the bounded flat mutation nodes. Retain the exact maximum node count, complete typed round trip and illegal capacity refusals. Zero rotations are now an explicit valid policy; nested policy containers no longer exist in the mutation vocabulary. Required-field and continuation negatives cover the new entry form."
+    },
+    {
+      "test": "rust:crates/opc-session-store::lib=lib::consensus::native::async_recovery::tests::native_async_boundary_watch_does_not_relabel_predecessor_effects",
+      "kind": "fixture-setup-changed",
+      "issue": 1252,
+      "reason": "Required recovery metadata occupies the first outward position after the new floor. Require that exact empty-effect entry and its complete recovery policy, keep the predecessor entry byte-for-byte unchanged, and require the following real acquisition at the next position. Preserve strict ordered page and watch-frontier checks."
+    },
+    {
+      "test": "rust:crates/opc-session-store::lib=lib::consensus::native::replay_policy_parity_tests::explicit_policy_watch_rebuild_and_application_restore_round_trip",
+      "kind": "fixture-setup-changed",
+      "issue": 1252,
+      "reason": "Run the complete watch, rebuild and restore fixture in a checked same-test child so unrelated parallel fixtures cannot consume its process-wide verification reservation. Preserve every data, policy, cursor, retained-state and restore assertion and the original memory cap. The parent requires successful exit and the exact one-test, non-ignored success summary."
+    },
+    {
+      "test": "rust:crates/opc-session-store::lib=lib::consensus::store::sequential_wal_sdk_tests::scope_authority::scope_authority_four_thousand_successions_keep_native_checkpoint_and_snapshots_bounded",
+      "kind": "fixture-setup-changed",
+      "issue": 1252,
+      "reason": "The first profile activation publishes one internal row; initial scope admission adds the authority checkpoint and empty child ledger. Require exactly two empty-effect contexts with complete preservation policies and internal counts one and three at both succession checkpoints. Keep zero session rows, the fixed checkpoint-size limit, one activation receipt, all four thousand successions, snapshot bounds and durable reopen checks."
+    },
+    {
+      "test": "rust:crates/opc-session-store::lib=lib::sqlite::consensus::tests::native::roster::export::install_base::native_roster_install_base_preserves_complete_cold_predecessor_and_exact_raft_pointers",
+      "kind": "fixture-setup-changed",
+      "issue": 1252,
+      "reason": "Account for the required canonical native profile at default frontiers. Independently derive both producer policies from the committed command history captured before log purge and compare complete effects and journal columns before comparing every original schema object and carrier. Preserve exact retained Raft pointers, votes, membership, unapplied suffixes, cold reopen and portable export checks."
+    },
+    {
+      "test": "rust:crates/opc-session-store::lib=lib::sqlite::consensus::tests::native::roster::export::install_base::native_roster_install_base_unapplied_copy_rejects_wrong_root_and_rolls_back_cancellation",
+      "kind": "fixture-setup-changed",
+      "issue": 1252,
+      "reason": "Include the validated default native profile when comparing empty and unapplied converted images. Preserve equality for every original schema object and column, exact unapplied Raft positions, wrong-root refusal, cancellation rollback and unchanged source bytes. Native-to-native comparisons remain exact."
+    },
+    {
+      "test": "rust:crates/opc-key-vault::test=integration_tests::rotate_key_failure_maps_to_rotation_failed",
+      "kind": "removed",
+      "renamed_to": "rust:crates/opc-key-vault::test=integration_tests::rotate_key_failure_preserves_outage",
+      "reason": "Rotation preserves the provider outage class instead of collapsing it to RotationFailed. The HTTP 500 failure and exact error assertion remain, with separate authentication and retry-count controls.",
+      "issue": 1197
+    },
+    {
+      "test": "rust:crates/opc-sdk-integration::test=fault_injection::fault_injection_missing_key_fails_closed_without_secret_leak",
+      "kind": "assertions-decreased",
+      "reason": "Use an intact envelope with an empty key provider to test actual key absence. Removing header decode, mutated-key construction and re-encode expectations lowers the syntactic assertion count, while exact KeyRejected, redacted text, definitive classification and no-secret-leak assertions remain. Separate crypto tests retain header-binding damage and require rejection before provider lookup.",
+      "issue": 1197,
+      "replacements": [
+        "rust:crates/opc-crypto::lib=lib::tests::damaged_key_binding_is_rejected_before_provider_lookup",
+        "rust:crates/opc-crypto::lib=lib::tests::decrypt_rejects_wrong_key_aad_corrupt_tag_and_unknown_key_id_with_redacted_errors"
+      ]
+    },
+    {
+      "test": "python:ci/test-qualify-local-kernel-lifecycle.py::CleanupTests.test_surviving_namespaces_and_host_residue_fail_cleanup",
+      "kind": "removed",
+      "renamed_to": "python:ci/test-qualify-local-kernel-lifecycle.py::CleanupTests.test_raw_inventory_differences_retain_host_interface_diagnostics",
+      "reason": "Rename the raw inventory-difference test to describe its diagnostic role. Every existing namespace, pin, mount, named-namespace and interface difference assertion remains. Separate verification tests retain refusal of owned namespace and interface residue while accepting unrelated host arrivals.",
+      "issue": 1225
+    },
+    {
+      "test": "rust:crates/opc-session-store::lib=lib::sqlite::consensus::tests::native::basis::reclaim_memory::native_reclaim_memory_noop_admission_keeps_consumers_live",
+      "kind": "disabled",
+      "issue": 1250,
+      "reason": "The parent re-executes the exact test in a fresh child with its marker set and --test-threads=1, and asserts that the child ran exactly one passing, non-ignored test. The complete body therefore runs isolated from other tests sharing the process allowance. The enclosing fixture process has a 300-second completion deadline, including teardown."
+    },
+    {
+      "test": "rust:crates/opc-session-store::lib=lib::sqlite::consensus::tests::native::basis::reclaim_memory::native_reclaim_memory_held_checkpoint_allows_consumer_work_and_finishes",
+      "kind": "disabled",
+      "issue": 1250,
+      "reason": "The parent re-executes the exact test in a fresh child with its marker set and --test-threads=1, and asserts that the child ran exactly one passing, non-ignored test. The complete body therefore runs isolated from other tests sharing the process allowance. The enclosing fixture process has a 300-second completion deadline, including teardown."
+    },
+    {
+      "test": "rust:crates/opc-config-bus-consensus::test=adapter::storage_failures::consensus_history_heap_outage_is_retryable_without_changing_bytes",
+      "kind": "fixture-setup-changed",
+      "issue": 1250,
+      "reason": "The exact test runs in a fresh child with its marker set and --test-threads=1. The parent requires a successful exit and exactly one passing, non-ignored test, preserving the original assertions and process-local resource bounds."
+    },
+    {
+      "test": "rust:crates/opc-persist::lib=lib::backend::tests::open_metadata_heap_outage_is_unavailable_without_changing_bytes",
+      "kind": "fixture-setup-changed",
+      "issue": 1250,
+      "reason": "The exact test runs in a fresh child with its marker set and --test-threads=1. The parent requires a successful exit and exactly one passing, non-ignored test, preserving the original assertions and process-local resource bounds."
+    },
+    {
+      "test": "rust:crates/opc-persist::lib=lib::consumer_checkpoint::tests::checkpoint_heap_outage_is_unavailable_without_changing_bytes",
+      "kind": "fixture-setup-changed",
+      "issue": 1250,
+      "reason": "The exact test runs in a fresh child with its marker set and --test-threads=1. The parent requires a successful exit and exactly one passing, non-ignored test, preserving the original assertions and process-local resource bounds."
+    },
+    {
+      "test": "rust:crates/opc-persist::lib=lib::consumer_checkpoint::tests::checkpoint_local_encryption_failure_is_not_evidence_against_stored_data",
+      "kind": "fixture-setup-changed",
+      "issue": 1250,
+      "reason": "The exact test runs in a fresh child with its marker set and --test-threads=1. The parent requires a successful exit and exactly one passing, non-ignored test, preserving the original assertions and process-local resource bounds."
+    },
+    {
+      "test": "rust:crates/opc-persist::lib=lib::retained::tests::retained_heap_outage_is_unavailable_without_changing_bytes",
+      "kind": "fixture-setup-changed",
+      "issue": 1250,
+      "reason": "The exact test runs in a fresh child with its marker set and --test-threads=1. The parent requires a successful exit and exactly one passing, non-ignored test, preserving the original assertions and process-local resource bounds."
+    },
+    {
+      "test": "rust:crates/opc-session-store::lib=lib::consensus::native::changes::tests::reclaim_memory::native_reclaim_memory_coalesced_delivery_preserves_atomic_publication",
+      "kind": "fixture-setup-changed",
+      "issue": 1250,
+      "reason": "The exact test runs in a fresh child with its marker set and --test-threads=1. The parent requires a successful exit and exactly one passing, non-ignored test, preserving the original assertions and process-local resource bounds."
+    },
+    {
+      "test": "rust:crates/opc-session-store::lib=lib::consensus::native::changes::tests::reclaim_memory::native_reclaim_memory_replay_multiple_full_transport_cohorts",
+      "kind": "fixture-setup-changed",
+      "issue": 1250,
+      "reason": "The exact test runs in a fresh child with its marker set and --test-threads=1. The parent requires a successful exit and exactly one passing, non-ignored test, preserving the original assertions and process-local resource bounds."
+    },
+    {
+      "test": "rust:crates/opc-session-store::lib=lib::consensus::native::changes::tests::reclaim_memory::native_reclaim_memory_void_journal_charges_rows_and_retains_capture_ownership",
+      "kind": "fixture-setup-changed",
+      "issue": 1250,
+      "reason": "The exact test runs in a fresh child with its marker set and --test-threads=1. The parent requires a successful exit and exactly one passing, non-ignored test, preserving the original assertions and process-local resource bounds."
+    },
+    {
+      "test": "rust:crates/opc-session-store::lib=lib::consensus::native::changes::tests::journal_admission::native_fixture_append_retries_typed_pressure_without_partial_publication",
+      "kind": "fixture-setup-changed",
+      "issue": 1250,
+      "reason": "The exact test runs in a fresh child with its marker set and --test-threads=1. The parent requires a successful exit and exactly one passing, non-ignored test, preserving the original assertions and process-local resource bounds."
+    },
+    {
+      "test": "rust:crates/opc-session-store::lib=lib::consensus::native::ordinary_retention_tests::native_notification_retention_bounds_committed_replay_and_rejects_stale_cursor",
+      "kind": "fixture-setup-changed",
+      "issue": 1250,
+      "reason": "The exact test runs in a fresh child with its marker set and --test-threads=1. The parent requires a successful exit and exactly one passing, non-ignored test, preserving the original assertions and process-local resource bounds."
+    },
+    {
+      "test": "rust:crates/opc-session-store::lib=lib::consensus::native::replay_policy_parity_tests::parity_fixture_tolerates_transient_journal_page_admission_refusal",
+      "kind": "fixture-setup-changed",
+      "issue": 1250,
+      "reason": "The exact test runs in a fresh child with its marker set and --test-threads=1. The parent requires a successful exit and exactly one passing, non-ignored test, preserving the original assertions and process-local resource bounds."
+    },
+    {
+      "test": "rust:crates/opc-session-store::lib=lib::consensus::native::roster::store::tests::publication_tests::native_empty_roster_snapshot_validation_uses_checkpoint_headroom",
+      "kind": "fixture-setup-changed",
+      "issue": 1250,
+      "reason": "The exact test runs in a fresh child with its marker set and --test-threads=1. The parent requires a successful exit and exactly one passing, non-ignored test, preserving the original assertions and process-local resource bounds."
+    },
+    {
+      "test": "rust:crates/opc-session-store::lib=lib::sqlite::consensus::wal::native_basis::rollover::compactor::wait_tests::native_rollover_coordinator_cancel_cannot_land_before_wait_registration",
+      "kind": "fixture-setup-changed",
+      "issue": 1250,
+      "reason": "The exact test runs in a fresh child with its marker set and --test-threads=1. The parent requires a successful exit and exactly one passing, non-ignored test, preserving the original assertions and process-local resource bounds."
+    },
+    {
+      "test": "rust:crates/opc-session-store::lib=lib::sqlite::consensus::wal::native_basis::rollover::compactor::wait_tests::native_rollover_coordinator_capacity_restart_returns_to_its_owner",
+      "kind": "fixture-setup-changed",
+      "issue": 1250,
+      "reason": "The exact test runs in a fresh child with its marker set and --test-threads=1. The parent requires a successful exit and exactly one passing, non-ignored test, preserving the original assertions and process-local resource bounds."
+    },
+    {
+      "test": "rust:crates/opc-session-store::lib=lib::sqlite::consensus::wal::native_basis::rollover::compactor::wait_tests::native_rollover_durable_restart_wait_returns_a_completed_capacity_outcome",
+      "kind": "fixture-setup-changed",
+      "issue": 1250,
+      "reason": "The exact test runs in a fresh child with its marker set and --test-threads=1. The parent requires a successful exit and exactly one passing, non-ignored test, preserving the original assertions and process-local resource bounds."
+    },
+    {
+      "test": "rust:crates/opc-session-store::lib=lib::sqlite::consensus::tests::native::basis::mixed_journals::native_journal_pressure_mixed_captured_and_live_crash_reopens",
+      "kind": "fixture-setup-changed",
+      "issue": 1250,
+      "reason": "The exact parent test runs in a fresh child with its marker set and --test-threads=1, requiring exactly one passing test. Its nested crash child selects one test and intentionally exits at the live-WAL boundary; the parent requires the specific exit and recovery report. The enclosing fixture process has a 300-second completion deadline, including teardown."
+    },
+    {
+      "test": "rust:crates/opc-session-store::lib=lib::sqlite::consensus::tests::native::basis::mixed_journals::native_journal_pressure_large_mixed_cold_replay_rebases_before_exhaustion",
+      "kind": "fixture-setup-changed",
+      "issue": 1250,
+      "reason": "The exact test runs in a fresh child with its marker set and --test-threads=1. The parent requires a successful exit and exactly one passing, non-ignored test, preserving the original assertions and process-local resource bounds."
+    },
+    {
+      "test": "rust:crates/opc-session-store::lib=lib::sqlite::consensus::tests::native::basis::reclaim_memory::native_reclaim_memory_void_checkpoint_and_replay_preserve_first_binding",
+      "kind": "fixture-setup-changed",
+      "issue": 1250,
+      "reason": "The exact test runs in a fresh child with its marker set and --test-threads=1. The parent requires a successful exit and exactly one passing, non-ignored test, preserving the original assertions and process-local resource bounds. The enclosing fixture process has a 300-second completion deadline, including teardown."
+    },
+    {
+      "test": "rust:crates/opc-session-store::lib=lib::sqlite::consensus::tests::native::basis::reclaim_memory::native_reclaim_memory_void_pressure_fence_replays_and_retires_epoch",
+      "kind": "fixture-setup-changed",
+      "issue": 1250,
+      "reason": "The exact test runs in a fresh child with its marker set and --test-threads=1. The parent requires a successful exit and exactly one passing, non-ignored test, preserving the original assertions and process-local resource bounds. The enclosing fixture process has a 300-second completion deadline, including teardown."
+    },
+    {
+      "test": "rust:crates/opc-session-store::lib=lib::sqlite::consensus::tests::native::basis::reclaim_memory::native_reclaim_memory_committed_wait_releases_permit_and_proceeds",
+      "kind": "fixture-setup-changed",
+      "issue": 1250,
+      "reason": "The exact test runs in a fresh child with its marker set and --test-threads=1. The parent requires a successful exit and exactly one passing, non-ignored test, preserving the original assertions and process-local resource bounds. The enclosing fixture process has a 300-second completion deadline, including teardown."
+    },
+    {
+      "test": "rust:crates/opc-session-store::lib=lib::sqlite::consensus::tests::native::basis::reclaim_memory::native_reclaim_memory_committed_wait_fails_closed_with_bounded_reason",
+      "kind": "fixture-setup-changed",
+      "issue": 1250,
+      "reason": "The exact test runs in a fresh child with its marker set and --test-threads=1. The parent requires a successful exit and exactly one passing, non-ignored test, preserving the original assertions and process-local resource bounds. The enclosing fixture process has a 300-second completion deadline, including teardown."
+    },
+    {
+      "test": "rust:crates/opc-session-store::lib=lib::sqlite::consensus::tests::native::basis::reclaim_memory::native_reclaim_memory_shutdown_interrupts_committed_wait",
+      "kind": "fixture-setup-changed",
+      "issue": 1250,
+      "reason": "The exact test runs in a fresh child with its marker set and --test-threads=1. The parent requires a successful exit and exactly one passing, non-ignored test, preserving the original assertions and process-local resource bounds. The enclosing fixture process has a 300-second completion deadline, including teardown."
+    },
+    {
+      "test": "rust:crates/opc-session-store::lib=lib::sqlite::consensus::tests::native::basis::reclaim_memory::native_reclaim_memory_shutdown_interrupts_wait_with_writer_already_blocked",
+      "kind": "fixture-setup-changed",
+      "issue": 1250,
+      "reason": "The exact test runs in a fresh child with its marker set and --test-threads=1. The parent requires a successful exit and exactly one passing, non-ignored test, preserving the original assertions and process-local resource bounds. The enclosing fixture process has a 300-second completion deadline, including teardown."
+    },
+    {
+      "test": "rust:crates/opc-session-store::lib=lib::sqlite::consensus::tests::native::basis::reclaim_memory::native_reclaim_memory_progress_extends_committed_wait",
+      "kind": "fixture-setup-changed",
+      "issue": 1250,
+      "reason": "The exact test runs in a fresh child with its marker set and --test-threads=1. The parent requires a successful exit and exactly one passing, non-ignored test, preserving the original assertions and process-local resource bounds. The enclosing fixture process has a 300-second completion deadline, including teardown."
+    },
+    {
+      "test": "rust:crates/opc-session-store::lib=lib::sqlite::consensus::tests::native::basis::reclaim_memory::native_reclaim_memory_unhelpful_checkpoints_do_not_extend_wait",
+      "kind": "fixture-setup-changed",
+      "issue": 1250,
+      "reason": "The exact test runs in a fresh child with its marker set and --test-threads=1. The parent requires a successful exit and exactly one passing, non-ignored test, preserving the original assertions and process-local resource bounds. The enclosing fixture process has a 300-second completion deadline, including teardown."
+    },
+    {
+      "test": "rust:crates/opc-session-store::lib=lib::sqlite::consensus::tests::native::basis::reclaim_memory::native_reclaim_memory_shortfall_relief_extends_committed_wait",
+      "kind": "fixture-setup-changed",
+      "issue": 1250,
+      "reason": "The exact test runs in a fresh child with its marker set and --test-threads=1. The parent requires a successful exit and exactly one passing, non-ignored test, preserving the original assertions and process-local resource bounds. The enclosing fixture process has a 300-second completion deadline, including teardown."
+    },
+    {
+      "test": "rust:crates/opc-session-store::lib=lib::sqlite::consensus::tests::native::basis::reclaim_memory::native_reclaim_memory_successful_reservation_resets_wait_after_retry",
+      "kind": "fixture-setup-changed",
+      "issue": 1250,
+      "reason": "The exact test runs in a fresh child with its marker set and --test-threads=1. The parent requires a successful exit and exactly one passing, non-ignored test, preserving the original assertions and process-local resource bounds. The enclosing fixture process has a 300-second completion deadline, including teardown."
+    },
+    {
+      "test": "rust:crates/opc-session-store::lib=lib::sqlite::consensus::tests::native::basis::reclaim_memory::native_reclaim_memory_planner_error_uses_real_evaluation",
+      "kind": "fixture-setup-changed",
+      "issue": 1250,
+      "reason": "The exact test runs in a fresh child with its marker set and --test-threads=1. The parent requires a successful exit and exactly one passing, non-ignored test, preserving the original assertions and process-local resource bounds. The enclosing fixture process has a 300-second completion deadline, including teardown."
+    },
+    {
+      "test": "rust:crates/opc-session-store::lib=lib::sqlite::consensus::tests::native::basis::reclaim_memory::native_reclaim_memory_preflight_avoids_unhelpful_checkpoints",
+      "kind": "fixture-setup-changed",
+      "issue": 1250,
+      "reason": "The exact test runs in a fresh child with its marker set and --test-threads=1. The parent requires a successful exit and exactly one passing, non-ignored test, preserving the original assertions and process-local resource bounds. The enclosing fixture process has a 300-second completion deadline, including teardown."
+    },
+    {
+      "test": "rust:crates/opc-session-store::lib=lib::sqlite::consensus::tests::native::basis::reclaim_memory::native_reclaim_memory_requested_checkpoint_relieves_wait",
+      "kind": "fixture-setup-changed",
+      "issue": 1250,
+      "reason": "The exact test runs in a fresh child with its marker set and --test-threads=1. The parent requires a successful exit and exactly one passing, non-ignored test, preserving the original assertions and process-local resource bounds. The enclosing fixture process has a 300-second completion deadline, including teardown."
+    },
+    {
+      "test": "rust:crates/opc-session-store::lib=lib::sqlite::consensus::tests::native::basis::reclaim_memory::native_reclaim_memory_eight_mib_journal_requests_checkpoint",
+      "kind": "fixture-setup-changed",
+      "issue": 1250,
+      "reason": "The exact test runs in a fresh child with its marker set and --test-threads=1. The parent requires a successful exit and exactly one passing, non-ignored test, preserving the original assertions and process-local resource bounds. The enclosing fixture process has a 300-second completion deadline, including teardown."
+    },
+    {
+      "test": "rust:crates/opc-session-store::lib=lib::sqlite::consensus::tests::native::basis::reclaim_memory::native_reclaim_memory_preflight_does_not_request_during_install",
+      "kind": "fixture-setup-changed",
+      "issue": 1250,
+      "reason": "The exact test runs in a fresh child with its marker set and --test-threads=1. The parent requires a successful exit and exactly one passing, non-ignored test, preserving the original assertions and process-local resource bounds. The enclosing fixture process has a 300-second completion deadline, including teardown."
+    },
+    {
+      "test": "rust:crates/opc-session-store::lib=lib::sqlite::consensus::tests::native::basis::reclaim_memory::native_reclaim_memory_full_generation_replays_maximum_retirement_suffix",
+      "kind": "fixture-setup-changed",
+      "issue": 1250,
+      "reason": "The exact test runs in a fresh child with its marker set and --test-threads=1. The parent requires a successful exit and exactly one passing, non-ignored test, preserving the original assertions and process-local resource bounds. The enclosing fixture process has a 1,200-second completion deadline, including teardown."
+    },
+    {
+      "test": "rust:crates/opc-session-store::lib=lib::sqlite::consensus::tests::native::basis::reclaim_memory::native_journal_pressure_consumer_application_waits_without_fencing",
+      "kind": "fixture-setup-changed",
+      "issue": 1250,
+      "reason": "The exact test runs in a fresh child with its marker set and --test-threads=1. The parent requires a successful exit and exactly one passing, non-ignored test, preserving the original assertions and process-local resource bounds."
+    },
+    {
+      "test": "rust:crates/opc-session-store::lib=lib::sqlite::consensus::tests::native::basis::reclaim_memory::native_journal_pressure_successful_preparation_resets_wait_after_retry",
+      "kind": "fixture-setup-changed",
+      "issue": 1250,
+      "reason": "The exact test runs in a fresh child with its marker set and --test-threads=1. The parent requires a successful exit and exactly one passing, non-ignored test, preserving the original assertions and process-local resource bounds."
+    },
+    {
+      "test": "rust:crates/opc-session-store::lib=lib::sqlite::consensus::tests::native::basis::reclaim_memory::native_journal_pressure_log_append_waits_without_fencing",
+      "kind": "fixture-setup-changed",
+      "issue": 1250,
+      "reason": "The exact test runs in a fresh child with its marker set and --test-threads=1. The parent requires a successful exit and exactly one passing, non-ignored test, preserving the original assertions and process-local resource bounds."
+    },
+    {
+      "test": "rust:crates/opc-session-store::lib=lib::sqlite::consensus::tests::native::basis::reclaim_memory::native_journal_pressure_tiny_relief_does_not_renew_retirement_wait",
+      "kind": "fixture-setup-changed",
+      "issue": 1250,
+      "reason": "The exact test runs in a fresh child with its marker set and --test-threads=1. The parent requires a successful exit and exactly one passing, non-ignored test, preserving the original assertions and process-local resource bounds."
+    },
+    {
+      "test": "rust:crates/opc-session-store::lib=lib::sqlite::consensus::tests::native::basis::reclaim_memory::native_journal_pressure_meaningful_relief_has_a_total_retirement_bound",
+      "kind": "fixture-setup-changed",
+      "issue": 1250,
+      "reason": "The exact test runs in a fresh child with its marker set and --test-threads=1. The parent requires a successful exit and exactly one passing, non-ignored test, preserving the original assertions and process-local resource bounds."
+    },
+    {
+      "test": "rust:crates/opc-session-store::lib=lib::sqlite::consensus::tests::native::basis::reclaim_memory::native_journal_pressure_detached_preparation_releases_before_wait",
+      "kind": "fixture-setup-changed",
+      "issue": 1250,
+      "reason": "The exact test runs in a fresh child with its marker set and --test-threads=1. The parent requires a successful exit and exactly one passing, non-ignored test, preserving the original assertions and process-local resource bounds."
+    },
+    {
+      "test": "rust:crates/opc-session-store::lib=lib::sqlite::consensus::tests::native::basis::reclaim_memory::native_journal_pressure_shutdown_interrupts_consumer_and_append_waits",
+      "kind": "fixture-setup-changed",
+      "issue": 1250,
+      "reason": "The exact test runs in a fresh child with its marker set and --test-threads=1. The parent requires a successful exit and exactly one passing, non-ignored test, preserving the original assertions and process-local resource bounds."
+    },
+    {
+      "test": "rust:crates/opc-session-store::lib=lib::sqlite::consensus::tests::native::basis::rollover::background::native_rollover_admission_advances_while_compactor_parked",
+      "kind": "fixture-setup-changed",
+      "issue": 1250,
+      "reason": "The exact test runs in a fresh child with its marker set and --test-threads=1. The parent requires a successful exit and exactly one passing, non-ignored test, preserving the original assertions and process-local resource bounds."
+    },
+    {
+      "test": "rust:crates/opc-session-store::lib=lib::sqlite::consensus::tests::native::basis::rollover::background::native_rollover_journal_pressure_is_relieved_while_compactor_parked",
+      "kind": "fixture-setup-changed",
+      "issue": 1250,
+      "reason": "The exact test runs in a fresh child with its marker set and --test-threads=1. The parent requires a successful exit and exactly one passing, non-ignored test, preserving the original assertions and process-local resource bounds."
+    },
+    {
+      "test": "rust:crates/opc-session-store::lib=lib::sqlite::consensus::tests::native::basis::rollover::background::native_rollover_background_relocation_does_not_gate_checkpoints",
+      "kind": "fixture-setup-changed",
+      "issue": 1250,
+      "reason": "The exact test runs in a fresh child with its marker set and --test-threads=1. The parent requires a successful exit and exactly one passing, non-ignored test, preserving the original assertions and process-local resource bounds."
+    },
+    {
+      "test": "rust:crates/opc-session-store::lib=lib::sqlite::consensus::tests::native::basis::rollover::background::native_rollover_ceiling_backpressure_never_refuses_or_poisons",
+      "kind": "fixture-setup-changed",
+      "issue": 1250,
+      "reason": "The exact test runs in a fresh child with its marker set and --test-threads=1. The parent requires a successful exit and exactly one passing, non-ignored test, preserving the original assertions and process-local resource bounds."
+    },
+    {
+      "test": "rust:crates/opc-session-store::lib=lib::sqlite::consensus::tests::native::basis::rollover::background::native_rollover_real_journal_stall_without_file_guard_still_fences",
+      "kind": "fixture-setup-changed",
+      "issue": 1250,
+      "reason": "The exact test runs in a fresh child with its marker set and --test-threads=1. The parent requires a successful exit and exactly one passing, non-ignored test, preserving the original assertions and process-local resource bounds."
+    },
+    {
+      "test": "rust:crates/opc-session-store::lib=lib::sqlite::consensus::tests::native::basis::rollover::background::native_rollover_pending_capacity_selects_a_complete_base_without_delta",
+      "kind": "fixture-setup-changed",
+      "issue": 1250,
+      "reason": "The exact test runs in a fresh child with its marker set and --test-threads=1. The parent requires a successful exit and exactly one passing, non-ignored test, preserving the original assertions and process-local resource bounds."
+    },
+    {
+      "test": "rust:crates/opc-session-store::lib=lib::sqlite::consensus::tests::native::basis::rollover::background::native_rollover_live_capacity_retirement_resumes_without_relabeling",
+      "kind": "fixture-setup-changed",
+      "issue": 1250,
+      "reason": "The exact test runs in a fresh child with its marker set and --test-threads=1. The parent requires a successful exit and exactly one passing, non-ignored test, preserving the original assertions and process-local resource bounds."
+    },
+    {
+      "test": "rust:crates/opc-session-store::lib=lib::sqlite::consensus::tests::native::basis::rollover::background::native_rollover_pending_capacity_reopens_at_each_new_boundary",
+      "kind": "fixture-setup-changed",
+      "issue": 1250,
+      "reason": "The exact test runs in a fresh child with its marker set and --test-threads=1. The parent requires a successful exit and exactly one passing, non-ignored test, preserving the original assertions and process-local resource bounds."
+    },
+    {
+      "test": "rust:crates/opc-session-store::lib=lib::sqlite::consensus::tests::native::basis::rollover::background::native_rollover_multiple_full_journals_drain_and_keep_the_owned_preparation",
+      "kind": "fixture-setup-changed",
+      "issue": 1250,
+      "reason": "The exact test runs in a fresh child with its marker set and --test-threads=1. The parent requires a successful exit and exactly one passing, non-ignored test, preserving the original assertions and process-local resource bounds."
+    },
+    {
+      "test": "rust:crates/opc-session-store::lib=lib::sqlite::consensus::tests::native::basis::rollover::background::native_rollover_pinned_base_and_suffix_readers_survive_the_switch",
+      "kind": "fixture-setup-changed",
+      "issue": 1250,
+      "reason": "The exact test runs in a fresh child with its marker set and --test-threads=1. The parent requires a successful exit and exactly one passing, non-ignored test, preserving the original assertions and process-local resource bounds."
+    },
+    {
+      "test": "rust:crates/opc-session-store::lib=lib::sqlite::consensus::tests::native::basis::rollover::background::native_rollover_switch_replays_exact_suffix",
+      "kind": "fixture-setup-changed",
+      "issue": 1250,
+      "reason": "The exact test runs in a fresh child with its marker set and --test-threads=1. The parent requires a successful exit and exactly one passing, non-ignored test, preserving the original assertions and process-local resource bounds."
+    },
+    {
+      "test": "rust:crates/opc-session-store::lib=lib::sqlite::consensus::tests::native::basis::rollover::concurrency::native_rollover_child_filter_rejects_a_successful_empty_selection",
+      "kind": "fixture-setup-changed",
+      "issue": 1250,
+      "reason": "The enclosing fixture runs one exact passing child with its marker set and --test-threads=1. Its negative control intentionally selects zero tests and asserts that the child result is rejected."
+    },
+    {
+      "test": "rust:crates/opc-session-store::lib=lib::sqlite::consensus::tests::native::basis::rollover::concurrency::native_rollover_durable_groups_complete_with_caught_up_compactor_and_active_checkpoint",
+      "kind": "fixture-setup-changed",
+      "issue": 1250,
+      "reason": "The exact test runs in a fresh child with its marker set and --test-threads=1. The parent requires a successful exit and exactly one passing, non-ignored test, preserving the original assertions and process-local resource bounds."
+    },
+    {
+      "test": "rust:crates/opc-session-store::lib=lib::sqlite::consensus::tests::native::basis::rollover::concurrency::native_rollover_relocation_worker_panic_notifies_and_fails_closed",
+      "kind": "fixture-setup-changed",
+      "issue": 1250,
+      "reason": "The exact test runs in a fresh child with its marker set and --test-threads=1. The parent requires a successful exit and exactly one passing, non-ignored test, preserving the original assertions and process-local resource bounds."
+    },
+    {
+      "test": "rust:crates/opc-session-store::lib=lib::sqlite::consensus::tests::native::basis::rollover::concurrency::native_rollover_async_capacity_error_clears_guard_and_install_fails_fast",
+      "kind": "fixture-setup-changed",
+      "issue": 1250,
+      "reason": "The exact test runs in a fresh child with its marker set and --test-threads=1. The parent requires a successful exit and exactly one passing, non-ignored test, preserving the original assertions and process-local resource bounds."
+    },
+    {
+      "test": "rust:crates/opc-session-store::lib=lib::sqlite::consensus::tests::native::basis::rollover::install_claim::native_rollover_ceiling_checkpoint_yields_install_until_relocation_drains",
+      "kind": "fixture-setup-changed",
+      "issue": 1250,
+      "reason": "The exact test runs in a fresh child with its marker set and --test-threads=1. The parent requires a successful exit and exactly one passing, non-ignored test, preserving the original assertions and process-local resource bounds."
+    },
+    {
+      "test": "rust:crates/opc-session-store::lib=lib::sqlite::consensus::tests::native::basis::rollover::install_claim::native_rollover_withdrawn_install_claim_preserves_queued_relocation",
+      "kind": "fixture-setup-changed",
+      "issue": 1250,
+      "reason": "The exact test runs in a fresh child with its marker set and --test-threads=1. The parent requires a successful exit and exactly one passing, non-ignored test, preserving the original assertions and process-local resource bounds."
+    },
+    {
+      "test": "rust:crates/opc-session-store::lib=lib::sqlite::consensus::tests::native::basis::rollover::install_claim::native_rollover_unarmed_install_claim_does_not_interrupt_guarded_waiters",
+      "kind": "fixture-setup-changed",
+      "issue": 1250,
+      "reason": "The exact test runs in a fresh child with its marker set and --test-threads=1. The parent requires a successful exit and exactly one passing, non-ignored test, preserving the original assertions and process-local resource bounds."
+    },
+    {
+      "test": "rust:crates/opc-session-store::lib=lib::sqlite::consensus::tests::native::basis::rollover::native_generation_rollover_keeps_durable_checkpoints_bounded",
+      "kind": "fixture-setup-changed",
+      "issue": 1250,
+      "reason": "The exact test runs in a fresh child with its marker set and --test-threads=1. The parent requires a successful exit and exactly one passing, non-ignored test, preserving the original assertions and process-local resource bounds."
+    },
+    {
+      "test": "rust:crates/opc-session-store::lib=lib::sqlite::consensus::tests::native::basis::rollover::native_generation_rollover_keeps_async_checkpoints_bounded",
+      "kind": "fixture-setup-changed",
+      "issue": 1250,
+      "reason": "The exact test runs in a fresh child with its marker set and --test-threads=1. The parent requires a successful exit and exactly one passing, non-ignored test, preserving the original assertions and process-local resource bounds."
+    },
+    {
+      "test": "rust:crates/opc-session-store::lib=lib::sqlite::consensus::tests::native::basis::rollover::native_generation_rollover_keeps_a_pinned_receipt_reader_live",
+      "kind": "fixture-setup-changed",
+      "issue": 1250,
+      "reason": "The exact test runs in a fresh child with its marker set and --test-threads=1. The parent requires a successful exit and exactly one passing, non-ignored test, preserving the original assertions and process-local resource bounds."
+    },
+    {
+      "test": "rust:crates/opc-session-store::lib=lib::sqlite::consensus::tests::native::basis::rollover::native_generation_rollover_preserves_changes_after_the_captured_cut",
+      "kind": "fixture-setup-changed",
+      "issue": 1250,
+      "reason": "The exact test runs in a fresh child with its marker set and --test-threads=1. The parent requires a successful exit and exactly one passing, non-ignored test, preserving the original assertions and process-local resource bounds."
+    },
+    {
+      "test": "rust:crates/opc-session-store::lib=lib::sqlite::consensus::tests::native::basis::rollover::native_generation_rollover_reopens_at_every_publication_boundary",
+      "kind": "fixture-setup-changed",
+      "issue": 1250,
+      "reason": "The exact test runs in a fresh child with its marker set and --test-threads=1. The parent requires a successful exit and exactly one passing, non-ignored test, preserving the original assertions and process-local resource bounds."
+    },
+    {
+      "test": "rust:crates/opc-session-store::lib=lib::sqlite::consensus::tests::native::basis::rollover::native_generation_rollover_serializes_the_complete_capture_once",
+      "kind": "fixture-setup-changed",
+      "issue": 1250,
+      "reason": "The exact test runs in a fresh child with its marker set and --test-threads=1. The parent requires a successful exit and exactly one passing, non-ignored test, preserving the original assertions and process-local resource bounds."
+    },
+    {
+      "test": "rust:crates/opc-session-store::lib=lib::sqlite::consensus::tests::native::recovery_snapshot::retained_recovery_snapshot_preserves_physical_rows_through_install_and_cold_reopen",
+      "kind": "fixture-setup-changed",
+      "issue": 1250,
+      "reason": "The exact test runs in a fresh child with its marker set and --test-threads=1. The parent requires a successful exit and exactly one passing, non-ignored test, preserving the original assertions and process-local resource bounds."
+    },
+    {
+      "test": "rust:crates/opc-session-store::lib=lib::sqlite::consensus::tests::native::retained_snapshot::canonical_native_notification_history_round_trips_through_cold_native_catalog",
+      "kind": "fixture-setup-changed",
+      "issue": 1250,
+      "reason": "The exact test runs in a fresh child with its marker set and --test-threads=1. The parent requires a successful exit and exactly one passing, non-ignored test, preserving the original assertions and process-local resource bounds."
+    },
+    {
+      "test": "rust:crates/opc-session-store::lib=lib::sqlite::consensus::tests::native::retained_snapshot::retained_snapshot_key_fence_floor_keeps_a_live_older_lease",
+      "kind": "fixture-setup-changed",
+      "issue": 1250,
+      "reason": "The exact test runs in a fresh child with its marker set and --test-threads=1. The parent requires a successful exit and exactly one passing, non-ignored test, preserving the original assertions and process-local resource bounds."
+    },
+    {
+      "test": "rust:crates/opc-session-store::lib=lib::sqlite::consensus::tests::native::root_lock::native_root_lock_duplicate_does_not_outlive_durable_opening",
+      "kind": "fixture-setup-changed",
+      "issue": 1250,
+      "reason": "The exact test runs in a fresh child with its marker set and --test-threads=1. The parent requires a successful exit and exactly one passing, non-ignored test, preserving the original assertions and process-local resource bounds."
+    },
+    {
+      "test": "rust:crates/opc-session-store::lib=lib::sqlite::consensus::tests::native::root_lock::native_root_lock_duplicate_does_not_outlive_async_opening",
+      "kind": "fixture-setup-changed",
+      "issue": 1250,
+      "reason": "The exact test runs in a fresh child with its marker set and --test-threads=1. The parent requires a successful exit and exactly one passing, non-ignored test, preserving the original assertions and process-local resource bounds."
+    },
+    {
+      "test": "rust:crates/opc-session-store::lib=lib::sqlite::consensus::tests::native::root_lock::native_root_lock_duplicate_does_not_outlive_failed_durable_validation",
+      "kind": "fixture-setup-changed",
+      "issue": 1250,
+      "reason": "The exact test runs in a fresh child with its marker set and --test-threads=1. The parent requires a successful exit and exactly one passing, non-ignored test, preserving the original assertions and process-local resource bounds."
+    },
+    {
+      "test": "rust:crates/opc-session-store::lib=lib::sqlite::consensus::tests::native::root_lock::native_root_lock_duplicate_does_not_outlive_failed_async_validation",
+      "kind": "fixture-setup-changed",
+      "issue": 1250,
+      "reason": "The exact test runs in a fresh child with its marker set and --test-threads=1. The parent requires a successful exit and exactly one passing, non-ignored test, preserving the original assertions and process-local resource bounds."
+    },
+    {
+      "test": "rust:crates/opc-session-store::lib=lib::sqlite::consensus::tests::native::root_lock::native_root_lock_duplicate_does_not_outlive_durable_writer",
+      "kind": "fixture-setup-changed",
+      "issue": 1250,
+      "reason": "The exact test runs in a fresh child with its marker set and --test-threads=1. The parent requires a successful exit and exactly one passing, non-ignored test, preserving the original assertions and process-local resource bounds."
+    },
+    {
+      "test": "rust:crates/opc-session-store::lib=lib::sqlite::consensus::tests::native::root_lock::native_root_lock_duplicate_does_not_outlive_async_writer",
+      "kind": "fixture-setup-changed",
+      "issue": 1250,
+      "reason": "The exact test runs in a fresh child with its marker set and --test-threads=1. The parent requires a successful exit and exactly one passing, non-ignored test, preserving the original assertions and process-local resource bounds."
+    },
+    {
+      "test": "rust:crates/opc-session-store::lib=lib::sqlite::consensus::tests::native::round6_sqlite_batch_entries_declare_their_true_command_boundaries",
+      "kind": "fixture-setup-changed",
+      "issue": 1250,
+      "reason": "The exact test runs in a fresh child with its marker set and --test-threads=1. The parent requires a successful exit and exactly one passing, non-ignored test, preserving the original assertions and process-local resource bounds."
+    },
+    {
+      "test": "rust:crates/opc-session-store::lib=lib::test_process::tests::captured_readiness_timeout_reaps_child_and_releases_snapshot_gate",
+      "kind": "fixture-setup-changed",
+      "issue": 1250,
+      "reason": "The exact child test runs with its marker set and --test-threads=1. This negative control requires one selected test, the intentional process termination and the named timeout diagnostic; a zero-test success cannot satisfy it."
+    },
+    {
+      "test": "rust:crates/opc-gtpu-dataplane::lib=lib::ebpf::tests::reassembled_downlink::ordinary_inner_ipv6_context_refuses_the_in_tunnel_packet_too_big_opt_in",
+      "kind": "removed",
+      "reason": "The former blanket refusal was replaced by explicit policy checks. The replacement covers rejection of fragmented inner traffic and an inner MTU below the supported bound while exercising the accepted opt-in.",
+      "issue": 1007,
+      "replacements": [
+        "rust:crates/opc-gtpu-dataplane::lib=lib::ebpf::tests::ordinary_ipv6::ordinary_inner_ipv6_ptb_opt_in_is_committed_read_back_and_removed"
+      ]
+    },
+    {
+      "test": "rust:crates/opc-gtpu-dataplane::lib=lib::reassembly::tests::a_retracked_destination_restarts_from_a_fresh_seed",
+      "kind": "removed",
+      "reason": "The fresh-seed test now waits for the idle grace and full budget refill before re-creating the destination. The replacement retains the fresh-seed check under the corrected eviction policy.",
+      "issue": 1018,
+      "replacements": [
+        "rust:crates/opc-gtpu-dataplane::lib=lib::reassembly::tests::a_retracked_destination_after_the_grace_restarts_from_a_fresh_seed"
+      ]
+    },
+    {
+      "test": "rust:crates/opc-gtpu-dataplane::lib=lib::reassembly::tests::session_buckets_evict_the_least_recently_used_key",
+      "kind": "removed",
+      "reason": "Eviction now requires an idle grace and a full refill. The replacement tests exercise refusal inside the grace and least-recently-used eviction after both conditions hold.",
+      "issue": 1018,
+      "replacements": [
+        "rust:crates/opc-gtpu-dataplane::lib=lib::reassembly::tests::session_buckets_refuse_new_keys_inside_the_eviction_grace",
+        "rust:crates/opc-gtpu-dataplane::lib=lib::reassembly::tests::session_buckets_evict_the_least_recently_used_key_after_the_grace"
+      ]
+    },
+    {
+      "test": "rust:crates/opc-gtpu-dataplane::test=ebpf_gtpu_privileged::ebpf_gtpu_downlink_ipv6_packet_too_big_is_signalled_in_tunnel",
+      "kind": "disabled",
+      "reason": "The real eBPF packet test requires privileged kernel setup and is run with explicit ignored-test selection in the privileged workflow; unprivileged tests cover the policy and packet construction.",
+      "issue": 1007
+    },
+    {
+      "test": "rust:crates/opc-gtpu-dataplane::test=linux_gtpu_privileged::unknown_tunnel_reaches_the_retained_socket_and_one_error_indication_leaves_it",
+      "kind": "disabled",
+      "reason": "The retained-socket proof requires kernel GTP, network administration privileges and an isolated namespace. The privileged workflow explicitly runs the ignored harness; ordinary tests cover tuple, budget, classification and registration boundaries.",
+      "issue": 1084
+    },
+    {
+      "test": "rust:crates/opc-gtpu-dataplane::lib=lib::ebpf::tests::active_initializing_marker_is_not_cleanup_recovery",
+      "kind": "assertions-decreased",
+      "reason": "Peer TEIDs now use the zero-permitting PeerTeid constructor rather than the nonzero Teid fixture helper, removing a peer-only unwrap from the static count. Local TEIDs retain nonzero validation, and the test retains its dataplane assertions.",
+      "issue": 1346
+    },
+    {
+      "test": "rust:crates/opc-gtpu-dataplane::lib=lib::ebpf::tests::affine_proof_ignores_later_matching_traffic_but_late_malformed_source_revokes_it",
+      "kind": "assertions-decreased",
+      "reason": "Peer TEIDs now use the zero-permitting PeerTeid constructor rather than the nonzero Teid fixture helper, removing a peer-only unwrap from the static count. Local TEIDs retain nonzero validation, and the test retains its dataplane assertions.",
+      "issue": 1346
+    },
+    {
+      "test": "rust:crates/opc-gtpu-dataplane::lib=lib::ebpf::tests::canceled_poll_retains_the_affine_proof_and_authority_lease_for_retry",
+      "kind": "assertions-decreased",
+      "reason": "Peer TEIDs now use the zero-permitting PeerTeid constructor rather than the nonzero Teid fixture helper, removing a peer-only unwrap from the static count. Local TEIDs retain nonzero validation, and the test retains its dataplane assertions.",
+      "issue": 1346
+    },
+    {
+      "test": "rust:crates/opc-gtpu-dataplane::lib=lib::ebpf::tests::canceled_rebind_finishes_the_exact_replacement_after_old_leases_drain",
+      "kind": "assertions-decreased",
+      "reason": "Peer TEIDs now use the zero-permitting PeerTeid constructor rather than the nonzero Teid fixture helper, removing a peer-only unwrap from the static count. Local TEIDs retain nonzero validation, and the test retains its dataplane assertions.",
+      "issue": 1346
+    },
+    {
+      "test": "rust:crates/opc-gtpu-dataplane::lib=lib::ebpf::tests::closing_one_attempt_preserves_the_current_authority_for_a_fresh_attempt",
+      "kind": "assertions-decreased",
+      "reason": "Peer TEIDs now use the zero-permitting PeerTeid constructor rather than the nonzero Teid fixture helper, removing a peer-only unwrap from the static count. Local TEIDs retain nonzero validation, and the test retains its dataplane assertions.",
+      "issue": 1346
+    },
+    {
+      "test": "rust:crates/opc-gtpu-dataplane::lib=lib::ebpf::tests::delayed_superseded_public_request_cannot_satisfy_current_attempt",
+      "kind": "assertions-decreased",
+      "reason": "Peer TEIDs now use the zero-permitting PeerTeid constructor rather than the nonzero Teid fixture helper, removing a peer-only unwrap from the static count. Local TEIDs retain nonzero validation, and the test retains its dataplane assertions.",
+      "issue": 1346
+    },
+    {
+      "test": "rust:crates/opc-gtpu-dataplane::lib=lib::ebpf::tests::dropping_an_abandoned_session_revokes_registration_and_capacity",
+      "kind": "assertions-decreased",
+      "reason": "Peer TEIDs now use the zero-permitting PeerTeid constructor rather than the nonzero Teid fixture helper, removing a peer-only unwrap from the static count. Local TEIDs retain nonzero validation, and the test retains its dataplane assertions.",
+      "issue": 1346
+    },
+    {
+      "test": "rust:crates/opc-gtpu-dataplane::lib=lib::ebpf::tests::duplicate_kernel_monotonic_sequence_cannot_fabricate_continuity",
+      "kind": "assertions-decreased",
+      "reason": "Peer TEIDs now use the zero-permitting PeerTeid constructor rather than the nonzero Teid fixture helper, removing a peer-only unwrap from the static count. Local TEIDs retain nonzero validation, and the test retains its dataplane assertions.",
+      "issue": 1346
+    },
+    {
+      "test": "rust:crates/opc-gtpu-dataplane::lib=lib::ebpf::tests::exact_group_removal_revokes_attempt_and_retires_canonical_authority_store",
+      "kind": "assertions-decreased",
+      "reason": "Peer TEIDs now use the zero-permitting PeerTeid constructor rather than the nonzero Teid fixture helper, removing a peer-only unwrap from the static count. Local TEIDs retain nonzero validation, and the test retains its dataplane assertions.",
+      "issue": 1346
+    },
+    {
+      "test": "rust:crates/opc-gtpu-dataplane::lib=lib::ebpf::tests::exact_removal_winning_a_rebind_race_leaves_no_usable_authority_or_old_proof",
+      "kind": "assertions-decreased",
+      "reason": "Peer TEIDs now use the zero-permitting PeerTeid constructor rather than the nonzero Teid fixture helper, removing a peer-only unwrap from the static count. Local TEIDs retain nonzero validation, and the test retains its dataplane assertions.",
+      "issue": 1346
+    },
+    {
+      "test": "rust:crates/opc-gtpu-dataplane::lib=lib::ebpf::tests::expired_fragment_entries_allow_all_three_selector_namespace_empty_proofs",
+      "kind": "assertions-decreased",
+      "reason": "Peer TEIDs now use the zero-permitting PeerTeid constructor rather than the nonzero Teid fixture helper, removing a peer-only unwrap from the static count. Local TEIDs retain nonzero validation, and the test retains its dataplane assertions.",
+      "issue": 1346
+    },
+    {
+      "test": "rust:crates/opc-gtpu-dataplane::lib=lib::ebpf::tests::fake_grouped_effect_readback_and_removal_expiry_after_lock_are_side_effect_free",
+      "kind": "assertions-decreased",
+      "reason": "Peer TEIDs now use the zero-permitting PeerTeid constructor rather than the nonzero Teid fixture helper, removing a peer-only unwrap from the static count. Local TEIDs retain nonzero validation, and the test retains its dataplane assertions.",
+      "issue": 1346
+    },
+    {
+      "test": "rust:crates/opc-gtpu-dataplane::lib=lib::ebpf::tests::fake_installing_no_effect_expiry_after_lock_has_no_observation_or_receipt",
+      "kind": "assertions-decreased",
+      "reason": "Peer TEIDs now use the zero-permitting PeerTeid constructor rather than the nonzero Teid fixture helper, removing a peer-only unwrap from the static count. Local TEIDs retain nonzero validation, and the test retains its dataplane assertions.",
+      "issue": 1346
+    },
+    {
+      "test": "rust:crates/opc-gtpu-dataplane::lib=lib::ebpf::tests::fake_pmtu_publication_uses_the_selector_graph_lock_and_preserves_foreign_tc_state",
+      "kind": "assertions-decreased",
+      "reason": "Peer TEIDs now use the zero-permitting PeerTeid constructor rather than the nonzero Teid fixture helper, removing a peer-only unwrap from the static count. Local TEIDs retain nonzero validation, and the test retains its dataplane assertions.",
+      "issue": 1346
+    },
+    {
+      "test": "rust:crates/opc-gtpu-dataplane::lib=lib::ebpf::tests::fake_retiring_no_effect_expiry_after_lock_has_no_observation_or_receipt",
+      "kind": "assertions-decreased",
+      "reason": "Peer TEIDs now use the zero-permitting PeerTeid constructor rather than the nonzero Teid fixture helper, removing a peer-only unwrap from the static count. Local TEIDs retain nonzero validation, and the test retains its dataplane assertions.",
+      "issue": 1346
+    },
+    {
+      "test": "rust:crates/opc-gtpu-dataplane::lib=lib::ebpf::tests::fake_reuse_quiescence_expiry_after_lock_stops_before_retired_observation",
+      "kind": "assertions-decreased",
+      "reason": "Peer TEIDs now use the zero-permitting PeerTeid constructor rather than the nonzero Teid fixture helper, removing a peer-only unwrap from the static count. Local TEIDs retain nonzero validation, and the test retains its dataplane assertions.",
+      "issue": 1346
+    },
+    {
+      "test": "rust:crates/opc-gtpu-dataplane::lib=lib::ebpf::tests::fake_selector_effect_graph_fence_rejects_each_structural_replacement",
+      "kind": "assertions-decreased",
+      "reason": "Peer TEIDs now use the zero-permitting PeerTeid constructor rather than the nonzero Teid fixture helper, removing a peer-only unwrap from the static count. Local TEIDs retain nonzero validation, and the test retains its dataplane assertions.",
+      "issue": 1346
+    },
+    {
+      "test": "rust:crates/opc-gtpu-dataplane::lib=lib::ebpf::tests::fake_selector_effect_guard_is_affine_and_never_mints_a_binding",
+      "kind": "assertions-decreased",
+      "reason": "Peer TEIDs now use the zero-permitting PeerTeid constructor rather than the nonzero Teid fixture helper, removing a peer-only unwrap from the static count. Local TEIDs retain nonzero validation, and the test retains its dataplane assertions.",
+      "issue": 1346
+    },
+    {
+      "test": "rust:crates/opc-gtpu-dataplane::lib=lib::ebpf::tests::fake_selector_provision_currentness_expiry_after_lock_has_no_effect_or_receipt",
+      "kind": "assertions-decreased",
+      "reason": "Peer TEIDs now use the zero-permitting PeerTeid constructor rather than the nonzero Teid fixture helper, removing a peer-only unwrap from the static count. Local TEIDs retain nonzero validation, and the test retains its dataplane assertions.",
+      "issue": 1346
+    },
+    {
+      "test": "rust:crates/opc-gtpu-dataplane::lib=lib::ebpf::tests::fake_selector_provisioning_refuses_legacy_forwarding_state",
+      "kind": "assertions-decreased",
+      "reason": "Peer TEIDs now use the zero-permitting PeerTeid constructor rather than the nonzero Teid fixture helper, removing a peer-only unwrap from the static count. Local TEIDs retain nonzero validation, and the test retains its dataplane assertions.",
+      "issue": 1346
+    },
+    {
+      "test": "rust:crates/opc-gtpu-dataplane::lib=lib::ebpf::tests::fake_selector_terminal_create_currentness_expiry_after_lock_has_no_mutation_or_receipt",
+      "kind": "assertions-decreased",
+      "reason": "Peer TEIDs now use the zero-permitting PeerTeid constructor rather than the nonzero Teid fixture helper, removing a peer-only unwrap from the static count. Local TEIDs retain nonzero validation, and the test retains its dataplane assertions.",
+      "issue": 1346
+    },
+    {
+      "test": "rust:crates/opc-gtpu-dataplane::lib=lib::ebpf::tests::fake_selector_terminal_inspect_currentness_expiry_after_lock_has_no_observation_or_receipt",
+      "kind": "assertions-decreased",
+      "reason": "Peer TEIDs now use the zero-permitting PeerTeid constructor rather than the nonzero Teid fixture helper, removing a peer-only unwrap from the static count. Local TEIDs retain nonzero validation, and the test retains its dataplane assertions.",
+      "issue": 1346
+    },
+    {
+      "test": "rust:crates/opc-gtpu-dataplane::lib=lib::ebpf::tests::fake_selector_terminal_readback_currentness_expiry_after_lock_has_no_observation_or_receipt",
+      "kind": "assertions-decreased",
+      "reason": "Peer TEIDs now use the zero-permitting PeerTeid constructor rather than the nonzero Teid fixture helper, removing a peer-only unwrap from the static count. Local TEIDs retain nonzero validation, and the test retains its dataplane assertions.",
+      "issue": 1346
+    },
+    {
+      "test": "rust:crates/opc-gtpu-dataplane::lib=lib::ebpf::tests::foreign_backend_close_fails_and_preserves_owner_cleanup_authority",
+      "kind": "assertions-decreased",
+      "reason": "Peer TEIDs now use the zero-permitting PeerTeid constructor rather than the nonzero Teid fixture helper, removing a peer-only unwrap from the static count. Local TEIDs retain nonzero validation, and the test retains its dataplane assertions.",
+      "issue": 1346
+    },
+    {
+      "test": "rust:crates/opc-gtpu-dataplane::lib=lib::ebpf::tests::foreign_backend_rebind_cannot_revoke_the_canonical_authority",
+      "kind": "assertions-decreased",
+      "reason": "Peer TEIDs now use the zero-permitting PeerTeid constructor rather than the nonzero Teid fixture helper, removing a peer-only unwrap from the static count. Local TEIDs retain nonzero validation, and the test retains its dataplane assertions.",
+      "issue": 1346
+    },
+    {
+      "test": "rust:crates/opc-gtpu-dataplane::lib=lib::ebpf::tests::fresh_active_grouped_attachment_mints_selector_marker_once",
+      "kind": "assertions-decreased",
+      "reason": "Peer TEIDs now use the zero-permitting PeerTeid constructor rather than the nonzero Teid fixture helper, removing a peer-only unwrap from the static count. Local TEIDs retain nonzero validation, and the test retains its dataplane assertions.",
+      "issue": 1346
+    },
+    {
+      "test": "rust:crates/opc-gtpu-dataplane::lib=lib::ebpf::tests::fresh_graph_publication_restart_cannot_authorize_an_old_redirect_nonce",
+      "kind": "assertions-decreased",
+      "reason": "Peer TEIDs now use the zero-permitting PeerTeid constructor rather than the nonzero Teid fixture helper, removing a peer-only unwrap from the static count. Local TEIDs retain nonzero validation, and the test retains its dataplane assertions.",
+      "issue": 1346
+    },
+    {
+      "test": "rust:crates/opc-gtpu-dataplane::lib=lib::ebpf::tests::grouped_attachment_loss_fails_closed_and_withdraws_capabilities",
+      "kind": "assertions-decreased",
+      "reason": "Peer TEIDs now use the zero-permitting PeerTeid constructor rather than the nonzero Teid fixture helper, removing a peer-only unwrap from the static count. Local TEIDs retain nonzero validation, and the test retains its dataplane assertions.",
+      "issue": 1346
+    },
+    {
+      "test": "rust:crates/opc-gtpu-dataplane::lib=lib::ebpf::tests::grouped_crossed_inner_outer_families_activate_simultaneously",
+      "kind": "assertions-decreased",
+      "reason": "Peer TEIDs now use the zero-permitting PeerTeid constructor rather than the nonzero Teid fixture helper, removing a peer-only unwrap from the static count. Local TEIDs retain nonzero validation, and the test retains its dataplane assertions.",
+      "issue": 1346
+    },
+    {
+      "test": "rust:crates/opc-gtpu-dataplane::lib=lib::ebpf::tests::grouped_dual_stack_same_group_republish_requires_mixed_provenance_authority",
+      "kind": "assertions-decreased",
+      "reason": "Peer TEIDs now use the zero-permitting PeerTeid constructor rather than the nonzero Teid fixture helper, removing a peer-only unwrap from the static count. Local TEIDs retain nonzero validation, and the test retains its dataplane assertions.",
+      "issue": 1346
+    },
+    {
+      "test": "rust:crates/opc-gtpu-dataplane::lib=lib::ebpf::tests::grouped_install_reconciles_ack_loss_by_exact_readback",
+      "kind": "assertions-decreased",
+      "reason": "Peer TEIDs now use the zero-permitting PeerTeid constructor rather than the nonzero Teid fixture helper, removing a peer-only unwrap from the static count. Local TEIDs retain nonzero validation, and the test retains its dataplane assertions.",
+      "issue": 1346
+    },
+    {
+      "test": "rust:crates/opc-gtpu-dataplane::lib=lib::ebpf::tests::grouped_install_recovers_every_durable_phase_after_process_crash",
+      "kind": "assertions-decreased",
+      "reason": "Peer TEIDs now use the zero-permitting PeerTeid constructor rather than the nonzero Teid fixture helper, removing a peer-only unwrap from the static count. Local TEIDs retain nonzero validation, and the test retains its dataplane assertions.",
+      "issue": 1346
+    },
+    {
+      "test": "rust:crates/opc-gtpu-dataplane::lib=lib::ebpf::tests::grouped_install_stamp_expiry_after_read_is_mutation_free",
+      "kind": "assertions-decreased",
+      "reason": "Peer TEIDs now use the zero-permitting PeerTeid constructor rather than the nonzero Teid fixture helper, removing a peer-only unwrap from the static count. Local TEIDs retain nonzero validation, and the test retains its dataplane assertions.",
+      "issue": 1346
+    },
+    {
+      "test": "rust:crates/opc-gtpu-dataplane::lib=lib::ebpf::tests::grouped_ipv6_only_attachment_reconciles_reads_and_removes_exactly",
+      "kind": "assertions-decreased",
+      "reason": "Peer TEIDs now use the zero-permitting PeerTeid constructor rather than the nonzero Teid fixture helper, removing a peer-only unwrap from the static count. Local TEIDs retain nonzero validation, and the test retains its dataplane assertions.",
+      "issue": 1346
+    },
+    {
+      "test": "rust:crates/opc-gtpu-dataplane::lib=lib::ebpf::tests::grouped_loader_debug_surfaces_redact_raw_map_identity",
+      "kind": "assertions-decreased",
+      "reason": "Peer TEIDs now use the zero-permitting PeerTeid constructor rather than the nonzero Teid fixture helper, removing a peer-only unwrap from the static count. Local TEIDs retain nonzero validation, and the test retains its dataplane assertions.",
+      "issue": 1346
+    },
+    {
+      "test": "rust:crates/opc-gtpu-dataplane::lib=lib::ebpf::tests::grouped_readback_rejects_corruption_and_semantic_aba",
+      "kind": "assertions-decreased",
+      "reason": "Peer TEIDs now use the zero-permitting PeerTeid constructor rather than the nonzero Teid fixture helper, removing a peer-only unwrap from the static count. Local TEIDs retain nonzero validation, and the test retains its dataplane assertions.",
+      "issue": 1346
+    },
+    {
+      "test": "rust:crates/opc-gtpu-dataplane::lib=lib::ebpf::tests::grouped_removal_reconciles_every_ack_loss_by_exact_readback",
+      "kind": "assertions-decreased",
+      "reason": "Peer TEIDs now use the zero-permitting PeerTeid constructor rather than the nonzero Teid fixture helper, removing a peer-only unwrap from the static count. Local TEIDs retain nonzero validation, and the test retains its dataplane assertions.",
+      "issue": 1346
+    },
+    {
+      "test": "rust:crates/opc-gtpu-dataplane::lib=lib::ebpf::tests::grouped_removal_recovers_every_durable_cut_and_fails_closed",
+      "kind": "assertions-decreased",
+      "reason": "Peer TEIDs now use the zero-permitting PeerTeid constructor rather than the nonzero Teid fixture helper, removing a peer-only unwrap from the static count. Local TEIDs retain nonzero validation, and the test retains its dataplane assertions.",
+      "issue": 1346
+    },
+    {
+      "test": "rust:crates/opc-gtpu-dataplane::lib=lib::ebpf::tests::grouped_removal_stamp_expiry_after_read_is_mutation_free",
+      "kind": "assertions-decreased",
+      "reason": "Peer TEIDs now use the zero-permitting PeerTeid constructor rather than the nonzero Teid fixture helper, removing a peer-only unwrap from the static count. Local TEIDs retain nonzero validation, and the test retains its dataplane assertions.",
+      "issue": 1346
+    },
+    {
+      "test": "rust:crates/opc-gtpu-dataplane::lib=lib::ebpf::tests::grouped_retirement_cancels_a_pending_production_dispatch",
+      "kind": "assertions-decreased",
+      "reason": "Peer TEIDs now use the zero-permitting PeerTeid constructor rather than the nonzero Teid fixture helper, removing a peer-only unwrap from the static count. Local TEIDs retain nonzero validation, and the test retains its dataplane assertions.",
+      "issue": 1346
+    },
+    {
+      "test": "rust:crates/opc-gtpu-dataplane::lib=lib::ebpf::tests::grouped_reuse_proof_cannot_launder_an_unproved_retired_selector",
+      "kind": "assertions-decreased",
+      "reason": "Peer TEIDs now use the zero-permitting PeerTeid constructor rather than the nonzero Teid fixture helper, removing a peer-only unwrap from the static count. Local TEIDs retain nonzero validation, and the test retains its dataplane assertions.",
+      "issue": 1346
+    },
+    {
+      "test": "rust:crates/opc-gtpu-dataplane::lib=lib::ebpf::tests::grouped_selector_collision_requires_exact_retirement_and_reuse_proof",
+      "kind": "assertions-decreased",
+      "reason": "Peer TEIDs now use the zero-permitting PeerTeid constructor rather than the nonzero Teid fixture helper, removing a peer-only unwrap from the static count. Local TEIDs retain nonzero validation, and the test retains its dataplane assertions.",
+      "issue": 1346
+    },
+    {
+      "test": "rust:crates/opc-gtpu-dataplane::lib=lib::ebpf::tests::grouped_transaction_collision_entropy_failure_and_generation_exhaustion_fail_closed",
+      "kind": "assertions-decreased",
+      "reason": "Peer TEIDs now use the zero-permitting PeerTeid constructor rather than the nonzero Teid fixture helper, removing a peer-only unwrap from the static count. Local TEIDs retain nonzero validation, and the test retains its dataplane assertions.",
+      "issue": 1346
+    },
+    {
+      "test": "rust:crates/opc-gtpu-dataplane::lib=lib::ebpf::tests::guarded_backend_read_rejects_a_control_path_replacement_before_receipt",
+      "kind": "assertions-decreased",
+      "reason": "Peer TEIDs now use the zero-permitting PeerTeid constructor rather than the nonzero Teid fixture helper, removing a peer-only unwrap from the static count. Local TEIDs retain nonzero validation, and the test retains its dataplane assertions.",
+      "issue": 1346
+    },
+    {
+      "test": "rust:crates/opc-gtpu-dataplane::lib=lib::ebpf::tests::historical_25_managed_attachment_refusal_does_not_revoke_traffic_attempts",
+      "kind": "assertions-decreased",
+      "reason": "Peer TEIDs now use the zero-permitting PeerTeid constructor rather than the nonzero Teid fixture helper, removing a peer-only unwrap from the static count. Local TEIDs retain nonzero validation, and the test retains its dataplane assertions.",
+      "issue": 1346
+    },
+    {
+      "test": "rust:crates/opc-gtpu-dataplane::lib=lib::ebpf::tests::inherited_rebind_default_revokes_a_registered_live_proof_authority",
+      "kind": "assertions-decreased",
+      "reason": "Peer TEIDs now use the zero-permitting PeerTeid constructor rather than the nonzero Teid fixture helper, removing a peer-only unwrap from the static count. Local TEIDs retain nonzero validation, and the test retains its dataplane assertions.",
+      "issue": 1346
+    },
+    {
+      "test": "rust:crates/opc-gtpu-dataplane::lib=lib::ebpf::tests::installing_admission_cannot_authorize_retirement_effect",
+      "kind": "assertions-decreased",
+      "reason": "Peer TEIDs now use the zero-permitting PeerTeid constructor rather than the nonzero Teid fixture helper, removing a peer-only unwrap from the static count. Local TEIDs retain nonzero validation, and the test retains its dataplane assertions.",
+      "issue": 1346
+    },
+    {
+      "test": "rust:crates/opc-gtpu-dataplane::lib=lib::ebpf::tests::n3_end_marker::end_marker_requires_available_successful_grace_and_exact_post_grace_retirement",
+      "kind": "assertions-decreased",
+      "reason": "Peer TEIDs now use the zero-permitting PeerTeid constructor rather than the nonzero Teid fixture helper, removing a peer-only unwrap from the static count. Local TEIDs retain nonzero validation, and the test retains its dataplane assertions.",
+      "issue": 1346
+    },
+    {
+      "test": "rust:crates/opc-gtpu-dataplane::lib=lib::ebpf::tests::n3_end_marker::end_marker_socket_is_not_bound_on_an_interface_that_does_not_receive_its_frames",
+      "kind": "assertions-decreased",
+      "reason": "Peer TEIDs now use the zero-permitting PeerTeid constructor rather than the nonzero Teid fixture helper, removing a peer-only unwrap from the static count. Local TEIDs retain nonzero validation, and the test retains its dataplane assertions.",
+      "issue": 1346
+    },
+    {
+      "test": "rust:crates/opc-gtpu-dataplane::lib=lib::ebpf::tests::n3_end_marker::mixed_end_marker_profiles_are_unsupported_before_grace_or_socket_effects",
+      "kind": "assertions-decreased",
+      "reason": "Peer TEIDs now use the zero-permitting PeerTeid constructor rather than the nonzero Teid fixture helper, removing a peer-only unwrap from the static count. Local TEIDs retain nonzero validation, and the test retains its dataplane assertions.",
+      "issue": 1346
+    },
+    {
+      "test": "rust:crates/opc-gtpu-dataplane::lib=lib::ebpf::tests::production_dispatch_requires_the_exact_current_backend_authority",
+      "kind": "assertions-decreased",
+      "reason": "Peer TEIDs now use the zero-permitting PeerTeid constructor rather than the nonzero Teid fixture helper, removing a peer-only unwrap from the static count. Local TEIDs retain nonzero validation, and the test retains its dataplane assertions.",
+      "issue": 1346
+    },
+    {
+      "test": "rust:crates/opc-gtpu-dataplane::lib=lib::ebpf::tests::proof_begin_worker_panics_exactly_clean_partial_kernel_authority",
+      "kind": "assertions-decreased",
+      "reason": "Peer TEIDs now use the zero-permitting PeerTeid constructor rather than the nonzero Teid fixture helper, removing a peer-only unwrap from the static count. Local TEIDs retain nonzero validation, and the test retains its dataplane assertions.",
+      "issue": 1346
+    },
+    {
+      "test": "rust:crates/opc-gtpu-dataplane::lib=lib::ebpf::tests::protected_grouped_refused_reattach_cleanup_preserves_serving_sibling",
+      "kind": "assertions-decreased",
+      "reason": "Peer TEIDs now use the zero-permitting PeerTeid constructor rather than the nonzero Teid fixture helper, removing a peer-only unwrap from the static count. Local TEIDs retain nonzero validation, and the test retains its dataplane assertions.",
+      "issue": 1346
+    },
+    {
+      "test": "rust:crates/opc-gtpu-dataplane::lib=lib::ebpf::tests::protected_grouped_returning_subscriber_reuses_paa_with_new_teid",
+      "kind": "assertions-decreased",
+      "reason": "Peer TEIDs now use the zero-permitting PeerTeid constructor rather than the nonzero Teid fixture helper, removing a peer-only unwrap from the static count. Local TEIDs retain nonzero validation, and the test retains its dataplane assertions.",
+      "issue": 1346
+    },
+    {
+      "test": "rust:crates/opc-gtpu-dataplane::lib=lib::ebpf::tests::queued_authority_replacement_cannot_deadlock_registration",
+      "kind": "assertions-decreased",
+      "reason": "Peer TEIDs now use the zero-permitting PeerTeid constructor rather than the nonzero Teid fixture helper, removing a peer-only unwrap from the static count. Local TEIDs retain nonzero validation, and the test retains its dataplane assertions.",
+      "issue": 1346
+    },
+    {
+      "test": "rust:crates/opc-gtpu-dataplane::lib=lib::ebpf::tests::raw_group_readback_refuses_a_selector_owned_namespace",
+      "kind": "assertions-decreased",
+      "reason": "Peer TEIDs now use the zero-permitting PeerTeid constructor rather than the nonzero Teid fixture helper, removing a peer-only unwrap from the static count. Local TEIDs retain nonzero validation, and the test retains its dataplane assertions.",
+      "issue": 1346
+    },
+    {
+      "test": "rust:crates/opc-gtpu-dataplane::lib=lib::ebpf::tests::raw_group_removal_refuses_a_selector_owned_namespace",
+      "kind": "assertions-decreased",
+      "reason": "Peer TEIDs now use the zero-permitting PeerTeid constructor rather than the nonzero Teid fixture helper, removing a peer-only unwrap from the static count. Local TEIDs retain nonzero validation, and the test retains its dataplane assertions.",
+      "issue": 1346
+    },
+    {
+      "test": "rust:crates/opc-gtpu-dataplane::lib=lib::ebpf::tests::reassembled_downlink::downlink_inner_mtu_requires_the_service_port_uplink_policy",
+      "kind": "assertions-decreased",
+      "reason": "Peer TEIDs now use the zero-permitting PeerTeid constructor rather than the nonzero Teid fixture helper, removing a peer-only unwrap from the static count. Local TEIDs retain nonzero validation, and the test retains its dataplane assertions.",
+      "issue": 1346
+    },
+    {
+      "test": "rust:crates/opc-gtpu-dataplane::lib=lib::ebpf::tests::reassembled_downlink::grouped_dual_family_generation_authorizes_both_inner_families",
+      "kind": "assertions-decreased",
+      "reason": "Peer TEIDs now use the zero-permitting PeerTeid constructor rather than the nonzero Teid fixture helper, removing a peer-only unwrap from the static count. Local TEIDs retain nonzero validation, and the test retains its dataplane assertions.",
+      "issue": 1346
+    },
+    {
+      "test": "rust:crates/opc-gtpu-dataplane::lib=lib::ebpf::tests::reassembled_downlink::grouped_inner_ipv4_header_checksum_is_validated",
+      "kind": "assertions-decreased",
+      "reason": "Peer TEIDs now use the zero-permitting PeerTeid constructor rather than the nonzero Teid fixture helper, removing a peer-only unwrap from the static count. Local TEIDs retain nonzero validation, and the test retains its dataplane assertions.",
+      "issue": 1346
+    },
+    {
+      "test": "rust:crates/opc-gtpu-dataplane::lib=lib::ebpf::tests::reassembled_downlink::grouped_stale_generation_and_unusable_datapath_fail_closed",
+      "kind": "assertions-decreased",
+      "reason": "Peer TEIDs now use the zero-permitting PeerTeid constructor rather than the nonzero Teid fixture helper, removing a peer-only unwrap from the static count. Local TEIDs retain nonzero validation, and the test retains its dataplane assertions.",
+      "issue": 1346
+    },
+    {
+      "test": "rust:crates/opc-gtpu-dataplane::lib=lib::ebpf::tests::reassembled_downlink::inner_fragment_budget_is_per_destination_with_non_repeating_identifications",
+      "kind": "assertions-decreased",
+      "reason": "The admission result is now a typed enum: matching Admitted(Some(...)) with an explicit panic replaces chained unwraps. Exact identifier uniqueness, per-destination isolation, rate refusal and the fixed capacity remain checked; the capacity path now refuses live entries and permits retirement only after the grace.",
+      "issue": 1018
+    },
+    {
+      "test": "rust:crates/opc-gtpu-dataplane::lib=lib::ebpf::tests::remote_selector_regression::cancelled_observer_retains_fence_until_exact_readback",
+      "kind": "assertions-decreased",
+      "reason": "Peer TEIDs now use the zero-permitting PeerTeid constructor rather than the nonzero Teid fixture helper, removing a peer-only unwrap from the static count. Local TEIDs retain nonzero validation, and the test retains its dataplane assertions.",
+      "issue": 1346
+    },
+    {
+      "test": "rust:crates/opc-gtpu-dataplane::lib=lib::ebpf::tests::remote_selector_regression::failed_readback_after_observer_timeout_cannot_publish_active",
+      "kind": "assertions-decreased",
+      "reason": "Peer TEIDs now use the zero-permitting PeerTeid constructor rather than the nonzero Teid fixture helper, removing a peer-only unwrap from the static count. Local TEIDs retain nonzero validation, and the test retains its dataplane assertions.",
+      "issue": 1346
+    },
+    {
+      "test": "rust:crates/opc-gtpu-dataplane::lib=lib::ebpf::tests::remote_selector_regression::lost_backend_mutation_acknowledgement_settles_only_by_exact_readback",
+      "kind": "assertions-decreased",
+      "reason": "Peer TEIDs now use the zero-permitting PeerTeid constructor rather than the nonzero Teid fixture helper, removing a peer-only unwrap from the static count. Local TEIDs retain nonzero validation, and the test retains its dataplane assertions.",
+      "issue": 1346
+    },
+    {
+      "test": "rust:crates/opc-gtpu-dataplane::lib=lib::ebpf::tests::remote_selector_regression::ordinary_remote_cas_lost_success_retains_owner_until_exact_readback",
+      "kind": "assertions-decreased",
+      "reason": "Peer TEIDs now use the zero-permitting PeerTeid constructor rather than the nonzero Teid fixture helper, removing a peer-only unwrap from the static count. Local TEIDs retain nonzero validation, and the test retains its dataplane assertions.",
+      "issue": 1346
+    },
+    {
+      "test": "rust:crates/opc-gtpu-dataplane::lib=lib::ebpf::tests::remote_selector_regression::ordinary_remote_cas_lost_success_unavailable_readback_denies_active",
+      "kind": "assertions-decreased",
+      "reason": "Peer TEIDs now use the zero-permitting PeerTeid constructor rather than the nonzero Teid fixture helper, removing a peer-only unwrap from the static count. Local TEIDs retain nonzero validation, and the test retains its dataplane assertions.",
+      "issue": 1346
+    },
+    {
+      "test": "rust:crates/opc-gtpu-dataplane::lib=lib::ebpf::tests::remote_selector_regression::singleton_public_protected_flow_keeps_original_request_deadline",
+      "kind": "assertions-decreased",
+      "reason": "Peer TEIDs now use the zero-permitting PeerTeid constructor rather than the nonzero Teid fixture helper, removing a peer-only unwrap from the static count. Local TEIDs retain nonzero validation, and the test retains its dataplane assertions.",
+      "issue": 1346
+    },
+    {
+      "test": "rust:crates/opc-gtpu-dataplane::lib=lib::ebpf::tests::remote_selector_regression::singleton_public_protected_flow_preserves_durable_state",
+      "kind": "assertions-decreased",
+      "reason": "Peer TEIDs now use the zero-permitting PeerTeid constructor rather than the nonzero Teid fixture helper, removing a peer-only unwrap from the static count. Local TEIDs retain nonzero validation, and the test retains its dataplane assertions.",
+      "issue": 1346
+    },
+    {
+      "test": "rust:crates/opc-gtpu-dataplane::lib=lib::ebpf::tests::reordered_or_duplicate_public_request_or_private_return_is_terminal",
+      "kind": "assertions-decreased",
+      "reason": "Peer TEIDs now use the zero-permitting PeerTeid constructor rather than the nonzero Teid fixture helper, removing a peer-only unwrap from the static count. Local TEIDs retain nonzero validation, and the test retains its dataplane assertions.",
+      "issue": 1346
+    },
+    {
+      "test": "rust:crates/opc-gtpu-dataplane::lib=lib::ebpf::tests::replay_after_proof_issuance_revokes_the_affine_proof",
+      "kind": "assertions-decreased",
+      "reason": "Peer TEIDs now use the zero-permitting PeerTeid constructor rather than the nonzero Teid fixture helper, removing a peer-only unwrap from the static count. Local TEIDs retain nonzero validation, and the test retains its dataplane assertions.",
+      "issue": 1346
+    },
+    {
+      "test": "rust:crates/opc-gtpu-dataplane::lib=lib::ebpf::tests::restart_adoption_clears_pinned_observations_and_revokes_old_proof",
+      "kind": "assertions-decreased",
+      "reason": "Peer TEIDs now use the zero-permitting PeerTeid constructor rather than the nonzero Teid fixture helper, removing a peer-only unwrap from the static count. Local TEIDs retain nonzero validation, and the test retains its dataplane assertions.",
+      "issue": 1346
+    },
+    {
+      "test": "rust:crates/opc-gtpu-dataplane::lib=lib::ebpf::tests::restart_rejects_old_rebind_authority_and_registers_only_exact_current_readback",
+      "kind": "assertions-decreased",
+      "reason": "Peer TEIDs now use the zero-permitting PeerTeid constructor rather than the nonzero Teid fixture helper, removing a peer-only unwrap from the static count. Local TEIDs retain nonzero validation, and the test retains its dataplane assertions.",
+      "issue": 1346
+    },
+    {
+      "test": "rust:crates/opc-gtpu-dataplane::lib=lib::ebpf::tests::retained_namespace_boundary::grouped_restart_detach_reopens_active_and_retired_history_without_touching_neighbor",
+      "kind": "assertions-decreased",
+      "reason": "Peer TEIDs now use the zero-permitting PeerTeid constructor rather than the nonzero Teid fixture helper, removing a peer-only unwrap from the static count. Local TEIDs retain nonzero validation, and the test retains its dataplane assertions.",
+      "issue": 1346
+    },
+    {
+      "test": "rust:crates/opc-gtpu-dataplane::lib=lib::ebpf::tests::retained_namespace_boundary::pristine_namespace_relocation_cancelled_precommit_resumes_only_exact_successor",
+      "kind": "assertions-decreased",
+      "reason": "Peer TEIDs now use the zero-permitting PeerTeid constructor rather than the nonzero Teid fixture helper, removing a peer-only unwrap from the static count. Local TEIDs retain nonzero validation, and the test retains its dataplane assertions.",
+      "issue": 1346
+    },
+    {
+      "test": "rust:crates/opc-gtpu-dataplane::lib=lib::ebpf::tests::retained_namespace_boundary::pristine_namespace_relocation_refuses_active_retired_unadmitted_and_terminal_history",
+      "kind": "assertions-decreased",
+      "reason": "Peer TEIDs now use the zero-permitting PeerTeid constructor rather than the nonzero Teid fixture helper, removing a peer-only unwrap from the static count. Local TEIDs retain nonzero validation, and the test retains its dataplane assertions.",
+      "issue": 1346
+    },
+    {
+      "test": "rust:crates/opc-gtpu-dataplane::lib=lib::ebpf::tests::retained_namespace_boundary::pristine_namespace_relocation_retains_ledger_and_excludes_original_owner",
+      "kind": "assertions-decreased",
+      "reason": "Peer TEIDs now use the zero-permitting PeerTeid constructor rather than the nonzero Teid fixture helper, removing a peer-only unwrap from the static count. Local TEIDs retain nonzero validation, and the test retains its dataplane assertions.",
+      "issue": 1346
+    },
+    {
+      "test": "rust:crates/opc-gtpu-dataplane::lib=lib::ebpf::tests::reverse_only_private_return_cannot_mint_proof_until_a_public_request_precedes_it",
+      "kind": "assertions-decreased",
+      "reason": "Peer TEIDs now use the zero-permitting PeerTeid constructor rather than the nonzero Teid fixture helper, removing a peer-only unwrap from the static count. Local TEIDs retain nonzero validation, and the test retains its dataplane assertions.",
+      "issue": 1346
+    },
+    {
+      "test": "rust:crates/opc-gtpu-dataplane::lib=lib::ebpf::tests::same_group_republish_refuses_every_update_ack_cut_before_effect",
+      "kind": "assertions-decreased",
+      "reason": "Peer TEIDs now use the zero-permitting PeerTeid constructor rather than the nonzero Teid fixture helper, removing a peer-only unwrap from the static count. Local TEIDs retain nonzero validation, and the test retains its dataplane assertions.",
+      "issue": 1346
+    },
+    {
+      "test": "rust:crates/opc-gtpu-dataplane::lib=lib::ebpf::tests::same_group_republish_refuses_every_update_crash_cut_before_effect",
+      "kind": "assertions-decreased",
+      "reason": "Peer TEIDs now use the zero-permitting PeerTeid constructor rather than the nonzero Teid fixture helper, removing a peer-only unwrap from the static count. Local TEIDs retain nonzero validation, and the test retains its dataplane assertions.",
+      "issue": 1346
+    },
+    {
+      "test": "rust:crates/opc-gtpu-dataplane::lib=lib::ebpf::tests::selector_binding_refuses_a_preexisting_terminal_stamp_before_any_reconcile_effect",
+      "kind": "assertions-decreased",
+      "reason": "Peer TEIDs now use the zero-permitting PeerTeid constructor rather than the nonzero Teid fixture helper, removing a peer-only unwrap from the static count. Local TEIDs retain nonzero validation, and the test retains its dataplane assertions.",
+      "issue": 1346
+    },
+    {
+      "test": "rust:crates/opc-gtpu-dataplane::lib=lib::ebpf::tests::selector_stamp_mismatches_are_mutation_free_before_install_or_removal_journal_recovery",
+      "kind": "assertions-decreased",
+      "reason": "Peer TEIDs now use the zero-permitting PeerTeid constructor rather than the nonzero Teid fixture helper, removing a peer-only unwrap from the static count. Local TEIDs retain nonzero validation, and the test retains its dataplane assertions.",
+      "issue": 1346
+    },
+    {
+      "test": "rust:crates/opc-gtpu-dataplane::lib=lib::ebpf::tests::source_loss_blocks_dispatch_before_transport_handoff",
+      "kind": "assertions-decreased",
+      "reason": "Peer TEIDs now use the zero-permitting PeerTeid constructor rather than the nonzero Teid fixture helper, removing a peer-only unwrap from the static count. Local TEIDs retain nonzero validation, and the test retains its dataplane assertions.",
+      "issue": 1346
+    },
+    {
+      "test": "rust:crates/opc-gtpu-dataplane::lib=lib::ebpf::tests::source_loss_during_route_resolution_is_caught_by_final_preflight",
+      "kind": "assertions-decreased",
+      "reason": "Peer TEIDs now use the zero-permitting PeerTeid constructor rather than the nonzero Teid fixture helper, removing a peer-only unwrap from the static count. Local TEIDs retain nonzero validation, and the test retains its dataplane assertions.",
+      "issue": 1346
+    },
+    {
+      "test": "rust:crates/opc-gtpu-dataplane::lib=lib::ebpf::tests::structurally_invalid_event_cannot_mint_traffic_proof",
+      "kind": "assertions-decreased",
+      "reason": "Peer TEIDs now use the zero-permitting PeerTeid constructor rather than the nonzero Teid fixture helper, removing a peer-only unwrap from the static count. Local TEIDs retain nonzero validation, and the test retains its dataplane assertions.",
+      "issue": 1346
+    },
+    {
+      "test": "rust:crates/opc-gtpu-dataplane::lib=lib::ebpf::tests::traffic_proof_begin_recovers_ambiguous_registration_publication",
+      "kind": "assertions-decreased",
+      "reason": "Peer TEIDs now use the zero-permitting PeerTeid constructor rather than the nonzero Teid fixture helper, removing a peer-only unwrap from the static count. Local TEIDs retain nonzero validation, and the test retains its dataplane assertions.",
+      "issue": 1346
+    },
+    {
+      "test": "rust:crates/opc-gtpu-dataplane::lib=lib::ebpf::tests::traffic_proof_begin_rejects_stale_or_invalid_authority_before_allocation",
+      "kind": "assertions-decreased",
+      "reason": "Peer TEIDs now use the zero-permitting PeerTeid constructor rather than the nonzero Teid fixture helper, removing a peer-only unwrap from the static count. Local TEIDs retain nonzero validation, and the test retains its dataplane assertions.",
+      "issue": 1346
+    },
+    {
+      "test": "rust:crates/opc-gtpu-dataplane::lib=lib::ebpf::tests::traffic_proof_expiring_during_worker_handoff_is_never_delivered",
+      "kind": "assertions-decreased",
+      "reason": "Peer TEIDs now use the zero-permitting PeerTeid constructor rather than the nonzero Teid fixture helper, removing a peer-only unwrap from the static count. Local TEIDs retain nonzero validation, and the test retains its dataplane assertions.",
+      "issue": 1346
+    },
+    {
+      "test": "rust:crates/opc-gtpu-dataplane::lib=lib::ebpf::tests::traffic_proof_expiry_and_live_hook_drift_are_terminal",
+      "kind": "assertions-decreased",
+      "reason": "Peer TEIDs now use the zero-permitting PeerTeid constructor rather than the nonzero Teid fixture helper, removing a peer-only unwrap from the static count. Local TEIDs retain nonzero validation, and the test retains its dataplane assertions.",
+      "issue": 1346
+    },
+    {
+      "test": "rust:crates/opc-gtpu-dataplane::lib=lib::ebpf::tests::traffic_proof_rebind_fails_closed_when_readback_is_adversarially_mutated",
+      "kind": "assertions-decreased",
+      "reason": "Peer TEIDs now use the zero-permitting PeerTeid constructor rather than the nonzero Teid fixture helper, removing a peer-only unwrap from the static count. Local TEIDs retain nonzero validation, and the test retains its dataplane assertions.",
+      "issue": 1346
+    },
+    {
+      "test": "rust:crates/opc-gtpu-dataplane::lib=lib::ebpf::tests::traffic_proof_rebind_revokes_old_artifacts_before_publishing_exact_new_readback",
+      "kind": "assertions-decreased",
+      "reason": "Peer TEIDs now use the zero-permitting PeerTeid constructor rather than the nonzero Teid fixture helper, removing a peer-only unwrap from the static count. Local TEIDs retain nonzero validation, and the test retains its dataplane assertions.",
+      "issue": 1346
+    },
+    {
+      "test": "rust:crates/opc-gtpu-dataplane::lib=lib::ebpf::tests::traffic_proof_session_keeps_cleanup_authority_after_backend_drop",
+      "kind": "assertions-decreased",
+      "reason": "Peer TEIDs now use the zero-permitting PeerTeid constructor rather than the nonzero Teid fixture helper, removing a peer-only unwrap from the static count. Local TEIDs retain nonzero validation, and the test retains its dataplane assertions.",
+      "issue": 1346
+    },
+    {
+      "test": "rust:crates/opc-gtpu-dataplane::lib=lib::ebpf::tests::traffic_proof_successor_collection_preserves_current_predecessor",
+      "kind": "assertions-decreased",
+      "reason": "Peer TEIDs now use the zero-permitting PeerTeid constructor rather than the nonzero Teid fixture helper, removing a peer-only unwrap from the static count. Local TEIDs retain nonzero validation, and the test retains its dataplane assertions.",
+      "issue": 1346
+    },
+    {
+      "test": "rust:crates/opc-gtpu-dataplane::lib=lib::ebpf::tests::traffic_proof_supersession_preserves_retryable_cleanup_authority",
+      "kind": "assertions-decreased",
+      "reason": "Peer TEIDs now use the zero-permitting PeerTeid constructor rather than the nonzero Teid fixture helper, removing a peer-only unwrap from the static count. Local TEIDs retain nonzero validation, and the test retains its dataplane assertions.",
+      "issue": 1346
+    },
+    {
+      "test": "rust:crates/opc-gtpu-dataplane::lib=lib::ebpf::tests::traffic_publication_id_exhaustion_and_corruption_fail_closed",
+      "kind": "assertions-decreased",
+      "reason": "Peer TEIDs now use the zero-permitting PeerTeid constructor rather than the nonzero Teid fixture helper, removing a peer-only unwrap from the static count. Local TEIDs retain nonzero validation, and the test retains its dataplane assertions.",
+      "issue": 1346
+    },
+    {
+      "test": "rust:crates/opc-gtpu-dataplane::lib=lib::ebpf::tests::traffic_publication_ids_fence_supersession_and_survive_source_reset",
+      "kind": "assertions-decreased",
+      "reason": "Peer TEIDs now use the zero-permitting PeerTeid constructor rather than the nonzero Teid fixture helper, removing a peer-only unwrap from the static count. Local TEIDs retain nonzero validation, and the test retains its dataplane assertions.",
+      "issue": 1346
+    },
+    {
+      "test": "rust:crates/opc-gtpu-dataplane::lib=lib::ebpf::tests::traffic_renewal_abandoned_pending_successor_has_bounded_drop_cleanup",
+      "kind": "assertions-decreased",
+      "reason": "Peer TEIDs now use the zero-permitting PeerTeid constructor rather than the nonzero Teid fixture helper, removing a peer-only unwrap from the static count. Local TEIDs retain nonzero validation, and the test retains its dataplane assertions.",
+      "issue": 1346
+    },
+    {
+      "test": "rust:crates/opc-gtpu-dataplane::lib=lib::ebpf::tests::traffic_renewal_cancellation_retains_exactly_one_pending_successor",
+      "kind": "assertions-decreased",
+      "reason": "Peer TEIDs now use the zero-permitting PeerTeid constructor rather than the nonzero Teid fixture helper, removing a peer-only unwrap from the static count. Local TEIDs retain nonzero validation, and the test retains its dataplane assertions.",
+      "issue": 1346
+    },
+    {
+      "test": "rust:crates/opc-gtpu-dataplane::lib=lib::ebpf::tests::traffic_renewal_does_not_extend_predecessor_expiry_or_expire_successor",
+      "kind": "assertions-decreased",
+      "reason": "Peer TEIDs now use the zero-permitting PeerTeid constructor rather than the nonzero Teid fixture helper, removing a peer-only unwrap from the static count. Local TEIDs retain nonzero validation, and the test retains its dataplane assertions.",
+      "issue": 1346
+    },
+    {
+      "test": "rust:crates/opc-gtpu-dataplane::lib=lib::ebpf::tests::traffic_renewal_exact_expiry_boundary_is_independent_for_each_proof",
+      "kind": "assertions-decreased",
+      "reason": "Peer TEIDs now use the zero-permitting PeerTeid constructor rather than the nonzero Teid fixture helper, removing a peer-only unwrap from the static count. Local TEIDs retain nonzero validation, and the test retains its dataplane assertions.",
+      "issue": 1346
+    },
+    {
+      "test": "rust:crates/opc-gtpu-dataplane::lib=lib::ebpf::tests::traffic_renewal_expiry_during_worker_handoff_refuses_delivery",
+      "kind": "assertions-decreased",
+      "reason": "Peer TEIDs now use the zero-permitting PeerTeid constructor rather than the nonzero Teid fixture helper, removing a peer-only unwrap from the static count. Local TEIDs retain nonzero validation, and the test retains its dataplane assertions.",
+      "issue": 1346
+    },
+    {
+      "test": "rust:crates/opc-gtpu-dataplane::lib=lib::ebpf::tests::traffic_renewal_late_predecessor_samples_cannot_prove_successor",
+      "kind": "assertions-decreased",
+      "reason": "Peer TEIDs now use the zero-permitting PeerTeid constructor rather than the nonzero Teid fixture helper, removing a peer-only unwrap from the static count. Local TEIDs retain nonzero validation, and the test retains its dataplane assertions.",
+      "issue": 1346
+    },
+    {
+      "test": "rust:crates/opc-gtpu-dataplane::lib=lib::ebpf::tests::traffic_renewal_ordinary_begin_retires_both_without_late_cleanup_damage",
+      "kind": "assertions-decreased",
+      "reason": "Peer TEIDs now use the zero-permitting PeerTeid constructor rather than the nonzero Teid fixture helper, removing a peer-only unwrap from the static count. Local TEIDs retain nonzero validation, and the test retains its dataplane assertions.",
+      "issue": 1346
+    },
+    {
+      "test": "rust:crates/opc-gtpu-dataplane::lib=lib::ebpf::tests::traffic_renewal_partial_publication_remains_bounded_and_recoverable",
+      "kind": "assertions-decreased",
+      "reason": "Peer TEIDs now use the zero-permitting PeerTeid constructor rather than the nonzero Teid fixture helper, removing a peer-only unwrap from the static count. Local TEIDs retain nonzero validation, and the test retains its dataplane assertions.",
+      "issue": 1346
+    },
+    {
+      "test": "rust:crates/opc-gtpu-dataplane::lib=lib::ebpf::tests::traffic_renewal_predecessor_close_cleans_undelivered_successor",
+      "kind": "assertions-decreased",
+      "reason": "Peer TEIDs now use the zero-permitting PeerTeid constructor rather than the nonzero Teid fixture helper, removing a peer-only unwrap from the static count. Local TEIDs retain nonzero validation, and the test retains its dataplane assertions.",
+      "issue": 1346
+    },
+    {
+      "test": "rust:crates/opc-gtpu-dataplane::lib=lib::ebpf::tests::traffic_renewal_source_and_authority_failures_revoke_both_proofs",
+      "kind": "assertions-decreased",
+      "reason": "Peer TEIDs now use the zero-permitting PeerTeid constructor rather than the nonzero Teid fixture helper, removing a peer-only unwrap from the static count. Local TEIDs retain nonzero validation, and the test retains its dataplane assertions.",
+      "issue": 1346
+    },
+    {
+      "test": "rust:crates/opc-gtpu-dataplane::lib=lib::ebpf::tests::traffic_renewal_spans_lifetimes_with_fresh_samples_and_bounded_state",
+      "kind": "assertions-decreased",
+      "reason": "Peer TEIDs now use the zero-permitting PeerTeid constructor rather than the nonzero Teid fixture helper, removing a peer-only unwrap from the static count. Local TEIDs retain nonzero validation, and the test retains its dataplane assertions.",
+      "issue": 1346
+    },
+    {
+      "test": "rust:crates/opc-gtpu-dataplane::lib=lib::ebpf::tests::traffic_renewal_unsupported_or_foreign_authority_preserves_registration",
+      "kind": "assertions-decreased",
+      "reason": "Peer TEIDs now use the zero-permitting PeerTeid constructor rather than the nonzero Teid fixture helper, removing a peer-only unwrap from the static count. Local TEIDs retain nonzero validation, and the test retains its dataplane assertions.",
+      "issue": 1346
+    },
+    {
+      "test": "rust:crates/opc-gtpu-dataplane::lib=lib::ebpf::tests::trusted_grouped_traffic_events_are_required_and_exactly_revocable",
+      "kind": "assertions-decreased",
+      "reason": "Peer TEIDs now use the zero-permitting PeerTeid constructor rather than the nonzero Teid fixture helper, removing a peer-only unwrap from the static count. Local TEIDs retain nonzero validation, and the test retains its dataplane assertions.",
+      "issue": 1346
+    },
+    {
+      "test": "rust:crates/opc-gtpu-dataplane::lib=lib::ebpf::tests::trusted_traffic_source_errors_are_terminal",
+      "kind": "assertions-decreased",
+      "reason": "Peer TEIDs now use the zero-permitting PeerTeid constructor rather than the nonzero Teid fixture helper, removing a peer-only unwrap from the static count. Local TEIDs retain nonzero validation, and the test retains its dataplane assertions.",
+      "issue": 1346
+    },
+    {
+      "test": "rust:crates/opc-gtpu-dataplane::lib=lib::selector_namespace::tests::bearer_ledger::resident_admission::durable_resident_admission_profile",
+      "kind": "assertions-decreased",
+      "reason": "Peer TEIDs now use the zero-permitting PeerTeid constructor rather than the nonzero Teid fixture helper, removing a peer-only unwrap from the static count. Local TEIDs retain nonzero validation, and the test retains its dataplane assertions.",
+      "issue": 1346
+    },
+    {
+      "test": "rust:crates/opc-gtpu-dataplane::lib=lib::selector_namespace::tests::bearer_ledger::retained_read_profile::durable_retained_selector_read_profile",
+      "kind": "assertions-decreased",
+      "reason": "Peer TEIDs now use the zero-permitting PeerTeid constructor rather than the nonzero Teid fixture helper, removing a peer-only unwrap from the static count. Local TEIDs retain nonzero validation, and the test retains its dataplane assertions.",
+      "issue": 1346
+    },
+    {
+      "test": "rust:crates/opc-gtpu-dataplane::test=ebpf_gtpu_privileged::ebpf_gtpu_backend_consumer_decapsulates_grouped_outer_fragmented_downlink",
+      "kind": "assertions-decreased",
+      "reason": "Peer TEIDs now use the zero-permitting PeerTeid constructor rather than the nonzero Teid fixture helper, removing a peer-only unwrap from the static count. Local TEIDs retain nonzero validation, and the test retains its dataplane assertions.",
+      "issue": 1346
+    },
+    {
+      "test": "rust:crates/opc-gtpu-dataplane::test=ebpf_gtpu_privileged::ebpf_gtpu_backend_consumer_decapsulates_outer_fragmented_downlink",
+      "kind": "assertions-decreased",
+      "reason": "Peer TEIDs now use the zero-permitting PeerTeid constructor rather than the nonzero Teid fixture helper, removing a peer-only unwrap from the static count. Local TEIDs retain nonzero validation, and the test retains its dataplane assertions.",
+      "issue": 1346
+    },
+    {
+      "test": "rust:crates/opc-gtpu-dataplane::test=ebpf_gtpu_privileged::ebpf_gtpu_backend_consumer_drains_shared_queue_under_pdp_churn",
+      "kind": "assertions-decreased",
+      "reason": "Peer TEIDs now use the zero-permitting PeerTeid constructor rather than the nonzero Teid fixture helper, removing a peer-only unwrap from the static count. Local TEIDs retain nonzero validation, and the test retains its dataplane assertions.",
+      "issue": 1346
+    },
+    {
+      "test": "rust:crates/opc-gtpu-dataplane::test=ebpf_gtpu_privileged::ebpf_gtpu_downlink_hand_offs_in_a_vlan_have_no_consumer",
+      "kind": "assertions-decreased",
+      "reason": "Peer TEIDs now use the zero-permitting PeerTeid constructor rather than the nonzero Teid fixture helper, removing a peer-only unwrap from the static count. Local TEIDs retain nonzero validation, and the test retains its dataplane assertions.",
+      "issue": 1346
+    },
+    {
+      "test": "rust:crates/opc-gtpu-dataplane::test=ebpf_gtpu_privileged::ebpf_gtpu_downlink_hand_offs_need_a_bound_consumer",
+      "kind": "assertions-decreased",
+      "reason": "Peer TEIDs now use the zero-permitting PeerTeid constructor rather than the nonzero Teid fixture helper, removing a peer-only unwrap from the static count. Local TEIDs retain nonzero validation, and the test retains its dataplane assertions. The IPv6 neighbour helper delegates to the common interface-aware helper, retaining the same command and readiness checks.",
+      "issue": 1346
+    },
+    {
+      "test": "rust:crates/opc-gtpu-dataplane::test=ebpf_gtpu_privileged::ebpf_gtpu_downlink_hand_offs_respect_the_vrf_of_the_attachment",
+      "kind": "assertions-decreased",
+      "reason": "Peer TEIDs now use the zero-permitting PeerTeid constructor rather than the nonzero Teid fixture helper, removing a peer-only unwrap from the static count. Local TEIDs retain nonzero validation, and the test retains its dataplane assertions.",
+      "issue": 1346
+    },
+    {
+      "test": "rust:crates/opc-gtpu-dataplane::test=ebpf_gtpu_privileged::ebpf_gtpu_downlink_inner_fragments_take_the_backend_queue",
+      "kind": "assertions-decreased",
+      "reason": "Peer TEIDs now use the zero-permitting PeerTeid constructor rather than the nonzero Teid fixture helper, removing a peer-only unwrap from the static count. Local TEIDs retain nonzero validation, and the test retains its dataplane assertions.",
+      "issue": 1346
+    },
+    {
+      "test": "rust:crates/opc-gtpu-dataplane::test=ebpf_gtpu_privileged::ebpf_gtpu_downlink_packet_too_big_is_signalled_in_tunnel",
+      "kind": "assertions-decreased",
+      "reason": "Peer TEIDs now use the zero-permitting PeerTeid constructor rather than the nonzero Teid fixture helper, removing a peer-only unwrap from the static count. Local TEIDs retain nonzero validation, and the test retains its dataplane assertions.",
+      "issue": 1346
+    },
+    {
+      "test": "rust:crates/opc-gtpu-dataplane::test=ebpf_gtpu_privileged::ebpf_gtpu_grouped_dual_stack_live_contract",
+      "kind": "assertions-decreased",
+      "reason": "The grouped fixture now permits zero peer TEIDs while retaining the nonzero local TEID check. The IPv6 reassembly proof receives through the retained control socket rather than binding a second host socket; it checks exact bytes, peer and local address, and uses the bounded receive helper.",
+      "issue": 1084
+    },
+    {
+      "test": "rust:crates/opc-gtpu-dataplane::test=ebpf_gtpu_privileged::ebpf_gtpu_n3_fixed_flow_live_contract",
+      "kind": "assertions-decreased",
+      "reason": "Peer TEIDs now use the zero-permitting PeerTeid constructor rather than the nonzero Teid fixture helper, removing a peer-only unwrap from the static count. Local TEIDs retain nonzero validation, and the test retains its dataplane assertions. The IPv6 neighbour helper delegates to the common interface-aware helper, retaining the same command and readiness checks.",
+      "issue": 1346
+    },
+    {
+      "test": "rust:crates/opc-gtpu-dataplane::test=ebpf_gtpu_privileged::ebpf_gtpu_shared_paa_tft_classifier_ipv4_live_contract",
+      "kind": "assertions-decreased",
+      "reason": "Peer TEIDs now use the zero-permitting PeerTeid constructor rather than the nonzero Teid fixture helper, removing a peer-only unwrap from the static count. Local TEIDs retain nonzero validation, and the test retains its dataplane assertions.",
+      "issue": 1346
+    },
+    {
+      "test": "rust:crates/opc-gtpu-dataplane::test=ebpf_gtpu_privileged::ebpf_gtpu_tft_classifier_removal_fence_forwards_default_uplink",
+      "kind": "assertions-decreased",
+      "reason": "Peer TEIDs now use the zero-permitting PeerTeid constructor rather than the nonzero Teid fixture helper, removing a peer-only unwrap from the static count. Local TEIDs retain nonzero validation, and the test retains its dataplane assertions.",
+      "issue": 1346
+    },
+    {
+      "test": "rust:crates/opc-gtpu-dataplane::test=ebpf_gtpu_privileged::ebpf_gtpu_tft_classifier_removal_keeps_default_uplink_continuous",
+      "kind": "assertions-decreased",
+      "reason": "Peer TEIDs now use the zero-permitting PeerTeid constructor rather than the nonzero Teid fixture helper, removing a peer-only unwrap from the static count. Local TEIDs retain nonzero validation, and the test retains its dataplane assertions.",
+      "issue": 1346
+    },
+    {
+      "test": "rust:crates/opc-gtpu-dataplane::test=ebpf_gtpu_privileged::ebpf_gtpu_tft_fragment_affinity_port_only_control",
+      "kind": "assertions-decreased",
+      "reason": "Peer TEIDs now use the zero-permitting PeerTeid constructor rather than the nonzero Teid fixture helper, removing a peer-only unwrap from the static count. Local TEIDs retain nonzero validation, and the test retains its dataplane assertions.",
+      "issue": 1346
+    },
+    {
+      "test": "rust:crates/opc-gtpu-dataplane::test=ebpf_gtpu_privileged::ebpf_gtpu_tft_fragmented_esp_pair",
+      "kind": "assertions-decreased",
+      "reason": "Peer TEIDs now use the zero-permitting PeerTeid constructor rather than the nonzero Teid fixture helper, removing a peer-only unwrap from the static count. Local TEIDs retain nonzero validation, and the test retains its dataplane assertions.",
+      "issue": 1346
+    },
+    {
+      "test": "rust:crates/opc-gtpu-ebpf-common::lib=lib::tft_classifier::tests::drop_counter_indices_are_distinct_and_within_the_fixed_map",
+      "kind": "assertions-decreased",
+      "reason": "Pairwise inequalities are now checked by a nested loop over all indices, including the new capacity counter, instead of three separate pair assertions. The loop still compares every distinct pair and the bounds check remains.",
+      "issue": 1087
+    },
+    {
+      "test": "rust:crates/opc-session-store::lib=lib::sqlite::consensus::tests::native::basis::reclaim_memory::native_reclaim_memory_committed_wait_fails_closed_with_bounded_reason",
+      "kind": "disabled",
+      "issue": 1250,
+      "reason": "The parent re-executes this exact test in a fresh child with the completion marker set and --test-threads=1, enforces a 300-second process deadline, and requires exactly one passing, non-ignored test. The fixture body runs in the child rather than being skipped."
+    },
+    {
+      "test": "rust:crates/opc-session-store::lib=lib::sqlite::consensus::tests::native::basis::reclaim_memory::native_reclaim_memory_committed_wait_releases_permit_and_proceeds",
+      "kind": "disabled",
+      "issue": 1250,
+      "reason": "The parent re-executes this exact test in a fresh child with the completion marker set and --test-threads=1, enforces a 300-second process deadline, and requires exactly one passing, non-ignored test. The fixture body runs in the child rather than being skipped."
+    },
+    {
+      "test": "rust:crates/opc-session-store::lib=lib::sqlite::consensus::tests::native::basis::reclaim_memory::native_reclaim_memory_eight_mib_journal_requests_checkpoint",
+      "kind": "disabled",
+      "issue": 1250,
+      "reason": "The parent re-executes this exact test in a fresh child with the completion marker set and --test-threads=1, enforces a 300-second process deadline, and requires exactly one passing, non-ignored test. The fixture body runs in the child rather than being skipped."
+    },
+    {
+      "test": "rust:crates/opc-session-store::lib=lib::sqlite::consensus::tests::native::basis::reclaim_memory::native_reclaim_memory_full_generation_replays_maximum_retirement_suffix",
+      "kind": "disabled",
+      "issue": 1250,
+      "reason": "The parent re-executes this exact test in a fresh child with the completion marker set and --test-threads=1, enforces a 1,200-second process deadline, and requires exactly one passing, non-ignored test. The fixture body runs in the child rather than being skipped."
+    },
+    {
+      "test": "rust:crates/opc-session-store::lib=lib::sqlite::consensus::tests::native::basis::reclaim_memory::native_reclaim_memory_planner_error_uses_real_evaluation",
+      "kind": "disabled",
+      "issue": 1250,
+      "reason": "The parent re-executes this exact test in a fresh child with the completion marker set and --test-threads=1, enforces a 300-second process deadline, and requires exactly one passing, non-ignored test. The fixture body runs in the child rather than being skipped."
+    },
+    {
+      "test": "rust:crates/opc-session-store::lib=lib::sqlite::consensus::tests::native::basis::reclaim_memory::native_reclaim_memory_preflight_avoids_unhelpful_checkpoints",
+      "kind": "disabled",
+      "issue": 1250,
+      "reason": "The parent re-executes this exact test in a fresh child with the completion marker set and --test-threads=1, enforces a 300-second process deadline, and requires exactly one passing, non-ignored test. The fixture body runs in the child rather than being skipped."
+    },
+    {
+      "test": "rust:crates/opc-session-store::lib=lib::sqlite::consensus::tests::native::basis::reclaim_memory::native_reclaim_memory_preflight_does_not_request_during_install",
+      "kind": "disabled",
+      "issue": 1250,
+      "reason": "The parent re-executes this exact test in a fresh child with the completion marker set and --test-threads=1, enforces a 300-second process deadline, and requires exactly one passing, non-ignored test. The fixture body runs in the child rather than being skipped."
+    },
+    {
+      "test": "rust:crates/opc-session-store::lib=lib::sqlite::consensus::tests::native::basis::reclaim_memory::native_reclaim_memory_progress_extends_committed_wait",
+      "kind": "disabled",
+      "issue": 1250,
+      "reason": "The parent re-executes this exact test in a fresh child with the completion marker set and --test-threads=1, enforces a 300-second process deadline, and requires exactly one passing, non-ignored test. The fixture body runs in the child rather than being skipped."
+    },
+    {
+      "test": "rust:crates/opc-session-store::lib=lib::sqlite::consensus::tests::native::basis::reclaim_memory::native_reclaim_memory_requested_checkpoint_relieves_wait",
+      "kind": "disabled",
+      "issue": 1250,
+      "reason": "The parent re-executes this exact test in a fresh child with the completion marker set and --test-threads=1, enforces a 300-second process deadline, and requires exactly one passing, non-ignored test. The fixture body runs in the child rather than being skipped."
+    },
+    {
+      "test": "rust:crates/opc-session-store::lib=lib::sqlite::consensus::tests::native::basis::reclaim_memory::native_reclaim_memory_shortfall_relief_extends_committed_wait",
+      "kind": "disabled",
+      "issue": 1250,
+      "reason": "The parent re-executes this exact test in a fresh child with the completion marker set and --test-threads=1, enforces a 300-second process deadline, and requires exactly one passing, non-ignored test. The fixture body runs in the child rather than being skipped."
+    },
+    {
+      "test": "rust:crates/opc-session-store::lib=lib::sqlite::consensus::tests::native::basis::reclaim_memory::native_reclaim_memory_shutdown_interrupts_committed_wait",
+      "kind": "disabled",
+      "issue": 1250,
+      "reason": "The parent re-executes this exact test in a fresh child with the completion marker set and --test-threads=1, enforces a 300-second process deadline, and requires exactly one passing, non-ignored test. The fixture body runs in the child rather than being skipped."
+    },
+    {
+      "test": "rust:crates/opc-session-store::lib=lib::sqlite::consensus::tests::native::basis::reclaim_memory::native_reclaim_memory_shutdown_interrupts_wait_with_writer_already_blocked",
+      "kind": "disabled",
+      "issue": 1250,
+      "reason": "The parent re-executes this exact test in a fresh child with the completion marker set and --test-threads=1, enforces a 300-second process deadline, and requires exactly one passing, non-ignored test. The fixture body runs in the child rather than being skipped."
+    },
+    {
+      "test": "rust:crates/opc-session-store::lib=lib::sqlite::consensus::tests::native::basis::reclaim_memory::native_reclaim_memory_successful_reservation_resets_wait_after_retry",
+      "kind": "disabled",
+      "issue": 1250,
+      "reason": "The parent re-executes this exact test in a fresh child with the completion marker set and --test-threads=1, enforces a 300-second process deadline, and requires exactly one passing, non-ignored test. The fixture body runs in the child rather than being skipped."
+    },
+    {
+      "test": "rust:crates/opc-session-store::lib=lib::sqlite::consensus::tests::native::basis::reclaim_memory::native_reclaim_memory_unhelpful_checkpoints_do_not_extend_wait",
+      "kind": "disabled",
+      "issue": 1250,
+      "reason": "The parent re-executes this exact test in a fresh child with the completion marker set and --test-threads=1, enforces a 300-second process deadline, and requires exactly one passing, non-ignored test. The fixture body runs in the child rather than being skipped."
+    },
+    {
+      "test": "rust:crates/opc-session-store::lib=lib::sqlite::consensus::tests::native::basis::reclaim_memory::native_reclaim_memory_void_checkpoint_and_replay_preserve_first_binding",
+      "kind": "disabled",
+      "issue": 1250,
+      "reason": "The parent re-executes this exact test in a fresh child with the completion marker set and --test-threads=1, enforces a 300-second process deadline, and requires exactly one passing, non-ignored test. The fixture body runs in the child rather than being skipped."
+    },
+    {
+      "test": "rust:crates/opc-session-store::lib=lib::sqlite::consensus::tests::native::basis::reclaim_memory::native_reclaim_memory_void_pressure_fence_replays_and_retires_epoch",
+      "kind": "disabled",
+      "issue": 1250,
+      "reason": "The parent re-executes this exact test in a fresh child with the completion marker set and --test-threads=1, enforces a 300-second process deadline, and requires exactly one passing, non-ignored test. The fixture body runs in the child rather than being skipped."
     }
   ]
 }

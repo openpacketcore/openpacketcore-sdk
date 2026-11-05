@@ -99,7 +99,18 @@ credentials against the platform's rotating trust bundle; authenticated policy
 and bundle updates apply live. A cluster's consensus identity includes a fresh
 installation nonce; reusing a human-readable cluster name after a fresh install
 must not recreate an old authority domain. This is installation identity, not
-an application activation certificate.
+an application activation certificate. The immutable session manifest takes the
+persisted non-zero installation nonce as an explicit constructor input and
+derives its consensus cluster identity with
+`ConsensusClusterId::for_installation(name, nonce)`; the manifest configuration
+digest (v2), fixed durable quorum identity and consensus node ordinals all
+inherit that qualification, and scope identities (RFC 022) use the same
+installation-qualified cluster ID. The voter-slot table's `cluster_instance`
+and table/manifest identity derive from this manifest consensus identity, so a
+fresh installation nonce is a fresh voter-slot authority domain: retained
+voter-slot tables from an earlier installation are rejected with a typed
+identity/replacement error rather than adopted, and this is a fresh-install
+boundary with no migration.
 
 The manifest digest supplied to `try_from_fixed_voter_slots` must commit to
 those placement rules as well as the slot ordinals and genesis keys. The
@@ -734,6 +745,15 @@ locally owned attempt before starting the loss probe, so simultaneous retries
 also report in-flight state before any Prepare is appended. Caller cancellation
 or deadline expiry does not release that reservation before definitive
 completion and durable reconciliation.
+
+Request reads of the table, provisional intent, snapshot evidence and applied
+frontier wait for strict publication within the original caller deadline. A
+quorum proof, liveness probe or dispatch does not restart that budget. Control
+replies read their state and supporting evidence at one durable cut. Only a
+transient publication interval is waited out; terminal writer failure and other
+storage errors remain refusals. A deadline after dispatch is an unknown outcome,
+not proof that the accepted work was cancelled. Opening and background
+reconciliation retain their explicit lifecycle policy without new read budgets.
 
 Use `W = 2 * DURABLE_OPENRAFT_PROFILE.election_timeout_max_millis` as the
 recent-traffic window, measured independently on each survivor's monotonic

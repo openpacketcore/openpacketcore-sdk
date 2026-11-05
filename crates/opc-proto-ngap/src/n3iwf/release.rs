@@ -306,7 +306,7 @@ impl ReleaseMessage {
                     .protocol_ies
                     .0
                     .iter()
-                    .map(|ie| (ie.id.0, ie.criticality as u8, ie.value.as_bytes())),
+                    .map(|ie| (ie.id, ie.criticality as u8, ie.value.as_bytes())),
                 ctx,
             ),
             PduKind::Successful {
@@ -318,7 +318,7 @@ impl ReleaseMessage {
                     .protocol_ies
                     .0
                     .iter()
-                    .map(|ie| (ie.id.0, ie.criticality as u8, ie.value.as_bytes())),
+                    .map(|ie| (ie.id, ie.criticality as u8, ie.value.as_bytes())),
                 ctx,
             ),
             _ => Err(invalid("release message outcome")),

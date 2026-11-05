@@ -76,6 +76,9 @@ fn native_roster_install_base_preserves_complete_cold_predecessor_and_exact_raft
         let mut entries = setup(&signed);
         entries.extend([admission(&signed), terminal(&signed, 4)]);
         sql_apply(&oracle, &signed, &entries);
+        // Retained application rows still refer to commands below the later
+        // Raft purge frontier. Keep that independent committed source history.
+        let command_source = copy(&oracle.conn.blocking_lock());
         let mut storage = NativeStorage::empty_with_roster_root(
             signed.identity,
             fixed_members(),
@@ -185,10 +188,10 @@ fn native_roster_install_base_preserves_complete_cold_predecessor_and_exact_raft
             storage
                 .export_cold_install_base_checked(&output, &|| Ok(()))
                 .unwrap();
-            assert_eq!(
-                database(&output),
-                database(&oracle.conn.blocking_lock()),
-                "every predecessor schema object, column and canonical body"
+            assert_sql_database_parity_with_source(
+                &output,
+                &oracle.conn.blocking_lock(),
+                &command_source,
             );
             assert_eq!(
                 read_applied_sync(&output, signed.identity).unwrap(),
@@ -257,7 +260,7 @@ fn native_roster_install_base_unapplied_copy_rejects_wrong_root_and_rolls_back_c
     storage
         .export_cold_install_base_checked(&empty, &|| Ok(()))
         .unwrap();
-    assert_eq!(database(&empty), database(&template));
+    assert_sql_database_parity(&empty, &template);
     let entries = [formation()];
     let vote = Vote::new_committed(2, node_id());
     for operation in [
@@ -280,7 +283,7 @@ fn native_roster_install_base_unapplied_copy_rejects_wrong_root_and_rolls_back_c
     storage
         .export_cold_install_base_checked(&output, &|| Ok(()))
         .unwrap();
-    assert_eq!(database(&output), database(&oracle.conn.blocking_lock()));
+    assert_sql_database_parity(&output, &oracle.conn.blocking_lock());
     assert_eq!(read_applied_sync(&output, signed.identity).unwrap(), None);
     assert_eq!(count(&output, "consensus_log"), 1);
     super::import::roundtrip(&output, [0xD9; 32], &signed);

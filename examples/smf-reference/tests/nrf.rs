@@ -16,9 +16,9 @@ fn sample_profile(id: &str) -> NfProfile {
         nf_status: NfStatus::Registered,
         ipv4_addresses: vec!["127.0.0.1".into()],
         fqdn: None,
-        plmn_list: vec![PlmnId::new("001", "01").expect("valid plmn")],
-        s_nssais: vec![Snssai::with_sd(1, "010203").expect("valid snssai")],
-        nf_services: vec!["nsmf-pdusession".into()],
+        plmn_list: vec![PlmnId::new("001", "01").expect("valid plmn").into()],
+        s_nssais: vec![Snssai::with_sd(1, "010203").expect("valid snssai").into()],
+        nf_services: vec![opc_sbi::testkit::nrf::test_service("nsmf-pdusession")],
         priority: 10,
         capacity: 100,
     }

@@ -32,6 +32,10 @@ impl SoftwareEphemeralDhKey {
             SoftwareEphemeralDhSecret::Modp768(value) => append!(value.to_be_bytes()),
             SoftwareEphemeralDhSecret::Modp1024(value) => append!(value.to_be_bytes()),
             SoftwareEphemeralDhSecret::Modp2048(value) => append!(value.to_be_bytes()),
+            SoftwareEphemeralDhSecret::Modp3072(value) => append!(value.to_be_bytes()),
+            SoftwareEphemeralDhSecret::Modp4096(value) => append!(value.to_be_bytes()),
+            SoftwareEphemeralDhSecret::Modp6144(value) => append!(value.to_be_bytes()),
+            SoftwareEphemeralDhSecret::Modp8192(value) => append!(value.to_be_bytes()),
             SoftwareEphemeralDhSecret::Ecp256(value) => append!(value.to_bytes()),
             SoftwareEphemeralDhSecret::Ecp384(value) => append!(value.to_bytes()),
             SoftwareEphemeralDhSecret::Ecp521(value) => append!(value.to_bytes()),
@@ -52,7 +56,7 @@ impl SoftwareEphemeralDhKey {
         }
         let scalar = &checkpoint[3..];
         macro_rules! modp {
-            ($uint:ty, $prime:ident, $pow:ident, $variant:ident) => {{
+            ($uint:ty, $prime:ident, $pow:ident, $variant:ident, $storage:expr) => {{
                 let private = Zeroizing::new(<$uint>::from_be_slice(scalar));
                 if *private < <$uint>::from_u64(2)
                     || *private > $prime().wrapping_sub(&<$uint>::from_u64(2))
@@ -64,7 +68,7 @@ impl SoftwareEphemeralDhKey {
                 Self {
                     group,
                     public_value: public.to_be_bytes().as_ref().to_vec(),
-                    secret: SoftwareEphemeralDhSecret::$variant(private),
+                    secret: SoftwareEphemeralDhSecret::$variant(($storage)(private)),
                 }
             }};
         }
@@ -84,9 +88,39 @@ impl SoftwareEphemeralDhKey {
             }};
         }
         let restored = match group {
-            Ikev2DhGroup::Modp768 => modp!(U768, modp768_prime, modp768_pow, Modp768),
-            Ikev2DhGroup::Modp1024 => modp!(U1024, modp1024_prime, modp1024_pow, Modp1024),
-            Ikev2DhGroup::Modp2048 => modp!(U2048, modp2048_prime, modp2048_pow, Modp2048),
+            Ikev2DhGroup::Modp768 => modp!(
+                U768,
+                modp768_prime,
+                modp768_pow,
+                Modp768,
+                core::convert::identity
+            ),
+            Ikev2DhGroup::Modp1024 => modp!(
+                U1024,
+                modp1024_prime,
+                modp1024_pow,
+                Modp1024,
+                core::convert::identity
+            ),
+            Ikev2DhGroup::Modp2048 => modp!(
+                U2048,
+                modp2048_prime,
+                modp2048_pow,
+                Modp2048,
+                core::convert::identity
+            ),
+            Ikev2DhGroup::Modp3072 => {
+                modp!(U3072, modp3072_prime, modp3072_pow, Modp3072, Box::new)
+            }
+            Ikev2DhGroup::Modp4096 => {
+                modp!(U4096, modp4096_prime, modp4096_pow, Modp4096, Box::new)
+            }
+            Ikev2DhGroup::Modp6144 => {
+                modp!(U6144, modp6144_prime, modp6144_pow, Modp6144, Box::new)
+            }
+            Ikev2DhGroup::Modp8192 => {
+                modp!(U8192, modp8192_prime, modp8192_pow, Modp8192, Box::new)
+            }
             Ikev2DhGroup::Ecp256 => ecp!(P256SecretKey, Ecp256),
             Ikev2DhGroup::Ecp384 => ecp!(P384SecretKey, Ecp384),
             Ikev2DhGroup::Ecp521 => ecp!(P521SecretKey, Ecp521),

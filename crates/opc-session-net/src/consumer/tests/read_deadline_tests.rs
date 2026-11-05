@@ -244,6 +244,7 @@ async fn split_deadline_v2_transport_rejects_non_receipt_operations_before_admis
                     deadline: boundary,
                     read_response_deadline: Some(now + Duration::from_secs(3)),
                     status_write_accepted: None,
+                    execution_progress: None,
                 },
             )
             .await;

@@ -737,6 +737,16 @@ pub(super) fn reclaim_covered(
     control: &IoControl,
     async_recovery_format: bool,
 ) -> io::Result<()> {
+    reclaim_covered_owned(disk, anchor, control, async_recovery_format, None)
+}
+
+pub(super) fn reclaim_covered_owned(
+    disk: &Disk,
+    anchor: &Anchor,
+    control: &IoControl,
+    async_recovery_format: bool,
+    owned_next: Option<&Path>,
+) -> io::Result<()> {
     // Do not report completion if cleanup fails. A subsequent owner verifies
     // and stabilizes the selected basis before retrying these exact removals.
     let mut retired = Vec::new();
@@ -763,12 +773,13 @@ pub(super) fn reclaim_covered(
             && super::async_authority::is_authority_file(name, entry.metadata()?.len())?
         {
             // Authority reservations outlive session generation reclamation.
-        } else if !namespace.visit(
+        } else if !namespace.visit_owned(
             name,
             entry.path(),
             entry.metadata()?.len(),
             Some(anchor),
             &mut retired,
+            owned_next,
         )? {
             return Err(invalid_data("private WAL basis has an unexplained file"));
         }
@@ -793,6 +804,18 @@ impl Namespace {
         len: u64,
         anchor: Option<&Anchor>,
         retired: &mut Vec<PathBuf>,
+    ) -> io::Result<bool> {
+        self.visit_owned(name, path, len, anchor, retired, None)
+    }
+
+    fn visit_owned(
+        &mut self,
+        name: &str,
+        path: PathBuf,
+        len: u64,
+        anchor: Option<&Anchor>,
+        retired: &mut Vec<PathBuf>,
+        owned_next: Option<&Path>,
     ) -> io::Result<bool> {
         let epoch = anchor.map_or(0, Anchor::file_epoch);
         if name == "ROOT" {
@@ -858,7 +881,13 @@ impl Namespace {
                 "private WAL basis namespace exceeds file bounds",
             ));
         }
-        if number != epoch {
+        let keep = preparing.is_some() && owned_next == Some(path.as_path());
+        if owned_next == Some(path.as_path()) && !keep {
+            return Err(invalid_data(
+                "native compactor exemption is not its preparing file",
+            ));
+        }
+        if number != epoch && !keep {
             retired.push(path);
         }
         Ok(true)

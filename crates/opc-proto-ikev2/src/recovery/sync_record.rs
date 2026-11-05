@@ -151,9 +151,11 @@ impl<P: RecoveryProfile> Ikev2SyncResponderRecord<P> {
                 return Err(Error::InvalidRecord);
             }
             if let Some(cached) = cached {
-                let (_, header) =
-                    decode_header(&cached.request, opc_protocol::DecodeContext::default())
-                        .map_err(|_| Error::InvalidRecord)?;
+                let (_, header) = decode_header(
+                    &cached.request.packets()[0],
+                    opc_protocol::DecodeContext::default(),
+                )
+                .map_err(|_| Error::InvalidRecord)?;
                 if ordinary.is_none_or(|highest| header.message_id > highest) {
                     return Err(Error::InvalidRecord);
                 }

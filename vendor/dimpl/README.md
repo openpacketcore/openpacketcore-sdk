@@ -10,15 +10,14 @@ verification and SRTP key export yourself.
 ## Goals
 - **DTLS 1.2 and 1.3**: Implements the DTLS handshake and record layer used by WebRTC.
 - **Safety**: `forbid(unsafe_code)` throughout the crate.
-- **Minimal Rust‑only deps**: Uses small, well‑maintained Rust crypto crates.
+- **Cryptography**: Uses maintained providers; DTLS 1.2 RSA uses ring.
 - **Low overhead**: Tight control over allocations and buffers; Sans‑IO integration.
 
 ### Non‑goals
 - **DTLS 1.0**
 - **Async** (the crate is Sans‑IO and event‑loop agnostic)
 - **no_std** (at least not without allocation)
-- **RSA**
-- **DHE**
+- **Static RSA key transport**
 
 ### Version selection
 
@@ -35,6 +34,9 @@ Four constructors control which DTLS version is used:
   - `ECDHE_ECDSA_AES256_GCM_SHA384`
   - `ECDHE_ECDSA_AES128_GCM_SHA256`
   - `ECDHE_ECDSA_CHACHA20_POLY1305_SHA256`
+  - `ECDHE_RSA_AES128_GCM_SHA256`
+  - `ECDHE_RSA_AES256_GCM_SHA384`
+  - `DHE_RSA_AES128_GCM_SHA256`
 - **PSK cipher suites (TLS 1.2 over DTLS)**
   - `PSK_AES128_CCM_8`
 - **Cipher suites (TLS 1.3 over DTLS)**
@@ -43,11 +45,25 @@ Four constructors control which DTLS version is used:
   - `TLS_CHACHA20_POLY1305_SHA256`
 - **AEAD**: AES‑GCM 128/256, ChaCha20‑Poly1305, and AES‑128‑CCM‑8
   (no CBC/EtM modes).
-- **Key exchange**: ECDHE (P‑256/P‑384), X25519
-- **Signatures**: ECDSA P‑256/SHA‑256, ECDSA P‑384/SHA‑384
+- **Key exchange**: ECDHE (P‑256/P‑384), X25519; DTLS 1.2 also
+  supports RFC 7919 FFDHE4096 (preferred) and FFDHE2048 using constant-time
+  `crypto-bigint` arithmetic with fresh 512-bit exponents. Custom DH groups
+  and DTLS 1.3 FFDHE are unsupported.
+- **Signatures**: ECDSA P‑256/P‑384; DTLS 1.2 also supports RSA-PSS-RSAE and
+  RSA-PKCS#1 with SHA‑256/384. Both built-in providers use ring for RSA,
+  with 2048–4096-bit signing keys and 2048–8192-bit verification keys.
+  DTLS 1.3 RSA authentication and PSS-constrained keys remain unsupported.
 - **DTLS‑SRTP**: Exports keying material for `SRTP_AEAD_AES_256_GCM`,
   `SRTP_AEAD_AES_128_GCM`, and `SRTP_AES128_CM_SHA1_80` ([RFC 5764], [RFC 7714]).
 - **Extended Master Secret** ([RFC 7627]) is negotiated and enforced (DTLS 1.2).
+
+DTLS 1.2 RSA client authentication follows the configured cipher-suite
+families; an ECDSA-only server policy requests and verifies only ECDSA.
+Client suite offers describe server authentication independently of the
+client certificate key. SDK users must opt into legacy DHE explicitly:
+RFC 10015 and TS 33.210 Release 19 prohibit FFDHE in (D)TLS 1.2. The
+engine's invalid-DH failures do not yet emit the fatal alerts required by
+RFC 7919. See the [patch record](UPSTREAM.md) for these intentional changes.
 
 ### Certificate model
 During the handshake the engine emits either [`Output::PeerCert`][peer_cert]

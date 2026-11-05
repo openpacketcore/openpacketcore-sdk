@@ -81,6 +81,25 @@ impl BootTimeTimer {
             .consume_expirations()
             .map_err(redact_boot_time_timer_error)
     }
+
+    /// Transfer the timer's descriptor to an I/O reactor without duplicating it.
+    ///
+    /// Returns an unsupported error on platforms without Linux timerfds.
+    #[cfg(unix)]
+    pub fn into_owned_fd(self) -> io::Result<std::os::fd::OwnedFd> {
+        self.inner
+            .into_owned_fd()
+            .map_err(redact_boot_time_timer_error)
+    }
+}
+
+/// Consume a nonblocking timerfd counter after transferring reactor ownership.
+///
+/// Uses the same complete, nonzero counter validation and value-free errors as
+/// [`BootTimeTimer::consume_expirations`]. The caller retains the descriptor.
+#[cfg(unix)]
+pub fn consume_timer_expirations(fd: std::os::fd::BorrowedFd<'_>) -> io::Result<u64> {
+    platform::consume_timer_expirations(fd).map_err(redact_boot_time_timer_error)
 }
 
 impl std::fmt::Debug for BootTimeTimer {

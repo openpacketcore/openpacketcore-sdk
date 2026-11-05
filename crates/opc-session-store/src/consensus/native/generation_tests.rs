@@ -1,4 +1,8 @@
 use super::super::changes::tests::{apply, clock, command, fixture, request, time};
+#[path = "generation_rebase_tests.rs"]
+mod rebase_tests;
+#[path = "generation_rollover_capacity_tests.rs"]
+mod rollover_capacity_tests;
 use super::*;
 use crate::sqlite::consensus::wal::Operation;
 use crate::test_process::CommandExt as _;
@@ -778,7 +782,7 @@ fn native_v1_current_delta_over_original_generic_base_preserves_cold_commitments
     assert_eq!(&bytes[..original.len()], original.as_slice());
     assert_eq!(
         &bytes[original.len()..original.len() + 8],
-        b"OPCNJD\x06\x00"
+        b"OPCNJD\x07\x00"
     );
     let (_, catalog) = Catalog::open(
         &path,

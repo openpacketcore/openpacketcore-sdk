@@ -1,10 +1,14 @@
 #!/usr/bin/env python3
-"""Attribute native lifecycle namespace residue and require host-state cleanup.
+"""Attribute native lifecycle residue to the qualification that owns it.
 
 Run namespace-creating commands through the run mode. Its child subreaper keeps
 orphaned descendants attributable until cleanup, including children of sudo.
-Unrelated processes may create or release namespaces on a shared host. Pins,
-mounts, named namespaces and interfaces must still match the original baseline.
+Unrelated processes may change a shared host's interfaces and namespaces.
+Qualification interfaces and routes live in the supervised private namespaces;
+retaining either retains an owned namespace and fails verification. A command
+creating an interface in the initial namespace must declare --owned-interface
+before execution. Those names are checked against the final inventory, not
+inferred from changes to a host snapshot. Pins and mounts remain baseline checks.
 """
 
 import argparse
@@ -16,6 +20,8 @@ from pathlib import Path
 import re
 import select
 import signal
+import socket
+import struct
 import subprocess
 import sys
 import time
@@ -75,7 +81,8 @@ def differences(before: dict, after: dict) -> dict:
     for name in sorted(required):
         added = sorted(set(after[name]) - set(before[name]))
         # Unrelated system services may finish and release their namespaces.
-        # Host-visible pins, mounts, names and interfaces must remain exact.
+        # Pins, mounts and namespace names remain exact. Interface changes are
+        # diagnostics; verify attributes declared links by namespace and index.
         removed = [] if name in {"net", "mnt"} else sorted(set(before[name]) - set(after[name]))
         if added or removed:
             changed[name] = {"added": added, "removed": removed}
@@ -197,6 +204,130 @@ def write_json(path: Path, value: dict) -> None:
         temporary.unlink(missing_ok=True)
 
 
+def interface_names(names) -> list[str]:
+    if not isinstance(names, list) or any(
+        not isinstance(name, str) or re.fullmatch(r"[A-Za-z0-9_.-]{1,15}", name) is None
+        for name in names
+    ) or len(set(names)) != len(names):
+        raise ValueError("invalid owned interface names")
+    return names
+
+
+def link_inventory() -> dict:
+    namespace = str(os.stat("/proc/self/ns/net").st_ino)
+    links = json.loads(subprocess.check_output(["ip", "-j", "link", "show"], text=True))
+    if not isinstance(links, list) or any(
+        not isinstance(link, dict) or type(link.get("ifindex")) is not int or link["ifindex"] <= 0
+        or not isinstance(link.get("ifname"), str) for link in links
+    ) or namespace != str(os.stat("/proc/self/ns/net").st_ino):
+        raise ValueError("incomplete interface identity inventory")
+    return {"namespace": namespace, "links": [
+        {"namespace": namespace, "ifindex": link["ifindex"], "ifname": link["ifname"]}
+        for link in links
+    ]}
+
+
+def link_events(data: bytes):
+    """Decode kernel RTM_NEWLINK/DELLINK notifications, refusing lost evidence."""
+    offset = 0
+    while offset < len(data):
+        if len(data) - offset < 16:
+            raise ValueError("truncated link event header")
+        length, kind, _flags, _sequence, _pid = struct.unpack_from("=IHHII", data, offset)
+        if length < 16 or offset + length > len(data):
+            raise ValueError("truncated link event")
+        if kind in {2, 4}:  # NLMSG_ERROR / NLMSG_OVERRUN
+            raise ValueError("kernel link event evidence was lost")
+        if kind in {16, 17}:  # RTM_NEWLINK / RTM_DELLINK
+            if length < 32:
+                raise ValueError("truncated link identity")
+            index = struct.unpack_from("=i", data, offset + 20)[0]
+            name, attribute = None, offset + 32
+            while attribute < offset + length:
+                if offset + length - attribute < 4:
+                    raise ValueError("truncated link attribute header")
+                size, tag = struct.unpack_from("=HH", data, attribute)
+                if size < 4 or attribute + size > offset + length:
+                    raise ValueError("truncated link attribute")
+                if tag == 3:  # IFLA_IFNAME
+                    value = data[attribute + 4:attribute + size]
+                    if not value or value[-1] != 0 or name is not None:
+                        raise ValueError("invalid link event name")
+                    name = value[:-1].decode("utf-8", errors="surrogateescape")
+                attribute += (size + 3) & ~3
+            if index <= 0 or name is None:
+                raise ValueError("incomplete link event identity")
+            if data[offset + 16] == socket.AF_UNSPEC:
+                yield kind, index, name
+        offset += (length + 3) & ~3
+
+
+class DeclaredLinks:
+    """Subscribe before exec so add-and-rename cannot outrun a name poll.
+
+    Every new lifetime carrying a declared name is bound. Deletion retires its
+    active index binding while retaining history for later verification.
+    """
+
+    def __init__(self, names):
+        self.names = set(names)
+        self.namespace = str(os.stat("/proc/self/ns/net").st_ino)
+        self.links, self.errors, self.initial = [], [], set()
+        self.socket = None
+
+    def start(self):
+        if not self.names:
+            return
+        try:
+            self.socket = socket.socket(socket.AF_NETLINK, socket.SOCK_RAW, socket.NETLINK_ROUTE)
+            self.socket.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 1 << 20)
+            self.socket.bind((0, 1))  # RTMGRP_LINK, in the controller's namespace.
+            self.socket.setblocking(False)
+            current = link_inventory()
+            if current["namespace"] != self.namespace:
+                raise ValueError("interface namespace changed before command")
+            if self.names & {link["ifname"] for link in current["links"]}:
+                raise ValueError("owned interface already exists before command")
+            self.initial = {link["ifindex"] for link in current["links"]}
+        except BaseException:
+            self.close()
+            raise
+
+    def observe(self, data):
+        for kind, index, name in link_events(data):
+            if kind == 17:
+                self.initial.discard(index)
+            existing = next((link for link in self.links if link["ifindex"] == index and not link["deleted"]), None)
+            if existing is not None:
+                if kind == 17:
+                    existing["deleted"] = True
+            elif kind == 16 and index not in self.initial and name in self.names:
+                self.links.append({"namespace": self.namespace, "ifindex": index,
+                                   "declared_name": name, "deleted": False})
+
+    def drain(self):
+        if self.socket is None:
+            return
+        try:
+            for _ in range(4096):  # Bound work even during unrelated link churn.
+                try:
+                    data, _control, flags, sender = self.socket.recvmsg(1 << 18)
+                except BlockingIOError:
+                    return
+                if flags & socket.MSG_TRUNC or sender[0] != 0:
+                    raise ValueError("incomplete kernel link event evidence")
+                self.observe(data)
+            raise ValueError("link event inventory exceeded its work budget")
+        except (OSError, ValueError) as error:
+            self.errors.append(str(error))
+            self.close()
+
+    def close(self):
+        if self.socket is not None:
+            self.socket.close()
+            self.socket = None
+
+
 def ownership(evidence: Path) -> tuple[dict, dict]:
     context = json.loads((evidence / "ownership.json").read_text())
     baseline = hashlib.sha256((evidence / "before.json").read_bytes()).hexdigest()
@@ -212,6 +343,23 @@ def ownership(evidence: Path) -> tuple[dict, dict]:
                 or not isinstance(record.get("command"), list) or not record["command"]:
             raise ValueError(f"invalid namespace ownership record: {path.name}")
         identity(record["root"])
+        names = interface_names(record.get("owned_interfaces", []))
+        if "preliminary_cleanup_passed" in record and type(record["preliminary_cleanup_passed"]) is not bool:
+            raise ValueError("invalid preliminary cleanup verdict")
+        if record.get("owned_links") and not names:
+            raise ValueError("link identities lack interface declarations")
+        if names:
+            namespace, links = record.get("interface_namespace"), record.get("owned_links")
+            if not isinstance(namespace, str) or not namespace.isdecimal() or not isinstance(links, list):
+                raise ValueError("incomplete declared link identity evidence")
+            if type(record.get("link_capture_complete")) is not bool:
+                raise ValueError("incomplete link capture status")
+            if any(not isinstance(link, dict) or link.get("namespace") != namespace
+                   or type(link.get("ifindex")) is not int or link["ifindex"] <= 0
+                   or link.get("declared_name") not in names or type(link.get("deleted")) is not bool
+                   for link in links) or len({link["ifindex"] for link in links if not link["deleted"]}) != sum(
+                       not link["deleted"] for link in links):
+                raise ValueError("invalid declared link identity evidence")
         if record["status"] == "complete":
             if type(record.get("exit_code")) is not int or type(record.get("cleanup_passed")) is not bool \
                     or not isinstance(record.get("survivors"), list):
@@ -222,17 +370,51 @@ def ownership(evidence: Path) -> tuple[dict, dict]:
     return context, records
 
 
-def verify(evidence: Path, run_id=None, command_exit_code=None) -> int:
+def verify(evidence: Path, run_id=None, command_exit_code=None, capture_pending=False) -> int:
     suffix = "" if run_id is None else "-" + run_id
-    result_path = evidence / ("result.json" if run_id is None else "attribution" + suffix + ".json")
-    result = {"passed": False, "differences": {}, "namespace_owners": {}, "errors": []}
+    prefix = "preliminary-" if capture_pending else ""
+    result_path = evidence / (prefix + ("result.json" if run_id is None else "attribution" + suffix + ".json"))
+    result = {"passed": False, "differences": {}, "namespace_owners": {},
+              "interface_owners": {}, "errors": []}
     current_record = None
     try:
         current = snapshot()
-        write_json(evidence / ("after" + suffix + ".json"), current)
-        result["differences"] = differences(json.loads((evidence / "before.json").read_text()), current)
+        write_json(evidence / (prefix + "after" + suffix + ".json"), current)
+        before = json.loads((evidence / "before.json").read_text())
+        result["differences"] = differences(before, current)
         _context, records = ownership(evidence)
         current_name = None if run_id is None else "run-" + run_id + ".json"
+        # Keep host churn as evidence, but never turn snapshot subtraction into
+        # ownership. The ledger covers declared initial-namespace interfaces;
+        # namespace attribution below covers every interface and route within
+        # the qualification's isolated network namespaces, including fd holders.
+        result["host_interface_changes"] = result["differences"].pop("interfaces", {})
+        links = link_inventory() if any(record.get("owned_interfaces") for record in records.values()) else None
+        live_ids = {(link["namespace"], link["ifindex"]) for link in links["links"]} if links else set()
+        for name, record in records.items():
+            for interface in record.get("owned_interfaces", []):
+                if interface in before["interfaces"]:
+                    raise ValueError("owned interface already existed in the cleanup baseline")
+            result["errors"].extend(record.get("interface_errors", []))
+            if record.get("owned_interfaces") and not record["link_capture_complete"] and not (
+                    capture_pending and name == current_name):
+                result["errors"].append("declared link capture is incomplete")
+            if record.get("owned_interfaces") and record["interface_namespace"] != links["namespace"]:
+                raise ValueError("declared interface belongs to another network namespace")
+            if name == current_name:
+                for owned in record.get("owned_links", []):
+                    if (owned["namespace"], owned["ifindex"]) not in live_ids:
+                        owned["deleted"] = True
+            for live in links["links"] if links else []:
+                if (name == current_name and live["ifname"] in record.get("owned_interfaces", [])) or any(
+                    not owned["deleted"] and (owned["namespace"], owned["ifindex"]) ==
+                    (live["namespace"], live["ifindex"]) for owned in record.get("owned_links", [])
+                ):
+                    result["interface_owners"].setdefault(live["ifname"], []).append(name)
+        if result["interface_owners"]:
+            result["differences"]["interfaces"] = {
+                "added": sorted(result["interface_owners"]), "removed": [],
+            }
         if current_name is not None:
             current_record = records[current_name]
             if current_record["status"] != "running" or command_exit_code is None:
@@ -304,11 +486,17 @@ def verify(evidence: Path, run_id=None, command_exit_code=None) -> int:
                 result["differences"][kind]["added"] = retained
             else:
                 result["differences"].pop(kind, None)
-        result["passed"] = not result["differences"] and not result["errors"]
+        prior_passed = current_record.get("preliminary_cleanup_passed", True) if current_record else True
+        result["passed"] = not result["differences"] and not result["errors"] and prior_passed
         if current_record:
-            current_record.update(status="complete", exit_code=command_exit_code,
-                                  survivors=survivors, cleanup_passed=result["passed"],
-                                  attribution=result_path.name)
+            current_record.update(exit_code=command_exit_code, survivors=survivors)
+            if capture_pending:
+                current_record.update(preliminary_cleanup_passed=result["passed"],
+                                      preliminary_attribution=result_path.name)
+            else:
+                current_record.update(status="complete", cleanup_passed=result["passed"], attribution=result_path.name)
+                if "preliminary_cleanup_passed" in current_record:
+                    result["preliminary_cleanup_passed"] = prior_passed
             write_json(evidence / current_name, current_record)
     except (OSError, ValueError, KeyError, TypeError, subprocess.SubprocessError) as error:
         result["passed"] = False
@@ -317,7 +505,8 @@ def verify(evidence: Path, run_id=None, command_exit_code=None) -> int:
     if not result["passed"]:
         print("::error::native lifecycle cleanup failed; inspect namespace ownership evidence", file=sys.stderr)
         return 1
-    print("local kernel lifecycle cleanup: PASS")
+    print("local kernel lifecycle preliminary attribution recorded" if capture_pending
+          else "local kernel lifecycle cleanup: PASS")
     return 0
 
 
@@ -472,17 +661,25 @@ def reap_finished_children(excluded: set[int]) -> None:
             pass
 
 
-def run_owned_command(evidence: Path, command: list[str]) -> int:
+def run_owned_command(evidence: Path, command: list[str], owned_interfaces=None) -> int:
     context, _records = ownership(evidence)
+    owned_interfaces = interface_names([] if owned_interfaces is None else owned_interfaces)
+    before = json.loads((evidence / "before.json").read_text())
+    if any(name in before["interfaces"] for name in owned_interfaces):
+        raise ValueError("owned interface already existed in the cleanup baseline")
     # An orphan stays in our process tree until verification. PID start times
     # prevent later PID reuse from inheriting this ownership after we exit.
     libc = ctypes.CDLL(None, use_errno=True)
     if libc.prctl(36, 1, 0, 0, 0) != 0:  # PR_SET_CHILD_SUBREAPER
         raise OSError(ctypes.get_errno(), "cannot become namespace-owner subreaper")
+    declared = DeclaredLinks(owned_interfaces)
+    declared.start()
     run_id = uuid.uuid4().hex
     root = read_stat(Path("/proc/self/stat"))
     record = {"version": 1, "owner_id": context["id"], "status": "running",
-              "root": {"pid": root["pid"], "start_time": root["start_time"]}, "command": command}
+              "root": {"pid": root["pid"], "start_time": root["start_time"]}, "command": command,
+              "owned_interfaces": owned_interfaces, "interface_namespace": declared.namespace,
+              "owned_links": [], "interface_errors": [], "link_capture_complete": not owned_interfaces}
     with (evidence / ("run-" + run_id + ".json")).open("x") as output:
         json.dump(record, output, indent=2)
         output.write("\n")
@@ -496,25 +693,12 @@ def run_owned_command(evidence: Path, command: list[str]) -> int:
     handlers = {signum: signal.signal(signum, interrupt)
                 for signum in [signal.SIGTERM, signal.SIGINT, signal.SIGHUP]}
     primary = None
-    try:
-        try:
-            primary = subprocess.Popen(command)
-            while primary.poll() is None and interrupted is None:
-                reap_finished_children({primary.pid})
-                time.sleep(0.02)
-            code = -interrupted if interrupted is not None else primary.returncode
-        except OSError:
-            code = 127
-        # Capture the original leak before disposal, including an interrupted
-        # primary command. The verifier has permission to signal sudo children.
-        reap_finished_children({primary.pid} if primary else set())
-        privileged = [] if os.geteuid() == 0 else ["sudo", "-n"]
-        check = privileged + [sys.executable, str(SCRIPT), "verify", str(evidence),
-                              "--run-id", run_id, "--command-exit-code", str(code),
-                              "--dispose-descendants"]
-        # A process-group interruption must not interrupt the cleanup helper.
-        verifier = subprocess.Popen(check, start_new_session=True)
+
+    def run_verifier(command):
+        # Keep capturing while the helper observes and disposes descendants.
+        verifier = subprocess.Popen(command, start_new_session=True)
         while verifier.poll() is None:
+            declared.drain()
             if primary:
                 primary.poll()
             reap_finished_children({verifier.pid} | ({primary.pid} if primary else set()))
@@ -522,7 +706,49 @@ def run_owned_command(evidence: Path, command: list[str]) -> int:
         if primary:
             primary.poll()
         reap_finished_children(set())
-        cleanup = verifier.returncode or bool(direct_children(os.getpid()))
+        return verifier.returncode or bool(direct_children(os.getpid()))
+
+    try:
+        try:
+            primary = subprocess.Popen(command)
+            while primary.poll() is None and interrupted is None:
+                declared.drain()
+                reap_finished_children({primary.pid})
+                time.sleep(0.02)
+            code = -interrupted if interrupted is not None else primary.returncode
+        except OSError:
+            code = 127
+        declared.drain()
+        if owned_interfaces:
+            record.update(owned_links=declared.links, interface_errors=declared.errors,
+                          link_capture_complete=False)
+            try:
+                write_json(evidence / ("run-" + run_id + ".json"), record)
+            except OSError:
+                declared.errors.append("cannot save preliminary link evidence")
+        # Capture the original leak before disposal, including an interrupted
+        # primary command. The verifier has permission to signal sudo children.
+        reap_finished_children({primary.pid} if primary else set())
+        privileged = [] if os.geteuid() == 0 else ["sudo", "-n"]
+        check = privileged + [sys.executable, str(SCRIPT), "verify", str(evidence),
+                              "--run-id", run_id, "--command-exit-code", str(code)]
+        # A process-group interruption must not interrupt the cleanup helper.
+        cleanup = run_verifier(check + ["--dispose-descendants"] + (["--capture-pending"] if owned_interfaces else []))
+        if owned_interfaces:
+            declared.drain()
+            declared.close()
+            # Reload after the helper exits; never overwrite concurrent
+            # attribution/disposal updates with the original running record.
+            record = json.loads((evidence / ("run-" + run_id + ".json")).read_text())
+            record.update(owned_links=declared.links, interface_errors=declared.errors,
+                          link_capture_complete=not bool(direct_children(os.getpid())),
+                          preliminary_cleanup_passed=record.get("preliminary_cleanup_passed", True) and not cleanup)
+            try:
+                write_json(evidence / ("run-" + run_id + ".json"), record)
+            except OSError:
+                pass  # The saved pending marker makes the final verifier refuse.
+            final_cleanup = run_verifier(check)
+            cleanup = cleanup or final_cleanup
         if interrupted is not None:
             # A signal can arrive during verification/disposal. Keep that
             # interruption sticky without replacing the original attribution.
@@ -533,6 +759,7 @@ def run_owned_command(evidence: Path, command: list[str]) -> int:
             return 128 + interrupted
         return (code if code > 0 else 128 - code) if code else int(cleanup)
     finally:
+        declared.close()
         for signum, handler in handlers.items():
             signal.signal(signum, handler)
 
@@ -547,7 +774,10 @@ def main() -> int:
             mode.add_argument("--run-id")
             mode.add_argument("--command-exit-code", type=int)
             mode.add_argument("--dispose-descendants", action="store_true")
+            mode.add_argument("--capture-pending", action="store_true")
         if name == "run":
+            mode.add_argument("--owned-interface", action="append", default=[],
+                              help="interface this command owns in the initial network namespace")
             mode.add_argument("command", nargs=argparse.REMAINDER)
     args = parser.parse_args()
     args.evidence_dir.mkdir(parents=True, exist_ok=True)
@@ -557,7 +787,7 @@ def main() -> int:
             command = args.command[1:] if args.command[:1] == ["--"] else args.command
             if not command:
                 parser.error("run requires a namespace-creating command")
-            return run_owned_command(args.evidence_dir, command)
+            return run_owned_command(args.evidence_dir, command, args.owned_interface)
         if os.geteuid() != 0:
             raise ValueError("snapshot and verify require root to attribute every process namespace")
         if args.mode == "snapshot":
@@ -576,9 +806,11 @@ def main() -> int:
             raise ValueError("invalid ownership run identifier")
         if args.dispose_descendants and args.run_id is None:
             raise ValueError("descendant disposal requires an ownership run identifier")
+        if args.capture_pending and (args.run_id is None or not args.dispose_descendants):
+            raise ValueError("pending capture requires owning-run descendant disposal")
         disposal = 0
         try:
-            result = verify(args.evidence_dir, args.run_id, args.command_exit_code)
+            result = verify(args.evidence_dir, args.run_id, args.command_exit_code, args.capture_pending)
         finally:
             if args.dispose_descendants:
                 disposal = dispose_descendants(args.evidence_dir, args.run_id)

@@ -209,6 +209,8 @@ impl fmt::Display for IkeHashAlgorithm {
 pub enum IkePrfAlgorithm {
     /// PRF_HMAC_SHA1, exposed for explicitly configured legacy interoperability.
     HmacSha1,
+    /// PRF_AES128_XCBC (RFC 4434).
+    Aes128Xcbc,
     /// PRF_HMAC_SHA2_256.
     HmacSha2_256,
     /// PRF_HMAC_SHA2_384.
@@ -222,6 +224,7 @@ impl IkePrfAlgorithm {
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::HmacSha1 => "prf_hmac_sha1",
+            Self::Aes128Xcbc => "prf_aes128_xcbc",
             Self::HmacSha2_256 => "prf_hmac_sha2_256",
             Self::HmacSha2_384 => "prf_hmac_sha2_384",
             Self::HmacSha2_512 => "prf_hmac_sha2_512",
@@ -233,6 +236,7 @@ impl IkePrfAlgorithm {
     pub const fn output_len(self) -> usize {
         match self {
             Self::HmacSha1 => 20,
+            Self::Aes128Xcbc => 16,
             Self::HmacSha2_256 => 32,
             Self::HmacSha2_384 => 48,
             Self::HmacSha2_512 => 64,
@@ -310,6 +314,14 @@ pub enum IkeAeadAlgorithm {
     AesGcm16_192,
     /// ENCR_AES_GCM_16 with a 256-bit key.
     AesGcm16_256,
+    /// ENCR_AES_CCM_8 with a 128-bit key.
+    AesCcm8_128,
+    /// ENCR_AES_CCM_8 with a 192-bit key.
+    AesCcm8_192,
+    /// ENCR_AES_CCM_8 with a 256-bit key.
+    AesCcm8_256,
+    /// ENCR_CHACHA20_POLY1305 with a 256-bit key (RFC 7634).
+    ChaCha20Poly1305,
 }
 
 impl IkeAeadAlgorithm {
@@ -319,6 +331,10 @@ impl IkeAeadAlgorithm {
             Self::AesGcm16_128 => "encr_aes_gcm_16_128",
             Self::AesGcm16_192 => "encr_aes_gcm_16_192",
             Self::AesGcm16_256 => "encr_aes_gcm_16_256",
+            Self::AesCcm8_128 => "encr_aes_ccm_8_128",
+            Self::AesCcm8_192 => "encr_aes_ccm_8_192",
+            Self::AesCcm8_256 => "encr_aes_ccm_8_256",
+            Self::ChaCha20Poly1305 => "encr_chacha20_poly1305",
         }
     }
 
@@ -326,16 +342,19 @@ impl IkeAeadAlgorithm {
     #[must_use]
     pub const fn key_len(self) -> usize {
         match self {
-            Self::AesGcm16_128 => 16,
-            Self::AesGcm16_192 => 24,
-            Self::AesGcm16_256 => 32,
+            Self::AesGcm16_128 | Self::AesCcm8_128 => 16,
+            Self::AesGcm16_192 | Self::AesCcm8_192 => 24,
+            Self::AesGcm16_256 | Self::AesCcm8_256 | Self::ChaCha20Poly1305 => 32,
         }
     }
 
-    /// RFC 4106 salt length in octets.
+    /// Per-direction salt length in octets.
     #[must_use]
     pub const fn salt_len(self) -> usize {
-        4
+        match self {
+            Self::AesCcm8_128 | Self::AesCcm8_192 | Self::AesCcm8_256 => 3,
+            _ => 4,
+        }
     }
 
     /// RFC 5282 explicit IV length in octets.
@@ -347,7 +366,10 @@ impl IkeAeadAlgorithm {
     /// Authentication tag length in octets.
     #[must_use]
     pub const fn tag_len(self) -> usize {
-        16
+        match self {
+            Self::AesCcm8_128 | Self::AesCcm8_192 | Self::AesCcm8_256 => 8,
+            _ => 16,
+        }
     }
 }
 
@@ -413,6 +435,14 @@ pub enum IkeDhGroup {
     Modp1024,
     /// 2048-bit MODP group (Transform ID 14).
     Modp2048,
+    /// 3072-bit MODP group (Transform ID 15).
+    Modp3072,
+    /// 4096-bit MODP group (Transform ID 16).
+    Modp4096,
+    /// 6144-bit MODP group (Transform ID 17).
+    Modp6144,
+    /// 8192-bit MODP group (Transform ID 18).
+    Modp8192,
     /// NIST P-256 ECP group (Transform ID 19).
     Ecp256,
     /// NIST P-384 ECP group (Transform ID 20).
@@ -429,6 +459,10 @@ impl IkeDhGroup {
             Self::Modp768 => 1,
             Self::Modp1024 => 2,
             Self::Modp2048 => 14,
+            Self::Modp3072 => 15,
+            Self::Modp4096 => 16,
+            Self::Modp6144 => 17,
+            Self::Modp8192 => 18,
             Self::Ecp256 => 19,
             Self::Ecp384 => 20,
             Self::Ecp521 => 21,
@@ -439,7 +473,7 @@ impl IkeDhGroup {
     ///
     /// Encoding: version byte `1`, big-endian two-byte group Transform ID, then
     /// a fixed-width big-endian MODP private exponent or ECP secret scalar.
-    /// MODP widths are 96/128/256 and ECP widths 32/48/66 octets. No module build
+    /// MODP widths are 96/128/256/384/512/768/1024 and ECP widths 32/48/66 octets. No module build
     /// identity, public value, nonce or envelope is embedded. These secret bytes
     /// must never appear in diagnostics or outside the enclosing row's custody.
     #[must_use]
@@ -453,6 +487,10 @@ impl IkeDhGroup {
             Self::Modp768 => "modp_768",
             Self::Modp1024 => "modp_1024",
             Self::Modp2048 => "modp_2048",
+            Self::Modp3072 => "modp_3072",
+            Self::Modp4096 => "modp_4096",
+            Self::Modp6144 => "modp_6144",
+            Self::Modp8192 => "modp_8192",
             Self::Ecp256 => "ecp_256",
             Self::Ecp384 => "ecp_384",
             Self::Ecp521 => "ecp_521",
@@ -466,6 +504,10 @@ impl IkeDhGroup {
             Self::Modp768 => 96,
             Self::Modp1024 => 128,
             Self::Modp2048 => 256,
+            Self::Modp3072 => 384,
+            Self::Modp4096 => 512,
+            Self::Modp6144 => 768,
+            Self::Modp8192 => 1024,
             Self::Ecp256 => 64,
             Self::Ecp384 => 96,
             Self::Ecp521 => 132,
@@ -479,6 +521,10 @@ impl IkeDhGroup {
             Self::Modp768 => 96,
             Self::Modp1024 => 128,
             Self::Modp2048 => 256,
+            Self::Modp3072 => 384,
+            Self::Modp4096 => 512,
+            Self::Modp6144 => 768,
+            Self::Modp8192 => 1024,
             Self::Ecp256 => 32,
             Self::Ecp384 => 48,
             Self::Ecp521 => 66,
@@ -492,19 +538,32 @@ impl fmt::Display for IkeDhGroup {
     }
 }
 
-/// IKE_AUTH signature algorithm (RFC 7296 method 1 and RFC 7427 method 14
-/// signature primitives).
+/// IKE_AUTH signature primitive for RFC 7296 method 1, RFC 4754 methods 9–11,
+/// and RFC 7427 method 14. ECDSA primitives use DER at this boundary; the
+/// protocol layer converts methods 9–11 to their fixed-width wire form.
 #[non_exhaustive]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum IkeSignatureAlgorithm {
     /// RSASSA-PKCS1-v1_5 with SHA-256.
     RsaPkcs1V15Sha2_256,
+    /// RSASSA-PSS with SHA-256, MGF1/SHA-256 and a 32-octet salt.
+    RsaPssSha2_256,
+    /// RSASSA-PSS with SHA-384, MGF1/SHA-384 and a 48-octet salt.
+    RsaPssSha2_384,
+    /// RSASSA-PSS with SHA-512, MGF1/SHA-512 and a 64-octet salt.
+    RsaPssSha2_512,
     /// ECDSA over P-256 with SHA-256, DER-encoded `ECDSA-Sig-Value`.
     EcdsaP256Sha2_256,
     /// ECDSA over P-384 with SHA-256, DER-encoded `ECDSA-Sig-Value`.
     EcdsaP384Sha2_256,
     /// ECDSA over P-384 with SHA-384, DER-encoded `ECDSA-Sig-Value`.
     EcdsaP384Sha2_384,
+    /// ECDSA over P-521 with SHA-512, DER-encoded `ECDSA-Sig-Value`.
+    EcdsaP521Sha2_512,
+    /// Pure Ed25519 over the complete message (RFC 8420), 64-octet signature.
+    Ed25519,
+    /// Pure Ed448 with empty context (RFC 8420), 114-octet signature.
+    Ed448,
 }
 
 impl IkeSignatureAlgorithm {
@@ -515,6 +574,12 @@ impl IkeSignatureAlgorithm {
             Self::EcdsaP256Sha2_256 => "ecdsa_p256_sha2_256",
             Self::EcdsaP384Sha2_256 => "ecdsa_p384_sha2_256",
             Self::EcdsaP384Sha2_384 => "ecdsa_p384_sha2_384",
+            Self::Ed448 => "ed448",
+            Self::Ed25519 => "ed25519",
+            Self::EcdsaP521Sha2_512 => "ecdsa_p521_sha2_512",
+            Self::RsaPssSha2_512 => "rsa_pss_sha2_512",
+            Self::RsaPssSha2_384 => "rsa_pss_sha2_384",
+            Self::RsaPssSha2_256 => "rsa_pss_sha2_256",
         }
     }
 }
@@ -527,7 +592,7 @@ impl fmt::Display for IkeSignatureAlgorithm {
 
 /// IKEv2 PRF operations ([`crate::CryptoCapability::IkePrf`]).
 ///
-/// RFC 7296 section 2.13 `prf` and `prf+` over the negotiated HMAC family.
+/// RFC 7296 section 2.13 `prf` and `prf+` over the negotiated PRF.
 pub trait IkePrfOperations: Send + Sync {
     /// Whether this module can execute `algorithm`.
     fn supports_prf(&self, algorithm: IkePrfAlgorithm) -> bool;
@@ -535,7 +600,8 @@ pub trait IkePrfOperations: Send + Sync {
     /// Compute `prf(key, data)`.
     ///
     /// The output is exactly [`IkePrfAlgorithm::output_len`] octets. A key
-    /// longer than the underlying block length is hashed first, per HMAC.
+    /// longer than the underlying block length is hashed first for HMAC.
+    /// AES-XCBC normalizes short and long keys as specified in RFC 4434 section 2.
     ///
     /// # Errors
     ///

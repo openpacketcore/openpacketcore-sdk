@@ -18,10 +18,11 @@ pub(super) fn session_request(
     use crate::*;
     let context = GtpPdpContext {
         local_teid: Teid::new(700 + u32::from(selector)).unwrap(),
-        peer_teid: Teid::new(800 + u32::from(selector)).unwrap(),
+        peer_teid: Teid::new(800 + u32::from(selector)).unwrap().into(),
         ms_address: std::net::IpAddr::from([10, 79, 0, selector]),
         peer_address: "192.0.2.2".parse().unwrap(),
         link_ifindex: ifindex,
+        downlink_peer_source_policy: crate::GtpuPeerSourcePolicy::BackendDefault,
         downlink_source_port_policy: GtpuSourcePortPolicy::Any,
         gtp_version: GtpVersion::V1,
         bearer_mark: None,
@@ -64,6 +65,7 @@ fn marked_sa_request() -> opc_ipsec_xfrm::ScopedXfrmRequest {
         output_mark: None,
         if_id: None,
         egress_dscp: Some(DscpCodepoint::new(46).unwrap()),
+        tfc_pad: None,
     };
     let policy = PolicyParameters {
         selector: sa.selector.clone(),

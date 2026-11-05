@@ -394,6 +394,11 @@ fn conditional_presence_key_custody_and_constructor_guards_are_explicit() {
         .unwrap()
         .value
         .as_bytes();
+    let reference_fields = fields(request, "fields");
+    assert_eq!(
+        &value.key.expose_bytes()[..],
+        field(&reference_fields, 94).unwrap()
+    );
     assert!(std::ptr::eq(
         value.key.expose_bytes().as_ptr(),
         key.as_ptr()

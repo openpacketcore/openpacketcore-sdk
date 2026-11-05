@@ -367,6 +367,30 @@ pub(super) struct LogChanges {
     cut: Option<PrefixCut>,
     rows: HashMap<u64, RowChange>,
     memory: Vec<Arc<VerificationMemory>>,
+    retained_bytes: usize,
+}
+
+impl NativeLog {
+    /// Relocation changes representation, never the predecessor's logical
+    /// revision or content stamp. An empty live journal still owns this root
+    /// for a possible later purge; leaving it behind pins a retired file even
+    /// after every visible row and detached reader has moved on.
+    pub(in crate::consensus::native) fn relocate_journal_predecessor(
+        &mut self,
+        index: u64,
+        row: &SharedRow<NativeLogEntry>,
+    ) -> Option<SharedRow<NativeLogEntry>> {
+        let dirty = self.changes.as_mut()?;
+        if dirty
+            .base_rows
+            .get(&index)
+            .is_some_and(|old| old.ptr_eq(row))
+        {
+            dirty.base_rows.insert(index, row.clone())
+        } else {
+            None
+        }
+    }
 }
 
 impl LogChanges {
@@ -378,6 +402,7 @@ impl LogChanges {
             cut: None,
             rows: HashMap::new(),
             memory: Vec::new(),
+            retained_bytes: 0,
         }
     }
 
@@ -654,7 +679,7 @@ impl Publication {
             // journal storage is reused; purge cannot wait for verifier space.
             None
         } else {
-            Some(Arc::new(VerificationMemory::reserve(bytes)?))
+            Some(Arc::new(VerificationMemory::reserve_journal(bytes)?))
         };
         let mut rows = BTreeMap::new();
         let mut cut = None;
@@ -1068,6 +1093,7 @@ impl Publication {
         if let Some(dirty) = &mut log.changes {
             dirty.target = self.proof.clone();
             if let Some(memory) = self.memory {
+                dirty.retained_bytes += memory.reserved_bytes();
                 dirty.memory.push(memory);
             }
         }
@@ -1081,6 +1107,12 @@ impl Publication {
 }
 
 impl NativeLog {
+    pub(crate) fn changed_verification_bytes(&self) -> usize {
+        self.changes
+            .as_ref()
+            .map_or(0, |changes| changes.retained_bytes)
+    }
+
     pub(super) fn validate_row(
         index: u64,
         row: &NativeLogEntry,

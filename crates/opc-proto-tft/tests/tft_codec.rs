@@ -471,6 +471,23 @@ fn constructors_reject_range_and_size_constraints() {
 }
 
 #[test]
+fn vlan_identifier_wire_boundaries_include_zero_and_all_twelve_bits() {
+    // TS 24.008 §10.5.6.12 defines a 12-bit C-TAG/S-TAG VID field without
+    // excluding 0 or 4095. Link-layer VLAN assignment policy is separate.
+    for value in [0, 4095] {
+        assert_eq!(
+            opc_proto_tft::VlanIdentifier::new(value).unwrap().value(),
+            value
+        );
+        for kind in [0x83, 0x84] {
+            let wire = [0x21, 0x31, 0x20, 3, kind, (value >> 8) as u8, value as u8];
+            assert_fixture_roundtrip(&wire);
+        }
+    }
+    assert!(opc_proto_tft::VlanIdentifier::new(4096).is_err());
+}
+
+#[test]
 fn structural_truncations_are_rejected() {
     let fixtures = [
         CREATE_PROTOCOL_FILTER,

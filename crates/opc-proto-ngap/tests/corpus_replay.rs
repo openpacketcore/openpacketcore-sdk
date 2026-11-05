@@ -9,6 +9,9 @@
 //! protection — if a future change makes the decode path panic on a known
 //! input, this test fails and names the offending input.
 
+#[path = "support/pdu_equivalence.rs"]
+mod pdu_equivalence;
+
 #[path = "support/network_instance.rs"]
 mod network_instance;
 #[path = "support/qos_admission.rs"]
@@ -331,7 +334,10 @@ fn exercise(data: &[u8]) {
         }
         if let Ok(wire) = encode(&pdu, EncodeContext::default()) {
             assert_eq!(pdu.wire_len(EncodeContext::default()).unwrap(), wire.len());
-            assert!(Pdu::decode_owned(Bytes::from(wire), ctx).unwrap().kind == pdu.kind);
+            assert!(pdu_equivalence::equivalent(
+                &Pdu::decode_owned(Bytes::from(wire), ctx).unwrap().kind,
+                &pdu.kind,
+            ));
         }
     }
     let ies: Vec<_> = data
@@ -352,7 +358,10 @@ fn exercise(data: &[u8]) {
         .collect();
     if let Ok(pdu) = Pdu::from_protocol_ies(MessageType::NgSetupRequest, &ies, ctx) {
         let wire = encode(&pdu, EncodeContext::default()).unwrap();
-        assert!(Pdu::decode_owned(Bytes::from(wire), ctx).unwrap().kind == pdu.kind);
+        assert!(pdu_equivalence::equivalent(
+            &Pdu::decode_owned(Bytes::from(wire), ctx).unwrap().kind,
+            &pdu.kind,
+        ));
     }
 }
 

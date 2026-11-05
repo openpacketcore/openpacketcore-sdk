@@ -226,6 +226,13 @@ impl<'a> PeerModel<'a> {
             return Ok(Event::Ignored);
         }
         let packet = self.wire.open(wire).map_err(Violation::Wire)?;
+        self.receive_opened(packet)
+    }
+
+    pub(super) fn receive_opened(&mut self, packet: Packet) -> Result<Event, Violation> {
+        if self.closed {
+            return Ok(Event::Ignored);
+        }
         if let Some(sync) = Sync::from_packet(&packet)? {
             return self.receive_sync(packet.header.flags.response(), sync);
         }

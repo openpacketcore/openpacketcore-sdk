@@ -79,12 +79,14 @@ async fn planned_leader_stop_preserves_write_stream_within_operation_budget() {
         path.pause_forward_response.store(true, Ordering::SeqCst);
         let caller = cluster.stores[survivors[0]].clone();
         let in_flight = tokio::spawn(async move {
-            caller
+            let started_at = tokio::time::Instant::now();
+            let result = caller
                 .append_commit_idempotent(
                     request,
                     accepted,
                 )
-                .await
+                .await;
+            (result, started_at, tokio::time::Instant::now())
         });
         path.forward_response_ready.notified().await;
         let (lagged, mut lag) = tokio::sync::mpsc::unbounded_channel();
@@ -149,11 +151,12 @@ async fn planned_leader_stop_preserves_write_stream_within_operation_budget() {
                 outages.push(stopped_at.elapsed());
             }
         }
-        let error = in_flight.await.unwrap().expect_err("lost response stays ambiguous");
-        assert!(matches!(error.kind(), PersistErrorKind::OutcomeUnknown));
+        let (result, started_at, completed_at) = in_flight.await.unwrap();
+        result.expect("same-ID retry recovers the applied result from the successor");
+        let elapsed = completed_at.duration_since(started_at);
+        assert!(elapsed < budget, "same-ID recovery preserves the original operation budget: {elapsed:?}");
         eprintln!(
-            "planned stop: in_flight={:?}, operation_budget={budget:?}, unavailable_at={outages:?}",
-            error.kind(),
+            "planned stop: in_flight=applied, elapsed={elapsed:?}, operation_budget={budget:?}, unavailable_at={outages:?}",
         );
         assert!(
             outages.is_empty(),
@@ -166,6 +169,28 @@ async fn planned_leader_stop_preserves_write_stream_within_operation_budget() {
             )
             .await
             .expect("same-ID recovery finds the accepted write after handoff");
+
+        let successor = survivors.iter().copied().find(|index| {
+            let status = cluster.stores[*index].status();
+            status.leader_id == Some(status.node_id)
+        }).expect("surviving leader after the write stream");
+        let history = cluster.stores[successor]
+            .load_since(ConfigVersion::INITIAL, 64)
+            .await
+            .expect("committed history after automatic and explicit same-ID retries");
+        assert_eq!(history.len() as u64, version - 1);
+        assert_eq!(history[1].record.tx_id, second);
+        assert_eq!(history[1].record.version, ConfigVersion::new(2));
+        assert_eq!(history.last().unwrap().record.tx_id, parent);
+        let applied_sequence: u64 = rusqlite::Connection::open(cluster.database_path(successor))
+            .expect("open successor for effect-count inspection")
+            .query_row(
+                "SELECT application_sequence FROM config_raft_machine WHERE singleton = 1",
+                [],
+                |row| row.get(0),
+            )
+            .expect("read the durable application effect count");
+        assert_eq!(applied_sequence, version - 1, "same-ID retries must not apply the accepted write twice");
         cluster.shutdown().await;
     })
     .await;

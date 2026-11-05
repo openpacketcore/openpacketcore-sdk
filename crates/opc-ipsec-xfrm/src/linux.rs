@@ -6,7 +6,9 @@ mod local_effect;
 mod local_netlink;
 mod local_profile;
 mod namespace_reset;
+mod tfc;
 pub(crate) use local_profile::LocalAdmissionProbe;
+pub use tfc::EspTfcDummySender;
 
 use std::fmt;
 use std::io;
@@ -27,12 +29,12 @@ use opc_linux_xfrm_sys::{
     NLM_F_REPLACE, NLM_F_REQUEST, XFRMA_ALG_AEAD, XFRMA_ALG_AUTH, XFRMA_ALG_AUTH_TRUNC,
     XFRMA_ALG_COMP, XFRMA_ALG_CRYPT, XFRMA_ENCAP, XFRMA_IF_ID, XFRMA_LASTUSED, XFRMA_MARK,
     XFRMA_OFFLOAD_DEV, XFRMA_PAD, XFRMA_POLICY_TYPE, XFRMA_REPLAY_ESN_VAL, XFRMA_REPLAY_VAL,
-    XFRMA_SAD_CNT, XFRMA_SA_DIR, XFRMA_SET_MARK, XFRMA_SET_MARK_MASK, XFRMA_TMPL, XFRM_AE_RVAL,
-    XFRM_MSG_ALLOCSPI, XFRM_MSG_DELPOLICY, XFRM_MSG_DELSA, XFRM_MSG_GETPOLICY, XFRM_MSG_GETSA,
-    XFRM_MSG_GETSADINFO, XFRM_MSG_MIGRATE_STATE, XFRM_MSG_NEWAE, XFRM_MSG_NEWPOLICY,
-    XFRM_MSG_NEWSA, XFRM_MSG_NEWSADINFO, XFRM_MSG_UPDPOLICY, XFRM_MSG_UPDSA, XFRM_POLICY_ALLOW,
-    XFRM_POLICY_BLOCK, XFRM_POLICY_FWD, XFRM_POLICY_IN, XFRM_POLICY_OUT, XFRM_POLICY_TYPE_MAIN,
-    XFRM_SA_DIR_IN, XFRM_SA_DIR_OUT, XFRM_STATE_ESN,
+    XFRMA_SAD_CNT, XFRMA_SA_DIR, XFRMA_SET_MARK, XFRMA_SET_MARK_MASK, XFRMA_TFCPAD, XFRMA_TMPL,
+    XFRM_AE_RVAL, XFRM_MSG_ALLOCSPI, XFRM_MSG_DELPOLICY, XFRM_MSG_DELSA, XFRM_MSG_GETPOLICY,
+    XFRM_MSG_GETSA, XFRM_MSG_GETSADINFO, XFRM_MSG_MIGRATE_STATE, XFRM_MSG_NEWAE,
+    XFRM_MSG_NEWPOLICY, XFRM_MSG_NEWSA, XFRM_MSG_NEWSADINFO, XFRM_MSG_UPDPOLICY, XFRM_MSG_UPDSA,
+    XFRM_POLICY_ALLOW, XFRM_POLICY_BLOCK, XFRM_POLICY_FWD, XFRM_POLICY_IN, XFRM_POLICY_OUT,
+    XFRM_POLICY_TYPE_MAIN, XFRM_SA_DIR_IN, XFRM_SA_DIR_OUT, XFRM_STATE_ESN,
 };
 use subtle::ConstantTimeEq;
 use zeroize::Zeroizing;
@@ -945,6 +947,7 @@ impl LinuxXfrmBackend {
             || state.replay_window != parameters.replay_window
             || state.lifetime_config != parameters.lifetime
             || state.output_mark != expected_output_mark
+            || state.tfc_pad != parameters.tfc_pad
         {
             return Err(indeterminate());
         }
@@ -1544,19 +1547,18 @@ impl XfrmBackend for LinuxXfrmBackend {
             body,
         )
         .await?;
-        if request.parameters.output_mark.is_some() || request.parameters.egress_dscp.is_some() {
-            // An update replaces pre-existing state, and `SaState`
-            // intentionally excludes key material, so a safe automatic
-            // rollback cannot reconstruct the old SA. Any failed mandatory
-            // readback therefore remains explicitly indeterminate.
-            let operation = if request.parameters.egress_dscp.is_some() {
-                "rekey_sa_dscp_readback"
-            } else {
-                "rekey_sa_output_mark_readback"
-            };
-            self.verify_output_mark_readback(&request.parameters, profile, operation)
-                .await?;
-        }
+        // Linux can ACK UPDSA while retaining the old TFC target. Verify even
+        // None, since clearing an enabled target can be ignored too. A failed
+        // read cannot justify rolling back an update to pre-existing state.
+        let operation = if request.parameters.egress_dscp.is_some() {
+            "rekey_sa_dscp_readback"
+        } else if request.parameters.output_mark.is_some() {
+            "rekey_sa_output_mark_readback"
+        } else {
+            "rekey_sa_tfc_readback"
+        };
+        self.verify_output_mark_readback(&request.parameters, profile, operation)
+            .await?;
         Ok(())
     }
 
@@ -2267,8 +2269,19 @@ fn receive_sad_state_count(
     operation: &'static str,
     expected_sequence: u32,
     config: LinuxXfrmBackendConfig,
-    mut receive: impl FnMut(&mut [u8]) -> io::Result<ReceiveMessageOutcome>,
+    receive: impl FnMut(&mut [u8]) -> io::Result<ReceiveMessageOutcome>,
 ) -> Result<u32, XfrmError> {
+    receive_sad_info(operation, config, receive, |datagram| {
+        parse_sad_state_count_reply(operation, datagram, expected_sequence)
+    })
+}
+
+fn receive_sad_info<T>(
+    operation: &'static str,
+    config: LinuxXfrmBackendConfig,
+    mut receive: impl FnMut(&mut [u8]) -> io::Result<ReceiveMessageOutcome>,
+    parse: impl Fn(&[u8]) -> Result<T, XfrmError>,
+) -> Result<T, XfrmError> {
     let mut buffer = Zeroizing::new(vec![0_u8; config.receive_buffer_len]);
     for _ in 0..config.receive_attempts {
         match receive(&mut buffer) {
@@ -2280,7 +2293,7 @@ fn receive_sad_state_count(
                         invalid_data("receive length exceeded bounded buffer"),
                     )
                 })?;
-                return parse_sad_state_count_reply(operation, datagram, expected_sequence);
+                return parse(datagram);
             }
             Ok(ReceiveMessageOutcome::ConsumedOversize {
                 buffer_bytes,
@@ -2499,6 +2512,7 @@ fn encode_alloc_spi_request(request: AllocateSpiRequest) -> Result<SensitiveBuff
         output_mark: None,
         if_id: None,
         egress_dscp: None,
+        tfc_pad: None,
     };
 
     let mut out = encode_sa_info_inner(&sa, true, None)?;
@@ -2646,6 +2660,9 @@ fn encode_sa_info_inner_observed(
     }
     append_replay_state_attr(&mut out, parameters)?;
     append_common_attrs(&mut out, parameters.mark, parameters.if_id)?;
+    if let Some(tfc_pad) = parameters.tfc_pad {
+        append_attr(&mut out, XFRMA_TFCPAD, &tfc_pad.to_ne_bytes())?;
+    }
     if let Some(output_mark) = plan.output_mark {
         append_attr(&mut out, XFRMA_SET_MARK, &output_mark.value.to_ne_bytes())?;
         append_attr(
@@ -2721,6 +2738,9 @@ fn sa_encoding_plan(
         checked_add_sa_attr(&mut encoded_len, XFRM_MARK_LEN)?;
     }
     if parameters.if_id.is_some() {
+        checked_add_sa_attr(&mut encoded_len, size_of::<u32>())?;
+    }
+    if parameters.tfc_pad.is_some() {
         checked_add_sa_attr(&mut encoded_len, size_of::<u32>())?;
     }
     if output_mark.is_some() {
@@ -3384,6 +3404,7 @@ fn parse_sa_state(payload: &[u8], dscp_profile: Option<MarkProfile>) -> Result<S
     )?;
     let output_mark = parse_output_mark_attrs(payload)?;
     let egress_dscp = parse_fixed_outer_dscp(output_mark, dscp_profile)?;
+    let tfc_pad = parse_tfc_pad_attr(payload)?;
     Ok(SaState {
         selector,
         id: XfrmId {
@@ -3401,6 +3422,7 @@ fn parse_sa_state(payload: &[u8], dscp_profile: Option<MarkProfile>) -> Result<S
         statistics,
         output_mark,
         egress_dscp,
+        tfc_pad,
     })
 }
 
@@ -3575,6 +3597,7 @@ fn parse_esp_peer_observation_registration(
             XFRMA_SET_MARK,
             XFRMA_SET_MARK_MASK,
             XFRMA_IF_ID,
+            XFRMA_TFCPAD,
             XFRMA_SA_DIR,
         ],
         OPERATION,
@@ -3802,6 +3825,7 @@ fn parse_outbound_sa_binding_shape(
             XFRMA_SET_MARK,
             XFRMA_SET_MARK_MASK,
             XFRMA_IF_ID,
+            XFRMA_TFCPAD,
             XFRMA_SA_DIR,
         ],
         "query_outbound_sa_binding",
@@ -3850,6 +3874,7 @@ fn validate_outbound_sa_fixed_header(
         && (payload[60..72].iter().any(|octet| *octet != 0)
             || payload[84..96].iter().any(|octet| *octet != 0));
     if family != address_family(expected.id.destination)
+        || parse_tfc_pad_attr(payload)? != expected.tfc_pad
         || noncanonical_ipv4
         || payload[77..80].iter().any(|octet| *octet != 0)
         // The SDK does not model soft/hard use-time expiry and always installs
@@ -4645,6 +4670,38 @@ fn parse_if_id_attr(payload: &[u8]) -> Result<Option<u32>, XfrmError> {
     Ok(Some(read_u32_ne(if_id, 0)?))
 }
 
+/// Parse the canonical Linux Traffic Flow Confidentiality padding attribute.
+/// Linux omits an unset target and accepts enabled targets only for ESP tunnel
+/// mode; other wire encodings cannot establish exact installed intent.
+fn parse_tfc_pad_attr(payload: &[u8]) -> Result<Option<u32>, XfrmError> {
+    let Some(tfc_pad) = find_unique_attr_payload(
+        payload,
+        XFRM_USER_SA_INFO_LEN,
+        XFRMA_TFCPAD,
+        "duplicate TFC padding attribute",
+    )?
+    else {
+        return Ok(None);
+    };
+    if tfc_pad.len() != 4 {
+        return Err(XfrmError::io(
+            "query_sa",
+            invalid_data("invalid TFC padding attribute length"),
+        ));
+    }
+    let value = read_u32_ne(tfc_pad, 0)?;
+    if value == 0
+        || read_u8(payload, 76)? != IPPROTO_ESP
+        || read_u8(payload, 214)? != encode_mode(XfrmMode::Tunnel)
+    {
+        return Err(XfrmError::io(
+            "query_sa",
+            invalid_data("noncanonical TFC padding configuration"),
+        ));
+    }
+    Ok(Some(value))
+}
+
 fn parse_output_mark_attrs(payload: &[u8]) -> Result<Option<XfrmMark>, XfrmError> {
     let value = find_unique_attr_payload(
         payload,
@@ -5013,6 +5070,26 @@ fn validate_sa_parameters(
             return Err(XfrmError::invalid_config(
                 "encap.port",
                 "UDP encapsulation ports must be nonzero",
+            ));
+        }
+    }
+    if let Some(tfc_pad) = parameters.tfc_pad {
+        if tfc_pad == 0 {
+            return Err(XfrmError::invalid_config(
+                "sa.tfc_pad",
+                "TFC padding length must be nonzero; use None for no TFC padding",
+            ));
+        }
+        if parameters.id.protocol != IPPROTO_ESP {
+            return Err(XfrmError::invalid_config(
+                "sa.tfc_pad",
+                "TFC padding supports ESP SAs only",
+            ));
+        }
+        if parameters.mode != XfrmMode::Tunnel {
+            return Err(XfrmError::invalid_config(
+                "sa.tfc_pad",
+                "TFC padding requires tunnel mode",
             ));
         }
     }
@@ -5845,6 +5922,7 @@ mod tests {
             output_mark: None,
             if_id: None,
             egress_dscp: None,
+            tfc_pad: None,
         }
     }
 
@@ -6854,6 +6932,7 @@ mod tests {
     mod child_sa_relocation_tests;
     mod installed_child_sa_tests;
     mod sa_key_snapshot_tests;
+    mod tfc_tests;
 
     #[tokio::test]
     async fn outbound_binding_backend_reads_policy_then_sa_and_rejects_key_substitution() {
@@ -8029,6 +8108,111 @@ mod tests {
         assert_eq!(&encap[8..], &[0_u8; 16]);
         assert_eq!(mark, &encode_mark(params.mark.unwrap()));
         assert_eq!(if_id, &7_u32.to_ne_bytes());
+    }
+
+    #[test]
+    fn encodes_sa_install_with_tfc_padding_attribute() {
+        let baseline = encode_sa_info(&sa_parameters()).unwrap();
+        let mut params = sa_parameters();
+        params.tfc_pad = Some(512);
+        let body = encode_sa_info(&params).unwrap();
+        let tfc_pad = route_attr_payload(&body, XFRMA_TFCPAD).expect("TFC padding attr");
+        assert_eq!(tfc_pad, &512_u32.to_ne_bytes());
+        // Attribute header plus `__u32` payload; the pair is already aligned.
+        assert_eq!(body.len(), baseline.len() + 8);
+        assert_eq!(body.len() % 4, 0);
+        assert!(route_attr_payload(&baseline, XFRMA_TFCPAD).is_none());
+    }
+
+    #[test]
+    fn tfc_padding_validation_rejects_kernel_rejected_configurations() {
+        let mut zero = sa_parameters();
+        zero.tfc_pad = Some(0);
+        assert!(matches!(
+            encode_sa_info(&zero),
+            Err(XfrmError::InvalidConfig {
+                field: "sa.tfc_pad",
+                reason: "TFC padding length must be nonzero; use None for no TFC padding"
+            })
+        ));
+
+        let mut transport = sa_parameters();
+        transport.mode = XfrmMode::Transport;
+        transport.tfc_pad = Some(512);
+        assert!(matches!(
+            encode_sa_info(&transport),
+            Err(XfrmError::InvalidConfig {
+                field: "sa.tfc_pad",
+                reason: "TFC padding requires tunnel mode"
+            })
+        ));
+
+        let mut non_esp = sa_parameters();
+        non_esp.id.protocol = 51;
+        non_esp.tfc_pad = Some(512);
+        assert!(matches!(
+            encode_sa_info(&non_esp),
+            Err(XfrmError::InvalidConfig {
+                field: "sa.tfc_pad",
+                reason: "TFC padding supports ESP SAs only"
+            })
+        ));
+
+        // Tunnel-mode ESP without TFC padding keeps the established path.
+        let mut absent = sa_parameters();
+        absent.tfc_pad = None;
+        assert!(encode_sa_info(&absent).is_ok());
+    }
+
+    #[test]
+    fn getsa_readback_round_trips_tfc_padding() {
+        let mut params = sa_parameters();
+        params.tfc_pad = Some(1024);
+        let body = encode_sa_info(&params).unwrap();
+        assert_eq!(parse_sa_state(&body, None).unwrap().tfc_pad, Some(1024));
+
+        let plain = encode_sa_info(&sa_parameters()).unwrap();
+        assert_eq!(parse_sa_state(&plain, None).unwrap().tfc_pad, None);
+
+        // The kernel omits the attribute for an unset length; a nonconforming
+        // zero value must not become a second spelling of absence.
+        let mut zero_attr = encode_sa_info(&sa_parameters()).unwrap();
+        append_attr(&mut zero_attr, XFRMA_TFCPAD, &0_u32.to_ne_bytes()).unwrap();
+        let error = parse_sa_state(&zero_attr, None).unwrap_err();
+        assert!(matches!(
+            error,
+            XfrmError::Io {
+                operation: "query_sa",
+                kind: std::io::ErrorKind::InvalidData,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn tfc_padding_parser_rejects_duplicate_and_malformed_attributes() {
+        let mut duplicate = encode_sa_info(&sa_parameters()).unwrap();
+        append_attr(&mut duplicate, XFRMA_TFCPAD, &256_u32.to_ne_bytes()).unwrap();
+        append_attr(&mut duplicate, XFRMA_TFCPAD, &512_u32.to_ne_bytes()).unwrap();
+        assert!(matches!(
+            parse_sa_state(&duplicate, None),
+            Err(XfrmError::Io {
+                operation: "query_sa",
+                kind: std::io::ErrorKind::InvalidData,
+                ..
+            })
+        ));
+
+        let mut malformed = encode_sa_info(&sa_parameters()).unwrap();
+        append_attr(&mut malformed, XFRMA_TFCPAD, &[0x01]).unwrap();
+        assert!(matches!(
+            parse_sa_state(&malformed, None),
+            Err(XfrmError::Io {
+                operation: "query_sa",
+                kind: std::io::ErrorKind::InvalidData,
+                ..
+            })
+        ));
     }
 
     #[test]

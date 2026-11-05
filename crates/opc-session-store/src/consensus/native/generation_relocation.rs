@@ -36,13 +36,13 @@ enum Expected {
     },
 }
 
+#[derive(Clone)]
 enum Replacement {
     Receipt {
         id: FencedTransitionV2RequestId,
         row: SharedRow<NativeReceipt>,
     },
     Notification {
-        index: usize,
         row: NotificationRow,
     },
     Log {
@@ -63,6 +63,8 @@ pub(in crate::consensus::native) struct RelocationBuilder {
 
 pub(crate) struct Relocations {
     rows: Vec<Replacement>,
+    base: Option<Box<super::rollover::RelocationStream>>,
+    replay: Option<Box<super::replay::ReplayStream>>,
     identity: SessionConsensusIdentity,
     members: BTreeSet<SessionConsensusNodeId>,
     root: Option<Arc<crate::fenced_mutation_roster::RosterAttestationTrustRootV1>>,
@@ -76,8 +78,9 @@ impl Relocations {
     }
 }
 
-/// One owner work unit performs at most 64 persistent-container mutations.
-/// The writer releases State and services its WAL queue between units.
+/// One owner work unit publishes at most 64 logical row revisions into their
+/// live, deferred and journal roots. The writer releases State and services
+/// its WAL queue between units.
 pub(crate) const RELOCATION_STEP_ROWS: usize = 64;
 
 /// Fixed stack storage keeps the old resident values until State is released.
@@ -85,6 +88,9 @@ pub(crate) const RELOCATION_STEP_ROWS: usize = 64;
 /// drops, including the final batch. No row or output allocation occurs here.
 pub(crate) struct RetiredRows<'a> {
     _rows: [Option<Replacement>; RELOCATION_STEP_ROWS],
+    _captured_rows: [Option<Replacement>; RELOCATION_STEP_ROWS],
+    _journal_rows: [Option<SharedRow<log::NativeLogEntry>>; RELOCATION_STEP_ROWS],
+    _captured_journal_rows: [Option<SharedRow<log::NativeLogEntry>>; RELOCATION_STEP_ROWS],
     remaining: bool,
     _memory: std::marker::PhantomData<&'a VerificationMemory>,
 }
@@ -252,10 +258,6 @@ impl RelocationBuilder {
                     length,
                 } => {
                     let sequence = row.sequence();
-                    let index = usize::try_from(sequence.checked_sub(1).ok_or_else(|| {
-                        invalid("native relocation notification sequence is zero")
-                    })?)
-                    .map_err(|_| invalid("native relocation notification index overflow"))?;
                     let facts = facts::Row {
                         content: row.row_fingerprint(3, &sequence)?,
                         facts: facts::Notification {
@@ -273,7 +275,6 @@ impl RelocationBuilder {
                         return Err(invalid("native notification relocation content differs"));
                     }
                     Replacement::Notification {
-                        index,
                         row: row.relocated(cold),
                     }
                 }
@@ -335,6 +336,8 @@ impl RelocationBuilder {
         check()?;
         Ok(Relocations {
             rows: replacements,
+            base: None,
+            replay: None,
             identity,
             members: members.clone(),
             root,
@@ -344,18 +347,143 @@ impl RelocationBuilder {
 }
 
 impl Relocations {
+    pub(crate) fn empty(native: &NativeStorage, source: Arc<VerifiedPrefix>) -> io::Result<Self> {
+        RelocationBuilder::new(0)?.prepare(
+            source,
+            native.business.identity,
+            native.business.applied(),
+            &native.business.members,
+            native.business.roster_root.clone(),
+            &|| Ok(()),
+        )
+    }
+
+    pub(crate) fn from_base(
+        capture: capture::SnapshotCapture,
+        source: Arc<VerifiedPrefix>,
+    ) -> io::Result<Self> {
+        let mut result = RelocationBuilder::new(0)?.prepare(
+            Arc::clone(&source),
+            capture.storage.business.identity,
+            capture.storage.business.applied(),
+            &capture.storage.business.members,
+            capture.storage.business.roster_root.clone(),
+            &|| Ok(()),
+        )?;
+        result.base = Some(Box::new(super::rollover::RelocationStream::new(
+            capture, source,
+        )?));
+        Ok(result)
+    }
+
+    pub(crate) fn from_replay(
+        capture: capture::SnapshotCapture,
+        source: Arc<VerifiedPrefix>,
+        old: Arc<VerifiedPrefix>,
+        cut: PrefixIdentity,
+        mappings: Vec<super::FrameMapping>,
+    ) -> io::Result<Self> {
+        let mut result = RelocationBuilder::new(0)?.prepare(
+            Arc::clone(&source),
+            capture.storage.business.identity,
+            capture.storage.business.applied(),
+            &capture.storage.business.members,
+            capture.storage.business.roster_root.clone(),
+            &|| Ok(()),
+        )?;
+        result.replay = Some(Box::new(super::replay::ReplayStream::new(
+            capture, source, old, cut, mappings,
+        )?));
+        Ok(result)
+    }
+
+    /// Complete at most one bounded base batch outside State. The immutable
+    /// capture is shared; no second full index or all-row relocation vector is
+    /// allocated, even when the compact file contains a full retained history.
+    pub(crate) fn prepare_step(&mut self, check: &impl Fn() -> io::Result<()>) -> io::Result<()> {
+        if self.rows.is_empty() {
+            if let Some(base) = &mut self.base {
+                let (next, finished) = base.next(check)?;
+                self.rows = next.rows;
+                self._memory = next._memory;
+                if finished {
+                    self.base = None;
+                }
+            }
+        }
+        if self.rows.is_empty() {
+            if let Some(replay) = &mut self.replay {
+                let (next, finished) = replay.next(check)?;
+                self.rows = next.rows;
+                self._memory = next._memory;
+                if finished {
+                    self.replay = None;
+                }
+            }
+        }
+        Ok(())
+    }
+
     pub(crate) fn is_empty(&self) -> bool {
-        self.rows.is_empty()
+        self.rows.is_empty() && self.base.is_none() && self.replay.is_none()
     }
 
     /// The integrating WAL owner has already made this exact generation's
     /// CURRENT durable and checked its live owner. All fallible validation is
     /// complete before changing a row. Proof counts, contents and logical
     /// revisions remain identical; concurrent replacements simply do not match.
+    #[cfg(test)]
     pub(crate) fn publish_step(
         &mut self,
         storage: &mut NativeStorage,
     ) -> io::Result<RetiredRows<'_>> {
+        self.publish_step_mirrored(storage, None)
+    }
+
+    /// The deferred selected cut is immutable logically, but its own row roots
+    /// must shed retired source pins too. Publish the same at-most-64 distinct
+    /// revisions into both roots; validation for both precedes any mutation.
+    /// Both old batches survive State and fit the existing 64 KiB workspace.
+    pub(crate) fn publish_step_mirrored(
+        &mut self,
+        storage: &mut NativeStorage,
+        mut mirror: Option<&mut NativeStorage>,
+    ) -> io::Result<RetiredRows<'_>> {
+        self.require_authority(storage)?;
+        if let Some(captured) = mirror.as_deref() {
+            self.require_authority(captured)?;
+        }
+        let mut retired = RetiredRows {
+            _rows: std::array::from_fn(|_| None),
+            _captured_rows: std::array::from_fn(|_| None),
+            _journal_rows: std::array::from_fn(|_| None),
+            _captured_journal_rows: std::array::from_fn(|_| None),
+            remaining: false,
+            _memory: std::marker::PhantomData,
+        };
+        for (((slot, captured_slot), journal_slot), captured_journal_slot) in retired
+            ._rows
+            .iter_mut()
+            .zip(&mut retired._captured_rows)
+            .zip(&mut retired._journal_rows)
+            .zip(&mut retired._captured_journal_rows)
+        {
+            let Some(mut replacement) = self.rows.pop() else {
+                break;
+            };
+            if let Some(captured) = mirror.as_deref_mut() {
+                let mut copy = replacement.clone();
+                *captured_journal_slot = publish_replacement(captured, &mut copy);
+                *captured_slot = Some(copy);
+            }
+            *journal_slot = publish_replacement(storage, &mut replacement);
+            *slot = Some(replacement);
+        }
+        retired.remaining = !self.is_empty();
+        Ok(retired)
+    }
+
+    fn require_authority(&self, storage: &NativeStorage) -> io::Result<()> {
         // Log admission includes the complete business proof admission under
         // this same exclusive storage borrow, before any row is relocated.
         storage.log.generation_version(&storage.business)?;
@@ -365,76 +493,85 @@ impl Relocations {
         {
             return Err(invalid("native relocation authority changed"));
         }
-        let mut retired = RetiredRows {
-            _rows: std::array::from_fn(|_| None),
-            remaining: false,
-            _memory: std::marker::PhantomData,
-        };
-        for slot in &mut retired._rows {
-            let Some(mut replacement) = self.rows.pop() else {
-                break;
-            };
-            match &mut replacement {
-                Replacement::Receipt { id, row } => {
-                    if storage
-                        .business
-                        .receipts
-                        .get(id)
-                        .is_some_and(|current| current.ptr_eq(row))
-                    {
-                        if let Some(previous) = storage.business.receipts.insert(*id, row.clone()) {
-                            *row = previous;
-                        }
-                    }
-                }
-                Replacement::Notification { index, row } => {
-                    if storage
-                        .business
-                        .notifications
-                        .get(*index)
-                        .is_some_and(|current| current.ptr_eq(row))
-                    {
-                        *row = storage.business.notifications.set(*index, row.clone());
-                    }
-                }
-                Replacement::Log { index, row } => {
-                    if storage
-                        .log
-                        .entries
-                        .get(index)
-                        .is_some_and(|current| current.ptr_eq(row))
-                    {
-                        if row.has_slot_projection() {
-                            storage.log.slot_projections.insert(*index, row.clone());
-                        } else {
-                            storage.log.slot_projections.remove(index);
-                        }
-                        if let Some(previous) = storage.log.entries.insert(*index, row.clone()) {
-                            *row = previous;
-                        }
-                    }
-                }
-                Replacement::Roster { binding, row } => {
-                    if storage
-                        .business
-                        .roster
-                        .rows
-                        .get(binding)
-                        .is_some_and(|current| current.ptr_eq(row))
-                    {
-                        if let Some(previous) =
-                            storage.business.roster.rows.insert(*binding, row.clone())
-                        {
-                            *row = previous;
-                        }
-                    }
+        Ok(())
+    }
+}
+
+// Two row roots plus their journal predecessor aliases still fit the same
+// fixed workspace. All four retired batches drop after the owner releases State.
+const _: () = assert!(
+    RELOCATION_STEP_ROWS
+        * (2 * size_of::<Replacement>() + 2 * size_of::<Option<SharedRow<log::NativeLogEntry>>>())
+        <= 64 * 1024
+);
+
+fn publish_replacement(
+    storage: &mut NativeStorage,
+    replacement: &mut Replacement,
+) -> Option<SharedRow<log::NativeLogEntry>> {
+    let mut journal = None;
+    match replacement {
+        Replacement::Receipt { id, row } => {
+            if storage
+                .business
+                .receipts
+                .get(id)
+                .is_some_and(|current| current.ptr_eq(row))
+            {
+                if let Some(previous) = storage.business.receipts.insert(*id, row.clone()) {
+                    *row = previous;
                 }
             }
-            *slot = Some(replacement);
         }
-        retired.remaining = !self.rows.is_empty();
-        Ok(retired)
+        Replacement::Notification { row } => {
+            if let Some(index) = storage
+                .business
+                .frontiers
+                .notification_position(row.sequence())
+            {
+                if storage
+                    .business
+                    .notifications
+                    .get(index)
+                    .is_some_and(|current| current.ptr_eq(row))
+                {
+                    *row = storage.business.notifications.set(index, row.clone());
+                }
+            }
+        }
+        Replacement::Log { index, row } => {
+            journal = storage.log.relocate_journal_predecessor(*index, row);
+            if storage
+                .log
+                .entries
+                .get(index)
+                .is_some_and(|current| current.ptr_eq(row))
+            {
+                if row.has_slot_projection() {
+                    storage.log.slot_projections.insert(*index, row.clone());
+                } else {
+                    storage.log.slot_projections.remove(index);
+                }
+                if let Some(previous) = storage.log.entries.insert(*index, row.clone()) {
+                    *row = previous;
+                }
+            }
+        }
+        Replacement::Roster { binding, row } => {
+            if storage
+                .business
+                .roster
+                .rows
+                .get(binding)
+                .is_some_and(|current| current.ptr_eq(row))
+            {
+                if let Some(previous) = storage.business.roster.rows.insert(*binding, row.clone()) {
+                    *row = previous;
+                }
+            }
+        }
     }
+    journal
 }
 
 pub(in crate::consensus::native) struct PositionedReader<'a> {

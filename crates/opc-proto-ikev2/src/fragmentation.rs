@@ -150,7 +150,7 @@ pub enum Ikev2FragmentationError {
         /// Missing fragment number.
         fragment_number: u16,
     },
-    /// Fragment 1 did not identify the first inner payload.
+    /// Fragment 1 did not identify the first inner payload of nonempty content.
     FirstFragmentMissingNextPayload,
     /// The concatenated cleartext would exceed the caller's limit.
     ReassembledPayloadTooLarge {
@@ -284,7 +284,7 @@ pub fn reassemble_decrypted_ikev2_fragments(
             return Err(Ikev2FragmentationError::MissingFragment { fragment_number: 1 });
         }
     };
-    if first_fragment.next_payload == PayloadType::NoNext {
+    if first_fragment.next_payload == PayloadType::NoNext && total_len != 0 {
         return Err(Ikev2FragmentationError::FirstFragmentMissingNextPayload);
     }
 
@@ -442,6 +442,28 @@ mod tests {
                 first_payload: PayloadType::SecurityAssociation,
                 cleartext: Bytes::from_static(b"hello!"),
             })
+        );
+    }
+
+    #[test]
+    fn reassembly_accepts_empty_fragmented_messages_but_not_unnamed_content() {
+        let mut fragment = Ikev2DecryptedFragment {
+            next_payload: PayloadType::NoNext,
+            fragment_number: 1,
+            total_fragments: 1,
+            cleartext: &[],
+        };
+        assert_eq!(
+            reassemble_decrypted_ikev2_fragments(&[fragment], 0),
+            Ok(Ikev2ReassembledFragmentedPayloads {
+                first_payload: PayloadType::NoNext,
+                cleartext: Bytes::new(),
+            })
+        );
+        fragment.cleartext = b"unexpected";
+        assert_eq!(
+            reassemble_decrypted_ikev2_fragments(&[fragment], 64),
+            Err(Ikev2FragmentationError::FirstFragmentMissingNextPayload)
         );
     }
 

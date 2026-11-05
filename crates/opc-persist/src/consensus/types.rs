@@ -646,7 +646,7 @@ impl ConfigConsensusCommand {
 pub(crate) enum ConfigMutationFailure {
     /// A referenced transaction or rollback target does not exist.
     NotFound,
-    /// A uniqueness, lineage, label, or version invariant was rejected.
+    /// A uniqueness, lineage, label, version, or required-audit policy was rejected.
     Conflict,
     /// The caller reused a durable request ID for a different payload.
     RequestIdCollision,

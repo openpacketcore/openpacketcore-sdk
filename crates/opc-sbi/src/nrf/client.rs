@@ -10,6 +10,7 @@ use crate::redact::{safe_metric_label, sanitize_error_message};
 use async_trait::async_trait;
 use opc_types::NfInstanceId;
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -25,8 +26,8 @@ pub trait NrfOperations: Send + Sync {
     /// (TS 29.510 NFManagement `PUT .../nf-instances/{nfInstanceId}`).
     ///
     /// On success returns the heartbeat interval the NF must honor: the
-    /// NRF-supplied `heartbeatTimer` (in seconds) when present, otherwise
-    /// the implementation's default (30 s for `NrfClient`).
+    /// NRF-supplied `heartBeatTimer` (in seconds) when present, otherwise
+    /// the interval already negotiated for this NF (initially 30 s for `NrfClient`).
     async fn register(&self, profile: &NfProfile) -> Result<Duration, String>;
     /// Remove the NF instance from the NRF (TS 29.510 `DELETE`), making it
     /// undiscoverable; used for graceful shutdown.
@@ -49,6 +50,7 @@ pub trait NrfOperations: Send + Sync {
 pub struct NrfClient {
     client: crate::client::SbiClient,
     nrf_uri: String,
+    heartbeat_intervals: Mutex<HashMap<NfInstanceId, Duration>>,
 }
 
 impl NrfClient {
@@ -57,7 +59,11 @@ impl NrfClient {
     /// appended verbatim). Retry, TLS, and circuit-breaking behavior come
     /// from the supplied client.
     pub fn new(client: crate::client::SbiClient, nrf_uri: String) -> Self {
-        Self { client, nrf_uri }
+        Self {
+            client,
+            nrf_uri,
+            heartbeat_intervals: Mutex::new(HashMap::new()),
+        }
     }
 
     /// Create an NRF client using the default plain-HTTP SBI client.
@@ -79,6 +85,22 @@ impl NrfClient {
             .build()?;
         Ok(Self::new(client, nrf_uri))
     }
+
+    fn response_heartbeat_interval(&self, instance: &NfInstanceId, body: &[u8]) -> Duration {
+        let timer = serde_json::from_slice::<NrfHeartbeatResponse>(body)
+            .ok()
+            .and_then(|response| response.heartbeat_timer);
+        let mut intervals = lock_or_recover(&self.heartbeat_intervals);
+        // TS 29.510 section 5.2.2.3.2: an omitted timer leaves the negotiated
+        // interval in force. One client may manage more than one NF instance.
+        if let Some(timer) = timer {
+            intervals.insert(instance.clone(), heartbeat_interval_from_timer(Some(timer)));
+        }
+        intervals
+            .get(instance)
+            .copied()
+            .unwrap_or(DEFAULT_HEARTBEAT_INTERVAL)
+    }
 }
 
 #[async_trait]
@@ -98,6 +120,7 @@ impl NrfDeregNotifier for NrfClient {
 #[derive(Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct NrfHeartbeatResponse {
+    #[serde(rename = "heartBeatTimer")]
     pub heartbeat_timer: Option<u32>,
 }
 
@@ -132,12 +155,7 @@ impl NrfOperations for NrfClient {
         let response = self.client.send(request).await?;
 
         if response.status().is_success() {
-            // Parse heartbeat timer
-            let body_bytes = response.into_body();
-            if let Ok(res) = serde_json::from_slice::<NrfHeartbeatResponse>(&body_bytes) {
-                return Ok(heartbeat_interval_from_timer(res.heartbeat_timer));
-            }
-            Ok(DEFAULT_HEARTBEAT_INTERVAL)
+            Ok(self.response_heartbeat_interval(&profile.nf_instance_id, response.body()))
         } else {
             Err(format!(
                 "NRF registration failed with status {}",
@@ -162,6 +180,7 @@ impl NrfOperations for NrfClient {
         let response = self.client.send(request).await?;
 
         if response.status().is_success() {
+            lock_or_recover(&self.heartbeat_intervals).remove(instance_id);
             Ok(())
         } else {
             Err(format!(
@@ -191,11 +210,7 @@ impl NrfOperations for NrfClient {
         let response = self.client.send(request).await?;
 
         if response.status().is_success() {
-            let body_bytes = response.into_body();
-            if let Ok(res) = serde_json::from_slice::<NrfHeartbeatResponse>(&body_bytes) {
-                return Ok(heartbeat_interval_from_timer(res.heartbeat_timer));
-            }
-            Ok(DEFAULT_HEARTBEAT_INTERVAL)
+            Ok(self.response_heartbeat_interval(instance_id, response.body()))
         } else if response.status() == http::StatusCode::NOT_FOUND {
             Err(NRF_HEARTBEAT_NOT_FOUND.to_string())
         } else {
@@ -207,22 +222,56 @@ impl NrfOperations for NrfClient {
     }
 
     async fn discover(&self, query: &DiscoveryQuery) -> Result<DiscoveryResult, String> {
-        // Construct query parameters
         let mut uri = format!(
-            "{}/nnrf-disc/v1/nf-instances?target-nf-type={}",
+            "{}/nnrf-disc/v1/nf-instances?target-nf-type={}&requester-nf-type={}",
             self.nrf_uri,
-            percent_encode(query.target_nf_type.as_str())
+            percent_encode(
+                &query
+                    .target_nf_type
+                    .as_str()
+                    .replace('-', "_")
+                    .to_ascii_uppercase()
+            ),
+            percent_encode(
+                &query
+                    .requester_nf_type
+                    .as_str()
+                    .replace('-', "_")
+                    .to_ascii_uppercase()
+            ),
         );
-        if let Some(ref plmn) = query.plmn {
-            let encoded = serde_json::to_string(plmn)
-                .map(|value| percent_encode(&value))
-                .map_err(|_| "failed to encode NRF discovery PLMN".to_string())?;
-            uri.push_str("&target-plmn=");
-            uri.push_str(&encoded);
+        if let Some(id) = &query.requester_nf_instance_id {
+            uri.push_str("&requester-nf-instance-id=");
+            uri.push_str(&percent_encode(id.as_str()));
         }
-        for svc in &query.service_names {
+        if let Some(plmn) = &query.plmn {
+            let value = serde_json::to_string(&[super::NnrfPlmnId(plmn.clone())])
+                .map_err(|_| "failed to encode NRF discovery PLMN".to_string())?;
+            uri.push_str("&target-plmn-list=");
+            uri.push_str(&percent_encode(&value));
+        }
+        if let Some(snssai) = &query.s_nssai {
+            let value = serde_json::to_string(&[super::NnrfSnssai(snssai.clone())])
+                .map_err(|_| "failed to encode NRF discovery slice".to_string())?;
+            uri.push_str("&snssais=");
+            uri.push_str(&percent_encode(&value));
+        }
+        if !query.service_names.is_empty() {
+            let mut services = query
+                .service_names
+                .iter()
+                .map(String::as_str)
+                .collect::<Vec<_>>();
+            services.sort_unstable();
+            services.dedup();
             uri.push_str("&service-names=");
-            uri.push_str(&percent_encode(svc));
+            uri.push_str(
+                &services
+                    .into_iter()
+                    .map(percent_encode)
+                    .collect::<Vec<_>>()
+                    .join(","),
+            );
         }
 
         let request = http::Request::builder()
@@ -231,22 +280,35 @@ impl NrfOperations for NrfClient {
             .body(Vec::new())
             .map_err(|_| "failed to build NRF discovery request".to_string())?;
 
+        let started = std::time::Instant::now();
         let response = self.client.send(request).await?;
 
         if response.status().is_success() {
-            let body_bytes = response.into_body();
-            // Parse NF profiles
             #[derive(Deserialize)]
+            #[serde(rename_all = "camelCase")]
             struct DiscoveryResponse {
-                pub nf_instances: Vec<NfProfile>,
+                validity_period: u64,
+                nf_instances: Vec<NfProfile>,
             }
-            if let Ok(res) = serde_json::from_slice::<DiscoveryResponse>(&body_bytes) {
-                Ok(DiscoveryResult::Found(res.nf_instances))
+            let res: DiscoveryResponse = serde_json::from_slice(response.body())
+                .map_err(|_| "invalid NRF SearchResult".to_string())?;
+            let valid_for = response_cache_lifetime(
+                response.headers(),
+                Some(Duration::from_secs(res.validity_period)),
+                started.elapsed(),
+            );
+            if res.nf_instances.is_empty() {
+                Ok(DiscoveryResult::NotFound { valid_for })
             } else {
-                Ok(DiscoveryResult::NotFound)
+                Ok(DiscoveryResult::Found {
+                    profiles: res.nf_instances,
+                    valid_for,
+                })
             }
         } else if response.status() == http::StatusCode::NOT_FOUND {
-            Ok(DiscoveryResult::NotFound)
+            // No heuristic caching: a 404 needs explicit server freshness.
+            let valid_for = response_cache_lifetime(response.headers(), None, started.elapsed());
+            Ok(DiscoveryResult::NotFound { valid_for })
         } else {
             Ok(DiscoveryResult::Error(format!(
                 "NRF error: {}",
@@ -471,102 +533,147 @@ impl CachedDiscoveryClient {
             cache_lock.lookup(&key)
         };
 
+        let was_stale = matches!(&lookup, CacheLookup::Stale(_));
+        let sensitive = self.production_mode
+            && matches!(
+                query.target_nf_type.as_str().to_ascii_uppercase().as_str(),
+                "UDM" | "AUSF" | "NRF" | "PCF"
+            );
         match lookup {
             CacheLookup::Hit(profiles) => {
-                lock_or_recover(&opc_redaction::metrics::METRICS.sbi_nrf_discovery_total)
-                    .entry("cache_hit".to_string())
-                    .and_modify(|c| *c += 1)
-                    .or_insert(1);
-                Ok(profiles)
+                record_discovery_metric("cache_hit");
+                return Ok(profiles);
             }
-            CacheLookup::Stale(profiles) => {
-                let is_sensitive = matches!(
-                    query.target_nf_type.as_str().to_uppercase().as_str(),
-                    "UDM" | "AUSF" | "NRF" | "PCF"
+            CacheLookup::Negative => {
+                return Err("Discovery cached negative result (NotFound)".into())
+            }
+            _ => {}
+        }
+        let error = match self.nrf_client.discover(query).await {
+            Ok(DiscoveryResult::Found {
+                profiles,
+                valid_for,
+            }) => {
+                let mut cache = lock_or_recover(&self.cache);
+                cache.insert_with_validity_at(
+                    key,
+                    profiles.clone(),
+                    valid_for,
+                    std::time::Instant::now(),
                 );
-
-                if self.production_mode && is_sensitive {
-                    // Fail-closed for sensitive paths: do not silently use stale
-                    match self.nrf_client.discover(query).await {
-                        Ok(DiscoveryResult::Found(fresh_profiles)) => {
-                            let mut cache_lock = lock_or_recover(&self.cache);
-                            cache_lock.insert(key, fresh_profiles.clone());
-                            lock_or_recover(
-                                &opc_redaction::metrics::METRICS.sbi_nrf_discovery_total,
-                            )
-                            .entry("refresh_success".to_string())
-                            .and_modify(|c| *c += 1)
-                            .or_insert(1);
-                            Ok(fresh_profiles)
-                        }
-                        _ => {
-                            lock_or_recover(
-                                &opc_redaction::metrics::METRICS.sbi_nrf_discovery_total,
-                            )
-                            .entry("fail_closed".to_string())
-                            .and_modify(|c| *c += 1)
-                            .or_insert(1);
-                            Err("NRF lookup failed for security-sensitive path (stale cache rejected in Production)".into())
-                        }
-                    }
+                record_discovery_metric(if was_stale {
+                    "refresh_success"
                 } else {
-                    // Try to refresh, fall back to stale
-                    match self.nrf_client.discover(query).await {
-                        Ok(DiscoveryResult::Found(fresh_profiles)) => {
-                            let mut cache_lock = lock_or_recover(&self.cache);
-                            cache_lock.insert(key, fresh_profiles.clone());
-                            lock_or_recover(
-                                &opc_redaction::metrics::METRICS.sbi_nrf_discovery_total,
-                            )
-                            .entry("refresh_success".to_string())
-                            .and_modify(|c| *c += 1)
-                            .or_insert(1);
-                            Ok(fresh_profiles)
-                        }
-                        _ => {
-                            lock_or_recover(
-                                &opc_redaction::metrics::METRICS.sbi_nrf_discovery_total,
-                            )
-                            .entry("stale_fallback".to_string())
-                            .and_modify(|c| *c += 1)
-                            .or_insert(1);
-                            Ok(profiles)
-                        }
-                    }
-                }
+                    "miss_found"
+                });
+                lock_or_recover(&opc_redaction::metrics::METRICS.sbi_nrf_cache_entries).insert(
+                    safe_metric_label(query.target_nf_type.as_str()),
+                    cache.len() as u64,
+                );
+                return Ok(profiles);
             }
-            CacheLookup::Negative => Err("Discovery cached negative result (NotFound)".into()),
-            CacheLookup::Miss => match self.nrf_client.discover(query).await {
-                Ok(DiscoveryResult::Found(profiles)) => {
-                    let mut cache_lock = lock_or_recover(&self.cache);
-                    cache_lock.insert(key, profiles.clone());
-                    lock_or_recover(&opc_redaction::metrics::METRICS.sbi_nrf_discovery_total)
-                        .entry("miss_found".to_string())
-                        .and_modify(|c| *c += 1)
-                        .or_insert(1);
-                    lock_or_recover(&opc_redaction::metrics::METRICS.sbi_nrf_cache_entries).insert(
-                        safe_metric_label(query.target_nf_type.as_str()),
-                        cache_lock.len() as u64,
-                    );
-                    Ok(profiles)
-                }
-                Ok(DiscoveryResult::NotFound) => {
-                    let mut cache_lock = lock_or_recover(&self.cache);
-                    cache_lock.insert_negative(key);
-                    lock_or_recover(&opc_redaction::metrics::METRICS.sbi_nrf_discovery_total)
-                        .entry("miss_not_found".to_string())
-                        .and_modify(|c| *c += 1)
-                        .or_insert(1);
-                    Err("Discovery returned NotFound".into())
-                }
-                Ok(DiscoveryResult::Error(e)) => Err(format!(
-                    "NRF discovery error: {}",
-                    sanitize_error_message(e)
-                )),
-                Err(e) => Err(format!("NRF query failed: {}", sanitize_error_message(e))),
-            },
+            Ok(DiscoveryResult::NotFound { valid_for }) => {
+                lock_or_recover(&self.cache).insert_negative_with_validity_at(
+                    key,
+                    valid_for,
+                    std::time::Instant::now(),
+                );
+                record_discovery_metric("miss_not_found");
+                return Err("Discovery returned NotFound".into());
+            }
+            Ok(DiscoveryResult::Error(error)) => {
+                format!("NRF discovery error: {}", sanitize_error_message(error))
+            }
+            Err(error) => format!("NRF query failed: {}", sanitize_error_message(error)),
+        };
+        // Refresh can outlive the server validity deadline or a configuration
+        // invalidation. Re-read the current entry instead of retaining a copy
+        // admitted before the await (TS 29.510 section 5.3.2.2.1).
+        let fallback = if was_stale && !sensitive {
+            match lock_or_recover(&self.cache).lookup(&key) {
+                CacheLookup::Hit(profiles) | CacheLookup::Stale(profiles) => Some(profiles),
+                _ => None,
+            }
+        } else {
+            None
+        };
+        if let Some(profiles) = fallback {
+            record_discovery_metric("stale_fallback");
+            Ok(profiles)
+        } else {
+            if was_stale && sensitive {
+                record_discovery_metric("fail_closed");
+            }
+            Err(error)
         }
     }
+}
+
+fn record_discovery_metric(outcome: &str) {
+    lock_or_recover(&opc_redaction::metrics::METRICS.sbi_nrf_discovery_total)
+        .entry(outcome.to_string())
+        .and_modify(|count| *count += 1)
+        .or_insert(1);
+}
+
+// Never reuse a response beyond NRF validity or HTTP freshness, even on error.
+fn response_cache_lifetime(
+    headers: &http::HeaderMap,
+    validity: Option<Duration>,
+    elapsed: Duration,
+) -> Duration {
+    let mut max_age: Option<Duration> = None;
+    for value in headers.get_all(http::header::CACHE_CONTROL) {
+        let Ok(value) = value.to_str() else {
+            return Duration::ZERO;
+        };
+        for directive in value.split(',') {
+            let (name, value) = directive
+                .trim()
+                .split_once('=')
+                .map_or((directive.trim(), None), |(n, v)| {
+                    (n.trim(), Some(v.trim()))
+                });
+            if name.eq_ignore_ascii_case("no-store") || name.eq_ignore_ascii_case("no-cache") {
+                return Duration::ZERO;
+            }
+            if name.eq_ignore_ascii_case("max-age") {
+                let Some(seconds) = value.and_then(|v| v.trim_matches('"').parse::<u64>().ok())
+                else {
+                    return Duration::ZERO;
+                };
+                let limit = Duration::from_secs(seconds);
+                max_age = Some(max_age.map_or(limit, |old| old.min(limit)));
+            }
+        }
+    }
+    let age = match headers.get(http::header::AGE) {
+        None => Duration::ZERO,
+        Some(value) => match value.to_str().ok().and_then(|v| v.parse::<u64>().ok()) {
+            Some(seconds) => Duration::from_secs(seconds),
+            None => return Duration::ZERO,
+        },
+    };
+    let apparent_age = match headers.get(http::header::DATE) {
+        None => Duration::ZERO,
+        Some(value) => match value
+            .to_str()
+            .ok()
+            .and_then(|v| crate::headers::parse_http_date(v).ok())
+        {
+            Some(date) => (time::OffsetDateTime::now_utc() - date)
+                .try_into()
+                .unwrap_or(Duration::ZERO),
+            None => return Duration::ZERO,
+        },
+    };
+    let lifetime = match (validity, max_age) {
+        (Some(validity), Some(max_age)) => validity.min(max_age),
+        (Some(validity), None) => validity,
+        (None, Some(max_age)) => max_age,
+        (None, None) => Duration::ZERO,
+    };
+    lifetime.saturating_sub(apparent_age.max(age.saturating_add(elapsed)))
 }
 
 fn percent_encode(value: &str) -> String {
@@ -586,6 +693,47 @@ fn percent_encode(value: &str) -> String {
 mod tests {
     use super::*;
     use std::sync::atomic::{AtomicUsize, Ordering};
+
+    #[test]
+    fn discovery_cache_lifetime_honors_http_age_and_server_limits() {
+        for (validity, control, age, expected) in [
+            (Some(60), None, None, 58),
+            (Some(60), Some("max-age=30"), Some("10"), 18),
+            (Some(10), Some("max-age=30"), None, 8),
+            (Some(60), Some("MAX-AGE=\"30\", max-age=15"), None, 13),
+            (Some(60), Some("no-store, max-age=30"), None, 0),
+            (Some(60), Some("no-cache=\"nfInstances\""), None, 0),
+            (Some(60), Some("max-age=invalid"), None, 0),
+            (Some(60), None, Some("invalid"), 0),
+            (Some(60), None, Some("100"), 0),
+            (None, None, None, 0),
+            (None, Some("max-age=20"), Some("1"), 17),
+        ] {
+            let mut headers = http::HeaderMap::new();
+            if let Some(value) = control {
+                headers.insert(http::header::CACHE_CONTROL, value.parse().unwrap());
+            }
+            if let Some(value) = age {
+                headers.insert(http::header::AGE, value.parse().unwrap());
+            }
+            assert_eq!(
+                response_cache_lifetime(
+                    &headers,
+                    validity.map(Duration::from_secs),
+                    Duration::from_secs(2)
+                ),
+                Duration::from_secs(expected)
+            );
+        }
+        for date in ["Sun, 06 Nov 1994 08:49:37 GMT", "malformed date"] {
+            let mut headers = http::HeaderMap::new();
+            headers.insert(http::header::DATE, date.parse().unwrap());
+            assert_eq!(
+                response_cache_lifetime(&headers, Some(Duration::from_secs(60)), Duration::ZERO),
+                Duration::ZERO
+            );
+        }
+    }
 
     #[test]
     fn heartbeat_timer_values_are_clamped() {
@@ -665,7 +813,9 @@ mod tests {
         }
 
         async fn discover(&self, _query: &DiscoveryQuery) -> Result<DiscoveryResult, String> {
-            Ok(DiscoveryResult::NotFound)
+            Ok(DiscoveryResult::NotFound {
+                valid_for: Duration::MAX,
+            })
         }
     }
 
@@ -676,8 +826,8 @@ mod tests {
             nf_status: crate::nrf::NfStatus::Registered,
             ipv4_addresses: vec!["127.0.0.1".to_string()],
             fqdn: None,
-            plmn_list: vec![opc_types::PlmnId::new("001", "01").unwrap()],
-            s_nssais: vec![opc_types::Snssai::new(1, Some("010203")).unwrap()],
+            plmn_list: vec![opc_types::PlmnId::new("001", "01").unwrap().into()],
+            s_nssais: vec![opc_types::Snssai::new(1, Some("010203")).unwrap().into()],
             nf_services: vec![],
             priority: 10,
             capacity: 100,

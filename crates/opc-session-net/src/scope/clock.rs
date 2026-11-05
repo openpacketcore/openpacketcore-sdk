@@ -12,7 +12,7 @@ use std::{
 pub struct AuthenticationTimeError;
 
 /// Trusted platform time observation, never accepted from protocol input.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct RealtimeReading {
     /// Platform realtime observation.
     pub now: Timestamp,
@@ -45,6 +45,7 @@ pub struct IntervalClock {
 struct ClockState {
     previous: Option<(RealtimeReading, tokio::time::Instant)>,
     recovering: Option<(tokio::time::Instant, u8)>,
+    budget_refused: bool,
 }
 impl IntervalClock {
     /// Install a trusted source and freeze the maximum allowed uncertainty.
@@ -66,7 +67,19 @@ impl AuthenticationClock for IntervalClock {
         let mut state = self.state.lock().map_err(|_| AuthenticationTimeError)?;
         let current = self.source.read()?;
         let monotonic = tokio::time::Instant::now();
-        if current.uncertainty > self.budget || current.synchronization_generation == 0 {
+        if current.uncertainty > self.budget {
+            if !state.budget_refused {
+                tracing::warn!(uncertainty = ?current.uncertainty, budget = ?self.budget,
+                    "authentication clock exceeds its fixed uncertainty budget");
+                state.budget_refused = true;
+            }
+            return Err(AuthenticationTimeError);
+        }
+        if state.budget_refused {
+            tracing::info!("authentication clock returned within its fixed uncertainty budget");
+            state.budget_refused = false;
+        }
+        if current.synchronization_generation == 0 {
             return Err(AuthenticationTimeError);
         }
         if let Some((old, old_monotonic)) = state.previous {

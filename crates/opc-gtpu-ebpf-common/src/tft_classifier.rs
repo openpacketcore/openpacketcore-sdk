@@ -26,7 +26,7 @@
 use core::fmt;
 
 /// Current shared-SA TFT map ABI version.
-pub const TFT_CLASSIFIER_ABI_VERSION: u8 = 5;
+pub const TFT_CLASSIFIER_ABI_VERSION: u8 = 6;
 /// The only inner family executable by the current GTP-U tc forwarding path.
 pub const TFT_CLASSIFIER_FAMILY_IPV4: u8 = 4;
 /// Number of immutable filter banks per classifier.
@@ -57,7 +57,7 @@ pub const TFT_CLASSIFIER_META_MAP_MAX_ENTRIES: u32 = 65_536;
 /// replacement records fit this fixed capacity before it touches metadata.
 pub const TFT_CLASSIFIER_FILTER_MAP_MAX_ENTRIES: u32 = 65_536;
 /// Number of bounded classifier-drop counters.
-pub const TFT_CLASSIFIER_COUNTER_SLOTS: u32 = 3;
+pub const TFT_CLASSIFIER_COUNTER_SLOTS: u32 = 4;
 
 /// Shared-SA TFT schema marker map name.
 pub const MAP_TFT_CLASSIFIER_SCHEMA: &str = "GTPU_TFT_SCHEMA";
@@ -71,8 +71,13 @@ pub const MAP_TFT_CLASSIFIER_COUNTERS: &str = "GTPU_TFT_DROP";
 /// Schema-marker value width.
 pub const TFT_CLASSIFIER_SCHEMA_VALUE_LEN: usize = 16;
 /// Current schema marker for the additive IPv4-only classifier map graph.
+///
+/// Version 6 adds the fourth bounded drop-counter slot (fragment-affinity
+/// capacity refusal). The pinned counter map therefore has a different
+/// definition from version 5; a retained version-5 graph is refused and needs a
+/// fresh attach, like every earlier pinned-ABI generation.
 pub const TFT_CLASSIFIER_SCHEMA_MARKER_VALUE: [u8; TFT_CLASSIFIER_SCHEMA_VALUE_LEN] =
-    *b"OPC-TFT-IPv4-v5\0";
+    *b"OPC-TFT-IPv4-v6\0";
 /// Classifier metadata-map key width.
 pub const TFT_CLASSIFIER_KEY_LEN: usize = 8;
 /// Exact classifier fingerprint width.
@@ -90,9 +95,14 @@ pub const COUNTER_TFT_CLASSIFIER_MALFORMED: u32 = 0;
 /// Counter index: no filter matched and the exact snapshot has no default.
 pub const COUNTER_TFT_CLASSIFIER_NO_MATCH: u32 = 1;
 /// Counter index: a retained classifier map graph was stale, partial, or
-/// internally inconsistent, or fragment affinity was absent, stale, full, or
-/// ambiguous. The packet was dropped fail closed.
+/// internally inconsistent, or fragment affinity was absent, stale, orphaned,
+/// or ambiguous. The packet was dropped fail closed.
 pub const COUNTER_TFT_CLASSIFIER_INVALID_STATE: u32 = 2;
+/// Counter index: a fragment-affinity bucket owned by this subscriber was full
+/// of live or poisoned entries, so a new fragmented datagram could not be
+/// tracked. The packet was dropped fail closed; no other owner's entry was
+/// evicted. This is distinct from the stale/invalid-state counter.
+pub const COUNTER_TFT_CLASSIFIER_CAPACITY: u32 = 3;
 
 const META_FLAG_HAS_DEFAULT: u8 = 1;
 const META_FLAG_REMOVING: u8 = 1 << 1;
@@ -2011,7 +2021,7 @@ pub const fn tft_classifier_schema_is_current(
         && value[11] == 0x34
         && value[12] == 0x2d
         && value[13] == 0x76
-        && value[14] == 0x35
+        && value[14] == 0x36
         && value[15] == 0
 }
 
@@ -2378,22 +2388,16 @@ mod tests {
             COUNTER_TFT_CLASSIFIER_MALFORMED,
             COUNTER_TFT_CLASSIFIER_NO_MATCH,
             COUNTER_TFT_CLASSIFIER_INVALID_STATE,
+            COUNTER_TFT_CLASSIFIER_CAPACITY,
         ];
         for index in indices {
             assert!(index < TFT_CLASSIFIER_COUNTER_SLOTS);
         }
-        assert_ne!(
-            COUNTER_TFT_CLASSIFIER_MALFORMED,
-            COUNTER_TFT_CLASSIFIER_NO_MATCH
-        );
-        assert_ne!(
-            COUNTER_TFT_CLASSIFIER_MALFORMED,
-            COUNTER_TFT_CLASSIFIER_INVALID_STATE
-        );
-        assert_ne!(
-            COUNTER_TFT_CLASSIFIER_NO_MATCH,
-            COUNTER_TFT_CLASSIFIER_INVALID_STATE
-        );
+        for (position, index) in indices.iter().enumerate() {
+            for other in &indices[position + 1..] {
+                assert_ne!(index, other, "drop-counter indices must be distinct");
+            }
+        }
     }
 
     #[test]
@@ -2730,6 +2734,7 @@ mod tests {
             &TFT_CLASSIFIER_SCHEMA_MARKER_VALUE
         ));
         assert!(!tft_classifier_schema_is_current(b"OPC-TFT-IPv4-v4\0"));
+        assert!(!tft_classifier_schema_is_current(b"OPC-TFT-IPv4-v5\0"));
         for index in 0..TFT_CLASSIFIER_SCHEMA_VALUE_LEN {
             let mut wrong = TFT_CLASSIFIER_SCHEMA_MARKER_VALUE;
             wrong[index] ^= 1;
@@ -2738,5 +2743,13 @@ mod tests {
                 "schema byte {index} must participate in the identity"
             );
         }
+    }
+
+    #[test]
+    fn metadata_abi_matches_the_current_schema_generation() {
+        assert_eq!(meta(true, 0).encode()[0], 6);
+        let mut prior = meta(true, 0).encode();
+        prior[0] = 5;
+        assert!(TftClassifierMeta::decode(prior).is_none());
     }
 }

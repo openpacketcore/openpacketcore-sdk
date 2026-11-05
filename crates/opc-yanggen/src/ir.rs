@@ -105,7 +105,10 @@ pub enum TypeRef {
     Int16,
     Int32,
     Int64,
-    Decimal64,
+    Decimal64 {
+        /// Required YANG scale, in the inclusive range 1..=18.
+        fraction_digits: u8,
+    },
     Empty,
     IdentityRef {
         base: String,
@@ -186,6 +189,15 @@ pub struct SchemaNode {
     pub type_ref: Option<TypeRef>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub numeric_range: Vec<NumericRangeInterval>,
+    /// Explicit YANG mandatory statement; omission is equivalent to false.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mandatory: Option<bool>,
+    /// Minimum list/leaf-list cardinality; omission means zero.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub min_elements: Option<u32>,
+    /// Maximum list/leaf-list cardinality; omission means unbounded.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_elements: Option<u32>,
     pub key_leaves: Vec<String>,
     pub child_paths: Vec<String>,
     pub source: YangSourceLocation,
@@ -210,6 +222,9 @@ impl Default for SchemaNode {
             config: false,
             type_ref: None,
             numeric_range: Vec::new(),
+            mandatory: None,
+            min_elements: None,
+            max_elements: None,
             key_leaves: Vec::new(),
             child_paths: Vec::new(),
             source: YangSourceLocation::default(),
@@ -219,6 +234,37 @@ impl Default for SchemaNode {
             data_class: None,
             unique_constraints: Vec::new(),
         }
+    }
+}
+
+impl SchemaNode {
+    pub(crate) fn validate_cardinality(&self) -> Result<(), &'static str> {
+        if self.mandatory.is_some()
+            && !matches!(self.kind, SchemaNodeKind::Leaf | SchemaNodeKind::Choice)
+        {
+            return Err("mandatory is only valid on a leaf or choice in this profile");
+        }
+        if self.mandatory == Some(true) && self.default.is_some() {
+            return Err("a mandatory node cannot declare a default");
+        }
+        if (self.min_elements.is_some() || self.max_elements.is_some())
+            && !matches!(self.kind, SchemaNodeKind::List | SchemaNodeKind::LeafList)
+        {
+            return Err("element bounds require a list or leaf-list");
+        }
+        if self
+            .max_elements
+            .is_some_and(|max| max == 0 || max < self.min_elements.unwrap_or(0))
+        {
+            return Err("max-elements must be positive and at least min-elements");
+        }
+        if self.kind == SchemaNodeKind::LeafList
+            && self.min_elements.is_some_and(|min| min > 0)
+            && self.default.is_some()
+        {
+            return Err("a leaf-list with positive min-elements cannot declare defaults");
+        }
+        Ok(())
     }
 }
 

@@ -17,10 +17,12 @@ pub(crate) async fn resolve_candidate<C: OpcConfig>(
     store: &dyn ManagedDatastore<C>,
     current_running: Arc<C>,
     has_pending: bool,
+    store_failure: &mut Option<StoreErrorCode>,
 ) -> Result<C, CommitError> {
     match mode {
         CommitMode::Rollback { target } => {
             let stored = store.load_rollback(target).await.map_err(|err| {
+                *store_failure = Some(err.code);
                 log_store_error("load_rollback failed", request_id, &err);
                 crate::metrics::record_rollback_failure();
                 if err.code == StoreErrorCode::NotFound {
@@ -30,6 +32,7 @@ pub(crate) async fn resolve_candidate<C: OpcConfig>(
                 }
             })?;
             validate_publishable_stored_config(&stored).map_err(|err| {
+                *store_failure = Some(err.code);
                 log_store_error("rollback target validation failed", request_id, &err);
                 crate::metrics::record_rollback_failure();
                 CommitError::rollback_unavailable(ROLLBACK_UNAVAILABLE_MESSAGE)
@@ -46,6 +49,7 @@ pub(crate) async fn resolve_candidate<C: OpcConfig>(
                 .load_latest()
                 .await
                 .map_err(|err| {
+                    *store_failure = Some(err.code);
                     log_store_error("load_latest confirmed commit failed", request_id, &err);
                     crate::metrics::record_rollback_failure();
                     CommitError::rollback_unavailable(ROLLBACK_UNAVAILABLE_MESSAGE)
@@ -63,6 +67,7 @@ pub(crate) async fn resolve_candidate<C: OpcConfig>(
                 .load_rollback(opc_config_model::RollbackTarget::TxId(parent_tx))
                 .await
                 .map_err(|err| {
+                    *store_failure = Some(err.code);
                     log_store_error("load_rollback confirmed parent failed", request_id, &err);
                     crate::metrics::record_rollback_failure();
                     if err.code == StoreErrorCode::NotFound {
@@ -72,6 +77,7 @@ pub(crate) async fn resolve_candidate<C: OpcConfig>(
                     }
                 })?;
             validate_publishable_stored_config(&stored).map_err(|err| {
+                *store_failure = Some(err.code);
                 log_store_error(
                     "confirmed commit rollback target validation failed",
                     request_id,

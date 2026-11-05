@@ -479,21 +479,30 @@ async fn lost_surviving_quorum_retains_failed_preparation_without_readmission_or
         .await
         .is_ready());
     cluster.heal(leader);
-    tokio::time::timeout(RECOVERY_TIMEOUT, async {
-        loop {
-            let status = cluster.stores[survivor].status();
-            if status.term > term
-                && status.leader_id != Some(cluster.stores[leader].status().node_id)
-                && cluster.stores[survivor]
-                    .probe_durable_readiness()
-                    .await
-                    .is_ready()
-            {
-                break;
+    let survivor_stores = (0..MEMBER_COUNT)
+        .filter(|index| *index != leader)
+        .map(|index| cluster.stores[index].clone())
+        .collect::<Vec<_>>();
+    wait_for_survivor_election(
+        RECOVERY_TIMEOUT,
+        term,
+        async {
+            loop {
+                let status = cluster.stores[survivor].status();
+                if status.term > term
+                    && status.leader_id != Some(cluster.stores[leader].status().node_id)
+                    && cluster.stores[survivor]
+                        .probe_durable_readiness()
+                        .await
+                        .is_ready()
+                {
+                    break;
+                }
+                tokio::time::sleep(POLL_INTERVAL).await;
             }
-            tokio::time::sleep(POLL_INTERVAL).await;
-        }
-    })
+        },
+        |term| next_election_term(&survivor_stores, term),
+    )
     .await
     .expect("survivors elect normally without the retiring voter campaigning");
     let retained = cluster.stores[leader].prepare_shutdown();

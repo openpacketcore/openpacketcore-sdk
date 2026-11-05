@@ -18,7 +18,7 @@ use time::{Date, Month, Time, Weekday};
 use crate::redact::SensitivePresence;
 
 /// `3gpp-Sbi-Message-Priority` (TS 29.500): relative SBI message priority.
-/// This crate restricts the value to the 0–7 range; values outside it are
+/// This crate restricts the value to the 0–31 range; values outside it are
 /// rejected at parse time.
 pub const HEADER_MESSAGE_PRIORITY: &str = "3gpp-sbi-message-priority";
 /// `3gpp-Sbi-Correlation-Info` (TS 29.500): opaque correlation data used to
@@ -82,7 +82,7 @@ pub enum HeaderParseError {
         header: &'static str,
     },
     /// The value is present and well-formed text but violates the grammar
-    /// for that header (e.g. priority out of 0–7, non-IMF-fixdate date,
+    /// for that header (e.g. priority out of 0–31, non-IMF-fixdate date,
     /// non-b64token bearer credentials).
     #[error("header '{header}' is invalid: {reason}")]
     InvalidValue {
@@ -319,9 +319,8 @@ impl RetryAfter {
 /// sensitive fields, never their values.
 #[derive(Clone, PartialEq, Eq, Default)]
 pub struct SbiHeaders {
-    /// Message priority (0–7), mapped from the 3GPP QosIdentifier field.
-    /// TS 29.500 defines QosIdentifier as 0–255, but this implementation
-    /// restricts the field to 0–7 per the SBI message priority semantics.
+    /// TS 29.500 message priority (0–31); lower means higher priority.
+    /// Absence is preserved; request consumers use default priority 24.
     pub message_priority: Option<u8>,
     /// `3gpp-Sbi-Correlation-Info` value: opaque visible-ASCII correlation
     /// data; treated as sensitive because it can carry subscriber
@@ -392,6 +391,7 @@ impl SbiHeaders {
         let mut headers = HeaderMap::new();
 
         if let Some(priority) = self.message_priority {
+            parse_message_priority(&priority.to_string())?;
             insert_header(&mut headers, HEADER_MESSAGE_PRIORITY, &priority.to_string())?;
         }
         if let Some(correlation_info) = &self.correlation_info {
@@ -504,12 +504,12 @@ fn parse_message_priority(value: &str) -> Result<u8, HeaderParseError> {
         .parse::<u8>()
         .map_err(|_| HeaderParseError::InvalidValue {
             header: HEADER_MESSAGE_PRIORITY,
-            reason: "priority must be an integer between 0 and 7".into(),
+            reason: "priority must be an integer between 0 and 31".into(),
         })?;
-    if priority > 7 {
+    if priority > 31 {
         return Err(HeaderParseError::InvalidValue {
             header: HEADER_MESSAGE_PRIORITY,
-            reason: "priority must be between 0 and 7".into(),
+            reason: "priority must be between 0 and 31".into(),
         });
     }
     Ok(priority)
@@ -614,7 +614,7 @@ fn is_b64token_char(byte: u8) -> bool {
     byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'.' | b'_' | b'~' | b'+' | b'/')
 }
 
-fn parse_http_date(value: &str) -> Result<(), HeaderParseError> {
+pub(crate) fn parse_http_date(value: &str) -> Result<time::OffsetDateTime, HeaderParseError> {
     validate_visible_ascii(HEADER_RETRY_AFTER, value)?;
     if value.len() != 29 {
         return Err(HeaderParseError::InvalidValue {
@@ -653,10 +653,11 @@ fn parse_http_date(value: &str) -> Result<(), HeaderParseError> {
             header: HEADER_RETRY_AFTER,
             reason: "retry-after date must be a valid IMF-fixdate HTTP-date".into(),
         })?;
-    Time::from_hms(hour, minute, second).map_err(|_| HeaderParseError::InvalidValue {
-        header: HEADER_RETRY_AFTER,
-        reason: "retry-after date must be a valid IMF-fixdate HTTP-date".into(),
-    })?;
+    let time =
+        Time::from_hms(hour, minute, second).map_err(|_| HeaderParseError::InvalidValue {
+            header: HEADER_RETRY_AFTER,
+            reason: "retry-after date must be a valid IMF-fixdate HTTP-date".into(),
+        })?;
 
     if date.weekday() != weekday {
         return Err(HeaderParseError::InvalidValue {
@@ -665,7 +666,7 @@ fn parse_http_date(value: &str) -> Result<(), HeaderParseError> {
         });
     }
 
-    Ok(())
+    Ok(date.with_time(time).assume_utc())
 }
 
 fn parse_weekday(value: &str) -> Result<Weekday, HeaderParseError> {

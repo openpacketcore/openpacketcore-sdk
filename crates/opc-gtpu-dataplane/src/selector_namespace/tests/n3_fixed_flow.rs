@@ -79,3 +79,62 @@ fn teid_only_transition_cannot_change_n3_profile_or_qfi() {
         &n3(&replacement, 10)
     ));
 }
+
+#[test]
+fn multihoming_descriptor_binds_policy_and_preserves_legacy_decoding() {
+    for legacy in [group(1, 2, 10, Some(40)), n3(&group(1, 2, 10, Some(40)), 9)] {
+        let old = canonical_desired_bytes(&legacy);
+        assert_eq!(decode_canonical_desired(&old), Some(legacy.clone()));
+        let candidate = GtpuSessionGroup::new(
+            legacy.id(),
+            legacy.device_id(),
+            legacy
+                .entries()
+                .iter()
+                .cloned()
+                .map(|entry| {
+                    entry.with_peer_source_policy(crate::GtpuPeerSourcePolicy::TeidAndLocal)
+                })
+                .collect(),
+        )
+        .unwrap();
+        let encoded = canonical_desired_bytes(&candidate);
+        assert_eq!(encoded[0], old[0] + 2);
+        assert_eq!(decode_canonical_desired(&encoded), Some(candidate.clone()));
+        let key = [0x4e; 32];
+        let a = CanonicalClaim::from_group(&legacy).with_key(&key).unwrap();
+        let b = CanonicalClaim::from_group(&candidate)
+            .with_key(&key)
+            .unwrap();
+        assert_eq!(a.atoms, b.atoms);
+        assert_ne!(a.desired_fingerprint, b.desired_fingerprint);
+        let mut wrong_version = encoded.clone();
+        wrong_version[0] = old[0];
+        assert!(decode_canonical_desired(&wrong_version).is_none());
+        // Locate the one added policy byte independently of optional mark/port fields.
+        let policy_offset = (1..old.len())
+            .find(|&offset| {
+                encoded[1..offset] == old[1..offset] && encoded[offset + 1..] == old[offset..]
+            })
+            .unwrap();
+        for invalid in [0, 2, 255] {
+            let mut malformed = encoded.clone();
+            malformed[policy_offset] = invalid;
+            assert!(decode_canonical_desired(&malformed).is_none());
+        }
+    }
+    let old = group(1, 2, 10, Some(40));
+    let new = group_with_paa(2, 2, 20, old.entries()[0].context().ms_address, Some(40));
+    let changed = GtpuSessionGroup::new(
+        new.id(),
+        new.device_id(),
+        new.entries()
+            .iter()
+            .cloned()
+            .map(|entry| entry.with_peer_source_policy(crate::GtpuPeerSourcePolicy::TeidAndLocal))
+            .collect(),
+    )
+    .unwrap();
+    assert!(single_bearer_reattach_is_exact(&old, &new));
+    assert!(!single_bearer_reattach_is_exact(&old, &changed));
+}

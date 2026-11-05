@@ -65,7 +65,12 @@ const BLOCK_B_POINTS: usize = 14_080;
 /// Regenerate deliberately, never to make a red run green: run the suite with
 /// `GTPV2C_ENCODER_DUMP=<path>`, diff the dump against the previous one, and
 /// only then update this literal.
-const BLOCK_A_DIGEST: u64 = 8_393_444_349_946_952_941;
+// TS 29.274 7.7.8 ARP correction (#1354): eight S2b outcomes for
+// malformed/profile_create_bearer_request_missing_tft.bin changed. The three
+// profile-less levels now accept its received 0x4f ARP (canonical 0x4d, raw
+// 0x4f); ProcedureAware reaches the existing missing-TFT refusal. Every other
+// Block A point and the complete Block B injection grid are unchanged.
+const BLOCK_A_DIGEST: u64 = 9_814_836_326_892_910_195;
 
 /// Digest of the ordered Block B `(label, outcome)` list. This is where the
 /// IE 176 canonical-encode deltas live: spare-nibble zeroing, Extendable

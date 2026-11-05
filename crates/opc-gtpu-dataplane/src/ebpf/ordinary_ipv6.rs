@@ -108,12 +108,28 @@ pub(super) fn ordinary_ipv6_plan(
     local_ip: Ipv4Addr,
 ) -> Result<OrdinaryIpv6Plan, GtpuError> {
     validate_gtp_version(context.gtp_version)?;
-    // The family-tagged entry carries no downlink inner MTU. Refuse the
-    // in-tunnel Packet Too Big opt-in rather than install without it.
-    if context.downlink_inner_mtu.is_some() {
-        return Err(GtpuError::UnsupportedFeature {
-            feature: "downlink_inner_mtu_inner_ipv6",
-        });
+    // IPv6 has no in-network fragmentation (RFC 8200 section 4.5), so the
+    // fragment-inner default policy cannot be enforced here: only the explicit
+    // in-tunnel Packet Too Big opt-in is meaningful. The family-tagged entry
+    // carries that MTU in its versioned profile.
+    if let Some(mtu) = context.downlink_inner_mtu {
+        if mtu.policy() == crate::GtpuDownlinkOversizePolicy::FragmentInner {
+            return Err(GtpuError::UnsupportedFeature {
+                feature: "downlink_inner_mtu_inner_ipv6_fragmentation",
+            });
+        }
+        if mtu.get() < 1_280 {
+            return Err(GtpuError::invalid_config(
+                "pdp.downlink_inner_mtu",
+                "an IPv6 downlink inner MTU must be at least the IPv6 minimum MTU (1280)",
+            ));
+        }
+        if context.uplink_source_port_policy != crate::GtpuUplinkSourcePortPolicy::LegacyServicePort
+        {
+            return Err(GtpuError::UnsupportedFeature {
+                feature: "downlink_inner_mtu_with_selected_uplink_source_port",
+            });
+        }
     }
     let IpAddr::V6(ms_address) = context.ms_address else {
         return Err(GtpuError::invalid_config(
@@ -162,12 +178,22 @@ pub(super) fn ordinary_ipv6_plan(
         context.downlink_source_port_policy,
         context.uplink_source_port_policy,
     )
+    .map(|entry| entry.with_peer_source_policy(context.downlink_peer_source_policy))
     .ok_or_else(|| {
         GtpuError::invalid_config(
             "pdp.uplink_source_port_policy",
             "uplink source-port policy and PDP graph must be canonical",
         )
     })?;
+    let entry = match context.downlink_inner_mtu.and_then(|mtu| mtu.to_wire()) {
+        Some(mtu) => entry.with_downlink_inner_mtu(mtu).ok_or_else(|| {
+            GtpuError::invalid_config(
+                "pdp.downlink_inner_mtu",
+                "unsupported family-entry MTU profile",
+            )
+        })?,
+        None => entry,
+    };
     Ok(OrdinaryIpv6Plan {
         entry,
         uplink_key: GtpuSessionUplinkKey::from_entry(entry).encode(),
@@ -179,10 +205,11 @@ fn context_from_entry(entry: EbpfSessionEntry, ifindex: u32) -> Option<GtpPdpCon
     let mark = u32::from_be_bytes(entry.bearer_mark());
     Some(GtpPdpContext {
         local_teid: Teid::new(u32::from_be_bytes(entry.local_teid()))?,
-        peer_teid: Teid::new(u32::from_be_bytes(entry.peer_teid()))?,
+        peer_teid: crate::PeerTeid::new(u32::from_be_bytes(entry.peer_teid())),
         ms_address: ip_address(entry.inner_paa().canonical_address()),
         peer_address: ip_address(entry.peer_outer_address()),
         link_ifindex: ifindex,
+        downlink_peer_source_policy: entry.peer_source_policy(),
         downlink_source_port_policy: entry.downlink_source_port_policy(),
         gtp_version: GtpVersion::V1,
         bearer_mark: if mark == 0 {
@@ -196,7 +223,9 @@ fn context_from_entry(entry: EbpfSessionEntry, ifindex: u32) -> Option<GtpPdpCon
             .transpose()
             .ok()?,
         uplink_source_port_policy: entry.uplink_source_port_policy(),
-        downlink_inner_mtu: None,
+        downlink_inner_mtu: entry
+            .downlink_inner_mtu()
+            .and_then(crate::GtpuDownlinkInnerMtu::from_wire),
     })
 }
 
@@ -344,7 +373,8 @@ impl EbpfGtpuDataplaneBackend {
         {
             return Err(indeterminate());
         }
-        context_from_entry(entry, ifindex).ok_or_else(indeterminate)
+        let context = context_from_entry(entry, ifindex).ok_or_else(indeterminate)?;
+        Ok(context)
     }
 
     /// Inspect the inner-IPv6 local-TEID selector of an ordinary attachment.

@@ -593,8 +593,8 @@ pub enum SubtreeScalar<'a> {
     Integer(i64),
     /// Unsigned integral leaf.
     Unsigned(u64),
-    /// Existing decimal output representation; never a non-key predicate codec.
-    Decimal(f64),
+    /// Exact decimal output value; never a non-key predicate codec.
+    Decimal(crate::Decimal64),
     /// String, enumeration or existing identityref text.
     Text(&'a str),
     /// Empty leaf.
@@ -644,13 +644,11 @@ impl SubtreeScalar<'_> {
                 let work =
                     budget.audit_admission("decimal default rendering", || budget.charge(327))?;
                 comparison.bytes_read(default);
-                default.parse::<f64>().is_ok_and(|expected| {
+                crate::Decimal64::parse(default, value.fraction_digits()).is_ok_and(|expected| {
                     let rendered = expected.to_string();
                     work.moved(rendered.len());
-                    comparison.text_cmp(&rendered, default).is_eq()
-                        && ((value.is_nan() && expected.is_nan())
-                            || (value == expected
-                                && value.is_sign_negative() == expected.is_sign_negative()))
+                    comparison.bytes_read(&rendered);
+                    value == expected
                 })
             }
         })
@@ -886,7 +884,7 @@ impl<'a> SubtreeProjection<'a> {
         if is_defaulted && self.report == DefaultReport::Explicit {
             return Ok(None);
         }
-        if is_defaulted && self.report == DefaultReport::Trim {
+        if self.report == DefaultReport::Trim {
             if let Some(default) = self.budget.node(self.registry, path)?.default {
                 if value.matches_default(default, self.budget)? {
                     return Ok(None);

@@ -10,7 +10,8 @@ held (`publish = false`) and does not complete [#790](https://github.com/openpac
 | Surface | Supported | Explicit limit |
 | --- | --- | --- |
 | Directional intent | Received uplink UPF TNL, locally supplied downlink N3IWF TNL, N3IWF role and caller-selected QFI/complete-mark association | No authentication, address ownership, selector allocation, route selection, SA mapping, match priority or default-flow decision |
-| Constructed send | Canonical uplink G-PDU, nonzero TEID, one first PSC, QFI 0–63, opaque nonempty inner payload | Software buffer construction only; no downlink constructor, packet transmission, UDP/IP header, checksum or offload claim |
+| Constructed send | Canonical uplink G-PDU, one first PSC, QFI 0–63, opaque nonempty inner payload, and either a nonzero TEID or the TS 29.281 section 5.1 all-zero peer TEID | Software buffer construction only; no downlink constructor, packet transmission, UDP/IP header, checksum or offload claim |
+| Peer TEID zero | Linux kernel-GTP (`GTPA_O_TEI = 0`) and eBPF install/readback/reconciliation, retained-owner recovery, ordinary tc forwarding in both inner families, and software G-PDU/End Marker encoding preserve TS 29.281 section 5.1 peer zero; local TEIDs, map keys and received-TEID lookup stay strictly nonzero | Native kernel and tc cases are in the privileged suites; the N3 qualification limitations below still apply |
 | Receive | Complete G-PDU; one PSC; uplink QFI or downlink QFI/RQI/optional PPI; caller-supplied expected direction | Shared PSC conditional-field subset; no monitoring timestamps, delay results, sequence-field extensions or MBS support |
 | Receive framing | Exact datagram length, bounded extension walk, duplicate PSC refusal, endpoint comprehension bits | Optional unknowns can appear before/after the PSC and remain in the borrowed original datagram; no raw re-encoder |
 | eBPF fixed-flow attachment | One QFI per inner family; UL PSC insertion and DL QFI/direction checks; atomic generation/readback and opaque selector authority | Four inner/outer IP combinations; existing checksum/offload limits; no multi-QFI, reflective QoS, in-place QFI change or ordered End Marker retirement |
@@ -98,13 +99,15 @@ their admission alone is not forwarding evidence.
 
 `tests/n3_reference.py` is a standalone, spec-authored byte generator with
 no SDK codec or fixture-catalog imports. Its checked-in TSV has **2,604
-cases: 1,511 accepted and 1,093 rejected**, SHA-256
-`87583b7b1a6474d0dc7ea46196bddcc915a3676c809ef6b642cb5273728703f2`.
+cases: 1,487 accepted and 1,117 rejected**, SHA-256
+`3706c33835e665078c54ea2c3b37d6a31aa3d804b393a16165d711134d67db38`.
 It covers all 64 QFIs, all downlink RQI/absent-or-present PPI combinations,
 all first-header octets, all other message types, declared-length variants,
 every nonzero non-PSC extension type before/after PSC, spare/padding fields,
 wrong direction, duplicate PSC, prefixes, tails and unsupported conditionals.
-PPI uses bits 7..5; the five low spare bits are ignored. Literal-byte tests
+PPI uses bits 7..5; spare bits 4..2 are ignored. Bits 1..0 are the BSSI/TTNBI
+flags in TS 38.415 V19.1.0 and are rejected as unsupported conditionals.
+Literal-byte tests
 independently check the PPI layout and the `UnsupportedQosMonitoring` refusal
 for downlink and uplink QMP packets without a T-PDU.
 

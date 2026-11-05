@@ -61,6 +61,8 @@ EXPLICIT_PATHS = (
     "crates/opc-session-testkit/tests/qualification_profile.rs",
     "scripts/build-egress-fence-ebpf.sh",
     "scripts/publish-order.py",
+    "ci/disk-scratch.sh",
+    "ci/disk-scratch.py",
     "ci/setup-fsverity-tmp.sh",
     "ci/fsverity-runtime.py",
     "ci/test-fsverity-runtime.py",

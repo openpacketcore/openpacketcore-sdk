@@ -52,6 +52,21 @@ fn inner_ipv6(destination: Ipv6Addr, payload: &[u8]) -> Vec<u8> {
     packet
 }
 
+fn inner_ipv6_from(
+    source: Ipv6Addr,
+    destination: Ipv6Addr,
+    next_header: u8,
+    payload: &[u8],
+) -> Vec<u8> {
+    let mut packet = vec![0x60, 0, 0, 0];
+    packet.extend_from_slice(&u16::try_from(payload.len()).unwrap().to_be_bytes());
+    packet.extend_from_slice(&[next_header, 64]);
+    packet.extend_from_slice(&source.octets());
+    packet.extend_from_slice(&destination.octets());
+    packet.extend_from_slice(payload);
+    packet
+}
+
 fn gpdu(teid: u32, inner: &[u8]) -> Vec<u8> {
     let mut message = vec![0x30, 0xff];
     message.extend_from_slice(&u16::try_from(inner.len()).unwrap().to_be_bytes());
@@ -445,6 +460,50 @@ async fn corrupt_pdr_ownership_is_malformed() {
         GtpuDownlinkDrop::Malformed
     );
     assert_eq!(counters.malformed, 2);
+}
+
+#[tokio::test]
+async fn ipv6_control_observation_never_uses_ipv4_tunnel_authority() {
+    let (runtime, _backend, _authority, _group, scope) =
+        grouped_fixture(vec![grouped_v4_entry(LOCAL_TEID, 0x2001)]).await;
+    let mut counters = GtpuDownlinkCounters::default();
+    let receive = || {
+        GtpuControlDatagram::received(
+            gpdu(LOCAL_TEID, &inner_ipv4(UE, b"ipv6-observation")).into(),
+            crate::control_port::GtpuControlProvenance::new(
+                "[2001:db8::2]:2152".parse().unwrap(),
+                (ipv6_local(), 2152).into(),
+                S2BU_IFINDEX,
+            )
+            .unwrap(),
+            Arc::new(()),
+        )
+    };
+    let process = |counters: &mut GtpuDownlinkCounters| {
+        event(process_downlink_datagram(
+            runtime.as_ref(),
+            scope,
+            receive(),
+            counters,
+        ))
+    };
+    assert!(matches!(
+        process(&mut counters),
+        GtpuDownlinkEvent::UnknownTunnel(_)
+    ));
+    let mut key = [0_u8; GTPU_SESSION_DOWNLINK_KEY_LEN];
+    key[0] = 6;
+    key[1] = 4;
+    key[4..8].copy_from_slice(&LOCAL_TEID.to_be_bytes());
+    runtime
+        .state()
+        .session_downlink_index
+        .insert((S2BU_IFINDEX, key), [0x44; GTPU_SESSION_GROUP_REF_LEN]);
+    assert_eq!(
+        expect_drop(process(&mut counters)),
+        GtpuDownlinkDrop::BindingMismatch(DownlinkBindingMismatch::Invalid)
+    );
+    assert_eq!(counters.decapsulated, 0);
 }
 
 #[tokio::test]
@@ -1046,7 +1105,7 @@ async fn dedicated_bearer_errors_use_the_default_bearer_uplink() {
 
 #[test]
 fn packet_too_big_limiter_is_an_exact_per_session_token_bucket() {
-    use crate::reassembly::PacketTooBigLimiter;
+    use crate::reassembly::{PacketTooBigAdmission, PacketTooBigLimiter};
     use std::time::Instant;
     assert!(crate::GtpuPacketTooBigRateLimit::new(0, Duration::from_secs(1)).is_none());
     assert!(crate::GtpuPacketTooBigRateLimit::new(1, Duration::ZERO).is_none());
@@ -1054,27 +1113,65 @@ fn packet_too_big_limiter_is_an_exact_per_session_token_bucket() {
     let mut limiter = PacketTooBigLimiter::new(limit);
     let (a, b) = ([0, 0, 0, 1], [0, 0, 0, 2]);
     let start = Instant::now();
-    assert!(limiter.admit(a, start));
-    assert!(limiter.admit(a, start));
-    assert!(!limiter.admit(a, start));
+    assert_eq!(limiter.admit(a, start), PacketTooBigAdmission::Admitted);
+    assert_eq!(limiter.admit(a, start), PacketTooBigAdmission::Admitted);
+    assert_eq!(limiter.admit(a, start), PacketTooBigAdmission::RateLimited);
     // Exhausting one session never limits another.
-    assert!(limiter.admit(b, start));
-    assert!(limiter.admit(b, start));
-    assert!(!limiter.admit(b, start));
-    assert!(!limiter.admit(a, start + Duration::from_millis(99)));
-    assert!(limiter.admit(a, start + Duration::from_millis(100)));
-    assert!(!limiter.admit(a, start + Duration::from_millis(150)));
+    assert_eq!(limiter.admit(b, start), PacketTooBigAdmission::Admitted);
+    assert_eq!(limiter.admit(b, start), PacketTooBigAdmission::Admitted);
+    assert_eq!(limiter.admit(b, start), PacketTooBigAdmission::RateLimited);
+    assert_eq!(
+        limiter.admit(a, start + Duration::from_millis(99)),
+        PacketTooBigAdmission::RateLimited
+    );
+    assert_eq!(
+        limiter.admit(a, start + Duration::from_millis(100)),
+        PacketTooBigAdmission::Admitted
+    );
+    assert_eq!(
+        limiter.admit(a, start + Duration::from_millis(150)),
+        PacketTooBigAdmission::RateLimited
+    );
     // A long idle period refills to the burst, never beyond it.
     let later = start + Duration::from_secs(60);
-    assert!(limiter.admit(a, later));
-    assert!(limiter.admit(a, later));
-    assert!(!limiter.admit(a, later));
-    // The table is bounded; the least recently used session is evicted.
+    assert_eq!(limiter.admit(a, later), PacketTooBigAdmission::Admitted);
+    assert_eq!(limiter.admit(a, later), PacketTooBigAdmission::Admitted);
+    assert_eq!(limiter.admit(a, later), PacketTooBigAdmission::RateLimited);
+
+    // The table is bounded and protects every session inside its 255-second
+    // eviction grace: a new session is refused, not admitted by resetting
+    // another session's budget.
     let mut limiter = PacketTooBigLimiter::new(limit);
-    for index in 0..4_097_u32 {
+    for index in 0..4_096_u32 {
         let now = start + Duration::from_micros(u64::from(index));
-        assert!(limiter.admit(index.to_be_bytes(), now));
+        assert_eq!(
+            limiter.admit(index.to_be_bytes(), now),
+            PacketTooBigAdmission::Admitted
+        );
     }
+    let recent = start + Duration::from_millis(500);
+    assert_eq!(
+        limiter.admit(4_096_u32.to_be_bytes(), recent),
+        PacketTooBigAdmission::CapacityExhausted,
+        "a table of sessions inside the grace fails closed instead of evicting"
+    );
+    // A session idle past the grace may be the least recently used tail and
+    // is then replaced.
+    let after_grace = start + Duration::from_secs(256);
+    assert_eq!(
+        limiter.admit(4_096_u32.to_be_bytes(), after_grace),
+        PacketTooBigAdmission::Admitted
+    );
+    // The replacement session's own budget starts full, and an exhausted
+    // session that stayed tracked keeps its empty bucket.
+    assert_eq!(
+        limiter.admit(4_096_u32.to_be_bytes(), after_grace),
+        PacketTooBigAdmission::Admitted
+    );
+    assert_eq!(
+        limiter.admit(4_096_u32.to_be_bytes(), after_grace),
+        PacketTooBigAdmission::RateLimited
+    );
     let default = crate::GtpuPacketTooBigRateLimit::default();
     assert_eq!(
         (default.burst(), default.refill_interval()),
@@ -1179,28 +1276,178 @@ async fn ordinary_inner_ipv6_context_decapsulates_through_its_family_authority()
     assert_eq!(counters.decapsulated, 2);
 }
 
-/// The family-tagged entry that carries an ordinary inner-IPv6 context has
-/// no downlink inner MTU field, so an opted-in IPv6 context must be refused
-/// explicitly rather than installed without enforcement.
+fn ipv6_signal_context(mtu: u16) -> GtpPdpContext {
+    let mut context = ordinary_ipv6_context();
+    context.downlink_inner_mtu =
+        Some(crate::GtpuDownlinkInnerMtu::in_tunnel_packet_too_big(mtu).unwrap());
+    context
+}
+
+fn ipv6_packet_too_big_plan(
+    runtime: &FakeRuntime,
+    packet: &[u8],
+) -> crate::ebpf::reassembled_downlink::PacketTooBigPlan {
+    let mut counters = GtpuDownlinkCounters::default();
+    plan(process_downlink_datagram(
+        runtime,
+        ordinary_scope(),
+        datagram_from(gpdu(LOCAL_TEID, packet), PEER, 2152),
+        &mut counters,
+    ))
+}
+
+/// An ordinary inner-IPv6 context that opts into in-tunnel Packet Too Big
+/// reports a plan whose G-PDU carries one well-formed RFC 4443 error quoting
+/// as much of the invoking packet as fits in the minimum IPv6 MTU.
 #[tokio::test]
-async fn ordinary_inner_ipv6_context_refuses_the_in_tunnel_packet_too_big_opt_in() {
+async fn ordinary_inner_ipv6_over_mtu_signals_one_in_tunnel_icmpv6_ptb() {
     let (backend, runtime) = ordinary_fixture(context()).await;
-    // IPv6 has no in-network fragmentation (RFC 8200 section 4.5), and the
-    // family-tagged entry has no MTU field: both policies are refused.
-    for mtu in [
-        crate::GtpuDownlinkInnerMtu::in_tunnel_packet_too_big(1_300),
-        crate::GtpuDownlinkInnerMtu::new(1_300),
+    let desired = ipv6_signal_context(1_300);
+    backend.install_pdp_context(desired.clone()).await.unwrap();
+    assert_eq!(
+        backend
+            .read_pdp_context(crate::PdpContextSelector::LocalTeid(
+                crate::PdpContextLocalTeidSelector::from_context(&desired).unwrap(),
+            ))
+            .await
+            .unwrap(),
+        crate::PdpContextReadback::Present(desired)
+    );
+    let mut counters = GtpuDownlinkCounters::default();
+    // Exactly the MTU fits and decapsulates; there is no IPv6 fragmentation
+    // policy, so only the explicit opt-in is installable.
+    let destination: Ipv6Addr = "2001:db8:45:1::abcd".parse().unwrap();
+    let originator: Ipv6Addr = "2001:db8:ffff::8".parse().unwrap();
+    let exact = inner_ipv6(destination, &vec![0x11; 1_300 - 40]);
+    assert!(matches!(
+        process(
+            &runtime,
+            ordinary_scope(),
+            gpdu(LOCAL_TEID, &exact),
+            &mut counters
+        ),
+        GtpuDownlinkEvent::Decapsulated(_)
+    ));
+    let oversized = inner_ipv6(destination, &vec![0x11; 1_301 - 40]);
+    let plan = plan(process_downlink_datagram(
+        runtime.as_ref(),
+        ordinary_scope(),
+        datagram_from(gpdu(LOCAL_TEID, &oversized), PEER, 2152),
+        &mut counters,
+    ));
+    assert_eq!(plan.family(), crate::GtpAddressFamily::Ipv6);
+    assert_eq!(plan.mtu(), 1_300);
+    assert_eq!(plan.session(), LOCAL_TEID.to_be_bytes());
+    assert_eq!(counters.packet_too_big, 1);
+    assert_eq!(counters.decapsulated, 1);
+
+    let (gpdu_bytes, local, peer) = plan.build_uplink_gpdu().unwrap();
+    assert_eq!((local, peer), (LOCAL, PEER));
+    // GTP-U header: v1/PT, T-PDU length, the default bearer's peer TEID.
+    assert_eq!(&gpdu_bytes[..2], &[0x30, 0xff]);
+    assert_eq!(
+        u16::from_be_bytes([gpdu_bytes[2], gpdu_bytes[3]]),
+        u16::try_from(gpdu_bytes.len() - 8).unwrap()
+    );
+    assert_eq!(&gpdu_bytes[4..8], &0x2000_0001_u32.to_be_bytes());
+    let outer = &gpdu_bytes[8..];
+    // Outer IPv6 header: ICMPv6 next header, payload length 8 + quote.
+    let quote_len = oversized.len().min(1_280 - 40 - 8);
+    assert_eq!(outer.len(), 40 + 8 + quote_len);
+    assert_eq!(outer[0], 0x60);
+    assert_eq!(
+        u16::from_be_bytes([outer[4], outer[5]]),
+        u16::try_from(8 + quote_len).unwrap()
+    );
+    assert_eq!(outer[6], 58);
+    assert_eq!(&outer[8..24], &destination.octets());
+    assert_eq!(&outer[24..40], &originator.octets());
+    // RFC 4443: type Packet Too Big, code 0, MTU field 1300, then the quote.
+    let icmp = &outer[40..];
+    assert_eq!(icmp[0], 2);
+    assert_eq!(icmp[1], 0);
+    assert_eq!(&icmp[4..8], &1_300_u32.to_be_bytes());
+    assert_eq!(&icmp[8..], &oversized[..quote_len]);
+    // The ICMPv6 checksum covers the pseudo-header of the outer IPv6 packet.
+    let mut checksum_input = Vec::new();
+    checksum_input.extend_from_slice(&destination.octets());
+    checksum_input.extend_from_slice(&originator.octets());
+    checksum_input
+        .extend_from_slice(&u32::from(u16::try_from(8 + quote_len).unwrap()).to_be_bytes());
+    checksum_input.extend_from_slice(&[0, 0, 0, 58]);
+    checksum_input.extend_from_slice(icmp);
+    assert_eq!(
+        opc_gtpu_ebpf_common::internet_checksum(&checksum_input),
+        0,
+        "one well-formed RFC 4443 error"
+    );
+}
+
+/// RFC 4443 section 2.4 never-answer rules for the in-tunnel error.
+#[tokio::test]
+async fn ordinary_inner_ipv6_ptb_applies_the_rfc_4443_never_answer_rules() {
+    let (backend, runtime) = ordinary_fixture(context()).await;
+    backend
+        .install_pdp_context(ipv6_signal_context(1_300))
+        .await
+        .unwrap();
+    let destination: Ipv6Addr = "2001:db8:45:1::abcd".parse().unwrap();
+    let originator: Ipv6Addr = "2001:db8:ffff::8".parse().unwrap();
+    let payload = vec![0x11; 1_301 - 40];
+    // Unspecified and multicast sources do not identify one host.
+    for source in [
+        Ipv6Addr::UNSPECIFIED,
+        "ff02::1".parse().unwrap(),
+        "ff0e::1".parse().unwrap(),
     ] {
-        let mut ipv6 = ordinary_ipv6_context();
-        ipv6.downlink_inner_mtu = mtu;
-        assert!(matches!(
-            backend.install_pdp_context(ipv6).await,
-            Err(GtpuError::UnsupportedFeature {
-                feature: "downlink_inner_mtu_inner_ipv6"
-            })
-        ));
+        let packet = inner_ipv6_from(source, destination, 17, &payload);
+        assert!(
+            ipv6_packet_too_big_plan(&runtime, &packet)
+                .build_uplink_gpdu()
+                .is_none(),
+            "source {source} must not be answered"
+        );
     }
-    assert!(runtime.state().session_downlink_index.is_empty());
+    // An ICMPv6 error is never answered; an informational message is.
+    for (icmp_type, answered) in [
+        (1_u8, false),
+        (2, false),
+        (3, false),
+        (4, false),
+        (128, true),
+        (129, true),
+    ] {
+        let mut icmp = payload.clone();
+        icmp[0] = icmp_type;
+        let packet = inner_ipv6_from(originator, destination, 58, &icmp);
+        assert_eq!(
+            ipv6_packet_too_big_plan(&runtime, &packet)
+                .build_uplink_gpdu()
+                .is_some(),
+            answered,
+            "ICMPv6 type {icmp_type}"
+        );
+    }
+    // Never answer a non-initial fragment; a first fragment is answerable.
+    for (fragment_word, answered) in [(0_u16, true), (8, false), (0xfff8, false)] {
+        let mut fragment = payload.clone();
+        fragment[0] = 17;
+        fragment[1] = 0;
+        fragment[2..4].copy_from_slice(&fragment_word.to_be_bytes());
+        let packet = inner_ipv6_from(originator, destination, 44, &fragment);
+        assert_eq!(
+            ipv6_packet_too_big_plan(&runtime, &packet)
+                .build_uplink_gpdu()
+                .is_some(),
+            answered,
+            "fragment word {fragment_word:#06x}"
+        );
+    }
+    // An ordinary oversized unicast datagram is answered.
+    let ordinary = inner_ipv6_from(originator, destination, 17, &payload);
+    assert!(ipv6_packet_too_big_plan(&runtime, &ordinary)
+        .build_uplink_gpdu()
+        .is_some());
 }
 
 #[tokio::test]
@@ -1437,7 +1684,7 @@ async fn default_policy_refuses_options_and_malformed_headers_before_taking_a_to
 
 #[test]
 fn inner_fragment_budget_is_per_destination_with_non_repeating_identifications() {
-    use crate::reassembly::InnerFragmentBudget;
+    use crate::reassembly::{InnerFragmentAdmission, InnerFragmentBudget};
     use crate::GtpuInnerFragmentRateLimit as Limit;
     use std::time::Instant;
     assert!(Limit::new(0, Duration::from_secs(1)).is_none());
@@ -1460,24 +1707,54 @@ fn inner_fragment_budget_is_per_destination_with_non_repeating_identifications()
     let mut budget = InnerFragmentBudget::new(limit);
     let (a, b) = ([10, 45, 0, 2], [10, 45, 0, 3]);
     let start = Instant::now();
-    let first = budget.admit(a, start, true).unwrap().unwrap();
+    let InnerFragmentAdmission::Admitted(Some(first)) = budget.admit(a, start, true) else {
+        panic!("first atomic datagram must be admitted");
+    };
     assert_ne!(first, 0);
     assert_eq!(
         budget.admit(a, start, false),
-        Some(None),
+        InnerFragmentAdmission::Admitted(None),
         "a non-atomic datagram keeps its own Identification but takes a token"
     );
-    assert_eq!(budget.admit(a, start, true), None);
+    assert_eq!(
+        budget.admit(a, start, true),
+        InnerFragmentAdmission::RateLimited
+    );
     assert!(
-        budget.admit(b, start, true).unwrap().is_some(),
+        matches!(
+            budget.admit(b, start, true),
+            InnerFragmentAdmission::Admitted(Some(_))
+        ),
         "per destination"
     );
     let refilled = start + Duration::from_millis(100);
-    let second = budget.admit(a, refilled, true).unwrap().unwrap();
+    let InnerFragmentAdmission::Admitted(Some(second)) = budget.admit(a, refilled, true) else {
+        panic!("refilled atomic datagram must be admitted");
+    };
     assert_eq!(second, first.checked_add(1).unwrap_or(1));
-    // A replacement keeps the sequence and never grants an extra burst.
-    budget.set_limit(Limit::new(64, Duration::from_secs(3_600)).unwrap());
-    assert_eq!(budget.admit(a, refilled, true), None);
+
+    // Replacements preserve the live sequence and never restore a burst.
+    assert!(budget.set_limit(limit, refilled));
+    assert!(
+        budget.set_limit(
+            Limit::new(64, Duration::from_secs(3_600)).unwrap(),
+            refilled
+        ),
+        "a valid tightening remains available during traffic"
+    );
+    assert_eq!(
+        budget.admit(a, refilled, true),
+        InnerFragmentAdmission::RateLimited,
+        "a replacement keeps the sequence and never grants an extra burst"
+    );
+    assert!(
+        budget.set_limit(default, refilled),
+        "the default can be restored without replacing the registration"
+    );
+    assert_eq!(
+        budget.admit(a, refilled, true),
+        InnerFragmentAdmission::RateLimited
+    );
 
     // One destination's sequence assigns every non-zero Identification
     // exactly once before its budget is exhausted: the largest burst, then
@@ -1488,20 +1765,42 @@ fn inner_fragment_budget_is_per_destination_with_non_repeating_identifications()
     let hour_later = start + Duration::from_secs(3_600);
     for index in 0..65_535 {
         let now = if index < 65_534 { start } else { hour_later };
-        let identification = budget.admit(a, now, true).unwrap().unwrap();
+        let InnerFragmentAdmission::Admitted(Some(identification)) = budget.admit(a, now, true)
+        else {
+            panic!("admission {index} must be inside the exact bound");
+        };
         assert_ne!(identification, 0);
         assert!(!seen[usize::from(identification)]);
         seen[usize::from(identification)] = true;
     }
-    assert_eq!(budget.admit(a, hour_later, true), None);
+    assert_eq!(
+        budget.admit(a, hour_later, true),
+        InnerFragmentAdmission::RateLimited
+    );
     assert!(format!("{budget:?}").contains("tracked: 1"));
 
-    // The table is bounded; the least recently used destination is evicted.
+    // The table is bounded and protects every destination inside its
+    // 255-second eviction grace: a new destination is refused fail closed
+    // instead of resetting another destination's budget or sequence.
     let mut budget = InnerFragmentBudget::new(limit);
-    for index in 0..4_097_u32 {
+    for index in 0..4_096_u32 {
         let now = start + Duration::from_micros(u64::from(index));
-        assert!(budget.admit(index.to_be_bytes(), now, true).is_some());
+        assert!(matches!(
+            budget.admit(index.to_be_bytes(), now, true),
+            InnerFragmentAdmission::Admitted(_)
+        ));
     }
+    let recent = start + Duration::from_millis(500);
+    assert_eq!(
+        budget.admit(4_096_u32.to_be_bytes(), recent, true),
+        InnerFragmentAdmission::CapacityExhausted
+    );
+    // A destination idle past the grace is evicted and re-created.
+    let after_grace = start + Duration::from_secs(256);
+    assert!(matches!(
+        budget.admit(4_096_u32.to_be_bytes(), after_grace, true),
+        InnerFragmentAdmission::Admitted(_)
+    ));
     assert!(format!("{budget:?}").contains("tracked: 4096"));
 }
 
@@ -1981,4 +2280,52 @@ async fn grouped_inner_ipv4_header_checksum_is_validated() {
     );
     assert_eq!(counters.decapsulated, 1);
     assert_eq!(counters.malformed, 1);
+}
+
+#[tokio::test]
+async fn reassembled_multihoming_matches_tc_peer_policy_and_other_checks() {
+    for policy in [
+        crate::GtpuPeerSourcePolicy::BackendDefault,
+        crate::GtpuPeerSourcePolicy::TeidAndLocal,
+    ] {
+        for marked in [false, true] {
+            let mut desired = context();
+            desired.downlink_peer_source_policy = policy;
+            desired.downlink_source_port_policy = crate::GtpuSourcePortPolicy::Exact(2152);
+            if marked {
+                desired.bearer_mark = GtpBearerMark::new(7);
+            }
+            let (_backend, runtime) = ordinary_fixture(desired.clone()).await;
+            let inner = inner_ipv4(UE, b"multi-home");
+            let mut counters = GtpuDownlinkCounters::default();
+            let result = event(process_downlink_datagram(
+                &*runtime,
+                ordinary_scope(),
+                datagram_from(gpdu(LOCAL_TEID, &inner), Ipv4Addr::new(192, 0, 2, 11), 2152),
+                &mut counters,
+            ));
+            if policy == crate::GtpuPeerSourcePolicy::BackendDefault {
+                assert_eq!(
+                    expect_drop(result),
+                    GtpuDownlinkDrop::BindingMismatch(DownlinkBindingMismatch::PeerAddress)
+                );
+            } else {
+                let GtpuDownlinkEvent::Decapsulated(packet) = result else {
+                    panic!("alternate source must decapsulate");
+                };
+                assert_eq!(packet.inner_packet(), inner);
+                assert_eq!(packet.bearer_mark(), desired.bearer_mark);
+                let result = event(process_downlink_datagram(
+                    &*runtime,
+                    ordinary_scope(),
+                    datagram_from(gpdu(LOCAL_TEID, &inner), Ipv4Addr::new(192, 0, 2, 11), 2153),
+                    &mut counters,
+                ));
+                assert_eq!(
+                    expect_drop(result),
+                    GtpuDownlinkDrop::BindingMismatch(DownlinkBindingMismatch::SourcePort)
+                );
+            }
+        }
+    }
 }

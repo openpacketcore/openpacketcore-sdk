@@ -114,6 +114,9 @@ pub enum MmMessageType {
     ServiceReject = 0x4D,
     ServiceAccept = 0x4E,
     ControlPlaneServiceRequest = 0x4F,
+    NetworkSliceSpecificAuthenticationCommand = 0x50,
+    NetworkSliceSpecificAuthenticationComplete = 0x51,
+    NetworkSliceSpecificAuthenticationResult = 0x52,
     ConfigurationUpdateCommand = 0x54,
     ConfigurationUpdateComplete = 0x55,
     AuthenticationRequest = 0x56,
@@ -131,6 +134,11 @@ pub enum MmMessageType {
     NotificationResponse = 0x66,
     UlNasTransport = 0x67,
     DlNasTransport = 0x68,
+    RelayKeyRequest = 0x69,
+    RelayKeyAccept = 0x6A,
+    RelayKeyReject = 0x6B,
+    RelayAuthenticationRequest = 0x6C,
+    RelayAuthenticationResponse = 0x6D,
 }
 
 impl MmMessageType {
@@ -151,6 +159,9 @@ impl MmMessageType {
             0x4D => Self::ServiceReject,
             0x4E => Self::ServiceAccept,
             0x4F => Self::ControlPlaneServiceRequest,
+            0x50 => Self::NetworkSliceSpecificAuthenticationCommand,
+            0x51 => Self::NetworkSliceSpecificAuthenticationComplete,
+            0x52 => Self::NetworkSliceSpecificAuthenticationResult,
             0x54 => Self::ConfigurationUpdateCommand,
             0x55 => Self::ConfigurationUpdateComplete,
             0x56 => Self::AuthenticationRequest,
@@ -168,6 +179,11 @@ impl MmMessageType {
             0x66 => Self::NotificationResponse,
             0x67 => Self::UlNasTransport,
             0x68 => Self::DlNasTransport,
+            0x69 => Self::RelayKeyRequest,
+            0x6A => Self::RelayKeyAccept,
+            0x6B => Self::RelayKeyReject,
+            0x6C => Self::RelayAuthenticationRequest,
+            0x6D => Self::RelayAuthenticationResponse,
             _ => return None,
         })
     }
@@ -193,6 +209,10 @@ pub enum SmMessageType {
     PduSessionReleaseCommand = 0xD3,
     PduSessionReleaseComplete = 0xD4,
     Status5gsm = 0xD6,
+    ServiceLevelAuthenticationCommand = 0xD8,
+    ServiceLevelAuthenticationComplete = 0xD9,
+    RemoteUeReport = 0xDA,
+    RemoteUeReportResponse = 0xDB,
 }
 
 impl SmMessageType {
@@ -216,6 +236,10 @@ impl SmMessageType {
             0xD3 => Self::PduSessionReleaseCommand,
             0xD4 => Self::PduSessionReleaseComplete,
             0xD6 => Self::Status5gsm,
+            0xD8 => Self::ServiceLevelAuthenticationCommand,
+            0xD9 => Self::ServiceLevelAuthenticationComplete,
+            0xDA => Self::RemoteUeReport,
+            0xDB => Self::RemoteUeReportResponse,
             _ => return None,
         })
     }

@@ -2276,13 +2276,15 @@ fn map_canonical_encode_error(error: CanonicalEncodeError) -> XfrmObjectInstallD
     }
 }
 
-/// Compute the domain-separated keyed fingerprint of one complete install
-/// request.
+/// Compute the domain-separated keyed fingerprint of one install request.
 ///
-/// The encoding is length-prefixed and covers every field the backend would
-/// send, so two requests that differ anywhere produce different fingerprints.
-/// The `domain` argument keeps sibling record families separate even when a
-/// deployment configures the same key bytes for both.
+/// The encoding is length-prefixed and covers the fields the backend sends,
+/// so two requests that differ in an encoded field produce different
+/// fingerprints. The `domain` argument keeps sibling record families separate
+/// even when a deployment configures the same key bytes for both.
+///
+/// Enabled TFC targets append a tagged extension after the existing SA
+/// encoding. An absent target preserves the original encoding exactly.
 ///
 /// # Errors
 ///
@@ -2342,6 +2344,11 @@ pub(crate) fn authenticate_install_request(
                     mac_u8(&mut mac, dscp.get());
                 }
                 None => mac_u8(&mut mac, 0),
+            }
+            // Preserve no-TFC fingerprints while binding every enabled target.
+            if let Some(target) = parameters.tfc_pad {
+                mac_bytes(&mut mac, b"tfc-padding\0")?;
+                mac_u32(&mut mac, target);
             }
         }
         XfrmObjectInstallRequest::Policy(request) => {
@@ -2955,6 +2962,7 @@ mod tests {
                 output_mark: None,
                 if_id: None,
                 egress_dscp: None,
+                tfc_pad: None,
             },
         })
     }
@@ -3041,6 +3049,41 @@ mod tests {
                 "{change}"
             );
         }
+    }
+
+    #[test]
+    fn tfc_durable_request_authentication_binds_padding_intent() {
+        let proof_key = key(9);
+        let mut request = golden_sa_request();
+        let disabled = authenticate_install_request(
+            proof_key.canonical_mac_key(),
+            INSTALL_REQUEST_AUTH_DOMAIN,
+            &request,
+        )
+        .unwrap();
+        let XfrmObjectInstallRequest::Sa(sa) = &mut request else {
+            panic!("SA fixture")
+        };
+        sa.parameters.tfc_pad = Some(1280);
+        let first = authenticate_install_request(
+            proof_key.canonical_mac_key(),
+            INSTALL_REQUEST_AUTH_DOMAIN,
+            &request,
+        )
+        .unwrap();
+        let XfrmObjectInstallRequest::Sa(sa) = &mut request else {
+            panic!("SA fixture")
+        };
+        sa.parameters.tfc_pad = Some(1400);
+        let second = authenticate_install_request(
+            proof_key.canonical_mac_key(),
+            INSTALL_REQUEST_AUTH_DOMAIN,
+            &request,
+        )
+        .unwrap();
+        assert_ne!(disabled, first);
+        assert_ne!(disabled, second);
+        assert_ne!(first, second);
     }
 
     /// Byte-pinned canonical encodings for the object family.

@@ -5,6 +5,15 @@
 //! lock inline and perform no helper calls or allocations. Expired slots are
 //! reused in place, never deleted. No live slot is evicted, including poisoned
 //! or completed datagrams. The fixed deadline is never refreshed.
+//!
+//! Bucket selection is owner-partitioned. The classifier identity in the first
+//! key bytes (attachment interface index and the subscriber PAA) selects one of
+//! [`TFT_FRAGMENT_OWNER_GROUPS`] owner groups; the remaining key bytes select a
+//! bucket inside that group. One subscriber can therefore occupy at most
+//! [`TFT_FRAGMENT_OWNER_MAX_DATAGRAMS`] concurrent fragmented datagrams and can
+//! never deny a bucket that belongs to another group. Two subscriber addresses
+//! that hash to the same group share that group's bound; the blast radius of a
+//! collision is one group, not the whole table.
 
 use crate::{TftClassifierIpv4Packet, TftClassifierKey, TftClassifierMeta};
 
@@ -14,6 +23,20 @@ pub const MAP_TFT_FRAGMENT_AFFINITY: &str = "GTPU_TFT_FRAG";
 pub const TFT_FRAGMENT_BUCKETS: u32 = 16_384;
 /// Slots in each bucket. A full bucket refuses admission even if others are free.
 pub const TFT_FRAGMENT_WAYS: usize = 4;
+/// Buckets one owner group may select. The first key bytes (attachment plus
+/// subscriber PAA) pick the group, so one subscriber is confined to these
+/// buckets and cannot occupy another owner group's capacity.
+pub const TFT_FRAGMENT_OWNER_BUCKETS: u32 = 64;
+/// Number of independently selected owner groups across the affinity table.
+pub const TFT_FRAGMENT_OWNER_GROUPS: u32 = TFT_FRAGMENT_BUCKETS / TFT_FRAGMENT_OWNER_BUCKETS;
+/// Maximum concurrent fragmented datagrams one owner can occupy:
+/// its buckets times the slots in each bucket. This is the stated
+/// per-subscriber admission bound.
+pub const TFT_FRAGMENT_OWNER_MAX_DATAGRAMS: u32 =
+    TFT_FRAGMENT_OWNER_BUCKETS * TFT_FRAGMENT_WAYS as u32;
+const _: () = assert!(TFT_FRAGMENT_BUCKETS.is_power_of_two());
+const _: () = assert!(TFT_FRAGMENT_OWNER_BUCKETS.is_power_of_two());
+const _: () = assert!(TFT_FRAGMENT_OWNER_BUCKETS < TFT_FRAGMENT_BUCKETS);
 /// Maximum distinct fragments accepted for one datagram, including its first.
 pub const TFT_FRAGMENT_MAX_RANGES: usize = 64;
 const _: () = assert!(TFT_FRAGMENT_MAX_RANGES.is_power_of_two());
@@ -83,15 +106,30 @@ impl TftFragmentKey {
         Self(bytes)
     }
 
-    /// Deterministic bounded bucket selection. Collisions never permit eviction.
+    /// Deterministic owner-partitioned bucket selection.
+    ///
+    /// The first eight bytes are the classifier identity (attachment interface
+    /// index and subscriber PAA); they select the owner group. The remaining
+    /// key bytes continue the same hash and select a bucket inside that group.
+    /// One FNV pass covers all 20 key bytes. Folding the upper hash bits before
+    /// masking keeps the high bits of every key byte relevant to placement.
+    /// Collisions never permit eviction.
     #[must_use]
     #[inline(always)]
     pub fn bucket(self) -> u32 {
         let mut hash = 2_166_136_261_u32;
-        for byte in self.0 {
-            hash = (hash ^ u32::from(byte)).wrapping_mul(16_777_619);
+        let mut index = 0;
+        while index < 8 {
+            hash = (hash ^ u32::from(self.0[index])).wrapping_mul(16_777_619);
+            index += 1;
         }
-        hash & (TFT_FRAGMENT_BUCKETS - 1)
+        let owner = (hash ^ (hash >> 16)) & (TFT_FRAGMENT_OWNER_GROUPS - 1);
+        while index < TFT_FRAGMENT_KEY_LEN {
+            hash = (hash ^ u32::from(self.0[index])).wrapping_mul(16_777_619);
+            index += 1;
+        }
+        let within = (hash ^ (hash >> 16)) & (TFT_FRAGMENT_OWNER_BUCKETS - 1);
+        owner * TFT_FRAGMENT_OWNER_BUCKETS + within
     }
 
     /// Fixed network-order key bytes for map inspection by a trusted loader.
@@ -103,8 +141,13 @@ impl TftFragmentKey {
     #[inline(always)]
     fn matches(&self, other: &Self) -> bool {
         let mut difference = 0;
-        for index in 0..TFT_FRAGMENT_KEY_LEN {
-            difference |= self.0[index] ^ other.0[index];
+        // Compare five complete words so the inlined bucket scan retains
+        // five key scalars rather than twenty byte scalars on the BPF stack.
+        // Both operands still use every exact key byte, including reserved.
+        let left = self.0.as_chunks::<4>().0;
+        let right = other.0.as_chunks::<4>().0;
+        for index in 0..TFT_FRAGMENT_KEY_LEN / 4 {
+            difference |= u32::from_le_bytes(left[index]) ^ u32::from_le_bytes(right[index]);
         }
         difference == 0
     }
@@ -191,6 +234,7 @@ impl TftIpv4Fragment {
 }
 
 /// Result of the bounded state transition, before downstream bearer authority.
+#[non_exhaustive]
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum TftFragmentDisposition {
     /// No classifier and no retained live key: preserve ordinary lookup behavior.
@@ -199,8 +243,12 @@ pub enum TftFragmentDisposition {
     Selected(u32),
     /// Malformed fragment envelope or incomplete first-fragment transport header.
     Malformed,
-    /// Orphan, stale authority, capacity, or ambiguous/overlapping fragments.
+    /// Orphan, stale authority, or ambiguous/overlapping fragments.
     Drop,
+    /// The classifier owner's bounded bucket group is full of live or poisoned
+    /// entries, so this subscriber's new fragmented datagram cannot be tracked.
+    /// The packet is dropped fail closed; no other owner's entry is evicted.
+    Capacity,
 }
 
 impl core::fmt::Debug for TftFragmentDisposition {
@@ -210,6 +258,7 @@ impl core::fmt::Debug for TftFragmentDisposition {
             Self::Selected(_) => f.write_str("Selected(<redacted>)"),
             Self::Malformed => f.write_str("Malformed"),
             Self::Drop => f.write_str("Drop"),
+            Self::Capacity => f.write_str("Capacity"),
         }
     }
 }
@@ -315,7 +364,7 @@ impl TftFragmentBucket {
             return TftFragmentDisposition::Malformed;
         };
         if matched == TFT_FRAGMENT_WAYS {
-            if !fragment.is_first() || available == TFT_FRAGMENT_WAYS {
+            if !fragment.is_first() {
                 return TftFragmentDisposition::Drop;
             }
             let Some((packet, mark)) = first else {
@@ -332,6 +381,10 @@ impl TftFragmentBucket {
             let Some(expires_at) = now_ns.checked_add(TFT_FRAGMENT_LIFETIME_NS) else {
                 return TftFragmentDisposition::Drop;
             };
+            if available == TFT_FRAGMENT_WAYS {
+                // Capacity is distinct from a malformed first fragment.
+                return TftFragmentDisposition::Capacity;
+            }
             // Write only the live fields and first range. Old unused ranges
             // remain inaccessible behind range_count, avoiding a large memset.
             let entry = &mut self.entries[available];
@@ -407,35 +460,47 @@ impl TftFragmentBucket {
             entry.poisoned = 1;
             return TftFragmentDisposition::Drop;
         }
+        let mut conflict = 0;
         for index in 0..TFT_FRAGMENT_MAX_RANGES as u32 {
             // Keep the address bound local to every access. The barrier stops
             // LLVM replacing this with a walking pointer; the mask survives
             // optimization even when an older verifier forgets scalar bounds
             // across a stack reload. It is an identity for this 0..64 loop.
             let index = core::hint::black_box(index) & (TFT_FRAGMENT_MAX_RANGES as u32 - 1);
-            if index >= u32::from(entry.range_count) {
-                // This is the first unused record. Reuse the same bounded
-                // index for the append, rather than reloading an older count
-                // whose bound an older verifier may have lost on the stack.
-                entry.ranges[index as usize] =
-                    [fragment.start.to_be_bytes(), fragment.end.to_be_bytes()];
-                entry.range_count += 1;
-                if !fragment.more {
-                    entry.final_end = fragment.end.to_be_bytes();
-                }
-                return TftFragmentDisposition::Selected(mark);
-            }
             let start = u16::from_be_bytes(entry.ranges[index as usize][0]);
             let end = u16::from_be_bytes(entry.ranges[index as usize][1]);
-            if (fragment.start < end && start < fragment.end)
-                || (!fragment.more && end > fragment.end)
-            {
-                entry.poisoned = 1;
-                return TftFragmentDisposition::Drop;
-            }
+            // Each operand is at most 16 bits, so the high bit of a wrapping
+            // u32 subtraction is exactly the strict-less-than result. Keep
+            // these arithmetic masks and their compiler barriers: without
+            // the barriers LLVM turns them back into boolean comparisons,
+            // multiplying BPF verifier states on every loop iteration.
+            // Inactive records may contain old bytes and contribute nothing.
+            let active =
+                core::hint::black_box(index.wrapping_sub(u32::from(entry.range_count))) >> 31;
+            let overlap =
+                (core::hint::black_box(u32::from(fragment.start).wrapping_sub(u32::from(end)))
+                    >> 31)
+                    & (core::hint::black_box(
+                        u32::from(start).wrapping_sub(u32::from(fragment.end)),
+                    ) >> 31);
+            let beyond_final =
+                core::hint::black_box(u32::from(fragment.end).wrapping_sub(u32::from(end))) >> 31;
+            conflict |= active & (overlap | (u32::from(!fragment.more) & beyond_final));
         }
-        entry.poisoned = 1;
-        TftFragmentDisposition::Drop
+        if conflict != 0 {
+            entry.poisoned = 1;
+            return TftFragmentDisposition::Drop;
+        }
+        // The earlier range-count check proves this is the first unused slot.
+        // Retain the address mask across verifier stack reloads, as in the walk.
+        let index = core::hint::black_box(u32::from(entry.range_count))
+            & (TFT_FRAGMENT_MAX_RANGES as u32 - 1);
+        entry.ranges[index as usize] = [fragment.start.to_be_bytes(), fragment.end.to_be_bytes()];
+        entry.range_count += 1;
+        if !fragment.more {
+            entry.final_end = fragment.end.to_be_bytes();
+        }
+        TftFragmentDisposition::Selected(mark)
     }
 }
 
@@ -508,6 +573,113 @@ mod tests {
             None,
             Some(12),
         )
+    }
+
+    #[test]
+    fn high_identification_bits_preserve_available_fragment_capacity() {
+        let mut buckets: [TftFragmentBucket; TFT_FRAGMENT_OWNER_BUCKETS as usize] =
+            core::array::from_fn(|_| TftFragmentBucket::new());
+        let metadata = meta(1);
+        // These identities differ only above each byte's lowest six bits.
+        // Ignoring those bits sends all five into one four-way bucket.
+        let identities = [0x0001, 0x0041, 0x0081, 0x00c1, 0x4001];
+        for id in identities {
+            let key = key(id);
+            let bucket = &mut buckets[(key.bucket() % TFT_FRAGMENT_OWNER_BUCKETS) as usize];
+            assert_eq!(
+                bucket.apply(
+                    key,
+                    Some(first()),
+                    Some(&metadata),
+                    Some((&packet(), 11)),
+                    10,
+                ),
+                TftFragmentDisposition::Selected(11),
+                "high Identification bits must distribute these five datagrams"
+            );
+        }
+        for id in identities {
+            let key = key(id);
+            let bucket = &mut buckets[(key.bucket() % TFT_FRAGMENT_OWNER_BUCKETS) as usize];
+            assert_eq!(
+                bucket.apply(key, Some(last()), Some(&metadata), None, 11),
+                TftFragmentDisposition::Selected(11)
+            );
+        }
+    }
+
+    #[test]
+    fn fragment_key_comparison_uses_every_byte_including_reserved() {
+        let original = key(1);
+        assert!(original.matches(&original));
+        for index in 0..TFT_FRAGMENT_KEY_LEN {
+            let mut changed = original;
+            changed.0[index] ^= 0x80;
+            assert!(
+                !original.matches(&changed),
+                "key byte {index} must remain exact"
+            );
+        }
+    }
+
+    #[test]
+    fn full_bucket_keeps_malformed_first_fragments_distinct_from_capacity() {
+        let mut bucket = TftFragmentBucket::new();
+        let metadata = meta(1);
+        for id in 1..=4 {
+            assert_eq!(
+                bucket.apply(
+                    key(id),
+                    Some(first()),
+                    Some(&metadata),
+                    Some((&packet(), 11)),
+                    10
+                ),
+                TftFragmentDisposition::Selected(11)
+            );
+        }
+        assert_eq!(
+            bucket.apply(key(5), Some(first()), Some(&metadata), None, 20),
+            TftFragmentDisposition::Malformed,
+            "an incomplete first-fragment transport header is malformed even at capacity"
+        );
+        let short_udp = TftClassifierIpv4Packet::new(
+            [192, 0, 2, 1],
+            [198, 51, 100, 2],
+            17,
+            0,
+            Some(1234),
+            Some(5678),
+            None,
+        )
+        .with_udp_length(4);
+        assert_eq!(
+            bucket.apply(
+                key(6),
+                Some(first()),
+                Some(&metadata),
+                Some((&short_udp, 11)),
+                20
+            ),
+            TftFragmentDisposition::Malformed,
+            "invalid UDP length must not be reported as capacity pressure"
+        );
+        assert_eq!(
+            bucket.apply(
+                key(7),
+                Some(first()),
+                Some(&metadata),
+                Some((&packet(), 11)),
+                20
+            ),
+            TftFragmentDisposition::Capacity
+        );
+        for id in 1..=4 {
+            assert_eq!(
+                bucket.apply(key(id), Some(last()), Some(&metadata), None, 30),
+                TftFragmentDisposition::Selected(11)
+            );
+        }
     }
 
     #[test]
@@ -615,7 +787,7 @@ mod tests {
                 Some((&packet(), 11)),
                 20
             ),
-            TftFragmentDisposition::Drop
+            TftFragmentDisposition::Capacity
         );
         for id in 1..=4 {
             assert_eq!(
@@ -623,6 +795,45 @@ mod tests {
                 TftFragmentDisposition::Selected(11)
             );
         }
+    }
+
+    #[test]
+    fn range_scan_ignores_expired_slots_unused_by_the_new_datagram() {
+        let mut bucket = TftFragmentBucket::new();
+        let metadata = meta(1);
+        assert_eq!(
+            bucket.apply(
+                key(1),
+                Some(first()),
+                Some(&metadata),
+                Some((&packet(), 11)),
+                10
+            ),
+            TftFragmentDisposition::Selected(11)
+        );
+        for index in 1..TFT_FRAGMENT_MAX_RANGES as u16 {
+            let fragment =
+                TftIpv4Fragment::from_header(0x45, 28, 28, 0x2000 | (2 + index)).unwrap();
+            assert_eq!(
+                bucket.apply(key(1), Some(fragment), Some(&metadata), None, 11),
+                TftFragmentDisposition::Selected(11)
+            );
+        }
+        let reused_at = 10 + TFT_FRAGMENT_LIFETIME_NS;
+        assert_eq!(
+            bucket.apply(
+                key(2),
+                Some(first()),
+                Some(&metadata),
+                Some((&packet(), 11)),
+                reused_at
+            ),
+            TftFragmentDisposition::Selected(11)
+        );
+        assert_eq!(
+            bucket.apply(key(2), Some(last()), Some(&metadata), None, reused_at + 1),
+            TftFragmentDisposition::Selected(11)
+        );
     }
 
     #[test]
@@ -756,6 +967,194 @@ mod tests {
         assert_eq!(
             bucket.apply(key, Some(valid_last), Some(&meta(1)), None, 30),
             TftFragmentDisposition::Drop
+        );
+    }
+
+    fn owner_group(classifier: TftClassifierKey) -> u32 {
+        TftFragmentKey::new(classifier, [192, 0, 2, 1], [198, 51, 100, 2], 50, 0).bucket()
+            / TFT_FRAGMENT_OWNER_BUCKETS
+    }
+
+    fn classifier_for_paa(paa: [u8; 4]) -> TftClassifierKey {
+        TftClassifierKey::new(7, paa).expect("canonical classifier key")
+    }
+
+    fn owner_buckets() -> [TftFragmentBucket; TFT_FRAGMENT_OWNER_BUCKETS as usize] {
+        core::array::from_fn(|_| TftFragmentBucket::new())
+    }
+
+    /// Fill every bucket of `classifier`'s owner group with exactly four live
+    /// first-fragment entries, skipping IDs whose bucket is already full.
+    fn fill_owner_group(
+        classifier: TftClassifierKey,
+        metadata: &TftClassifierMeta,
+    ) -> (
+        [TftFragmentBucket; TFT_FRAGMENT_OWNER_BUCKETS as usize],
+        u16,
+    ) {
+        let first = first();
+        let packet = packet();
+        let mut buckets = owner_buckets();
+        let owner = owner_group(classifier);
+        let mut counts = [0_u8; TFT_FRAGMENT_OWNER_BUCKETS as usize];
+        let mut identification = 0_u16;
+        let mut live = 0_u32;
+        while live < TFT_FRAGMENT_OWNER_MAX_DATAGRAMS {
+            identification = identification.wrapping_add(1);
+            let key = TftFragmentKey::new(
+                classifier,
+                [192, 0, 2, 1],
+                [198, 51, 100, 2],
+                50,
+                identification,
+            );
+            let slot = (key.bucket() - owner * TFT_FRAGMENT_OWNER_BUCKETS) as usize;
+            if counts[slot] == TFT_FRAGMENT_WAYS as u8 {
+                continue;
+            }
+            assert_eq!(
+                buckets[slot].apply(key, Some(first), Some(metadata), Some((&packet, 11)), 10),
+                TftFragmentDisposition::Selected(11)
+            );
+            counts[slot] += 1;
+            live += 1;
+        }
+        (buckets, identification)
+    }
+
+    /// One subscriber's classifier confines every key it can create to one
+    /// owner group of `TFT_FRAGMENT_OWNER_BUCKETS` buckets.
+    #[test]
+    fn owner_bucket_partition_is_exact_and_subscriber_scoped() {
+        assert_eq!(
+            TFT_FRAGMENT_OWNER_GROUPS * TFT_FRAGMENT_OWNER_BUCKETS,
+            TFT_FRAGMENT_BUCKETS
+        );
+        assert_eq!(TFT_FRAGMENT_OWNER_MAX_DATAGRAMS, 256);
+        let classifier = classifier_for_paa([192, 0, 2, 1]);
+        let owner = owner_group(classifier);
+        let mut seen = 0_u64;
+        for identification in 0..4_096_u16 {
+            let key = TftFragmentKey::new(
+                classifier,
+                [192, 0, 2, 1],
+                [198, 51, 100, 2],
+                50,
+                identification,
+            );
+            let bucket = key.bucket();
+            assert!(bucket < TFT_FRAGMENT_BUCKETS);
+            assert_eq!(
+                bucket / TFT_FRAGMENT_OWNER_BUCKETS,
+                owner,
+                "one subscriber must stay inside one owner group"
+            );
+            seen |= 1 << (bucket % TFT_FRAGMENT_OWNER_BUCKETS);
+        }
+        assert_eq!(
+            seen.count_ones(),
+            TFT_FRAGMENT_OWNER_BUCKETS,
+            "one subscriber must be able to reach every bucket in its own group"
+        );
+    }
+
+    /// A subscriber that fills every slot of its own group is refused fail
+    /// closed; another owner group keeps admitting.
+    #[test]
+    fn a_saturating_owner_is_refused_without_touching_another_group() {
+        let classifier = classifier_for_paa([192, 0, 2, 1]);
+        let meta_a = meta(1);
+        let (mut buckets, last_identification) = fill_owner_group(classifier, &meta_a);
+        let owner = owner_group(classifier);
+        // Every bucket in the group now has four live entries; a new datagram
+        // for the same subscriber is refused with the distinct capacity outcome
+        // without resetting any entry.
+        let first = first();
+        let packet = packet();
+        let refused = TftFragmentKey::new(
+            classifier,
+            [192, 0, 2, 1],
+            [198, 51, 100, 2],
+            50,
+            last_identification.wrapping_add(1),
+        );
+        let slot = (refused.bucket() - owner * TFT_FRAGMENT_OWNER_BUCKETS) as usize;
+        assert_eq!(
+            buckets[slot].apply(refused, Some(first), Some(&meta_a), Some((&packet, 11)), 10),
+            TftFragmentDisposition::Capacity
+        );
+        // A different owner group is unaffected.
+        let other = (2_u8..=255)
+            .map(|last| classifier_for_paa([10, 0, 0, last]))
+            .find(|candidate| owner_group(*candidate) != owner)
+            .expect("a different owner group exists");
+        let key = TftFragmentKey::new(other, [192, 0, 2, 1], [198, 51, 100, 2], 50, 1);
+        assert_eq!(
+            TftFragmentBucket::new().apply(
+                key,
+                Some(first),
+                Some(&meta(2)),
+                Some((&packet, 11)),
+                10
+            ),
+            TftFragmentDisposition::Selected(11)
+        );
+    }
+
+    /// A hash collision only shares one group's bound; a third group is still
+    /// admitted, and the colliding subscriber cannot evict the first one's
+    /// entries (they are retained, not reset).
+    #[test]
+    fn colliding_owner_groups_share_only_their_group() {
+        let first_classifier = classifier_for_paa([192, 0, 2, 1]);
+        let mut colliding = None;
+        let mut distinct = None;
+        for last in 2_u8..=255 {
+            let candidate = classifier_for_paa([10, 0, 0, last]);
+            if owner_group(candidate) == owner_group(first_classifier) && colliding.is_none() {
+                colliding = Some(candidate);
+            }
+            if owner_group(candidate) != owner_group(first_classifier) && distinct.is_none() {
+                distinct = Some(candidate);
+            }
+        }
+        let colliding = colliding.expect("a colliding owner group exists");
+        let distinct = distinct.expect("a distinct owner group exists");
+        let meta_a = meta(1);
+        let (mut buckets, last_identification) = fill_owner_group(first_classifier, &meta_a);
+        let owner = owner_group(first_classifier);
+        let first = first();
+        let packet = packet();
+        let refused = TftFragmentKey::new(
+            colliding,
+            [192, 0, 2, 1],
+            [198, 51, 100, 2],
+            50,
+            last_identification.wrapping_add(1),
+        );
+        let slot = (refused.bucket() - owner * TFT_FRAGMENT_OWNER_BUCKETS) as usize;
+        assert_eq!(
+            buckets[slot].apply(
+                refused,
+                Some(first),
+                Some(&meta(2)),
+                Some((&packet, 11)),
+                10
+            ),
+            TftFragmentDisposition::Capacity,
+            "a colliding owner shares the group bound"
+        );
+        let admitted = TftFragmentKey::new(distinct, [192, 0, 2, 1], [198, 51, 100, 2], 50, 1);
+        assert_eq!(
+            TftFragmentBucket::new().apply(
+                admitted,
+                Some(first),
+                Some(&meta(3)),
+                Some((&packet, 11)),
+                10
+            ),
+            TftFragmentDisposition::Selected(11),
+            "a non-colliding owner is unaffected"
         );
     }
 

@@ -2,8 +2,8 @@ use std::net::{IpAddr, Ipv4Addr};
 
 use bytes::BytesMut;
 use opc_proto_diameter::apps::rf::{
-    AccountingRecordType, MultipleServicesCreditControl, PsInformation, RfAccountingAnswer,
-    RfAccountingRequest, SubscriptionId, SubscriptionIdType, UsedServiceUnit,
+    AccountingRecordType, PsInformation, RfAccountingAnswer, RfAccountingRequest,
+    ServiceDataContainer, SubscriptionId, SubscriptionIdType,
 };
 use opc_proto_diameter::apps::swm::{
     AllocationRetentionPriority, Ambr, ApnConfiguration, AuthRequestType, EpsSubscribedQosProfile,
@@ -490,6 +490,250 @@ fn rf_debug_does_not_leak_subscriber_identifiers() {
     assert!(!debug.contains("session;rf"));
     assert!(!debug.contains("epdg.example"));
     assert!(debug.contains("REDACTED"));
+}
+
+#[test]
+#[cfg(feature = "app-rf")]
+fn rf_charging_wire_uses_service_information_and_offline_containers() {
+    for (record_type, wire_type) in [
+        (AccountingRecordType::StartRecord, 2u32),
+        (AccountingRecordType::InterimRecord, 3),
+        (AccountingRecordType::StopRecord, 4),
+    ] {
+        let request = sample_rf_request(record_type, 1);
+        let built = apps::rf::build_rf_accounting_request(&request, 1, 2, EncodeContext::default())
+            .expect("build accounting record");
+        let encoded = encode_message(&built);
+        let decoded = decode_message(&encoded);
+        let avps: Vec<_> = decoded
+            .avps(DecodeContext::default())
+            .map(Result::unwrap)
+            .collect();
+        assert_eq!(
+            avps.iter()
+                .find(|avp| avp.header.code.get() == 480)
+                .unwrap()
+                .value,
+            wire_type.to_be_bytes()
+        );
+        assert!(avps
+            .iter()
+            .all(|avp| ![443, 456, 874].contains(&avp.header.code.get())));
+        let service = avps
+            .iter()
+            .find(|avp| avp.header.code.get() == 873)
+            .expect("Service-Information");
+        assert_eq!(service.header.vendor_id, Some(VendorId::new(10415)));
+        let children: Vec<_> = service
+            .grouped_avps(DecodeContext::default())
+            .map(Result::unwrap)
+            .collect();
+        assert!(children
+            .iter()
+            .any(|avp| avp.header.code.get() == 443 && avp.header.vendor_id.is_none()));
+        let ps = children
+            .iter()
+            .find(|avp| avp.header.code.get() == 874)
+            .expect("PS-Information");
+        let ps_children: Vec<_> = ps
+            .grouped_avps(DecodeContext::default())
+            .map(Result::unwrap)
+            .collect();
+        assert!(ps_children.iter().any(|avp| avp.header.code.get() == 1228));
+        assert!(ps_children.iter().any(|avp| avp.header.code.get() == 847));
+        for code in [2, 3] {
+            let avp = ps_children
+                .iter()
+                .find(|avp| avp.header.code.get() == code)
+                .unwrap();
+            assert!(
+                avp.header.flags.is_mandatory(),
+                "TS 32.299 section 7.2.0 requires M for AVP {code}"
+            );
+            assert_eq!(avp.header.vendor_id, Some(VendorId::new(10415)));
+        }
+        assert!(ps_children
+            .iter()
+            .all(|avp| ![6, 7, 456].contains(&avp.header.code.get())));
+        let usage = ps_children
+            .iter()
+            .find(|avp| avp.header.code.get() == 2040)
+            .expect("Service-Data-Container");
+        let counters: Vec<_> = usage
+            .grouped_avps(DecodeContext::default())
+            .map(Result::unwrap)
+            .collect();
+        for (code, value) in [(363, 200_000u64), (364, 800_000)] {
+            let avp = counters
+                .iter()
+                .find(|avp| avp.header.code.get() == code)
+                .unwrap();
+            assert_eq!(avp.header.vendor_id, None);
+            assert_eq!(avp.value, value.to_be_bytes());
+        }
+        let time = counters
+            .iter()
+            .find(|avp| avp.header.code.get() == 2045)
+            .unwrap();
+        assert_eq!(time.header.vendor_id, Some(VendorId::new(10415)));
+        assert_eq!(time.value, 3600u32.to_be_bytes());
+    }
+}
+
+#[test]
+#[cfg(feature = "app-rf")]
+fn rf_decodes_literal_service_information_group() {
+    // Independent AVP headers: 873 / 874 / Charging-Id 2, vendor 10415.
+    let group = BytesMut::from(
+        &[
+            0, 0, 3, 105, 0xc0, 0, 0, 40, 0, 0, 40, 175, 0, 0, 3, 106, 0xc0, 0, 0, 28, 0, 0, 40,
+            175, 0, 0, 0, 2, 0xc0, 0, 0, 16, 0, 0, 40, 175, 0x12, 0x34, 0x56, 0x78,
+        ][..],
+    );
+    let built = build_raw_rf_acr(Some(3), &[group]);
+    let encoded = encode_message(&built);
+    let message = decode_message(&encoded);
+    message
+        .validate_avps_with_dictionary(
+            DecodeContext::conservative(),
+            DictionarySet::new(&[base::dictionary(), apps::rf::dictionary()]),
+        )
+        .expect("normative Rf structure and cardinality");
+    let service = message
+        .avps(DecodeContext::default())
+        .map(Result::unwrap)
+        .find(|avp| avp.header.code.get() == 873)
+        .expect("Service-Information");
+    let ps = service
+        .grouped_avps(DecodeContext::default())
+        .map(Result::unwrap)
+        .find(|avp| avp.header.code.get() == 874)
+        .expect("PS-Information");
+    let charging_id = ps
+        .grouped_avps(DecodeContext::default())
+        .map(Result::unwrap)
+        .find(|avp| avp.header.code.get() == 2)
+        .expect("3GPP-Charging-Id");
+    assert!(charging_id.header.flags.is_mandatory());
+    let parsed = apps::rf::parse_rf_accounting_request(&message, DecodeContext::default())
+        .expect("normative Service-Information nesting");
+    assert_eq!(parsed.ps_information.unwrap().charging_id, Some(0x12345678));
+}
+
+#[test]
+#[cfg(feature = "app-rf")]
+fn review_rf_repeated_packet_addresses_survive_decode_and_encode() {
+    let group = |code, value: &[u8]| {
+        encode_raw_vendor_avp(AvpCode::new(code), VendorId::new(10415), true, value)
+    };
+    let mut children = BytesMut::new();
+    for code in [1228, 847] {
+        children.extend_from_slice(&group(code, &[0, 1, 192, 0, 2, 1]));
+        children.extend_from_slice(&group(
+            code,
+            &[
+                0, 2, 0x20, 1, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1,
+            ],
+        ));
+    }
+    let encoded = encode_message(&build_raw_rf_acr_service_information(
+        Some(3),
+        &[group(874, &children)],
+    ));
+    let message = decode_message(&encoded);
+    let parsed = apps::rf::parse_rf_accounting_request(&message, DecodeContext::conservative())
+        .expect("TS 32.299 section 7.2.158 allows repeated SGSN and GGSN addresses");
+    let roundtrip = encode_message(
+        &apps::rf::build_rf_accounting_request(&parsed, 1, 2, EncodeContext::default()).unwrap(),
+    );
+    let roundtrip = decode_message(&roundtrip);
+    let service = roundtrip
+        .avps(DecodeContext::default())
+        .map(Result::unwrap)
+        .find(|a| a.header.code.get() == 873)
+        .unwrap();
+    let ps = service
+        .grouped_avps(DecodeContext::default())
+        .map(Result::unwrap)
+        .find(|a| a.header.code.get() == 874)
+        .unwrap();
+    assert_eq!(ps.value, children.as_ref());
+    roundtrip
+        .validate_avps_with_dictionary(
+            DecodeContext::conservative(),
+            DictionarySet::new(&[base::dictionary(), apps::rf::dictionary()]),
+        )
+        .unwrap();
+}
+
+#[test]
+#[cfg(feature = "app-rf")]
+fn review_rf_radius_dictionary_requires_mandatory_flag() {
+    for code in [2, 3] {
+        assert_eq!(
+            apps::rf::dictionary()
+                .find_avp(AvpKey::vendor(AvpCode::new(code), VendorId::new(10415)))
+                .unwrap()
+                .flags()
+                .mandatory(),
+            FlagRequirement::MustBeSet
+        );
+    }
+}
+
+#[test]
+#[cfg(feature = "app-rf")]
+fn review_rf_dictionary_allows_repeatable_children_and_rejects_singletons() {
+    let group = |code, value: &[u8]| {
+        encode_raw_vendor_avp(AvpCode::new(code), VendorId::new(10415), true, value)
+    };
+    let mut subscription = encode_raw_avp(AvpCode::new(450), true, &1u32.to_be_bytes());
+    subscription.extend_from_slice(&encode_raw_avp(AvpCode::new(444), true, b"001010123456789"));
+    let subscription = encode_raw_avp(AvpCode::new(443), true, &subscription);
+    let usage = group(
+        2040,
+        &encode_raw_avp(AvpCode::new(363), true, &42u64.to_be_bytes()),
+    );
+    let address = group(1228, &[0, 1, 192, 0, 2, 1]);
+    let gateway = group(847, &[0, 1, 192, 0, 2, 2]);
+    for child in [&usage, &address, &gateway] {
+        let mut repeated = child.clone();
+        repeated.extend_from_slice(child);
+        let message = encode_message(&build_raw_rf_acr_service_information(
+            Some(3),
+            &[group(874, &repeated)],
+        ));
+        decode_message(&message)
+            .validate_avps_with_dictionary(
+                DecodeContext::conservative(),
+                DictionarySet::new(&[base::dictionary(), apps::rf::dictionary()]),
+            )
+            .expect("repeatable PS-Information child");
+    }
+    let message = encode_message(&build_raw_rf_acr_service_information(
+        Some(3),
+        &[subscription.clone(), subscription],
+    ));
+    decode_message(&message)
+        .validate_avps_with_dictionary(
+            DecodeContext::conservative(),
+            DictionarySet::new(&[base::dictionary(), apps::rf::dictionary()]),
+        )
+        .expect("repeatable Subscription-Id");
+    let ps = group(874, &[]);
+    let message = encode_message(&build_raw_rf_acr_service_information(
+        Some(3),
+        &[ps.clone(), ps],
+    ));
+    assert!(
+        decode_message(&message)
+            .validate_avps_with_dictionary(
+                DecodeContext::conservative(),
+                DictionarySet::new(&[base::dictionary(), apps::rf::dictionary()])
+            )
+            .is_err(),
+        "PS-Information remains a singleton"
+    );
 }
 
 #[test]
@@ -4606,21 +4850,18 @@ fn sample_rf_request(record_type: AccountingRecordType, record_number: u32) -> R
             subscription_id_type: SubscriptionIdType::EndUserImsi,
             subscription_id_data: "001010123456789".into(),
         }],
-        multiple_services_credit_controls: vec![MultipleServicesCreditControl {
-            used_service_unit: Some(UsedServiceUnit {
-                cc_time: Some(3600),
-                cc_total_octets: Some(1_000_000),
-                cc_input_octets: Some(200_000),
-                cc_output_octets: Some(800_000),
-            }),
-            rating_group: Some(1),
-            service_identifier: Some(42),
-        }],
         ps_information: Some(PsInformation {
             charging_id: Some(0x12345678),
             pdp_type: Some(0),
-            sgsn_address: Some(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)).into()),
-            ggsn_address: Some(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 2)).into()),
+            sgsn_addresses: vec![IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)).into()],
+            ggsn_addresses: vec![IpAddr::V4(Ipv4Addr::new(10, 0, 0, 2)).into()],
+            service_data_containers: vec![ServiceDataContainer {
+                accounting_input_octets: Some(200_000),
+                accounting_output_octets: Some(800_000),
+                time_usage: Some(3600),
+                rating_group: Some(1),
+                service_identifier: Some(42),
+            }],
         }),
     }
 }
@@ -5376,7 +5617,8 @@ fn rf_grouped_subscription_id_rejects_duplicate_child() {
         true,
         &sub_value,
     )];
-    let message = build_raw_rf_acr(Some(apps::rf::APPLICATION_ID.get()), &extras);
+    let message =
+        build_raw_rf_acr_service_information(Some(apps::rf::APPLICATION_ID.get()), &extras);
     let encoded = encode_message(&message);
     let decoded = decode_message(&encoded);
     assert!(apps::rf::parse_rf_accounting_request(&decoded, DecodeContext::default()).is_err());
@@ -5400,7 +5642,8 @@ fn rf_grouped_subscription_id_preserves_established_child_flag_tolerance() {
         true,
         &sub_value,
     )];
-    let message = build_raw_rf_acr(Some(apps::rf::APPLICATION_ID.get()), &extras);
+    let message =
+        build_raw_rf_acr_service_information(Some(apps::rf::APPLICATION_ID.get()), &extras);
     let encoded = encode_message(&message);
     let decoded = decode_message(&encoded);
 
@@ -5448,7 +5691,8 @@ fn rf_grouped_subscription_id_preserves_optional_vendor_child_tolerance() {
             true,
             &sub_value,
         )];
-        let message = build_raw_rf_acr(Some(apps::rf::APPLICATION_ID.get()), &extras);
+        let message =
+            build_raw_rf_acr_service_information(Some(apps::rf::APPLICATION_ID.get()), &extras);
         let encoded = encode_message(&message);
         let decoded = decode_message(&encoded);
         for unknown_ie_policy in [UnknownIePolicy::Preserve, UnknownIePolicy::Drop] {
@@ -5480,7 +5724,8 @@ fn rf_grouped_subscription_id_rejects_noncanonical_outer_flags() {
         b"001010123456789",
     ));
     let outer = encode_raw_avp(apps::rf::AVP_SUBSCRIPTION_ID, false, &sub_value);
-    let message = build_raw_rf_acr(Some(apps::rf::APPLICATION_ID.get()), &[outer]);
+    let message =
+        build_raw_rf_acr_service_information(Some(apps::rf::APPLICATION_ID.get()), &[outer]);
     let encoded = encode_message(&message);
     let decoded = decode_message(&encoded);
     assert!(apps::rf::parse_rf_accounting_request(&decoded, DecodeContext::default()).is_err());
@@ -5492,7 +5737,8 @@ fn rf_grouped_subscription_id_tolerates_optional_foreign_vendor_outer_code() {
     for vendor_id in [VendorId::new(42_424), VendorId::new(0)] {
         let outer =
             encode_raw_vendor_avp(apps::rf::AVP_SUBSCRIPTION_ID, vendor_id, false, b"optional");
-        let message = build_raw_rf_acr(Some(apps::rf::APPLICATION_ID.get()), &[outer]);
+        let message =
+            build_raw_rf_acr_service_information(Some(apps::rf::APPLICATION_ID.get()), &[outer]);
         let encoded = encode_message(&message);
         let decoded = decode_message(&encoded);
 
@@ -5530,7 +5776,8 @@ fn rf_grouped_subscription_id_rejects_unknown_mandatory_child() {
         true,
         &sub_value,
     )];
-    let message = build_raw_rf_acr(Some(apps::rf::APPLICATION_ID.get()), &extras);
+    let message =
+        build_raw_rf_acr_service_information(Some(apps::rf::APPLICATION_ID.get()), &extras);
     let encoded = encode_message(&message);
     let decoded = decode_message(&encoded);
     assert!(apps::rf::parse_rf_accounting_request(&decoded, DecodeContext::default()).is_err());
@@ -5560,7 +5807,8 @@ fn rf_grouped_subscription_id_rejects_too_many_children() {
         true,
         &sub_value,
     )];
-    let message = build_raw_rf_acr(Some(apps::rf::APPLICATION_ID.get()), &extras);
+    let message =
+        build_raw_rf_acr_service_information(Some(apps::rf::APPLICATION_ID.get()), &extras);
     let encoded = encode_message(&message);
     let decoded = decode_message(&encoded);
     let ctx = DecodeContext {
@@ -5593,7 +5841,8 @@ fn rf_acr_rejects_duplicate_ps_information() {
         &ps_value,
     );
     let extras = [ps_info.clone(), ps_info];
-    let message = build_raw_rf_acr(Some(apps::rf::APPLICATION_ID.get()), &extras);
+    let message =
+        build_raw_rf_acr_service_information(Some(apps::rf::APPLICATION_ID.get()), &extras);
     let encoded = encode_message(&message);
     let decoded = decode_message(&encoded);
     let err = apps::rf::parse_rf_accounting_request(&decoded, DecodeContext::default())
@@ -5606,32 +5855,23 @@ fn rf_acr_rejects_duplicate_ps_information() {
 
 #[test]
 #[cfg(feature = "app-rf")]
-fn rf_grouped_mscc_rejects_excessive_nesting_depth() {
-    let mut usu_value = BytesMut::new();
-    usu_value.extend_from_slice(&encode_raw_avp(
-        apps::rf::AVP_CC_TIME,
-        true,
-        &3600u32.to_be_bytes(),
-    ));
-    let mut mscc_value = BytesMut::new();
-    mscc_value.extend_from_slice(&encode_raw_avp(
-        apps::rf::AVP_USED_SERVICE_UNIT,
-        true,
-        &usu_value,
-    ));
-    let extras = [encode_raw_avp(
-        apps::rf::AVP_MULTIPLE_SERVICES_CREDIT_CONTROL,
-        true,
-        &mscc_value,
-    )];
-    let message = build_raw_rf_acr(Some(apps::rf::APPLICATION_ID.get()), &extras);
+fn rf_grouped_service_data_rejects_excessive_nesting_depth() {
+    let counter = encode_raw_avp(AvpCode::new(363), true, &200_000u64.to_be_bytes());
+    let usage = encode_raw_vendor_avp(AvpCode::new(2040), VendorId::new(10415), true, &counter);
+    let ps = encode_raw_vendor_avp(AvpCode::new(874), VendorId::new(10415), true, &usage);
+    let message = build_raw_rf_acr_service_information(Some(3), &[ps]);
     let encoded = encode_message(&message);
     let decoded = decode_message(&encoded);
     let ctx = DecodeContext {
-        max_depth: 1,
+        max_depth: 2,
         ..DecodeContext::default()
     };
-    assert!(apps::rf::parse_rf_accounting_request(&decoded, ctx).is_err());
+    let err = apps::rf::parse_rf_accounting_request(&decoded, ctx)
+        .expect_err("usage exceeds depth limit");
+    assert!(matches!(
+        err.code(),
+        opc_protocol::DecodeErrorCode::DepthExceeded
+    ));
 }
 
 #[test]
@@ -7023,4 +7263,84 @@ fn swm_dea_debug_redacts_subscription_data() {
     let debug = format!("{:?}", sample_apn_configuration());
     assert!(!debug.contains("internet"));
     assert!(debug.contains("REDACTED"));
+}
+
+#[cfg(feature = "app-rf")]
+fn build_raw_rf_acr_service_information(
+    acct_application_id: Option<u32>,
+    children: &[BytesMut],
+) -> OwnedMessage {
+    let value: Vec<u8> = children
+        .iter()
+        .flat_map(|child| child.iter().copied())
+        .collect();
+    let service = encode_raw_vendor_avp(AvpCode::new(873), VendorId::new(10415), true, &value);
+    build_raw_rf_acr(acct_application_id, &[service])
+}
+
+#[test]
+#[cfg(feature = "app-rf")]
+fn rf_offline_usage_preserves_repetitions_and_rejects_bad_counters() {
+    let vendor = VendorId::new(10415);
+    let group = |code, value: &[u8]| encode_raw_vendor_avp(AvpCode::new(code), vendor, true, value);
+    let counter = encode_raw_avp(AvpCode::new(363), true, &u64::MAX.to_be_bytes());
+    let usage = group(2040, &counter);
+    let mut repeated = usage.clone();
+    repeated.extend_from_slice(&usage);
+    let ps = group(874, &repeated);
+    let built = build_raw_rf_acr_service_information(Some(3), &[ps]);
+    let encoded = encode_message(&built);
+    let message = decode_message(&encoded);
+    let parsed = apps::rf::parse_rf_accounting_request(&message, DecodeContext::default()).unwrap();
+    let usage = parsed.ps_information.unwrap().service_data_containers;
+    assert_eq!(usage.len(), 2);
+    assert!(usage
+        .iter()
+        .all(|item| item.accounting_input_octets == Some(u64::MAX)));
+
+    let mut duplicate = counter.clone();
+    duplicate.extend_from_slice(&counter);
+    for (value, is_duplicate) in [
+        (duplicate, true),
+        (encode_raw_avp(AvpCode::new(363), true, &[0; 7]), false),
+    ] {
+        let usage = group(2040, &value);
+        let ps = group(874, &usage);
+        let built = build_raw_rf_acr_service_information(Some(3), &[ps]);
+        let encoded = encode_message(&built);
+        let message = decode_message(&encoded);
+        let err =
+            apps::rf::parse_rf_accounting_request(&message, DecodeContext::default()).unwrap_err();
+        if is_duplicate {
+            assert_eq!(err.code(), &opc_protocol::DecodeErrorCode::DuplicateIe);
+        } else {
+            assert!(matches!(
+                err.code(),
+                opc_protocol::DecodeErrorCode::InvalidLength { .. }
+            ));
+        }
+        assert!(err.offset() > DIAMETER_HEADER_LEN + 36);
+    }
+}
+
+#[test]
+#[cfg(feature = "app-rf")]
+fn rf_service_information_cardinality_and_scope_are_enforced() {
+    let empty = encode_raw_vendor_avp(AvpCode::new(873), VendorId::new(10415), true, &[]);
+    let built = build_raw_rf_acr(Some(3), &[empty.clone(), empty]);
+    let encoded = encode_message(&built);
+    let message = decode_message(&encoded);
+    let error =
+        apps::rf::parse_rf_accounting_request(&message, DecodeContext::default()).unwrap_err();
+    assert_eq!(error.code(), &opc_protocol::DecodeErrorCode::DuplicateIe);
+    for misplaced in [
+        encode_raw_vendor_avp(AvpCode::new(874), VendorId::new(10415), true, &[]),
+        encode_raw_avp(AvpCode::new(456), true, &[]),
+        encode_raw_avp(AvpCode::new(443), true, &[]),
+    ] {
+        let built = build_raw_rf_acr(Some(3), &[misplaced]);
+        let encoded = encode_message(&built);
+        let message = decode_message(&encoded);
+        assert!(apps::rf::parse_rf_accounting_request(&message, DecodeContext::default()).is_err());
+    }
 }

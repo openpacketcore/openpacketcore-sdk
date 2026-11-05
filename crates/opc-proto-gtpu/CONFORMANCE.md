@@ -4,7 +4,7 @@ This document defines the conformance of the `opc-proto-gtpu` crate against the 
 
 ## Specification Baseline
 - **Document**: 3GPP TS 29.281
-- **Release**: Release 18 (R18)
+- **Release**: Release 19 (TS 29.281 V19.2.0)
 - **Status**: Full support for User Plane GTPv1-U framing and the typed control-codec subset listed below
 
 ## Supported Features
@@ -29,12 +29,15 @@ This document defines the conformance of the `opc-proto-gtpu` crate against the 
 - **5G SA QoS Flow Identifier (QFI)**: Decodes base downlink and uplink PDU Session Container extension headers.
 - **Paging Policy Indicator (PPI)**: Encodes and decodes bits 7..5 when the PPP
   flag is set in DL PDU Session Information (TS 38.415 figure 5.5.2.1-1).
-  Senders zero the five spare bits; receivers ignore them.
+  Senders zero the lower five bits. Receivers ignore bits 4..2, but reject
+  BSSI/TTNBI in bits 1..0, identified in TS 38.415 V19.1.0 figure 5.5.2.1-1,
+  because this model does not represent their burst fields (#1520).
 - **Reflective QoS Indicator (RQI)**: Decodes RQI in DL PDU Session Information.
 - **Fail-closed subset boundary**: PDU types 2–15 are rejected. Presence flags
   for QMP timestamps, QFI sequence numbers, MBS sequence numbers, delay
-  results, congestion information, or future fields are rejected instead of
-  being partially represented by the QFI/PPI/RQI model. Extension alignment,
+  results, congestion information, burst size / time to next burst, or future
+  fields are rejected instead of being partially represented by the QFI/PPI/RQI
+  model. Extension alignment,
   the PPP-dependent PPI width, and the exact supported base-frame width are
   checked before values are exposed.
 - **Fail-closed construction and encode**: validated downlink/uplink
@@ -48,6 +51,26 @@ This document defines the conformance of the `opc-proto-gtpu` crate against the 
 - **Owned Slicing**: `OwnedGtpuMessage` implements cheap reference-counted slicing of `bytes::Bytes` for thread-safe boundaries.
 
 ### 5. Extension-header comprehension (§5.2.1)
+- **Typed values**: `GtpuTypedExtension` decodes/encodes UDP Port, short PDCP,
+  18-bit Long PDCP, Service Class Indicator, and the existing PSC subset. RAN,
+  Xw RAN and NR RAN container bytes are borrowed and opaque. Fixed lengths,
+  aligned container bounds, 18-bit send limits and SCI send values 0–15 are
+  checked. Receive ignores spare bits; typed send clears them. Short PDCP
+  interface-specific 12/15-bit restrictions remain caller policy.
+- **Long PDCP assignments**: figure 5.2.1-3 notes 2/3 require current senders
+  to use `0x03`; `0x82` is the earlier-release receive form (the issue's legacy
+  wording was reversed). Both have typed decode; explicit legacy encoding is
+  available for interop, not the current sender default.
+- **Comprehension scope**: wire-format recognition is separate from endpoint
+  comprehension. PSC is the supported required extension; UDP Port is supported
+  where applicable to control messages. Types 0x81–0x84 and 0xC0 require
+  notification and discard at an endpoint even
+  though typed format decoding exists. The SGW/G-PDU exception for 0xC0 remains.
+  With `Preserve` or `Drop`, structural GTP-U decode retains raw extensions;
+  `ProcedureAware`, the typed decode and comprehension scan check fixed lengths.
+  `Reject` refuses every required type outside the endpoint profile, including
+  the parseable 0x81–0x84 and 0xC0 formats. PDU Set containers `0x04` and `0x86`
+  remain unimplemented pending that feature's TS 38.415 semantics.
 - **Typed classes**: all four bits-8/7 comprehension classes are exposed for
   endpoint and intermediate recipients, including the type `0xc0` SGW/G-PDU
   exception.
@@ -63,7 +86,7 @@ This document defines the conformance of the `opc-proto-gtpu` crate against the 
 - **Known control extension**: the optional UDP Port extension on Error
   Indication is decoded and canonically encoded with exact four-octet length.
 
-### 6. Path and tunnel-management codec (§§7.2.1–7.2.3, 7.3.1–7.3.2, 8.1–8.6, 8.8)
+### 6. Path and tunnel-management codec (§§7.2.1–7.2.3, 7.3.1–7.3.3, 8.1–8.8)
 - **Echo Request/Response**: exact zero TEID and S-flag checks, sequence copying,
   mandatory Recovery, optional Recovery Time Stamp, and repeatable Private
   Extensions. Received Recovery counters are ignored and canonical output is
@@ -82,9 +105,17 @@ This document defines the conformance of the `opc-proto-gtpu` crate against the 
   structurally validated PDU Session Container where permitted for 5GS
   forwarding. Container semantics remain exposed through the shared extension
   model rather than duplicated in the control codec.
-- **IE invariants**: ascending type order, exact TV/TLV lengths,
-  mandatory/singleton cardinality, configured IE/message bounds, unknown TLV
-  preserve/drop/reject policy, and fail-closed unknown TV behavior. Canonical
+- **IE receiver rules** (TS 29.281 §9.1, TS 29.060 §§11.1.9–11.1.12):
+  ascending type order, complete TV/TLV framing, mandatory presence and configured
+  IE/message bounds remain enforced. Known unexpected IEs are skipped, including
+  GTP-C TV elements whose lengths are defined in TS 29.060 Table 37. First
+  occurrences win regardless of `DuplicateIePolicy`; Private Extensions may repeat.
+  Unknown TLVs are opaque under `Preserve`, skipped under both `Drop` and `Reject`.
+  Known limitation: unknown TVs currently reject the whole message, although
+  §11.1.9 permits discarding only the remainder when mandatory information is
+  complete. Malformed optional Recovery Time Stamp and Private Extension IEs
+  also still reject the message instead of being treated as absent (§11.1.13).
+  These receiver-tolerance corrections remain follow-up work. Canonical
   encoding checks the model IE count and exact final datagram/u16 length before
   allocating or writing its serialized IE payload.
 - **Validated conversion boundary**: `GtpuControlMessage::from_message`
@@ -107,8 +138,13 @@ This document defines the conformance of the `opc-proto-gtpu` crate against the 
   and places it first as required by TS 29.281 figure 5.2.1-3 note 4. Unrelated
   optional unknown headers retain their relative order. Generic raw-preserving
   encoding continues to retain the accepted bytes exactly.
-- **Explicit exclusion**: Tunnel Status (§7.3.3 and §8.7) is not implemented
-  by this codec slice and is rejected as a known procedure-inapplicable IE.
+- **Tunnel Status** (§7.3.3 and §8.7): S flag zero, tunnel TEID, mandatory
+  Tunnel Status Information with SPOC, and repeatable Private Extensions.
+  Received spare bits are exposed but cleared on canonical send; future octets
+  are retained. The dataplane port classifies a valid message as `TunnelStatus`
+  for consumers to ignore when unsupported or when no tunnel exists. It grants
+  no charging or response authority. Tunnel lookup, pause-of-charging application
+  and upstream forwarding require consumer policy.
 
 ---
 
@@ -126,9 +162,10 @@ This document defines the conformance of the `opc-proto-gtpu` crate against the 
   integration, peer admission, rate limits, response tuple selection, unknown-
   TEID lookup, and End Marker ordering policy are not implemented by this codec
   slice.
-- **Tracking**: these runtime/dataplane acceptance items remain open under
-  issue #341. Typed-codec tests do not claim Linux/eBPF behavioral parity or
-  production qualification.
+- **Runtime implementation**: the [dataplane control port](../opc-gtpu-dataplane/docs/control-port.md)
+  supplies retained Linux/eBPF sockets, IPv4/IPv6 tuples and typed responses for
+  #341. Peer admission, response pacing and lifecycle policy remain caller-owned.
+  Codec tests alone do not qualify backend behavior or live-peer interoperability.
 
 ---
 

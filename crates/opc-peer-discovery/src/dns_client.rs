@@ -10,7 +10,7 @@ use std::time::Duration;
 
 use socket2::{Domain, Protocol, Socket, Type};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::{TcpSocket, UdpSocket};
+use tokio::net::{TcpSocket, TcpStream, UdpSocket};
 use tokio::sync::Semaphore;
 
 use crate::dns_wire::{self, DecodeError, Message};
@@ -22,6 +22,7 @@ use crate::{
 const MAX_CONFIG_BYTES: usize = 65_536;
 const MAX_SERVERS: usize = 8;
 const PORT_BIND_ATTEMPTS: usize = 32;
+const TCP_IDLE_TIMEOUT: Duration = Duration::from_secs(1);
 
 #[path = "dns_order.rs"]
 mod order;
@@ -518,11 +519,19 @@ impl ServerTimeouts {
     }
 }
 
+struct PooledTcp {
+    stream: TcpStream,
+    idle_close: tokio::task::AbortHandle,
+}
+
+type TcpSlot = Arc<tokio::sync::Mutex<Option<PooledTcp>>>;
+
 struct Inner {
     config: DnsClientConfig,
     permits: Semaphore,
     counters: Counters,
     server_timeouts: ServerTimeouts,
+    tcp_connections: Vec<TcpSlot>,
     #[cfg(test)]
     test_datagram: Option<Arc<TestDatagram>>,
 }
@@ -540,7 +549,12 @@ type TestDatagram = dyn Fn(Vec<u8>) -> std::pin::Pin<Box<dyn std::future::Future
 /// Only configured servers are contacted; there is no recursive traversal,
 /// DNSSEC validation, DoT or DoH. Uses Tokio networking and timers;
 /// call [`Self::resolve`] inside an I/O/time-enabled Tokio runtime. Dropping
-/// its future closes its sockets and releases admission without a worker task.
+/// an active exchange closes its checked-out socket and releases admission.
+/// Successful TCP exchanges reuse one connection per configured server; idle
+/// connections close after one second. This short burst-reuse window is a
+/// deliberate deviation from RFC 7766 section 6.2.3's recommended immediate
+/// idle close: EDNS TCP keepalive is not negotiated. Cleanup tasks hold only weak references
+/// and never keep a dropped client or its sockets alive.
 /// There is no durable/node state or operator cleanup on restart or crash.
 ///
 /// Each exchange uses OS randomness for the full 16-bit ID and the kernel's
@@ -589,6 +603,11 @@ impl DnsClient {
         Ok(Self {
             inner: Arc::new(Inner {
                 permits: Semaphore::new(config.max_in_flight),
+                tcp_connections: config
+                    .servers
+                    .iter()
+                    .map(|_| Arc::new(tokio::sync::Mutex::new(None)))
+                    .collect(),
                 config,
                 counters: Counters::default(),
                 server_timeouts: ServerTimeouts::default(),
@@ -1049,7 +1068,13 @@ impl DnsClient {
             }
             if size > limit {
                 increment(&self.inner.counters.oversized);
-                if u16::from_be_bytes([buffer[0], buffer[1]]) != id {
+                if buffer[2] & 0x02 != 0 {
+                    // TC permits an incomplete answer section, but never a
+                    // mismatched source, ID, question or malformed header.
+                    if let Some(message) = self.decode(&buffer[..size], query, kind, id)? {
+                        return Ok(message);
+                    }
+                } else if u16::from_be_bytes([buffer[0], buffer[1]]) != id {
                     increment(&self.inner.counters.id);
                 }
                 continue;
@@ -1069,17 +1094,67 @@ impl DnsClient {
         id: u16,
         bytes: &[u8],
     ) -> Result<Message, DnsError> {
-        let local = self
+        let index = self
             .inner
             .config
-            .local_address
-            .unwrap_or_else(|| unspecified(server));
-        let socket = self.bound_socket(server, Type::STREAM, Protocol::TCP, local)?;
-        let socket = TcpSocket::from_std_stream(socket.into());
-        let mut stream = socket
-            .connect(server)
-            .await
-            .map_err(|_| DnsError::Transport)?;
+            .servers
+            .iter()
+            .position(|value| *value == server)
+            .ok_or(DnsError::InvalidQuery)?;
+        let slot = &self.inner.tcp_connections[index];
+        // One transaction per server; cancellation owns and drops the checked-out
+        // socket, so a partial frame can never be returned to the pool.
+        let mut connection = slot.lock().await;
+        for _ in 0..2 {
+            let previous = connection.take();
+            let reused = previous.is_some();
+            let mut stream = if let Some(previous) = previous {
+                previous.idle_close.abort();
+                previous.stream
+            } else {
+                let local = self
+                    .inner
+                    .config
+                    .local_address
+                    .unwrap_or_else(|| unspecified(server));
+                let socket = self.bound_socket(server, Type::STREAM, Protocol::TCP, local)?;
+                TcpSocket::from_std_stream(socket.into())
+                    .connect(server)
+                    .await
+                    .map_err(|_| DnsError::Transport)?
+            };
+            match self
+                .tcp_transaction(&mut stream, query, kind, id, bytes)
+                .await
+            {
+                Ok(message) => {
+                    let weak_slot = Arc::downgrade(slot);
+                    let idle_deadline = tokio::time::Instant::now() + TCP_IDLE_TIMEOUT;
+                    let idle_close = tokio::spawn(async move {
+                        tokio::time::sleep_until(idle_deadline).await;
+                        if let Some(slot) = weak_slot.upgrade() {
+                            slot.lock().await.take();
+                        }
+                    })
+                    .abort_handle();
+                    *connection = Some(PooledTcp { stream, idle_close });
+                    return Ok(message);
+                }
+                Err(DnsError::Transport) if reused => continue,
+                Err(error) => return Err(error),
+            }
+        }
+        Err(DnsError::Transport)
+    }
+
+    async fn tcp_transaction(
+        &self,
+        stream: &mut TcpStream,
+        query: &DnsQuery,
+        kind: u16,
+        id: u16,
+        bytes: &[u8],
+    ) -> Result<Message, DnsError> {
         // RFC 7766 section 8: submit the length and message together.
         let mut frame = Vec::with_capacity(bytes.len() + 2);
         frame.extend((bytes.len() as u16).to_be_bytes());

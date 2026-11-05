@@ -54,6 +54,18 @@ class LibraryPartitionTests(unittest.TestCase):
                 for shard in PARTITION.SHARDS}
 
     def test_all_names_including_ignored_duplicates_and_future_siblings_keep_one_owner(self):
+        import hashlib
+
+        self.assertEqual(PARTITION.SHARDS, tuple(range(12)))
+        quarters = {index: set() for index in range(3)}
+        for number in range(3000):
+            name = f"module::future_test_{number}"
+            digest = hashlib.sha256(name.encode()).digest()
+            original = int.from_bytes(digest[:8], "big") % 3
+            expected = original + 3 * (int.from_bytes(digest[8:16], "big") % 4)
+            self.assertEqual(PARTITION.owner(name), expected)
+            quarters[original].add(expected)
+        self.assertEqual(quarters, {index: {index, index + 3, index + 6, index + 9} for index in range(3)})
         plans = self.plans()
         original = [cargo_test_selection.resolve(argv, self.metadata) for argv in self.phase]
         selections = {shard: [cargo_test_selection.resolve(argv, self.metadata) for argv in commands]
@@ -76,6 +88,32 @@ class LibraryPartitionTests(unittest.TestCase):
                 self.assertEqual(command[:len(self.base)], self.base)
                 self.assertNotIn("--ignored", command)
         PARTITION.verify(self.phase, 2, self.rows, plans, self.metadata)
+
+    def test_serial_resource_cases_keep_one_fresh_process_on_their_declared_runner(self):
+        owners = {self.serial[1]: 4}
+        plans = {shard: PARTITION.commands(self.phase, 2, self.rows, shard, owners)
+                 for shard in PARTITION.SHARDS}
+        self.assertEqual(plans[0][0], self.phase[0])
+        self.assertEqual(plans[4][0], self.phase[1])
+        self.assertEqual(len(plans[0]), 2)
+        self.assertEqual(len(plans[4]), 2)
+        self.assertEqual(sum(command == self.phase[1]
+                             for phase in plans.values() for command in phase), 1)
+        self.assertIn("--test-threads=1", plans[4][0])
+        PARTITION.verify(self.phase, 2, self.rows, plans, self.metadata, owners)
+        for mutation in ({"missing": 1}, {self.serial[0]: len(PARTITION.SHARDS)}, {self.serial[0]: True}):
+            with self.subTest(mutation=mutation), self.assertRaises(ValueError):
+                PARTITION.commands(self.phase, 2, self.rows, 0, mutation)
+        for mutation in ("missing", "ignored", "ambiguous"):
+            rows = copy.deepcopy(self.rows)
+            if mutation == "missing":
+                rows = [row for row in rows if row["name"] != self.serial[1]]
+            elif mutation == "ignored":
+                rows[1]["ignored"] = True
+            else:
+                rows.append(dict(rows[1], package="b", target="b"))
+            with self.subTest(mutation=mutation), self.assertRaises(ValueError):
+                PARTITION.commands(self.phase, 2, rows, 4, owners)
 
     def test_missing_overlap_profile_or_selector_mutation_is_rejected(self):
         for mutation in ("missing-shard", "missing-command", "overlap", "profile", "threads", "prefix", "package"):
@@ -231,6 +269,7 @@ mod process {
                     plan = SHARDS.load_plan()
                     plan["lib_groups"] = [group] if mode == "moved" else []
                     plan["quiescent_lib_shards"] = {}
+                    plan["serial_lib_shards"] = {}
                     plan["fixed_weights"] = {}
                     plan["integration_groups"] = []
                     observed = []

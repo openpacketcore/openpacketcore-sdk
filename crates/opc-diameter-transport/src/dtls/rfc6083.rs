@@ -193,7 +193,7 @@ impl Policy {
         self
     }
 
-    /// Restrict the existing ECDHE-ECDSA AEAD cipher allowlist.
+    /// Restrict the ECDHE-ECDSA/RSA AEAD cipher allowlist.
     pub fn with_allowed_ciphers(mut self, allowed: &[Cipher]) -> Result<Self, Error> {
         self.shared = self
             .shared
@@ -1073,7 +1073,7 @@ impl Connection {
         Ok(())
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, target_os = "linux"))]
     pub(crate) async fn wait_for_carrier_terminal_for_test(&self) {
         self.close
             .terminal_changes_for_test()

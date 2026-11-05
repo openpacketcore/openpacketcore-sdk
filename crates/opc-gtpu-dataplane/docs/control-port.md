@@ -1,20 +1,26 @@
 # Shared GTP-U control receive queue
 
 `control_port::GtpuControlPort` defines bounded, nonblocking receive and
-response operations. The first implementation is the existing Linux IPv4
-`GtpuReassemblySocket`. Both its legacy `receive` and new
+response operations over IPv4 and IPv6. The sealed Linux
+`GtpuReassemblySocket` supplies the eBPF queues. Both its legacy IPv4 `receive` and
 `try_receive_datagram` consume the **same UDP/2152 queue**. One consumer must
 demultiplex that queue; a competing reuse-port listener can steal controls
 or reassembled user packets.
 
 Each non-cloneable `GtpuControlDatagram` retains exact received bytes,
-length, peer/local tuple and kernel ingress provenance. It reports typed
+length, peer/local `SocketAddr` tuples and `GtpuControlProvenance` from kernel
+packet info. IPv6 retains link-local scope and refuses IPv4-mapped aliases;
+`provenance().ipv4()` returns a legacy reassembly observation only for IPv4. It reports typed
 control, structurally complete G-PDU, unsupported required extension,
-unmodelled message, or malformed input. G-PDU framing alone grants no
+`TunnelStatus`, unmodelled message, or malformed input. G-PDU framing alone grants no
 decapsulation authority: installed-selector and current-generation checks
 remain in the existing consumer. Unknown optional extension bytes remain
 in the original datagram. Required unknown extensions cannot enter its
 G-PDU classification.
+
+A valid Tunnel Status carries no response authority. Ignore it if charging pause
+is unsupported or its TEID has no context (TS 29.281 §7.3.3); applying SPOC or
+forwarding upstream requires the consumer's admitted tunnel and charging state.
 
 | Response plan | Transport and wire behavior |
 | --- | --- |
@@ -37,6 +43,18 @@ An identically addressed replacement socket refuses the old plan. Success
 counts UDP payload bytes accepted by the local kernel; it does not prove
 peer receipt. There is no automatic reply, retry queue or timeout worker.
 
+`send_echo_request(source, peer, sequence)` sends a canonical Echo Request
+through that same attachment-owned socket. This profile uses UDP/2152 at both
+ends and requires a concrete source address belonging to the attachment;
+wildcard-bound Linux sockets pin the chosen local source with `IP_PKTINFO`.
+The operation retains the same lifetime and live-binding checks as responses.
+The caller owns admission, matching Echo Responses, sequence allocation and
+retransmission. TS 29.281 §7.2.1 limits new requests to one per path per 60
+seconds; retransmissions retain their sequence. Sending successfully proves
+kernel acceptance only. Native tests inspect independent wire literals through
+both Linux GTP and eBPF ports, receive the solicited response on the same queue,
+and verify that retired handles cannot originate more requests.
+
 Receive capacity is 8–65,507 bytes; truncation of either payload or control
 metadata is an error. Per-response policy is a positive byte cap and integer
 amplification cap of 1–16. The 16-fold ceiling and codec walk limits of 256
@@ -49,12 +67,52 @@ only static classes and lengths; packet and deployment values are exposed
 only by explicit processing getters.
 
 `GtpuDataplaneBackend::open_gtpu_control_port` exposes the queue for an
-existing eBPF attachment with a concrete IPv4 endpoint. Repeated opens share
-one backend-owned socket. This includes a grouped attachment with IPv4;
-an IPv6-only attachment returns `UnsupportedFeature { feature:
-"gtpu_control_port_ipv6" }`. Linux kernel-GTP, mock and unsupported backends
-return `UnsupportedFeature { feature: "gtpu_control_port" }`. They do not
-open another listener or expose their private file descriptors.
+existing eBPF attachment with concrete IPv4 and/or IPv6 endpoints. Repeated
+opens share one backend-owned socket per family; IPv6 sockets are `V6ONLY`.
+A dual-stack port alternates nonempty shared queues, preserving the bounded
+turns for the IPv4 hand-off queues. All families share the attachment generation
+and are revoked together. Mock and unsupported backends return
+`UnsupportedFeature { feature: "gtpu_control_port" }`.
+
+
+For `LinuxGtpuDataplaneBackend`, an ordinary (non-recoverable) creation keeps
+one userspace UDP socket and passes its descriptor to the kernel GTP driver.
+The driver returns non-G-PDUs, unknown-TEID G-PDUs, and some known-TEID
+G-PDUs with an invalid inner MS binding to this queue. Socket delivery alone
+therefore does not establish the TS 29.281 section 7.3.1 Error Indication
+trigger. `try_receive_downlink` validates nonzero TEID and nonempty T-PDU,
+then performs two equal PDP reads in each of the IPv4 and IPv6 tables for
+that TEID. Only absence in both yields `UnknownTunnel`; a context in either
+family yields `Dropped(DestinationMismatch)`, and any readback error yields
+`Dropped(StateUnavailable)`. The T-PDU can be short or unstructured; its bytes
+never select the table to consult. Each netlink transaction makes one
+nonblocking receive attempt with no retry delay. A delayed reply therefore
+produces `Dropped(StateUnavailable)`, without waiting. Controls,
+unmodelled messages and unsupported required-extension events remain
+`Control`; malformed framing is dropped. `try_receive_datagram` exposes the
+received observation without a PDP lookup. Its caller must establish current
+context absence before planning an Error Indication. Neither API grants peer
+authorization or decides response policy.
+
+`open_gtpu_control_port` never binds, duplicates or reopens a socket. Repeated
+opens share the same socket generation and preserve already prepared response
+plans. Receive and response verify namespace, link name/index, socket cookie
+and local bind before and after I/O. Observed binding loss permanently retires
+that generation. Receive and classification share one attachment operation
+boundary, without the backend socket-registry or PDP mutation mutex. A
+competing receive returns `Busy` before consuming anything. Binding loss after
+dequeue yields `Dropped(StateUnavailable)`. Responses can proceed during
+receive/classification and do not return `Busy`; a retired binding returns
+`Unavailable`. A response pins its IP source with
+`IP_PKTINFO` or `IPV6_PKTINFO` to the original local destination, including for wildcard binds.
+Removal, replacement, adoption or socket-generation change retires old ports
+and plans. The retained descriptor remains the only socket owner.
+
+IPv4 and IPv6 UDP/2152 userspace sockets are supported, including wildcard binds.
+A kernel-owned recoverable attachment has no userspace descriptor and returns
+`UnsupportedFeature { feature: "gtpu_control_port_kernel_owned" }`; restart
+recovery of a control queue is not implemented. Nonstandard-port binds return `gtpu_control_port_port`. An
+unattached backend retains the default `gtpu_control_port` unsupported result.
 
 The backend checks its exact current tc hooks/maps and serializes each socket
 operation per attachment, through that registration's socket slot. PDP
@@ -82,9 +140,9 @@ retried. An external listener produces a bind
 error; no reuse-port distribution is enabled.
 
 The port grants no tunnel installation, selector provenance, peer admission,
-or forwarding authority. Kernel/eBPF/mock parity, IPv6 typed responses,
-outgoing Echo requests, per-tunnel End Marker ordering and installed N3
-forwarding remain tracked by #341 and #790.
+or forwarding authority. Mock backends have no network queue. End Marker
+ordering remains tied to an admitted tunnel's retirement procedure; this
+control port does not authorize handover or create a new tunnel send path.
 Existing forwarding capabilities and checksum-offload control pass-through
 are unchanged.
 
@@ -95,8 +153,12 @@ GTP-U bytes and never forwards the inner packet. The unknown-TEID counter
 still counts the lookup miss. A retained grouped selector with invalid
 authority, or a legacy endpoint binding without its PDR, remains a drop;
 neither becomes an unknown-tunnel event. This lookup-miss path refuses zero
-TEID and malformed packets. Grouped IPv6 attachments deliver the raw G-PDU to
-the local UDP stack, but the typed IPv6 port remains unsupported.
+TEID and malformed packets. IPv6 controls and unknown-tunnel G-PDUs now have
+the same typed response planners. This does not enable IPv6 reassembly
+forwarding: `try_receive_downlink` uses the IPv6 selector key, returns only a
+lookup miss as an observation, and refuses any retained IPv6 selector before
+the IPv4 decapsulation path. `try_receive_datagram` remains a raw bounded
+observation requiring caller lookup and policy.
 
 An observed lookup miss is not an absence receipt. Installed state can
 change before a consumer processes the datagram, and the queue also serves
@@ -110,10 +172,10 @@ Validation uses independently authored packet literals, all 65,536 source
 ports at four sequence boundaries, all 255 nonterminal extension types,
 all 256 received Recovery values, malformed framing and explicit byte/ratio
 boundaries. The independent standard-library Python generator
-`tests/fixtures/control_port.py` produces 1,204 receive/response records:
-283 controls, 129 G-PDUs, 127 required-extension events, 250 unmodelled
-messages and 415 malformed inputs. TSV SHA-256:
-`7b474796a8318ec926f931a86c98f535bd207545a01a6ecaa9be7c38698da783`.
+`tests/fixtures/control_port.py` produces 1,208 receive/response records:
+283 controls, 129 G-PDUs, 127 required-extension events, 249 unmodelled
+messages, two Tunnel Status events and 418 malformed inputs. TSV SHA-256:
+`55bc9e876ac38e5dd53fbdb581b25cdb9c34f338483cb3d4e5d99d59640b4f8e`.
 CI checks byte-exact regeneration. A separate private-network-namespace UDP peer checks actual
 reply bytes/tuples, the single queue, truncation, foreign and replaced socket
 plans, and interface-rename refusal. It does not attach a tc program or GTP
@@ -122,11 +184,17 @@ requires exactly one executed test, its completion marker and zero ignored
 tests. The PR records guard-removal results and public base/head/tree.
 
 Separate native eBPF tests now obtain this same port through the public
-backend trait. They attach the committed classifier and check all 127 unknown
-required extension identifiers, original tuple/bytes, bounded notification
-responses, all 127 optional identifiers and malformed suffix rejection.
-The IPv6 parser handoff still uses an ordinary UDP receiver and does not
-qualify IPv6 typed responses. A second native case checks dynamic-port Echo
+backend trait. They attach the committed classifier and check all 127 required
+extension handoffs outside PSC: all 127 permit bounded notifications,
+including the five RAN/PDCP formats whose syntax is known but whose semantics
+are not comprehended by this endpoint. Original tuple/bytes, all 127 optional
+identifiers and malformed suffix rejection are also checked.
+The ordinary IPv4 attachment's IPv6 parser handoff retains a raw UDP probe
+because that attachment has no configured IPv6 control endpoint. Separate
+IPv6-only and dual-stack attachment tests qualify typed Echo, Error Indication
+and extension-notification bytes. Both live backends share the independent
+IPv6 wire fixture, including source selection on a wildcard Linux bind.
+A second native case checks dynamic-port Echo
 bytes, shared-queue behavior, external-listener exclusion, kernel-observed
 queued receive retirement, same-tuple reinstall, old-plan rejection, backend
 loss and live hook loss. Its completion marker and exact native inventory
@@ -136,8 +204,9 @@ namespace-local addresses are used.
 The backend implementation adds two unit cases for writer contention and
 poisoned serialization, plus an exact unsupported-result contract test for
 Linux kernel, mock and unsupported adapters. Independent Echo wire literals
-exercise both legacy and grouped IPv4 attachments; IPv6-only attachments
-refuse explicitly. The original parent lacks the backend method, retained
+exercise legacy and grouped attachments. IPv6-only and dual-stack attachments
+share the same lifetime rules; readiness watches both shared-family sockets
+under the `Shared` queue class and wakes on retirement. The original parent lacks the backend method, retained
 as a compile-time API detector. Four separate production guard removals
 (backend exposure, live-hook check, weak backend ownership and socket release)
 and an independent Echo sequence mutation each compile and fail during the
@@ -160,6 +229,56 @@ sources and the rebuilt object are byte-identical and pass. The local endpoint
 check adds the existing IPv4 configuration map to the downlink program's exact
 map-identity set; map layouts, pin inventory and frozen historical objects do
 not change.
+
+## Readiness without polling
+
+`GtpuControlPort::downlink_readiness` returns a `GtpuControlReadiness` for one
+control port registration. The port keeps ownership of every receive socket:
+the source owns only a private epoll instance in which the backend-owned
+UDP/2152, UDP/2153 and UDP/2154 queues are registered, and its `AsFd`
+descriptor is that epoll instance, not a socket. A consumer therefore cannot
+read, close or duplicate a socket through it, and cannot use it to bypass
+attachment invalidation.
+
+```text
+let readiness = port.downlink_readiness()?;
+// Duplicate only the SDK's private epoll descriptor. The registration must
+// own it, including if the registration is forgotten or the source is dropped.
+let epoll = readiness.as_fd().try_clone_to_owned()?;
+let async_fd = opc_tokio_fd_sys::AsyncOwnedFd::with_interest(
+    epoll,
+    tokio::io::Interest::READABLE,
+)?;
+loop {
+    let mut guard = async_fd.readable().await?;
+    // Consume the SDK notification, then drain with the production consumer.
+    let ready = readiness.try_readiness()?;
+    while port.try_receive_downlink(65_507)?.is_some() {}
+    guard.clear_ready();
+}
+```
+
+Readiness is advisory and value-free: it consumes no datagram, grants no
+forwarding or peer authority, and does not change the service order documented
+below (the shared queue first for at most eight datagrams, then one turn for
+the hand-off queues, alternating). An empty readiness snapshot never proves the
+queues are empty. Every wake from the exposed descriptor must be consumed with
+`try_readiness` (which names the ready queue classes) or `wait(timeout)`;
+`try_readiness` never blocks and `wait` blocks for a bounded interval.
+
+The source is bound to one registration. Attachment removal, replacement or
+backend loss permanently signals a private eventfd inside the epoll instance.
+Fencing and failed readback are observed at the next port operation, which
+then revokes the source. Revocation wakes an idle `AsyncFd`/epoll consumer;
+`try_readiness`, `wait` and receive report `Unavailable`. The signal is never
+drained, so the descriptor remains readable for every observer. Stop waiting
+on and drop that source, then reopen through the backend after a fresh exact
+registration. An old source never observes the replacement queues.
+
+Ports without backend-owned downlink queues, including standalone
+`GtpuReassemblySocket` values and Linux kernel-GTP control ports, keep the
+default `Unsupported` readiness result. A standalone reassembly socket does
+not implement `try_receive_downlink` either.
 
 ## Backend-authoritative downlink consumer
 
@@ -214,10 +333,10 @@ the datagram.
 | --- | --- |
 | `Decapsulated` | The inner packet, its family and bearer mark (default bearer is `None`). An IPv4 packet has a validated header and ends at its total length. The caller injects it toward XFRM with that mark. The packet can be an inner IPv4 fragment; see [Inner fragments](#inner-fragments). |
 | `Control` | Non-G-PDU message; use the response planners above. |
-| `UnknownTunnel` | Untouched G-PDU whose TEID selects no tunnel. An observation, not an absence receipt. |
+| `UnknownTunnel` | Untouched G-PDU whose TEID selects no tunnel. An observation, not an absence receipt. On Linux kernel-GTP it is the datagram the kernel passed up from the retained userspace socket; the caller decides whether an Error Indication is due. |
 | `Dropped` | Value-free `GtpuDownlinkDrop`: malformed (including an inner IPv4 header that fails the checks above), binding mismatch, destination mismatch, state unavailable, or an over-MTU packet refused by the inner fragmenter (rate limited, or carrying IPv4 options). |
 | `Fragmented` | An over-MTU DF IPv4 packet split into RFC 791 inner fragments under the default policy below, with the bearer mark. The caller injects every fragment, in order, toward XFRM with that mark. |
-| `PacketTooBig` | An over-MTU DF IPv4 packet under the explicit in-tunnel Packet Too Big opt-in below; never forwarded. |
+| `PacketTooBig` | An over-MTU DF IPv4 packet, or an over-MTU inner IPv6 packet, under the explicit in-tunnel Packet Too Big opt-in below; never forwarded. |
 
 `downlink_counters` returns bounded, value-free counters for the current
 attachment registration. The ordinary legacy socket port keeps the default
@@ -247,7 +366,7 @@ decapsulating them:
 
 | Hand-off | Queue |
 | --- | --- |
-| An authorized over-MTU Don't Fragment packet of a context with a downlink inner MTU | UDP/2153 |
+| An authorized over-MTU Don't Fragment packet of an IPv4 context, or any over-MTU packet of an inner-IPv6 context, with a downlink inner MTU | UDP/2153 |
 | Every other authorized inner fragment of such a context | UDP/2154 |
 | A G-PDU for one of the attachment's endpoints whose TEID selects no tunnel | UDP/2152 |
 | A G-PDU for one of the attachment's endpoints with a required unknown extension | UDP/2152 |
@@ -735,29 +854,45 @@ set that exceeds the MTU:
 - `GtpuDownlinkInnerMtu::new(mtu)` selects the **default**, inner
   fragmentation before encapsulation (RFC 4459 section 3.4);
 - `GtpuDownlinkInnerMtu::in_tunnel_packet_too_big(mtu)` is the **explicit
-  opt-in** alternative, one in-tunnel RFC 1191 error.
+  opt-in** alternative, one in-tunnel RFC 1191 error for IPv4 or RFC 4443
+  Packet Too Big for IPv6.
 
-Under either policy, tc also hands every inner IPv4 fragment of the context
-to this consumer; see [Inner fragments](#inner-fragments).
+Under either IPv4 policy, tc also hands every inner IPv4 fragment of the
+context to this consumer; see [Inner fragments](#inner-fragments). An
+ordinary inner-IPv6 context accepts only the opt-in: IPv6 has no in-network
+fragmentation (RFC 8200 section 4.5), so the fragment-inner default is
+refused with `downlink_inner_mtu_inner_ipv6_fragmentation`, and its MTU must
+be at least the IPv6 minimum 1,280.
 
 `None` keeps today's behaviour: tc decapsulates every packet, fragment or
 not, and the host drops an over-MTU Don't Fragment packet with its own
 Fragmentation Needed toward the core.
 
-**Storage.** The field lives in the previously reserved bytes 66..68 of the
-Active `PdpContextCommit`, so it is published, replaced and read back
-atomically with the rest of the graph. The MTU is in the low 15 bits; bit 15
-is set only for the in-tunnel Packet Too Big opt-in. A record without an MTU
-is byte-identical to the original layout, so retained graphs are unchanged.
-An older SDK does not tolerate a record carrying an MTU: its retained-graph
-recovery rejects the non-canonical commit and refuses the whole attachment
-as indeterminate, not just that context. Before downgrading, drain every
-MTU-bearing context (reinstall it with `None`, or remove it).
+**Storage.** For an IPv4 context the field lives in the previously reserved
+bytes 66..68 of the Active `PdpContextCommit`, so it is published, replaced
+and read back atomically with the rest of the graph. The MTU is in the low 15
+bits; bit 15 is set only for the in-tunnel Packet Too Big opt-in. A record
+without an MTU is byte-identical to the original layout, so retained IPv4
+graphs are unchanged. An older SDK does not tolerate a record carrying an
+MTU: its retained-graph recovery rejects the non-canonical commit and refuses
+the whole attachment as indeterminate, not just that context. Before
+downgrading, drain every MTU-bearing context (reinstall it with `None`, or
+remove it).
 
-**Refusals and capability.** The in-tunnel Packet Too Big opt-in requires
-the legacy service-port uplink policy; the default fragmentation sends
-nothing uplink and accepts either. Grouped entries and ordinary inner-IPv6
-contexts refuse both policies. The eBPF probe reports
+For an ordinary inner-IPv6 context the opt-in MTU lives in a versioned
+profile of the family-tagged entry (the 2-byte field at bytes 73..74; byte 75
+is reserved). That entry is shared with
+grouped records and the protected selector ledger, so the grouped schema
+marker advances to `OPC-GROUP-IP-v7`; a retained version-6 graph is refused
+and needs a fresh attachment before it can carry the field. Entries without
+the field keep their byte-exact older profiles and read back with `None`.
+
+**Refusals and capability.** The in-tunnel Packet Too Big opt-in
+requires the legacy service-port uplink policy; the default fragmentation
+sends nothing uplink and accepts either. Grouped entries refuse both policies.
+An ordinary inner-IPv6 context accepts only the opt-in, with an MTU of at
+least 1,280 and IPv4 outer endpoints, and refuses the fragment-inner default with
+`downlink_inner_mtu_inner_ipv6_fragmentation`. The eBPF probe reports
 `downlink_inner_mtu_enforcement`. `Available` covers the datapath only:
 fragments are produced, and errors sent, only while the application drains
 this port.
@@ -959,12 +1094,16 @@ The G-PDU is re-authorized against the same Active commit. Then, in order:
 3. **Budget.** One token bucket per destination (the session PAA):
    `GtpuInnerFragmentRateLimit`, a burst of 64 with one token per 4 ms by
    default, set by `set_inner_fragment_rate_limit`. At most 4,096
-   destinations are tracked per attachment, least recently used first out;
-   a refused admission still counts as a use. An evicted destination
-   restarts with a full bucket, so past 4,096 concurrently tracked
-   destinations the per-destination bound does not hold (#1018). An empty
-   bucket is an `InnerFragmentRateLimited` drop. Steps 1 and 2 take no
-   token.
+   destinations are tracked per attachment. A destination used within the
+   last 255 seconds is never evicted: when the table holds only such
+   destinations, a new destination is refused fail closed as
+   `InnerFragmentCapacityExhausted` (counted in
+   `inner_fragment_capacity_exhausted`) instead of resetting another
+   destination's budget or Identification sequence. A destination idle for
+   at least 255 seconds may be evicted only after its bucket fully refills;
+   this also preserves limits whose refill takes longer than the lifetime. A refused
+   admission still counts as a use. An empty bucket is an
+   `InnerFragmentRateLimited` drop. Steps 1 and 2 take no token.
 4. **Fragmentation** by the RFC 791 section 3.2 procedure, generalized to
    an n-way split. Every fragment except the last carries the largest
    multiple of 8 data octets that fits the MTU, so the count is minimal
@@ -984,14 +1123,21 @@ The G-PDU is re-authorized against the same Active commit. Then, in order:
    `GtpuInnerFragmentRateLimit::new` refuses any limit above 65,535. While
    the destination stays tracked under one unchanged limit, its sequence
    therefore cannot repeat within the maximum datagram lifetime (RFC 791
-   Time to Live; RFC 6864 sections 4.3 and 5.2). Past 4,096 concurrently
-   tracked destinations, an evicted destination restarts from a fresh
-   keyed-random value, so uniqueness is probabilistic. A new attachment
-   registration (a process restart, a re-adoption or a re-created
-   attachment) likewise restarts every destination from a new random value
-   and a full bucket, possibly within 255 seconds of the previous
-   registration's Identifications. Admissions before and after a limit
-   replacement are not counted together (#1018).
+   Time to Live; RFC 6864 sections 4.3 and 5.2). A destination evicted only
+   after the 255-second grace restarts from a fresh keyed-random value; the
+   grace guarantees no 255-second window contains both lives'
+   Identifications. A new attachment registration (a process restart, a
+   re-adoption or a re-created attachment) still restarts every destination
+   from a new random value and a full bucket, possibly within 255 seconds of
+   the previous registration's Identifications; that reset is the documented
+   residual of the host-side budget (#1018). Every valid limit replacement
+   preserves sequences and budgets. A separate per-destination sliding count
+   enforces at most 65,535 admissions across every replacement. Its 256
+   one-second bins retain admissions for up to one extra second, preventing
+   an admission near a bin boundary from expiring early. The counters occupy
+   512 bytes per destination (2 MiB at the 4,096-key cap), plus fixed
+   bookkeeping, and expire at most 256 bins per admission. Live limit changes
+   never require re-registering the attachment.
 
 The result is `GtpuDownlinkEvent::Fragmented`: the fragments in offset order,
 the MTU and the bearer mark. Its `Debug` output shows only the fragment
@@ -1070,18 +1216,24 @@ Destination Unreachable (Fragmentation Needed) error is sent:
 - **Rate limit.** One token bucket per offending session (RFC 1812 section
   4.3.2.8): a burst of 16 with one token per 10 ms by default, set by
   `set_packet_too_big_rate_limit`. At most 4,096 sessions are tracked per
-  attachment, least recently used first out. While the session stays
-  tracked, a flood toward one PAA exhausts only that session's budget. Past
-  4,096 concurrently tracked sessions, a re-tracked session restarts with a
-  full bucket (#1018).
+  attachment. A session used within the last 255 seconds is never evicted;
+  while the table holds only such sessions, a new session's error budget is
+  refused fail closed (`CapacityExhausted`, counted in
+  `packet_too_big_capacity_exhausted`). A session idle for at least 255
+  seconds may be evicted only after its bucket fully refills. Explicitly
+  replacing the limit restarts every session's bucket full, including an equal
+  limit, while retaining tracked identities and their eviction grace. A flood
+  toward one PAA still exhausts only that session's budget. New registrations
+  retain the documented residual of starting with fresh volatile budgets.
 - **Tradeoff.** The error's source is the subscriber's own address. The ePDG
   is routing, so RFC 1812 4.3.2.4 would have it use its own address, but the
   PGW's per-PDN anti-spoofing admits only the PAA. The originator therefore
   attributes the error to the subscriber.
 
 **Counters.** Value-free counters report fragmented packets and fragments,
-rate-limited and unfragmentable packets under the default policy, and
-too-big, signalled, rate-limited and unsendable packets under the opt-in.
+rate-limited, capacity-exhausted and unfragmentable packets under the default
+policy, and too-big, signalled, rate-limited, capacity-exhausted and
+unsendable packets under the opt-in.
 `decapsulated_inner_fragments` reports the decapsulated packets that were
 inner fragments. `SO_RXQ_OVFL` reports kernel drops from the shared queue,
 from the packet-too-big queue and from the inner-fragment queue. The kernel
@@ -1102,14 +1254,51 @@ visible yet.
 **IPv6.** IPv6 has no in-network fragmentation: only the source fragments
 (RFC 8200 sections 4.5 and 5), and a router answers an oversized packet with
 Packet Too Big (RFC 4443 section 3.2). Ordinary inner-IPv6 contexts (#998) are
-stored as family-tagged entries, and those entries have no MTU field, so an
-inner-IPv6 context with a downlink inner MTU is refused with
-`downlink_inner_mtu_inner_ipv6` under either policy rather than installed
-without enforcement. Inner IPv6 Packet Too Big (#1007) needs three pieces:
-- an MTU in the family-tagged entry wire, which is shared with grouped
-  records and the protected selector ledger;
-- the same steering in tc's family-tagged decapsulation;
-- the existing ICMPv6 builder, quoting up to 1,232 octets.
+stored as family-tagged entries; their versioned entry profile carries the
+opt-in downlink inner MTU (the 2-byte field at bytes 73..74; byte 75 is
+reserved). tc's family-tagged decapsulation
+steers an over-MTU inner IPv6 packet to the same packet-too-big queue, and
+the consumer sends exactly one in-tunnel RFC 4443 Packet Too Big:
+
+- **Addresses.** The source is the invoking packet's own destination (the
+  subscriber address inside its `/64`, the only inner source the PGW's
+  anti-spoofing admits); the destination is the originator. Nothing is sent
+  unencapsulated.
+- **Quote.** As much of the invoking packet as fits in the minimum IPv6 MTU:
+  1,232 octets after the outer IPv6 and ICMPv6 headers.
+- **Never answered** (RFC 4443 section 2.4(e)), checked before any rate-limit
+  token is taken: an unspecified, multicast, loopback or known subnet-router
+  anycast source; an ICMPv6 error (type below 128) or Redirect (type 137),
+  including behind extension headers. A multicast or subnet-router anycast
+  destination is also refused because this proxy uses it as the error's
+  source, which must be unicast (RFC 4443 section 2.2).
+  The subnet-router anycast address has a zero interface
+  identifier (RFC 4291 section 2.6.1). Other informational ICMPv6 messages,
+  such as Echo, are answered.
+- **Header validation.** A truncated or inconsistent invoking IPv6 packet is
+  silently discarded and counted as unsendable. The bounded extension walk
+  also conservatively refuses unresolved chains, repeated Fragment headers
+  and non-initial fragments, whose upper-layer contents cannot be classified.
+- **Bearer and rate limit.** The error rides the subscriber's default-bearer
+  uplink tunnel as the IPv4 opt-in does, with the same per-session token
+  bucket, 255-second eviction grace and never-answer-before-token order. If
+  the entry is a dedicated bearer, its own PAA's default-bearer entry is used;
+  without one nothing is sent. Both entries must authorize UDP source port
+  2152, and the resolved default must authorize its exact uplink key. A zero
+  peer TEID remains valid; a selected source port or N3 profile is refused.
+
+The ordinary IPv6 path shares the family-tagged wire layout with grouped
+records and the protected selector ledger, so the grouped schema marker
+advances to `OPC-GROUP-IP-v7`. The grouped API still refuses MTU policies and
+rejects retained records it cannot represent without losing that policy.
+A retained version-6 graph and an older reader's attempt to open version 7
+are refused; crossing schema generations requires a fresh installation.
+
+The native lane `ebpf_gtpu_downlink_ipv6_packet_too_big_is_signalled_in_tunnel`
+gives one well-formed RFC 4443 error with the exact quote and checksum, no
+host-generated ICMPv6, a forwarded fitting packet, the never-answer rule
+consuming no token, and the per-session rate limit. It runs in the same
+privileged lanes as the IPv4 opt-in and requires those lanes' kernels.
 
 **Native evidence.** The committed classifier is exercised with:
 

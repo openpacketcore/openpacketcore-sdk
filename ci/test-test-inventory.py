@@ -6,8 +6,10 @@ from pathlib import Path
 import io
 import json
 import os
+import shutil
 import subprocess
 import tempfile
+import tomllib
 import unittest
 from unittest.mock import patch
 import urllib.error
@@ -675,6 +677,264 @@ class RepositoryWorkflowTests(unittest.TestCase):
                 self.assertNotEqual(run(status).returncode, 0)
 
 
+class AdvisoryWorkflowTests(unittest.TestCase):
+    REGISTRY = 'registry+https://github.com/rust-lang/crates.io-index'
+
+    def setUp(self):
+        root = Path(__file__).resolve().parents[1]
+        path = '.github/workflows/security.yml'
+        workflow = documents({path: (root / path).read_text()})[path]
+        self.step = next(step for step in workflow['jobs']['rust-advisories']['steps']
+                         if step['name'] == 'Run cargo audit')
+        self.temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temporary.cleanup)
+        self.root = Path(self.temporary.name)
+        self.repo = self.root / 'checkout'
+        self.repo.mkdir()
+        subprocess.run(['git', 'init', '-q', str(self.repo)], check=True)
+        self.bin = self.root / 'bin'
+        self.bin.mkdir()
+        self.record = self.root / 'calls.jsonl'
+        self.env = {**os.environ, 'PATH': str(self.bin) + os.pathsep + os.environ['PATH'],
+                    'RUNNER_TEMP': str(self.root), 'ADVISORY_CALLS': str(self.record),
+                    'ADVISORY_METADATA': json.dumps({'packages': [], 'resolve': {'nodes': []}})}
+        cargo = self.bin / 'cargo'
+        cargo.write_text('''#!/usr/bin/env python3
+import json, os, sys
+args = sys.argv[1:]
+with open(os.environ['ADVISORY_CALLS'], 'a') as output:
+    output.write(json.dumps(args) + '\\n')
+operation = args[0]
+if operation == 'metadata':
+    print(os.environ['ADVISORY_METADATA'])
+elif operation == 'audit':
+    lock = args[args.index('--file') + 1] if '--file' in args else 'Cargo.lock'
+    if lock == os.environ.get('FAIL_AUDIT_LOCK'):
+        raise SystemExit(17)
+    # The independent locked-version guard must also reject vulnerable bigint.
+    print('audit accepted configured exceptions')
+elif operation == 'fetch':
+    if os.environ.get('FAIL_FETCH'):
+        raise SystemExit(19)
+else:
+    raise SystemExit('unexpected cargo command: ' + repr(args))
+''')
+        cargo.chmod(0o755)
+        self.write('crates/opc-proto-ikev2/Cargo.toml',
+                   '[dependencies]\ncrypto-bigint = { version = "0.7.10" }\n')
+        self.write('.cargo/audit.toml', '[advisories]\nignore = []\n')
+        self.lock('Cargo.lock')
+
+    def write(self, name, content):
+        path = self.repo / name
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(content)
+        subprocess.run(['git', '-C', str(self.repo), 'add', '--', name], check=True)
+
+    def lock(self, name, version='0.7.10', source=None):
+        source = self.REGISTRY if source is None else source
+        if version == '0.5.5' and source == self.REGISTRY:
+            self.graph_lock(name, self.legacy_graph())
+        else:
+            self.write(name, 'version = 4\n[[package]]\nname = "crypto-bigint"\n'
+                       f'version = {json.dumps(version)}\nsource = {json.dumps(source)}\n')
+
+    def graph_lock(self, name, metadata):
+        packages = {package['id']: package for package in metadata['packages']}
+        nodes = {node['id']: node for node in metadata['resolve']['nodes']}
+        parts = ['version = 4']
+        for identifier, package in packages.items():
+            parts.extend(['[[package]]', f'name = {json.dumps(package["name"])}',
+                          f'version = {json.dumps(package["version"])}'])
+            if package['source'] is not None:
+                parts.append(f'source = {json.dumps(package["source"])}')
+            dependencies = []
+            for edge in nodes.get(identifier, {}).get('deps', []):
+                dependency = packages[edge['pkg']]
+                dependencies.append(f'{dependency["name"]} {dependency["version"]}')
+            parts.append(f'dependencies = {json.dumps(dependencies)}')
+        self.write(name, '\n'.join(parts) + '\n')
+
+    def legacy_graph(self):
+        versions = {'crypto-bigint': '0.5.5', 'elliptic-curve': '0.13.8', 'ecdsa': '0.16.9',
+                    'primeorder': '0.13.6', 'p256': '0.13.2', 'p384': '0.13.1',
+                    'dimpl': '0.7.2', 'opc-diameter-transport': '0.2.0'}
+        paths = {'dimpl': 'vendor/dimpl/Cargo.toml',
+                 'opc-diameter-transport': 'crates/opc-diameter-transport/Cargo.toml'}
+        packages = [{'id': name, 'name': name, 'version': version,
+                     'source': None if name in paths else self.REGISTRY,
+                     'manifest_path': str(self.repo / paths.get(name, f'registry/{name}/Cargo.toml'))}
+                    for name, version in versions.items()]
+        parents = {'crypto-bigint': ['elliptic-curve'],
+                   'elliptic-curve': ['ecdsa', 'primeorder', 'p256', 'p384'],
+                   'ecdsa': ['p256', 'p384', 'dimpl'], 'primeorder': ['p256', 'p384'],
+                   'p256': ['dimpl'], 'p384': ['dimpl'], 'dimpl': ['opc-diameter-transport']}
+        nodes = {name: {'id': name, 'deps': []} for name in versions}
+        for child, incoming in parents.items():
+            for parent in incoming:
+                nodes[parent]['deps'].append({'pkg': child})
+        return {'packages': packages, 'resolve': {'nodes': list(nodes.values())}}
+
+    def scan(self, metadata=None, **extra):
+        if self.record.exists():
+            self.record.unlink()
+        env = {**self.env, **extra}
+        if metadata is not None:
+            env['ADVISORY_METADATA'] = json.dumps(metadata)
+        result = subprocess.run(['bash', '-e', '-c', self.step['run']], cwd=self.repo,
+                                env=env, text=True, capture_output=True)
+        calls = [json.loads(line) for line in self.record.read_text().splitlines()] if self.record.exists() else []
+        return result, calls
+
+    def test_every_production_example_fuzz_and_consumer_lock_is_audited(self):
+        locks = ['Cargo.lock', 'crates/protocol/fuzz/Cargo.lock',
+                 'crates/protocol/tests/consumer/Cargo.lock', 'examples/reference/Cargo.lock']
+        for name in locks[1:]:
+            self.lock(name)
+        self.lock('ci/fixtures/rejected-crypto/Cargo.lock', '0.7.5')
+        result, calls = self.scan()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        audits = [args for args in calls if args[0] == 'audit']
+        self.assertEqual([args[args.index('--file') + 1] for args in audits], locks)
+        self.assertNotIn('--no-fetch', audits[0])
+        self.assertTrue(all('--no-fetch' in args for args in audits[1:]))
+        self.assertTrue(all('--deny' in args and 'warnings' in args for args in audits))
+        metadata = [args for args in calls if args[0] == 'metadata']
+        self.assertEqual(len(metadata), len(locks))
+        self.assertTrue(all('--locked' in args and '--offline' in args and '--all-features' in args
+                            for args in metadata))
+
+    def test_id_wide_ignore_does_not_accept_unpatched_independent_consumer(self):
+        name = 'crates/protocol/tests/consumer/Cargo.lock'
+        self.lock(name, '0.7.5')
+        result, _ = self.scan()
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn(f'{name}: RUSTSEC-2026-0387 is not accepted for crypto-bigint 0.7.5', result.stderr)
+
+    def test_other_affected_versions_and_prereleases_fail_closed(self):
+        for version in ('0.5.4', '0.5.5+unreviewed', '0.6.1', '0.7.0', '0.7.6-rc.1'):
+            with self.subTest(version=version):
+                self.lock('Cargo.lock', version)
+                result, _ = self.scan()
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn(f'is not accepted for crypto-bigint {version}', result.stderr)
+
+    def test_ike_manifest_cannot_keep_a_vulnerable_consumer_floor(self):
+        self.write('crates/opc-proto-ikev2/Cargo.toml',
+                   '[dependencies]\ncrypto-bigint = { version = "0.7.5" }\n')
+        result, calls = self.scan()
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn('must require a patched stable release', result.stderr)
+        self.assertEqual(calls, [])
+
+    def test_migrated_crypto_stack_no_longer_accepts_the_legacy_exception(self):
+        self.lock('Cargo.lock', '0.5.5')
+        result, _ = self.scan(self.legacy_graph())
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn('is not accepted for crypto-bigint 0.5.5', result.stderr)
+        root = Path(__file__).resolve().parents[1]
+        for name in ('.cargo/audit.toml', 'deny.toml'):
+            with self.subTest(config=name):
+                config = tomllib.loads((root / name).read_text())
+                ignores = config['advisories']['ignore']
+                ids = {entry if isinstance(entry, str) else entry['id'] for entry in ignores}
+                self.assertNotIn('RUSTSEC-2026-0386', ids)
+                self.assertNotIn('RUSTSEC-2026-0387', ids)
+
+    def test_reviewed_vendored_legacy_stack_is_rejected(self):
+        self.lock('Cargo.lock', '0.5.5')
+        result, calls = self.scan(self.legacy_graph())
+        self.assertNotEqual(result.returncode, 0, result.stderr)
+        self.assertIn('is not accepted for crypto-bigint 0.5.5', result.stderr)
+        self.assertEqual(sum(args[0] == 'audit' for args in calls), 0)
+
+    def test_additional_legacy_consumer_is_rejected_at_every_boundary(self):
+        for target in ('crypto-bigint', 'elliptic-curve', 'ecdsa', 'primeorder', 'p256', 'p384', 'dimpl'):
+            with self.subTest(target=target):
+                self.lock('Cargo.lock', '0.5.5')
+                metadata = self.legacy_graph()
+                metadata['packages'].append({'id': 'extra', 'name': 'extra', 'version': '0.1.0',
+                                             'source': None, 'manifest_path': str(self.repo / 'extra/Cargo.toml')})
+                metadata['resolve']['nodes'].append({'id': 'extra', 'deps': [{'pkg': target}]})
+                result, _ = self.scan(metadata)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn('is not accepted for crypto-bigint 0.5.5', result.stderr)
+
+    def test_optional_locked_consumer_cannot_hide_outside_enabled_metadata(self):
+        # Cargo.lock retains optional packages outside the enabled feature graph.
+        resolved = self.legacy_graph()
+        locked = deepcopy(resolved)
+        locked['packages'].append({'id': 'optional', 'name': 'optional', 'version': '0.1.0',
+                                   'source': self.REGISTRY, 'manifest_path': '/unused/Cargo.toml'})
+        locked['resolve']['nodes'].append({'id': 'optional', 'deps': [{'pkg': 'crypto-bigint'}]})
+        self.graph_lock('Cargo.lock', locked)
+        result, _ = self.scan(resolved)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn('is not accepted for crypto-bigint 0.5.5', result.stderr)
+
+    def test_standalone_checked_in_fork_also_rejects_legacy_crypto(self):
+        metadata = self.legacy_graph()
+        metadata['packages'] = [package for package in metadata['packages']
+                                if package['name'] != 'opc-diameter-transport']
+        metadata['resolve']['nodes'] = [node for node in metadata['resolve']['nodes']
+                                        if node['id'] != 'opc-diameter-transport']
+        self.graph_lock('vendor/dimpl/Cargo.lock', metadata)
+        result, calls = self.scan(metadata)
+        self.assertNotEqual(result.returncode, 0, result.stderr)
+        self.assertIn('is not accepted for crypto-bigint 0.5.5', result.stderr)
+        self.assertEqual(sum(args[0] == 'audit' for args in calls), 1)
+        self.graph_lock('Cargo.lock', metadata)
+        result, _ = self.scan(metadata)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn('is not accepted for crypto-bigint 0.5.5', result.stderr)
+
+    def test_similarly_named_registry_or_unvendored_fork_is_rejected(self):
+        self.lock('Cargo.lock', '0.5.5')
+        for name in ('dimpl', 'opc-diameter-transport'):
+            for field, value in (('source', self.REGISTRY),
+                                 ('manifest_path', str(self.repo / 'different/Cargo.toml'))):
+                with self.subTest(name=name, field=field):
+                    metadata = self.legacy_graph()
+                    package = next(package for package in metadata['packages'] if package['name'] == name)
+                    package[field] = value
+                    result, _ = self.scan(metadata)
+                    self.assertNotEqual(result.returncode, 0)
+                    self.assertIn('is not accepted for crypto-bigint 0.5.5', result.stderr)
+
+    def test_unresolved_or_disconnected_legacy_copy_is_rejected(self):
+        self.lock('Cargo.lock', '0.5.5')
+        result, _ = self.scan()
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn('is not accepted for crypto-bigint 0.5.5', result.stderr)
+        metadata = self.legacy_graph()
+        for node in metadata['resolve']['nodes']:
+            node['deps'] = []
+        result, _ = self.scan(metadata)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn('is not accepted for crypto-bigint 0.5.5', result.stderr)
+
+    def test_registry_source_is_part_of_the_exception(self):
+        self.lock('Cargo.lock', '0.5.5', 'registry+https://registry.example.invalid/index')
+        result, _ = self.scan(self.legacy_graph())
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn('crypto-bigint must use the reviewed registry source', result.stderr)
+
+    def test_lock_resolution_and_advisory_errors_still_fail_the_gate(self):
+        for settings in ({'FAIL_FETCH': '1'}, {'FAIL_AUDIT_LOCK': 'Cargo.lock'}):
+            with self.subTest(settings=settings):
+                result, _ = self.scan(**settings)
+                self.assertNotEqual(result.returncode, 0)
+        self.lock('examples/reference/Cargo.lock')
+        result, _ = self.scan(FAIL_AUDIT_LOCK='examples/reference/Cargo.lock')
+        self.assertNotEqual(result.returncode, 0)
+
+    def test_empty_or_missing_root_lock_inventory_is_rejected(self):
+        subprocess.run(['git', '-C', str(self.repo), 'rm', '--cached', '-q', 'Cargo.lock'], check=True)
+        result, _ = self.scan()
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn('no tracked root Cargo.lock to audit', result.stderr)
+
+
 class SecretScanWorkflowTests(unittest.TestCase):
     def setUp(self):
         root = Path(__file__).resolve().parents[1]
@@ -714,14 +974,19 @@ class SecretScanWorkflowTests(unittest.TestCase):
         self.unrelated = self.commit('unrelated', 'unrelated branch')
         self.git('checkout', '-q', 'main', repo=self.origin)
         self.git('clone', '-q', '--no-local', str(self.origin), str(self.repo), repo=self.origin)
-        self.program('gitleaks', '''import json, os, shlex, subprocess, sys
+        self.program('gitleaks', '''import json, os, re, shlex, subprocess, sys
 from pathlib import Path
 args = sys.argv[1:]
 opts = args[args.index('--log-opts') + 1] if '--log-opts' in args else '--all'
 history = subprocess.run(['git', 'rev-list', *shlex.split(opts)], capture_output=True, text=True)
-patches = subprocess.run(['git', 'log', '-p', '-U0', *shlex.split(opts)], capture_output=True, text=True)
-record = dict(args=args, commits=history.stdout.splitlines(), ignore=Path('.gitleaksignore').read_text())
-plain = bool(os.environ.get('NO_COLOR')) and not os.environ.get('FAKE_IGNORES_NO_COLOR')
+patches = subprocess.run(['git', 'log', '-p', '-U0', '--format=commit %H', *shlex.split(opts)],
+                         capture_output=True, text=True)
+record = dict(args=args, commits=history.stdout.splitlines(), ignore=Path('.gitleaksignore').read_text(),
+              scan_marker=('SCOPE_FIXTURE_' + 'A' * 12) in patches.stdout)
+def setting(name, default=''):
+    prefix = 'MERGE_' if '--no-walk' in shlex.split(opts) else ''
+    return os.environ.get(prefix + name, os.environ.get(name, default))
+plain = bool(os.environ.get('NO_COLOR')) and not setting('FAKE_IGNORES_NO_COLOR')
 def line(level, text):
     # gitleaks 8.30.1 colours every log line unless NO_COLOR is not empty.
     if plain:
@@ -732,25 +997,48 @@ with Path(os.environ['SCAN_RECORD']).open('a') as output:
     output.write(json.dumps(record) + '\\n')
 if history.returncode or patches.returncode or patches.stderr:
     error = history.stderr or patches.stderr
-    level = os.environ.get('FAKE_GIT_LEVEL', 'ERR')
+    level = setting('FAKE_GIT_LEVEL', 'ERR')
     sys.stderr.write(line(level, '[git] ' + error.splitlines()[0]) + line(level, 'error="stderr is not empty"')
                      + line('INF', 'no leaks found'))
     sys.exit(0)
-count = int(os.environ.get('FAKE_FINDINGS', '3'))
-exit_code = int(os.environ.get('SCAN_EXIT', '0'))
-if 'SCOPE_FIXTURE_' + 'A' * 12 in patches.stdout:
-    count, exit_code = 1, 2
-    sys.stderr.write(line('WRN', 'leaks found: 1'))
-sys.stderr.write(os.environ.get('FAKE_SCAN_LOG', ''))
+count = int(setting('FAKE_FINDINGS', '3'))
+exit_code = int(setting('SCAN_EXIT', '0'))
+# Model the scanner's exact commit:file:rule:line ignore fingerprints. A merge
+# patch has its own commit identity, even when it copies an ignored side commit.
+ignored = set(record['ignore'].splitlines())
+marker_findings = []
+commit, path, new_line = '', '', 0
+for patch_line in patches.stdout.splitlines():
+    commit_header = re.fullmatch(r'commit ([0-9a-f]{40,64})', patch_line)
+    hunk_header = re.match(r'@@ -[0-9]+(?:,[0-9]+)? \\+([0-9]+)', patch_line)
+    if commit_header:
+        commit = commit_header[1]
+    elif patch_line.startswith('+++ b/'):
+        path = patch_line[6:]
+    elif hunk_header:
+        new_line = int(hunk_header[1])
+    elif patch_line.startswith('+'):
+        if 'SCOPE_FIXTURE_' + 'A' * 12 in patch_line:
+            fingerprint = f'{commit}:{path}:scope-fixture:{new_line}'
+            if fingerprint not in ignored:
+                marker_findings.append({'Fingerprint': fingerprint,
+                                        'Secret': 'fixture-value-must-not-be-published'})
+        new_line += 1
+    elif patch_line.startswith(' '):
+        new_line += 1
+if marker_findings:
+    count, exit_code = len(marker_findings), 2
+    sys.stderr.write(line('WRN', f'leaks found: {count}'))
+sys.stderr.write(setting('FAKE_SCAN_LOG'))
 if exit_code == 0:
     sys.stderr.write(line('INF', 'no leaks found'))
 if '--report-path' in args:
     report = Path(args[args.index('--report-path') + 1])
-    if os.environ.get('SCAN_REPORT') == 'invalid':
+    if setting('SCAN_REPORT') == 'invalid':
         report.write_text('not JSON')
-    elif os.environ.get('SCAN_REPORT') != 'missing':
-        report.write_text(json.dumps([{'Secret': 'fixture-value-must-not-be-published'}]
-                                    * count))
+    elif setting('SCAN_REPORT') != 'missing':
+        report.write_text(json.dumps(marker_findings or
+                                    [{'Secret': 'fixture-value-must-not-be-published'}] * count))
 sys.exit(exit_code)
 ''')
         self.program('gh', '''import json, os, sys
@@ -787,8 +1075,9 @@ sys.exit(int(os.environ.get('GH_EXIT', '0')))
         self.scan_report.unlink(missing_ok=True)
         result = subprocess.run(['bash', '--noprofile', '--norc', '-e', '-o', 'pipefail', '-c', step['run']],
                                 cwd=self.repo, env={**self.env, **env}, capture_output=True, text=True, check=False)
-        records = [json.loads(line) for line in self.record.read_text().splitlines()] if self.record.exists() else []
-        return result, records
+        all_records = [json.loads(line) for line in self.record.read_text().splitlines()] if self.record.exists() else []
+        self.last_records = all_records
+        return result, all_records
 
     def scan_event(self, event, **env):
         return self.run_step(self.scan, **{'GITHUB_EVENT_NAME': event, 'GITHUB_SHA': self.base,
@@ -803,6 +1092,153 @@ sys.exit(int(os.environ.get('GH_EXIT', '0')))
         self.git('fetch', '-q', 'origin', head)
         self.git('checkout', '-q', head)
         return head
+
+    def edited_merge_fixture(self):
+        self.git('checkout', '-qb', 'edited-side', self.base, repo=self.origin)
+        side = self.commit('side-file', 'clean side change')
+        self.git('checkout', '-q', 'main', repo=self.origin)
+        self.commit('main-file', 'clean main change')
+        self.git('merge', '--no-ff', '--no-commit', side, repo=self.origin)
+        head = self.commit('merge-only-file', 'clean manual edit while merging')
+        self.git('fetch', '-q', 'origin', head)
+        self.git('checkout', '-q', head)
+        return head
+
+    def test_clean_merge_keeps_the_original_commit_ignore_fingerprint(self):
+        marker = 'SCOPE_FIXTURE_' + 'A' * 12
+        self.git('checkout', '-qb', 'pinned-side', self.base, repo=self.origin)
+        introduced = self.commit('pinned.txt', marker)
+        fingerprint = f'{introduced}:pinned.txt:scope-fixture:1'
+        side = self.commit('.gitleaksignore', f'base fingerprint\n{fingerprint}')
+        self.git('checkout', '-q', 'main', repo=self.origin)
+        self.commit('main-file', 'clean main change')
+        self.git('-c', 'commit.gpgsign=false', 'merge', '--no-ff', '-qm', 'clean merge', side,
+                 repo=self.origin)
+        head = self.git('rev-parse', 'HEAD', repo=self.origin)
+        self.git('fetch', '-q', 'origin', head)
+        self.git('checkout', '-q', head)
+
+        for event in ('pull_request', 'push', 'schedule', 'workflow_dispatch'):
+            with self.subTest(event=event):
+                result, records = self.scan_event(event, GITHUB_SHA=head, PR_HEAD_SHA=head)
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                self.assertEqual(len(records), 1)
+                self.assertIn(introduced, records[0]['commits'])
+                self.assertIn(fingerprint, records[0]['ignore'].splitlines())
+                self.assertEqual(self.output.read_text(), '')
+
+        # The exception remains exact: changing any fingerprint field exposes
+        # the original side-branch finding, without a second copy at the merge.
+        for wrong_pin in (f'{head}:pinned.txt:scope-fixture:1',
+                          f'{introduced}:different.txt:scope-fixture:1',
+                          f'{introduced}:pinned.txt:other-rule:1',
+                          f'{introduced}:pinned.txt:scope-fixture:2'):
+            with self.subTest(wrong_pin=wrong_pin):
+                (self.repo / '.gitleaksignore').write_text(wrong_pin + '\n')
+                result, records = self.scan_event('push', GITHUB_SHA=head)
+                self.assertEqual(result.returncode, 2, result.stderr)
+                self.assertEqual(len(records), 1)
+                self.assertEqual(self.output.read_text(), 'findings=1\n')
+                self.assertEqual(json.loads(self.scan_report.read_text())[0]['Fingerprint'], fingerprint)
+
+    def test_merge_scan_findings_errors_and_diagnostics_are_not_hidden(self):
+        head = self.edited_merge_fixture()
+        diagnostic = '0:00AM WRN merge scan diagnostic\n'
+        for event in ('pull_request', 'push', 'schedule', 'workflow_dispatch'):
+            for status in (0, 1, 2, 7):
+                with self.subTest(event=event, status=status):
+                    result, records = self.scan_event(event, GITHUB_SHA=head, PR_HEAD_SHA=head,
+                                                      MERGE_SCAN_EXIT=str(status),
+                                                      MERGE_FAKE_FINDINGS='5',
+                                                      MERGE_FAKE_SCAN_LOG=diagnostic)
+                    self.assertEqual(result.returncode, status, result.stderr)
+                    self.assertEqual(len(records), 2)
+                    self.assertEqual(records[1]['commits'], [head])
+                    self.assertIn(diagnostic, result.stderr)
+                    self.assertEqual(self.output.read_text(), 'findings=5\n' if status == 2 else '')
+
+    def test_merge_scan_rejects_logged_errors_colours_and_broken_reports(self):
+        head = self.edited_merge_fixture()
+        cases = (
+            ({'MERGE_FAKE_SCAN_LOG': '0:00AM ERR merge scan failed\n'}, 'scanner logged an error'),
+            ({'MERGE_FAKE_IGNORES_NO_COLOR': '1'}, 'scanner did not log'),
+            ({'MERGE_SCAN_EXIT': '2', 'MERGE_SCAN_REPORT': 'invalid'}, 'JSONDecodeError'),
+            ({'MERGE_SCAN_EXIT': '2', 'MERGE_SCAN_REPORT': 'missing'}, 'FileNotFoundError'),
+        )
+        for env, message in cases:
+            with self.subTest(env=env):
+                result, records = self.scan_event('push', GITHUB_SHA=head, **env)
+                self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+                self.assertEqual(len(records), 2)
+                self.assertIn(message, result.stdout + result.stderr)
+                self.assertEqual(self.output.read_text(), '')
+
+    def test_merge_scan_error_after_ordinary_findings_stays_an_error(self):
+        head = self.edited_merge_fixture()
+        result, records = self.scan_event('push', GITHUB_SHA=head, SCAN_EXIT='2', FAKE_FINDINGS='3',
+                                          MERGE_SCAN_EXIT='7',
+                                          MERGE_FAKE_SCAN_LOG='0:00AM ERR merge scan failed\n')
+        self.assertEqual(result.returncode, 7, result.stderr)
+        self.assertEqual(len(records), 2)
+        self.assertIn('ERR merge scan failed', result.stderr)
+        self.assertEqual(self.output.read_text(), '')
+
+    def test_merge_classification_failure_is_never_clean(self):
+        head = self.edited_merge_fixture()
+        real_git = shutil.which('git')
+        self.assertIsNotNone(real_git)
+        self.program('git', f'''import os, sys
+if sys.argv[1:2] == ['merge-tree']:
+    sys.stderr.write('synthetic merge-tree failure\\n')
+    sys.exit(7)
+os.execv({real_git!r}, [{real_git!r}, *sys.argv[1:]])
+''')
+        result, records = self.scan_event('push', GITHUB_SHA=head)
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        self.assertEqual(len(records), 1)
+        self.assertIn('Cannot classify merge', result.stdout)
+        self.assertIn('synthetic merge-tree failure', result.stderr)
+        self.assertEqual(self.output.read_text(), '')
+
+    def test_merge_classification_requires_a_tree_after_success(self):
+        head = self.edited_merge_fixture()
+        real_git = shutil.which('git')
+        self.assertIsNotNone(real_git)
+        for output in ('', 'not a tree\n'):
+            with self.subTest(output=output):
+                self.program('git', f'''import os, sys
+if sys.argv[1:2] == ['merge-tree']:
+    sys.stdout.write({output!r})
+    sys.exit(0)
+os.execv({real_git!r}, [{real_git!r}, *sys.argv[1:]])
+''')
+                result, records = self.scan_event('push', GITHUB_SHA=head)
+                self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+                self.assertEqual(len(records), 1)
+                self.assertIn('Cannot classify merge', result.stdout)
+                self.assertEqual(self.output.read_text(), '')
+
+    def test_octopus_merge_only_text_is_scanned(self):
+        self.git('checkout', '-qb', 'octopus-a', self.base, repo=self.origin)
+        side_a = self.commit('side-a', 'clean first side')
+        self.git('checkout', '-qb', 'octopus-b', self.base, repo=self.origin)
+        side_b = self.commit('side-b', 'clean second side')
+        self.git('checkout', '-q', 'main', repo=self.origin)
+        main_edit = self.commit('main-file', 'clean main change')
+        self.git('merge', '--no-ff', '--no-commit', side_a, side_b, repo=self.origin)
+        head = self.commit('octopus-resolution', 'SCOPE_FIXTURE_' + 'A' * 12)
+        self.assertEqual(self.git('show', '-s', '--format=%P', head, repo=self.origin),
+                         f'{main_edit} {side_a} {side_b}')
+        self.git('fetch', '-q', 'origin', head)
+        self.git('checkout', '-q', head)
+
+        for event in ('pull_request', 'push', 'schedule', 'workflow_dispatch'):
+            with self.subTest(event=event):
+                result, records = self.scan_event(event, GITHUB_SHA=head, PR_HEAD_SHA=head)
+                self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
+                self.assertEqual(len(records), 2)
+                self.assertEqual(records[1]['commits'], [head])
+                self.assertEqual(self.output.read_text(), 'findings=1\n')
 
     def test_required_guard_runs_the_security_workflow_regressions(self):
         root = Path(__file__).resolve().parents[1]
@@ -861,6 +1297,61 @@ echo "${RUNNER_TEMP}" >> "${GITHUB_PATH}"
         self.assertEqual(scan['commits'], [self.head])
         self.assertEqual(scan['ignore'], 'PR head fingerprint\n')
 
+    def test_each_event_runs_a_merge_commit_diff_pass(self):
+        head = self.edited_merge_fixture()
+        cases = (
+            ('pull_request', f'{self.base}..{head}'),
+            ('push', f'--full-history {head}'),
+            ('schedule', '--full-history --all'),
+            ('workflow_dispatch', '--full-history --all'),
+        )
+        for event, expected in cases:
+            with self.subTest(event=event):
+                result, records = self.scan_event(event, GITHUB_SHA=head, PR_HEAD_SHA=head)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(len(records), 2)
+                self.assertEqual(len(self.last_records), 2)
+                self.assertEqual(records[0]['args'][-2:], ['--log-opts', expected])
+                merge = [record for record in records
+                         if '--diff-merges=first-parent' in record['args'][-1].split()]
+                self.assertEqual(len(merge), 1)
+                self.assertEqual(merge[0]['args'][-2:],
+                                 ['--log-opts', f'--diff-merges=first-parent --no-walk {head}'])
+                self.assertIn(str(self.root / 'gitleaks-merge-0.json'), merge[0]['args'])
+                self.assertNotIn('--first-parent', merge[0]['args'][-1].split())
+                self.assertNotIn('--merges', merge[0]['args'][-1].split())
+
+    def test_merge_resolution_text_is_scanned(self):
+        # Text that exists only in a merge commit's resolution must be seen
+        # alongside ordinary patches in the aggregate report.
+        self.git('checkout', '-qb', 'merge-side', 'main', repo=self.origin)
+        side = self.commit('merge-side', 'clean side change')
+        self.git('checkout', '-q', 'main', repo=self.origin)
+        main_edit = self.commit('main-diverged', 'clean main change')
+        self.git('merge', '--no-commit', '--no-ff', 'merge-side', repo=self.origin)
+        (self.origin / 'merge-resolution.txt').write_text('SCOPE_FIXTURE_' + 'A' * 12 + '\n')
+        self.git('add', 'merge-resolution.txt', repo=self.origin)
+        self.git('-c', 'commit.gpgsign=false', 'commit', '-qm', 'merge resolution', repo=self.origin)
+        merge_head = self.git('rev-parse', 'HEAD', repo=self.origin)
+        self.git('fetch', '-q', 'origin', 'main', repo=self.repo)
+        self.git('checkout', '-q', merge_head, repo=self.repo)
+
+        result, primary = self.scan_event('pull_request', PR_BASE_SHA=self.base, PR_HEAD_SHA=merge_head)
+        self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
+        self.assertEqual(self.output.read_text(), 'findings=1\n')
+        self.assertEqual(len(primary), 2)
+        self.assertEqual(set(primary[0]['commits']), {main_edit, side, merge_head})
+        patches = self.git('log', '-p', '-U0', f'{self.base}..{merge_head}')
+        self.assertFalse(('SCOPE_FIXTURE_' + 'A' * 12) in patches,
+                         "ordinary git log patches must not see merge-only text")
+        merge = [record for record in self.last_records
+                 if '--diff-merges=first-parent' in record['args'][-1].split()]
+        self.assertEqual(len(merge), 1)
+        self.assertEqual(merge[0]['commits'], [merge_head])
+        self.assertTrue(merge[0]['scan_marker'],
+                        "the merge-diff pass must see the resolution text")
+        self.assertEqual(primary[0]['ignore'], 'base fingerprint\n')
+
     def test_main_push_scans_full_pushed_history_only(self):
         result, records = self.scan_event('push')
         self.assertEqual(result.returncode, 0, result.stderr)
@@ -871,6 +1362,45 @@ echo "${RUNNER_TEMP}" >> "${GITHUB_PATH}"
                                         '--report-path', str(self.scan_report),
                                         '--log-opts', f'--full-history {self.base}'])
         self.assertEqual(set(scan['commits']), {self.first, self.base})
+
+    def test_nested_merge_resolution_only_findings_fail_every_scan(self):
+        marker = 'SCOPE_FIXTURE_' + 'A' * 12
+        self.git('checkout', '-qb', 'nested-side', self.base, repo=self.origin)
+        side = self.commit('base', 'side of inner conflict')
+        self.git('checkout', '-qb', 'nested-leaf', self.base, repo=self.origin)
+        leaf = self.commit('base', 'other side of inner conflict')
+        self.git('checkout', '-q', 'nested-side', repo=self.origin)
+        conflict = subprocess.run(['git', 'merge', '--no-ff', '--no-commit', leaf],
+                                  cwd=self.origin, env=self.env, capture_output=True, text=True)
+        self.assertEqual(conflict.returncode, 1, conflict.stderr)
+        self.assertIn('CONFLICT (content)', conflict.stdout)
+        inner_merge = self.commit('base', marker)
+        for parent in (side, leaf):
+            self.assertNotIn(marker, self.git('show', f'{parent}:base', repo=self.origin))
+
+        self.git('checkout', '-q', 'main', repo=self.origin)
+        self.commit('base', 'main side of outer conflict')
+        conflict = subprocess.run(['git', 'merge', '--no-ff', '--no-commit', inner_merge],
+                                  cwd=self.origin, env=self.env, capture_output=True, text=True)
+        self.assertEqual(conflict.returncode, 1, conflict.stderr)
+        self.assertIn('CONFLICT (content)', conflict.stdout)
+        head = self.commit('base', 'clean outer resolution')
+        self.assertNotIn(marker, self.git('show', f'{head}:base', repo=self.origin))
+        # Only main reaches the inner merge; no side ref can rescue --first-parent.
+        self.git('branch', '-D', 'nested-side', 'nested-leaf', repo=self.origin)
+        self.git('fetch', '-q', 'origin', head)
+        self.git('checkout', '-q', head)
+
+        for event in ('pull_request', 'push', 'schedule', 'workflow_dispatch'):
+            with self.subTest(event=event):
+                result, primary = self.scan_event(event, GITHUB_SHA=head, PR_HEAD_SHA=head)
+                self.assertEqual(len(primary), 2)
+                self.assertIn(inner_merge, primary[0]['commits'])
+                self.assertIn(inner_merge, primary[1]['commits'])
+                patches = self.git('log', '-p', '-U0', f'{self.base}..{head}')
+                self.assertFalse(marker in patches)
+                self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
+                self.assertEqual(self.output.read_text(), 'findings=1\n')
 
     def test_schedule_fetches_and_scans_all_refs_including_unopened_branches_and_tags(self):
         for event in ('schedule', 'workflow_dispatch'):
@@ -911,6 +1441,79 @@ echo "${RUNNER_TEMP}" >> "${GITHUB_PATH}"
                     self.assertEqual(len(records), 1)
                     self.assertEqual(self.output.read_text(), 'findings=3\n' if exit_code == 2 else '')
                     self.assertIn(harmless_log, result.stderr)
+
+    def test_merge_resolution_only_findings_fail_every_scan(self):
+        marker = 'SCOPE_FIXTURE_' + 'A' * 12
+        self.git('checkout', '-qb', 'merge-side', self.base, repo=self.origin)
+        side = self.commit('base', 'side of conflict')
+        self.git('checkout', '-q', 'main', repo=self.origin)
+        first_parent = self.commit('base', 'main side of conflict')
+        merge = subprocess.run(['git', 'merge', '--no-ff', '--no-commit', side],
+                               cwd=self.origin, env=self.env, capture_output=True, text=True)
+        self.assertEqual(merge.returncode, 1, merge.stderr)
+        self.assertIn('CONFLICT (content)', merge.stdout)
+        head = self.commit('base', marker)
+        self.assertEqual(self.git('show', '-s', '--format=%P', head, repo=self.origin),
+                         f'{first_parent} {side}')
+        for parent in (first_parent, side):
+            self.assertNotIn(marker, self.git('show', f'{parent}:base', repo=self.origin))
+        self.git('fetch', '-q', 'origin', head)
+        self.git('checkout', '-q', head)
+
+        for event in ('pull_request', 'push', 'schedule', 'workflow_dispatch'):
+            with self.subTest(event=event):
+                result, records = self.scan_event(event, GITHUB_SHA=head, PR_HEAD_SHA=head)
+                self.assertEqual(result.returncode, 2, result.stderr)
+                self.assertEqual(len(records), 2)
+                self.assertIn(head, records[0]['commits'])
+                self.assertEqual(records[1]['commits'], [head])
+                self.assertEqual(self.output.read_text(), 'findings=1\n')
+                self.assertIn('WRN leaks found: 1', result.stderr)
+
+    def test_ordinary_and_merge_findings_share_one_report(self):
+        marker = 'SCOPE_FIXTURE_' + 'A' * 12
+        self.git('checkout', '-qb', 'merge-side', self.base, repo=self.origin)
+        side = self.commit('side-file', 'clean side change')
+        self.git('checkout', '-q', 'main', repo=self.origin)
+        ordinary = self.commit('ordinary-finding', marker)
+        self.git('merge', '--no-ff', '--no-commit', side, repo=self.origin)
+        head = self.commit('merge-only-finding', marker)
+        self.git('fetch', '-q', 'origin', head)
+        self.git('checkout', '-q', head)
+
+        for event in ('pull_request', 'push', 'schedule', 'workflow_dispatch'):
+            with self.subTest(event=event):
+                result, records = self.scan_event(event, GITHUB_SHA=head, PR_HEAD_SHA=head)
+                self.assertEqual(result.returncode, 2, result.stderr)
+                self.assertEqual(len(records), 2)
+                self.assertIn(ordinary, records[0]['commits'])
+                self.assertIn(head, records[0]['commits'])
+                self.assertEqual(records[1]['commits'], [head])
+                self.assertEqual(self.output.read_text(), 'findings=2\n')
+                self.assertEqual(result.stderr.count('WRN leaks found: 1'), 2)
+                self.assertEqual(len(json.loads(self.scan_report.read_text())), 2)
+
+    def test_merged_side_branch_history_is_still_scanned(self):
+        marker = 'SCOPE_FIXTURE_' + 'A' * 12
+        self.git('checkout', '-qb', 'merge-side', self.base, repo=self.origin)
+        leaked = self.commit('side-file', marker)
+        side = self.commit('side-file', 'removed before merge')
+        self.git('checkout', '-q', 'main', repo=self.origin)
+        self.commit('main-file', 'main change')
+        self.git('-c', 'commit.gpgsign=false', 'merge', '--no-ff', '-qm', 'merge side', side,
+                 repo=self.origin)
+        head = self.git('rev-parse', 'HEAD', repo=self.origin)
+        self.assertNotIn(marker, self.git('show', f'{head}:side-file', repo=self.origin))
+        self.git('fetch', '-q', 'origin', head)
+        self.git('checkout', '-q', head)
+
+        for event in ('pull_request', 'push', 'schedule', 'workflow_dispatch'):
+            with self.subTest(event=event):
+                result, records = self.scan_event(event, GITHUB_SHA=head, PR_HEAD_SHA=head)
+                self.assertEqual(result.returncode, 2, result.stderr)
+                self.assertEqual(len(records), 1)
+                self.assertIn(leaked, records[0]['commits'])
+                self.assertEqual(self.output.read_text(), 'findings=1\n')
 
     def test_git_failure_inside_the_scanner_is_never_a_clean_result(self):
         absent = '0' * 39 + '1'
@@ -1081,6 +1684,44 @@ echo "${RUNNER_TEMP}" >> "${GITHUB_PATH}"
 
 
 class DeclarationTests(unittest.TestCase):
+    def test_semantic_change_is_visible_without_an_assertion_count_change(self):
+        head = declare(rust('assert_eq!(value(), 2);'), kind='fixture-setup-changed')
+        for base in (rust(), {'Cargo.toml': MANIFEST, 'src/lib.rs': ''}):
+            with self.subTest(base=base):
+                result = report(base, head)
+                self.assertTrue(result.success)
+                self.assertEqual([(f.subject, f.kind, f.allowed) for f in result.findings],
+                                 [(TEST, 'fixture-setup-changed', True)])
+
+    def test_semantic_change_does_not_waive_coverage_reductions(self):
+        old = rust('assert!(ready()); assert_eq!(value(), 1);')
+        head = declare(rust('assert_eq!(value(), 2);', attributes='#[test] #[ignore]'),
+                       kind='fixture-setup-changed')
+        result = report(old, head)
+        self.assertFalse(result.success)
+        self.assertEqual({(f.kind, f.allowed) for f in result.findings},
+                         {('fixture-setup-changed', True), ('assertions-decreased', False), ('disabled', False)})
+
+    def test_semantic_change_requires_changed_source_existing_test_and_issue(self):
+        self.assertFalse(report(rust(), declare(rust(), kind='fixture-setup-changed')).success)
+        missing = declare({'Cargo.toml': MANIFEST, 'src/lib.rs': ''}, kind='fixture-setup-changed')
+        result = report(rust(), missing)
+        self.assertFalse(result.success)
+        self.assertTrue(any(f.kind == 'removed' and not f.allowed for f in result.findings))
+        invalid_issue = declare(rust('assert_eq!(value(), 2);'), kind='fixture-setup-changed', issue=99)
+        self.assertFalse(report(rust(), invalid_issue).success)
+
+    def test_semantic_change_cannot_declare_job_or_reduction_fields(self):
+        for extra in ({'renamed_to': TEST}, {'replacements': [TEST]}, {'behavior_deleted': True, 'deleting_change': 'change'}):
+            with self.subTest(extra=extra), self.assertRaises(GuardError):
+                report(rust(), declare(rust(), kind='fixture-setup-changed', **extra))
+        head = declare(rust(), kind='fixture-setup-changed')
+        record = json.loads(head['ci/test-changes.json'])
+        record['changes'][0]['job'] = record['changes'][0].pop('test')
+        head['ci/test-changes.json'] = json.dumps(record)
+        with self.assertRaises(GuardError):
+            report(rust(), head)
+
     def test_clock_conversion_is_printed_without_waiving_assertion_loss(self):
         old = rust('assert!(ready()); assert_eq!(value(), 1);')
         new = declare(rust('controlled_clock(); assert!(ready());'), kind='clock-source-changed')
@@ -1102,6 +1743,42 @@ class DeclarationTests(unittest.TestCase):
             with self.subTest(extra=extra), self.assertRaises(GuardError):
                 report(rust(), declare(rust(), kind='clock-source-changed', **extra))
         head = declare(rust(), kind='clock-source-changed')
+        record = json.loads(head['ci/test-changes.json'])
+        record['changes'][0]['job'] = record['changes'][0].pop('test')
+        head['ci/test-changes.json'] = json.dumps(record)
+        with self.assertRaises(GuardError):
+            report(rust(), head)
+
+    def test_fixture_setup_change_is_recorded_without_waiving_assertion_loss(self):
+        old = rust('assert!(ready()); assert_eq!(value(), 1);')
+        changed = declare(rust('initialize_required_witness(); assert!(ready());'),
+                          kind='fixture-setup-changed')
+        result = report(old, changed)
+        self.assertFalse(result.success)
+        self.assertTrue(any(f.kind == 'fixture-setup-changed' and f.allowed for f in result.findings))
+        self.assertTrue(any(f.kind == 'assertions-decreased' and not f.allowed for f in result.findings))
+
+    def test_fixture_setup_change_requires_changed_source_and_existing_test(self):
+        self.assertFalse(report(rust(), declare(rust(), kind='fixture-setup-changed')).success)
+        missing = declare({'Cargo.toml': MANIFEST, 'src/lib.rs': ''}, kind='fixture-setup-changed')
+        self.assertFalse(report(rust(), missing).success)
+        changed = declare(rust('initialize_required_witness(); assert_eq!(value(), 1);'),
+                          kind='fixture-setup-changed')
+        self.assertTrue(report(rust(), changed).success)
+
+    def test_fixture_setup_change_cannot_waive_a_new_gate(self):
+        changed = declare(rust('initialize_required_witness(); assert_eq!(value(), 1);',
+                               attributes='#[test] #[ignore]'), kind='fixture-setup-changed')
+        result = report(rust(), changed)
+        self.assertFalse(result.success)
+        self.assertTrue(any(f.kind == 'disabled' and not f.allowed for f in result.findings))
+
+    def test_fixture_setup_change_cannot_declare_job_or_reduction_fields(self):
+        for extra in ({'renamed_to': TEST}, {'replacements': [TEST]},
+                      {'behavior_deleted': True, 'deleting_change': 'change'}):
+            with self.subTest(extra=extra), self.assertRaises(GuardError):
+                report(rust(), declare(rust(), kind='fixture-setup-changed', **extra))
+        head = declare(rust(), kind='fixture-setup-changed')
         record = json.loads(head['ci/test-changes.json'])
         record['changes'][0]['job'] = record['changes'][0].pop('test')
         head['ci/test-changes.json'] = json.dumps(record)
@@ -1390,6 +2067,41 @@ class LocalRevisionTests(unittest.TestCase):
     def test_explicit_common_ancestor_and_historical_head_are_supported(self):
         self.assertEqual(comparison_revisions(self.root, self.base), (self.base, self.head, 'explicit common ancestor'))
         self.assertEqual(comparison_revisions(self.root, self.base, self.head), (self.base, self.head, 'explicit common ancestor'))
+
+    def test_explicit_backlog_target_reports_removals_outside_main_history(self):
+        self.git('checkout', '--detach', self.base)
+        (self.root / 'README.md').write_text('Integration branch\n')
+        self.git('add', '.')
+        self.git('-c', 'commit.gpgsign=false', 'commit', '-qm', 'backlog base')
+        backlog = self.git('rev-parse', 'HEAD')
+        self.git('update-ref', 'refs/remotes/origin/backlog', backlog)
+        (self.root / 'src/lib.rs').write_text('')
+        self.git('add', '.')
+        self.git('-c', 'commit.gpgsign=false', 'commit', '-qm', 'remove backlog test')
+        head = self.git('rev-parse', 'HEAD')
+        for base in ('origin/backlog', 'refs/remotes/origin/backlog'):
+            with self.subTest(base=base), patch('sys.stdout', new=io.StringIO()) as output:
+                self.assertEqual(comparison_revisions(self.root, base, 'HEAD'),
+                                 (backlog, head, 'explicit backlog target'))
+                self.assertEqual(main(['--repo', str(self.root), '--base', base, '--head', 'HEAD']), 1)
+                self.assertIn('UNDECLARED removed', output.getvalue())
+        self.git('update-ref', 'refs/remotes/origin/feature', backlog)
+        for base, comparison_head in ((backlog, head), ('origin/feature', head), ('origin/backlog', None)):
+            with self.subTest(base=base, head=comparison_head), self.assertRaisesRegex(GuardError, 'ancestor of both HEAD'):
+                comparison_revisions(self.root, base, comparison_head)
+
+    def test_explicit_backlog_target_rejects_empty_or_unchecked_history(self):
+        self.git('update-ref', 'refs/remotes/origin/backlog', self.base)
+        for base in ('origin/backlog', 'refs/remotes/origin/backlog'):
+            with self.subTest(base=base), self.assertRaisesRegex(GuardError, 'refusing an empty comparison'):
+                comparison_revisions(self.root, base, self.base)
+            for head in (self.main, self.unrelated):
+                with self.subTest(base=base, head=head), self.assertRaisesRegex(GuardError, 'backlog base must be an ancestor of its head, and its head must be in the checked-out HEAD'):
+                    comparison_revisions(self.root, base, head)
+        for base in (self.main, self.unrelated):
+            self.git('update-ref', 'refs/remotes/origin/backlog', base)
+            with self.subTest(base=base), self.assertRaisesRegex(GuardError, 'backlog base must be an ancestor of its head, and its head must be in the checked-out HEAD'):
+                comparison_revisions(self.root, 'origin/backlog', 'HEAD')
 
     def test_identical_comparison_revisions_are_rejected_after_ref_resolution(self):
         for base, head in ((self.base, self.base), ('HEAD^', self.base), (self.base, 'HEAD^')):

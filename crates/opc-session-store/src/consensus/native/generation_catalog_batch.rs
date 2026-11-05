@@ -95,6 +95,7 @@ fn frame<'a, 'r>(
     reader: &'a mut Cursor<'r>,
     table: Table,
     notifications: usize,
+    retired: u64,
     check: &impl Fn() -> io::Result<()>,
 ) -> io::Result<(Header, Frame<'a, 'r>)> {
     check()?;
@@ -105,7 +106,7 @@ fn frame<'a, 'r>(
             if notifications >= validation::MAX_ITEMS {
                 return Err(invalid("native catalog watch count exceeds original bound"));
             }
-            Header::Notification(notifications as u64 + 1)
+            Header::Notification(retired + notifications as u64 + 1)
         }
     };
     let offset = reader
@@ -281,7 +282,7 @@ impl Batch {
                     .take()
                     .unwrap_or_else(|| invalid("native catalog inspection result absent"))
             })??;
-            destination.accept_inspected(staged.header, staged.range, row, section)?;
+            destination.accept_inspected(staged.header, staged.range, row, after, section)?;
         }
         self.bytes = 0;
         if let Some(error) = failure {
@@ -335,16 +336,21 @@ impl Rows {
         };
         for _ in 0..section.counts[table.index()] {
             let pending = batch.as_ref().map_or(0, |batch| batch.rows.len());
-            let (header, mut frame) =
-                match frame(reader, table, self.notifications.len() + pending, check) {
-                    Ok(frame) => frame,
-                    Err(error) => {
-                        if let Some(batch) = &mut batch {
-                            batch.finish(self, after, section, resources, check)?;
-                        }
-                        return Err(error);
+            let (header, mut frame) = match frame(
+                reader,
+                table,
+                self.notifications.len() + pending,
+                after.business.frontiers.retention.watch_retired_through,
+                check,
+            ) {
+                Ok(frame) => frame,
+                Err(error) => {
+                    if let Some(batch) = &mut batch {
+                        batch.finish(self, after, section, resources, check)?;
                     }
-                };
+                    return Err(error);
+                }
+            };
             if frame.range.length as usize > INPUT {
                 if let Some(batch) = &mut batch {
                     batch.finish(self, after, section, resources, check)?;
@@ -359,7 +365,7 @@ impl Rows {
                     &after.business.frontiers,
                     check,
                 )?;
-                self.accept_inspected(header, range, row, section)?;
+                self.accept_inspected(header, range, row, after, section)?;
                 continue;
             };
             if current.rows.len() == ROWS || current.bytes + frame.range.length as usize > BYTES {
@@ -377,7 +383,7 @@ impl Rows {
                         &after.business.frontiers,
                         check,
                     )?;
-                    self.accept_inspected(header, range, row, section)?;
+                    self.accept_inspected(header, range, row, after, section)?;
                     continue;
                 }
             };
@@ -408,7 +414,7 @@ impl Rows {
             if bytes > BYTES {
                 batch = None;
                 let row = input.inspect_serial(&after.business.frontiers, check)?;
-                self.accept_inspected(header, range, row, section)?;
+                self.accept_inspected(header, range, row, after, section)?;
                 continue;
             }
             let input = match input.reserve(&|bytes| (resources.reserve)(bytes)) {
@@ -417,7 +423,7 @@ impl Rows {
                     current.finish(self, after, section, resources, check)?;
                     batch = None;
                     let row = input.inspect_serial(&after.business.frontiers, check)?;
-                    self.accept_inspected(header, range, row, section)?;
+                    self.accept_inspected(header, range, row, after, section)?;
                     continue;
                 }
             };
@@ -446,6 +452,7 @@ impl Rows {
         header: Header,
         range: Range,
         row: CatalogRow,
+        after: &Context,
         section: RowSection,
     ) -> io::Result<()> {
         let RowSection {
@@ -485,7 +492,11 @@ impl Rows {
                 )?;
             }
             (Header::Notification(sequence), CatalogRow::Notification(row)) => {
-                if sequence != self.notifications.len() as u64 + 1 || row.facts.sequence != sequence
+                if sequence
+                    != after.business.frontiers.retention.watch_retired_through
+                        + self.notifications.len() as u64
+                        + 1
+                    || row.facts.sequence != sequence
                 {
                     return Err(invalid(
                         "native catalog inspected notification order differs",

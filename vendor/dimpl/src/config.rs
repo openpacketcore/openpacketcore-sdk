@@ -338,6 +338,8 @@ impl Config {
     /// PSK cipher suites are excluded when no [`PskResolver`] is configured,
     /// preventing a certificate-mode endpoint from negotiating a PSK suite
     /// and inadvertently skipping certificate authentication.
+    /// Certificate suites without an allowed group of the matching key-exchange
+    /// family are also excluded.
     pub fn dtls12_cipher_suites(
         &self,
     ) -> impl Iterator<Item = &'static dyn SupportedDtls12CipherSuite> + '_ {
@@ -350,6 +352,12 @@ impl Config {
                 None => true,
             })
             .filter(move |cs| has_psk || !cs.suite().is_psk())
+            .filter(|cs| {
+                cs.suite().is_psk()
+                    || self
+                        .kx_groups()
+                        .any(|kx| kx.name().is_ffdhe() == cs.suite().has_dhe())
+            })
     }
 
     /// Allowed DTLS 1.3 cipher suites, filtered by the config's allow-list.
@@ -369,6 +377,12 @@ impl Config {
                 Some(list) => list.contains(&cs.suite()),
                 None => true,
             })
+    }
+
+    pub(crate) fn dtls13_kx_groups(
+        &self,
+    ) -> impl Iterator<Item = &'static dyn SupportedKxGroup> + '_ {
+        self.kx_groups().filter(|kx| !kx.name().is_ffdhe())
     }
 
     /// Allowed key exchange groups, filtered by the config's allow-list.
@@ -742,7 +756,8 @@ impl ConfigBuilder {
         // suites are exclusively PSK — those don't negotiate an ECDHE group.
         // Any cert-based DTLS 1.2 suite left in the filter still needs a
         // compatible key exchange group, even when PSK is also configured.
-        let has_non_psk_dtls12 = dtls12_suites.iter().any(|cs| !cs.suite().is_psk());
+        let needs_ecdh = dtls12_suites.iter().any(|cs| cs.suite().has_ecc());
+        let needs_dhe = dtls12_suites.iter().any(|cs| cs.suite().has_dhe());
 
         // Validate kx_groups filter: each enabled version needs compatible groups
         // (PSK-only DTLS 1.2 configs don't need key exchange groups)
@@ -752,12 +767,18 @@ impl ConfigBuilder {
                 None => true,
             }
         };
-        if has_non_psk_dtls12 {
-            let dtls12_kx_count = crypto_provider
+        if needs_ecdh || needs_dhe {
+            let has_group = crypto_provider
                 .supported_kx_groups()
                 .filter(|kx| filtered_kx(kx))
-                .count();
-            if dtls12_kx_count == 0 {
+                .any(|kx| {
+                    if kx.name().is_ffdhe() {
+                        needs_dhe
+                    } else {
+                        needs_ecdh
+                    }
+                });
+            if !has_group {
                 return Err(Error::ConfigError(
                     ConfigError::NoDtls12KeyExchangeGroupsAfterFiltering,
                 ));
@@ -766,6 +787,7 @@ impl ConfigBuilder {
         if dtls13_count > 0 {
             let kx_count = crypto_provider
                 .supported_kx_groups()
+                .filter(|kx| !kx.name().is_ffdhe())
                 .filter(|kx| filtered_kx(kx))
                 .count();
             if kx_count == 0 {
@@ -907,6 +929,53 @@ impl fmt::Debug for ConfigBuilder {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn finite_field_groups_require_dtls12_and_filter_incompatible_suites() {
+        let config = Config::builder()
+            .dtls13_cipher_suites(&[])
+            .kx_groups(&[NamedGroup::FFDHE2048])
+            .build()
+            .unwrap();
+        assert_eq!(
+            config
+                .dtls12_cipher_suites()
+                .map(|s| s.suite())
+                .collect::<Vec<_>>(),
+            [Dtls12CipherSuite::DHE_RSA_AES128_GCM_SHA256]
+        );
+        assert_eq!(config.dtls13_kx_groups().count(), 0);
+        assert!(matches!(
+            Config::builder()
+                .kx_groups(&[NamedGroup::FFDHE2048])
+                .build(),
+            Err(Error::ConfigError(
+                ConfigError::NoDtls13KeyExchangeGroupsAfterFiltering
+            ))
+        ));
+        assert!(matches!(
+            Config::builder()
+                .dtls13_cipher_suites(&[])
+                .dtls12_cipher_suites(&[Dtls12CipherSuite::DHE_RSA_AES128_GCM_SHA256])
+                .kx_groups(&[NamedGroup::X25519])
+                .build(),
+            Err(Error::ConfigError(
+                ConfigError::NoDtls12KeyExchangeGroupsAfterFiltering
+            ))
+        ));
+        let config = Config::builder()
+            .kx_groups(&[NamedGroup::X25519])
+            .build()
+            .unwrap();
+        assert!(config.dtls12_cipher_suites().all(|s| !s.suite().has_dhe()));
+        assert!(
+            Config::builder()
+                .build()
+                .unwrap()
+                .dtls13_kx_groups()
+                .all(|g| !g.name().is_ffdhe())
+        );
+    }
 
     struct FixedPsk;
 

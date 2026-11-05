@@ -12,7 +12,7 @@ use std::time::{Duration, Instant};
 use opc_crypto::{decrypt_envelope, encrypt_envelope};
 use opc_key::{ConsumerCheckpointAad, EnvelopeAad, KeyProvider};
 use opc_types::{SchemaDigest, SpiffeId, TenantId};
-use rusqlite::Connection;
+use rusqlite::{Connection, OptionalExtension};
 use sha2::{Digest, Sha256};
 use zeroize::Zeroizing;
 
@@ -112,7 +112,14 @@ pub struct ConsumerCheckpointOptions {
     max_payload_bytes: usize,
     max_storage_bytes: u64,
     timeout: Duration,
+    #[cfg(test)]
+    io_hook: Option<CheckpointIoHook>,
+    #[cfg(test)]
+    clock: Option<fn() -> Instant>,
 }
+
+#[cfg(test)]
+type CheckpointIoHook = Arc<dyn Fn(&Work, &'static str) + Send + Sync>;
 
 impl ConsumerCheckpointOptions {
     /// Configure an absolute, exclusively owned file and bounded operations.
@@ -147,6 +154,10 @@ impl ConsumerCheckpointOptions {
             max_payload_bytes,
             max_storage_bytes,
             timeout,
+            #[cfg(test)]
+            io_hook: None,
+            #[cfg(test)]
+            clock: None,
         })
     }
 }
@@ -249,22 +260,39 @@ struct EncodedRow {
 
 struct Work {
     deadline: Instant,
+    #[cfg(test)]
+    clock: Option<fn() -> Instant>,
     cancelled: AtomicBool,
     mutated: AtomicBool,
 }
 
 impl Work {
-    fn new(timeout: Duration) -> Result<Arc<Self>, ConsumerCheckpointError> {
+    fn new(options: &ConsumerCheckpointOptions) -> Result<Arc<Self>, ConsumerCheckpointError> {
+        let now = Instant::now();
+        #[cfg(test)]
+        let now = options.clock.map_or(now, |clock| clock());
         Ok(Arc::new(Self {
-            deadline: Instant::now()
-                .checked_add(timeout)
+            deadline: now
+                .checked_add(options.timeout)
                 .ok_or(ConsumerCheckpointError::InvalidRequest)?,
+            #[cfg(test)]
+            clock: options.clock,
             cancelled: AtomicBool::new(false),
             mutated: AtomicBool::new(false),
         }))
     }
+    fn now(&self) -> Instant {
+        #[cfg(test)]
+        if let Some(clock) = self.clock {
+            return clock();
+        }
+        Instant::now()
+    }
+    fn remaining(&self) -> Duration {
+        self.deadline.saturating_duration_since(self.now())
+    }
     fn check(&self) -> Result<(), ConsumerCheckpointError> {
-        if self.cancelled.load(Ordering::Acquire) || Instant::now() >= self.deadline {
+        if self.cancelled.load(Ordering::Acquire) || self.now() >= self.deadline {
             Err(self.error(ConsumerCheckpointError::Limit))
         } else {
             Ok(())
@@ -282,6 +310,20 @@ impl Work {
             error
         }
     }
+}
+
+/// Failure-only test diagnostic: name the stage that produced an ambiguous
+/// durable outcome so a regression can identify whether settlement, decryption,
+/// verification or the storage operation itself returned Indeterminate.
+/// Production builds return the typed error with no side effect.
+fn indeterminate(path: &Path, stage: &'static str) -> ConsumerCheckpointError {
+    #[cfg(all(test, unix))]
+    tests::record_indeterminate_stage(path, stage);
+    #[cfg(not(all(test, unix)))]
+    let _ = (path, stage);
+    #[cfg(all(test, unix))]
+    let _ = stage;
+    ConsumerCheckpointError::Indeterminate
 }
 
 struct CancelOnDrop(Arc<Work>);
@@ -408,7 +450,7 @@ impl ConsumerCheckpointStore {
         )
         .await
         .map_err(|_| ConsumerCheckpointError::Limit)?
-        .map_err(|_| ConsumerCheckpointError::Unavailable)?;
+        .map_err(checkpoint_encrypt_error)?;
         if envelope.len() > self.options.max_payload_bytes + ENVELOPE_OVERHEAD_LIMIT {
             return Err(ConsumerCheckpointError::Limit);
         }
@@ -425,9 +467,12 @@ impl ConsumerCheckpointStore {
         let stored = self
             .decrypt(&row)
             .await
-            .map_err(|_| ConsumerCheckpointError::Indeterminate)?;
+            .map_err(|_| indeterminate(&self.options.path, "compare-and-set-decrypt"))?;
         if row.generation != generation || *stored != *payload {
-            return Err(ConsumerCheckpointError::Indeterminate);
+            return Err(indeterminate(
+                &self.options.path,
+                "compare-and-set-verification",
+            ));
         }
         self.verified = Some((row.generation, Sha256::digest(&row.envelope).into()));
         self.uncertain = false;
@@ -480,7 +525,7 @@ impl ConsumerCheckpointStore {
         )
         .await
         .map_err(|_| ConsumerCheckpointError::Limit)?
-        .map_err(|_| ConsumerCheckpointError::Rejected)?;
+        .map_err(checkpoint_decrypt_error)?;
         if payload.len() > self.options.max_payload_bytes {
             return Err(ConsumerCheckpointError::Limit);
         }
@@ -496,7 +541,7 @@ impl ConsumerCheckpointStore {
             .map_err(|_| ConsumerCheckpointError::Limit)?;
         let connection = Arc::clone(&self.connection);
         let options = self.options.clone();
-        let work = Work::new(options.timeout)?;
+        let work = Work::new(&options)?;
         let task_work = Arc::clone(&work);
         let task = tokio::task::spawn_blocking(move || {
             let _permit = permit;
@@ -519,6 +564,10 @@ impl ConsumerCheckpointStore {
                     }
                     // WAL is truncated between writes; reserve worst-case DB and
                     // journal growth before allocating a replacement transaction.
+                    #[cfg(test)]
+                    if let Some(hook) = &options.io_hook {
+                        hook(&task_work, "before-mutation");
+                    }
                     task_work.mutation()?;
                     conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE)")
                         .map_err(|_| ConsumerCheckpointError::Unavailable)?;
@@ -540,6 +589,9 @@ impl ConsumerCheckpointStore {
                     }
                     tx.execute("INSERT INTO consumer_checkpoint (singleton, generation, envelope) VALUES (1, ?1, ?2)", rusqlite::params![row.generation as i64, row.envelope])
                         .map_err(|_| ConsumerCheckpointError::Unavailable)?;
+                    // Deterministic pre-commit storage-fault regression hook.
+                    #[cfg(all(test, unix))]
+                    tests::storage_failure(&options.path, "before-commit")?;
                     #[cfg(test)]
                     tests::crash_at("before-commit");
                     tx.commit()
@@ -551,12 +603,28 @@ impl ConsumerCheckpointStore {
                     #[cfg(test)]
                     tests::crash_at("after-checkpoint");
                 }
+                #[cfg(test)]
+                if let Some(hook) = &options.io_hook {
+                    hook(&task_work, "before-readback");
+                }
+                task_work.check()?;
                 let row = read_row(conn, &options)?;
                 check_storage_size(&options)?;
-                task_work.check()?;
+                #[cfg(test)]
+                if let Some(hook) = &options.io_hook {
+                    hook(&task_work, "readback-complete");
+                }
+                // Preserve completed readback; settle still bounds an unfinished worker.
                 Ok(row)
             })();
-            result.map_err(|e| task_work.error(e))
+            result.map_err(|error| {
+                let error = task_work.error(error);
+                #[cfg(all(test, unix))]
+                if error == ConsumerCheckpointError::Indeterminate {
+                    tests::record_indeterminate_stage(&options.path, "storage-operation");
+                }
+                error
+            })
         });
         self.pending = Some(PendingIo { task, work });
         Ok(())
@@ -572,8 +640,8 @@ impl ConsumerCheckpointStore {
         let _cancel = CancelOnDrop(Arc::clone(&pending.work));
         let result = tokio::time::timeout(self.options.timeout, &mut pending.task)
             .await
-            .map_err(|_| ConsumerCheckpointError::Indeterminate)?
-            .map_err(|_| ConsumerCheckpointError::Indeterminate)?;
+            .map_err(|_| indeterminate(&self.options.path, "settle-deadline"))?
+            .map_err(|_| indeterminate(&self.options.path, "settle-task-join"))?;
         self.pending = None;
         Ok(result)
     }
@@ -593,7 +661,7 @@ impl ConsumerCheckpointStore {
         provider: Arc<dyn KeyProvider>,
         provision: bool,
     ) -> Result<Self, ConsumerCheckpointError> {
-        let work = Work::new(options.timeout)?;
+        let work = Work::new(&options)?;
         let _cancel = CancelOnDrop(Arc::clone(&work));
         let result = async {
             let prepare_options = options.clone();
@@ -608,13 +676,13 @@ impl ConsumerCheckpointStore {
                     1,
                     metadata.clone(),
                 );
-                let envelope = crate::deadline::timeout(
-                    work.deadline,
+                let envelope = tokio::time::timeout(
+                    work.remaining(),
                     encrypt_envelope(provider.as_ref(), &aad, &[]),
                 )
                 .await
                 .map_err(|_| ConsumerCheckpointError::Limit)?
-                .map_err(|_| ConsumerCheckpointError::Unavailable)?;
+                .map_err(checkpoint_encrypt_error)?;
                 EncodedRow {
                     generation: 1,
                     envelope,
@@ -629,13 +697,13 @@ impl ConsumerCheckpointStore {
                     row.generation,
                     metadata.clone(),
                 );
-                let payload = crate::deadline::timeout(
-                    work.deadline,
+                let payload = tokio::time::timeout(
+                    work.remaining(),
                     decrypt_envelope(provider.as_ref(), &aad, &row.envelope),
                 )
                 .await
                 .map_err(|_| ConsumerCheckpointError::Limit)?
-                .map_err(|_| ConsumerCheckpointError::Rejected)?;
+                .map_err(checkpoint_decrypt_error)?;
                 if payload.len() > options.max_payload_bytes {
                     return Err(ConsumerCheckpointError::Limit);
                 }
@@ -681,13 +749,13 @@ async fn run_open_io<T: Send + 'static>(
     let permit = IO_SLOTS
         .try_acquire()
         .map_err(|_| ConsumerCheckpointError::Limit)?;
-    let deadline = work.deadline;
+    let task_work = Arc::clone(&work);
     let mut task = tokio::task::spawn_blocking(move || {
         let _permit = permit;
-        work.check()?;
-        operation(&work)
+        task_work.check()?;
+        operation(&task_work)
     });
-    crate::deadline::timeout(deadline, &mut task)
+    tokio::time::timeout(work.remaining(), &mut task)
         .await
         .map_err(|_| ConsumerCheckpointError::Indeterminate)?
         .map_err(|_| ConsumerCheckpointError::Indeterminate)?
@@ -816,6 +884,7 @@ fn prepare_files(
         parent,
         lock,
         database,
+        completion: None,
         identity,
     });
     admission.read_back()?;
@@ -840,7 +909,7 @@ fn prepare_files(
             .map_err(|_| ConsumerCheckpointError::Unavailable)?;
         let integrity: String = conn
             .query_row("PRAGMA integrity_check", [], |r| r.get(0))
-            .map_err(|_| ConsumerCheckpointError::Rejected)?;
+            .map_err(checkpoint_read_error)?;
         if integrity != "ok" {
             return Err(ConsumerCheckpointError::Rejected);
         }
@@ -908,6 +977,7 @@ fn finish_open(
         #[cfg(test)]
         tests::crash_at("provision-complete");
     }
+    work.check()?;
     let read = read_row(&conn, options)?;
     if read.generation != initial.generation || read.envelope != initial.envelope {
         return Err(ConsumerCheckpointError::Rejected);
@@ -925,8 +995,40 @@ fn finish_open(
     .map_err(|_| ConsumerCheckpointError::Unavailable)?;
     conn.progress_handler(0, None::<fn() -> bool>)
         .map_err(|_| ConsumerCheckpointError::Unavailable)?;
-    work.check()?;
+    #[cfg(test)]
+    if let Some(hook) = &options.io_hook {
+        hook(work, "open-complete");
+    }
+    // All readback and admission checks succeeded; retain that known result.
+    // run_open_io still bounds the caller's wait for unfinished validation.
     Ok(BackendConnection::retained(conn, prepared.admission))
+}
+
+// Only a read that actually rejected stored data authorizes Rejected.
+fn checkpoint_read_error(error: rusqlite::Error) -> ConsumerCheckpointError {
+    match crate::error::sqlite_read_error(error).kind() {
+        crate::PersistErrorKind::CorruptBlob => ConsumerCheckpointError::Rejected,
+        crate::PersistErrorKind::Unavailable
+        | crate::PersistErrorKind::PreflightFailed(_)
+        | crate::PersistErrorKind::RollbackNotFound
+        | crate::PersistErrorKind::WalRecoveryFailed
+        | crate::PersistErrorKind::AuditChainBroken
+        | crate::PersistErrorKind::InconsistentState(_)
+        | crate::PersistErrorKind::ForeignKeyViolation
+        | crate::PersistErrorKind::ConstraintViolation(_)
+        | crate::PersistErrorKind::RequestIdCollision
+        | crate::PersistErrorKind::ConfigHistoryCompacted
+        | crate::PersistErrorKind::ConfigHistoryFull
+        | crate::PersistErrorKind::ConfigHistoryProtected
+        | crate::PersistErrorKind::OutcomeUnknown
+        | crate::PersistErrorKind::PathNotWritable(_)
+        | crate::PersistErrorKind::DatabaseLocked
+        | crate::PersistErrorKind::OutOfSpace { .. }
+        | crate::PersistErrorKind::Io(_)
+        | crate::PersistErrorKind::SchemaVersionMismatch { .. }
+        | crate::PersistErrorKind::SchemaDigestMismatch { .. }
+        | crate::PersistErrorKind::Sqlite(_) => ConsumerCheckpointError::Unavailable,
+    }
 }
 
 fn configure_connection(
@@ -940,7 +1042,7 @@ fn configure_connection(
     crate::schema::apply_pragma_profile(conn).map_err(|_| ConsumerCheckpointError::Unavailable)?;
     let page_size: u64 = conn
         .pragma_query_value(None, "page_size", |r| r.get(0))
-        .map_err(|_| ConsumerCheckpointError::Rejected)?;
+        .map_err(checkpoint_read_error)?;
     if page_size != SQLITE_PAGE_BYTES {
         return Err(ConsumerCheckpointError::Rejected);
     }
@@ -954,7 +1056,7 @@ fn configure_connection(
     .map_err(|_| ConsumerCheckpointError::Unavailable)?;
     let pages: u64 = conn
         .pragma_query_value(None, "max_page_count", |r| r.get(0))
-        .map_err(|_| ConsumerCheckpointError::Rejected)?;
+        .map_err(checkpoint_read_error)?;
     if pages > (options.max_storage_bytes - STORAGE_RESERVE_BYTES) / (3 * SQLITE_PAGE_BYTES) {
         return Err(ConsumerCheckpointError::Limit);
     }
@@ -977,7 +1079,7 @@ fn read_row(
             [SCHEMA],
             |r| r.get(0),
         )
-        .map_err(|_| ConsumerCheckpointError::Rejected)?;
+        .map_err(checkpoint_read_error)?;
     if !schema_ok {
         return Err(ConsumerCheckpointError::Rejected);
     }
@@ -987,7 +1089,7 @@ fn read_row(
             [],
             |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
         )
-        .map_err(|_| ConsumerCheckpointError::Rejected)?;
+        .map_err(checkpoint_read_error)?;
     if count != 1
         || generation <= 0
         || length <= 0
@@ -1001,7 +1103,9 @@ fn read_row(
             [],
             |r| r.get(0),
         )
-        .map_err(|_| ConsumerCheckpointError::Rejected)?;
+        .optional()
+        .map_err(checkpoint_read_error)?
+        .ok_or(ConsumerCheckpointError::Rejected)?;
     Ok(EncodedRow {
         generation: generation as u64,
         envelope,
@@ -1091,6 +1195,33 @@ fn copy_for_validation(
         }
     }
     Ok(())
+}
+
+// Preserve provider failures before the checkpoint's data-rejection boundary.
+fn checkpoint_encrypt_error(error: opc_crypto::CryptoError) -> ConsumerCheckpointError {
+    match error.encryption_failure_kind() {
+        opc_crypto::EncryptionFailureKind::ProviderUnavailable => {}
+        opc_crypto::EncryptionFailureKind::ProviderUnusable => {
+            tracing::warn!("checkpoint key provider configuration unavailable; retain checkpoint and back off until provider repair");
+        }
+        opc_crypto::EncryptionFailureKind::Local => {
+            tracing::warn!("checkpoint local encryption failed; retain checkpoint and investigate before retrying");
+        }
+    }
+    ConsumerCheckpointError::Unavailable
+}
+
+fn checkpoint_decrypt_error(error: opc_crypto::CryptoError) -> ConsumerCheckpointError {
+    if error.is_definitive_rejection() {
+        return ConsumerCheckpointError::Rejected;
+    }
+    match error {
+        opc_crypto::CryptoError::ProviderUnavailable => ConsumerCheckpointError::Unavailable,
+        _ => {
+            tracing::warn!("checkpoint key provider configuration unavailable; retain checkpoint and back off until provider repair");
+            ConsumerCheckpointError::Unavailable
+        }
+    }
 }
 
 #[cfg(all(test, unix))]

@@ -76,8 +76,10 @@ impl Summary {
 
 struct Rows {
     base_format: Format,
+    base_bytes: u64,
     context: Context,
     keys: HashMap<facts::KeyId, Indexed<facts::Key>>,
+    retired_counts: BTreeMap<u64, usize>,
     receipts: HashMap<FencedTransitionV2RequestId, Indexed<facts::Receipt>>,
     generic: HashMap<SessionConsensusRequestId, Indexed<facts::Request>>,
     v1_count: usize,
@@ -121,7 +123,7 @@ impl Catalog {
     /// New native roots cannot select a vocabulary with logical-only purge.
     /// The format-order check during reconstruction covers every later delta.
     pub(crate) fn require_reclamation_format(&self) -> io::Result<()> {
-        if self.rows.base_format.vocabulary < Format::V6.vocabulary {
+        if self.rows.base_format.vocabulary < Format::V7.vocabulary {
             return Err(invalid("native generation discriminator differs"));
         }
         Ok(())
@@ -193,6 +195,10 @@ impl Catalog {
         self.cut_binding
     }
 
+    pub(crate) fn base_bytes(&self) -> u64 {
+        self.rows.base_bytes
+    }
+
     /// Consume the prospective indexes into the one resident owner. Each
     /// source row is removed before its replacement is inserted. Hash bucket
     /// capacity can overlap during conversion and remains part of measured
@@ -214,8 +220,10 @@ impl Catalog {
         }
         let Rows {
             base_format: _,
+            base_bytes: _,
             context,
             keys,
+            retired_counts: _,
             receipts,
             mut generic,
             v1_count: _,
@@ -716,8 +724,10 @@ impl Rows {
         // temporary before/after headers keep their Loaded guard until dropped.
         let mut rows = Self {
             base_format: format,
+            base_bytes: 0,
             context: base.context.clone(),
             keys: HashMap::new(),
+            retired_counts: BTreeMap::new(),
             receipts: HashMap::new(),
             generic: HashMap::new(),
             v1_count: 0,
@@ -772,6 +782,7 @@ impl Rows {
         rows.validate_index(&base.context, expected.binding, origin)?;
         rows.validate_log_order(check)?;
         reader.boundary(base.block_bytes, check)?;
+        rows.base_bytes = reader.position;
         let mut previous = reader.identity(
             base,
             base.checkpoint_epoch,
@@ -840,6 +851,19 @@ impl Rows {
                 }
             }
             roster_index::transition(&delta.before, &delta.after)?;
+            let retired = delta
+                .after
+                .business
+                .frontiers
+                .retention
+                .watch_retired_through;
+            let removed = rows
+                .notifications
+                .partition_point(|row| row.row.facts.sequence <= retired);
+            for row in rows.notifications.drain(..removed) {
+                check()?;
+                rows.summary[3].replace(Some(row.row.content), None)?;
+            }
             rows.read_rows(
                 &mut reader,
                 &delta.after,
@@ -931,11 +955,57 @@ impl Rows {
             let (range, input) = reader.bytes(MAX_ITEM)?;
             let (key, row) = decode::inspect_key_format(input.bytes(), format, frontiers, check)?;
             predecessor(self.keys.get(&key), before, checkpoint, base)?;
-            // A native key retains its fence floor after deletion. Physical
-            // key/receipt removal requires the future explicit lifecycle codec.
-            let row = row.ok_or_else(|| {
-                invalid("native generation key removal lacks its lifecycle codec")
-            })?;
+            let Some(row) = row else {
+                if base
+                    || frontiers.retention.keys.floor_prev == 0
+                    || self.keys.get(&key).is_some_and(|old| {
+                        old.row.facts.scope.is_some() || old.row.facts.batch.is_some()
+                    })
+                {
+                    return Err(invalid(
+                        "native catalog key retirement lacks its namespace floor",
+                    ));
+                }
+                let before_fence = self.keys.get(&key).map(|old| old.row.facts.fence);
+                if format.vocabulary >= Format::V7.vocabulary {
+                    // The original cut may precede retirement. Require the
+                    // final dead-row witness, not a tag on that earlier live
+                    // predecessor; plain untagged tombstones remain invalid.
+                    let (_, input) = reader.bytes(20).map_err(|_| {
+                        invalid("native key retirement witness is missing or malformed")
+                    })?;
+                    let witness: retention::KeyRemoval = binary::decode(input.bytes())
+                        .map_err(|_| invalid("native key retirement witness is malformed"))?;
+                    witness.validate(
+                        before_fence,
+                        self.keys
+                            .get(&key)
+                            .and_then(|old| old.row.facts.retired_epoch)
+                            .unwrap_or(self.context.business.frontiers.retention.keys.epoch),
+                        frontiers.retention,
+                    )?;
+                } else if before_fence
+                    .is_some_and(|fence| fence >= frontiers.retention.keys.floor_prev)
+                {
+                    return Err(invalid(
+                        "native legacy key retirement lacks its namespace floor",
+                    ));
+                }
+                self.rosters.key_replaced(
+                    key,
+                    self.keys.get(&key).map(|old| &old.row.facts),
+                    None,
+                )?;
+                self.summary[0].replace(before, None)?;
+                self.replace_retired_key(
+                    self.keys
+                        .get(&key)
+                        .and_then(|old| old.row.facts.retired_epoch),
+                    None,
+                )?;
+                self.keys.remove(&key);
+                continue;
+            };
             if self
                 .keys
                 .get(&key)
@@ -959,7 +1029,13 @@ impl Rows {
             self.rosters.key_replaced(
                 key,
                 self.keys.get(&key).map(|old| &old.row.facts),
-                &row.facts,
+                Some(&row.facts),
+            )?;
+            self.replace_retired_key(
+                self.keys
+                    .get(&key)
+                    .and_then(|old| old.row.facts.retired_epoch),
+                row.facts.retired_epoch,
             )?;
             put(
                 &mut self.keys,
@@ -1243,12 +1319,45 @@ impl Rows {
         check()
     }
 
+    fn replace_retired_key(&mut self, before: Option<u64>, after: Option<u64>) -> io::Result<()> {
+        if before == after {
+            return Ok(());
+        }
+        if let Some(epoch) = before {
+            let count = self
+                .retired_counts
+                .get_mut(&epoch)
+                .ok_or_else(|| invalid("native catalog retirement index missing predecessor"))?;
+            *count = count
+                .checked_sub(1)
+                .ok_or_else(|| invalid("native catalog retirement index underflow"))?;
+            if *count == 0 {
+                self.retired_counts.remove(&epoch);
+            }
+        }
+        if let Some(epoch) = after {
+            let count = self.retired_counts.entry(epoch).or_default();
+            *count = count
+                .checked_add(1)
+                .ok_or_else(|| invalid("native catalog retirement index overflow"))?;
+        }
+        Ok(())
+    }
+
     fn validate_index(
         &self,
         context: &Context,
         binding: [u8; 32],
         origin: Option<&NativeSnapshotAuthority>,
     ) -> io::Result<()> {
+        let retention = context.business.frontiers.retention.keys;
+        if self.retired_counts.iter().any(|(epoch, count)| {
+            !retention.retains_epoch(*epoch)
+                || *count > crate::key_retention::RETIRED_KEYS_PER_EPOCH as usize
+                || (*epoch == retention.epoch && *count as u64 > retention.retired_count)
+        }) {
+            return Err(invalid("native catalog key retirement counts differ"));
+        }
         let lengths = [
             self.keys.len(),
             self.receipts.len(),

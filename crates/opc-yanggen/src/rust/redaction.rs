@@ -271,15 +271,9 @@ pub fn generate(input: &CanonicalInput) -> Result<String, RustGenerationError> {
             }
         }
 
-        impl DeterministicHash for YangDecimal64 {
+        impl<const F: u8> DeterministicHash for YangDecimal64<F> {
             fn deterministic_hash(&self) -> Self {
-                let bits = self.0.to_bits();
-                let mut hash: u64 = 0xcbf29ce484222325;
-                for &byte in &bits.to_be_bytes() {
-                    hash ^= byte as u64;
-                    hash = hash.wrapping_mul(0x100000001b3);
-                }
-                YangDecimal64(f64::from_bits(hash))
+                YangDecimal64::from_scaled(self.scaled().deterministic_hash())
             }
         }
 

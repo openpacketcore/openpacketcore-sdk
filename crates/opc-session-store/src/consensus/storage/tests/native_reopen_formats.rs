@@ -365,7 +365,7 @@ async fn native_unknown_frontier_public_reopen_refuses_before_backend_or_snapsho
         let mut original = None;
         wal.rewrite_closed_native_generation_for_test(|bytes| {
             original = Some(bytes.clone());
-            assert_eq!(&bytes[..8], b"OPCNJB\x06\x00");
+            assert_eq!(&bytes[..8], b"OPCNJB\x07\x00");
             let length = u32::from_le_bytes(bytes[8..12].try_into().unwrap()) as usize;
             let field = b"\"frontiers\":{";
             let offset = 12
@@ -626,8 +626,8 @@ async fn native_future_generation_public_reopen_refuses_before_backend_or_snapsh
         let mut original = None;
         wal.rewrite_closed_native_generation_for_test(|bytes| {
             original = Some(bytes.clone());
-            assert_eq!(&bytes[..8], b"OPCNJB\x06\x00");
-            bytes[..8].copy_from_slice(b"OPCNJB\x07\x00");
+            assert_eq!(&bytes[..8], b"OPCNJB\x07\x00");
+            bytes[..8].copy_from_slice(b"OPCNJB\x08\x00");
         })
         .unwrap();
         for expected_identity in [identity(1), identity(2)] {

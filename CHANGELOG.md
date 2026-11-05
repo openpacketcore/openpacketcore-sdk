@@ -7,7 +7,907 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- Retain accepted snapshot chunk processing after caller cancellation, so
+  repeated delivery can continue the same receiver under bounded admission.
+
+- Rootless full roster admission uses checkpoint memory headroom during store
+  creation, reopen, generation selection, snapshot export and install, while
+  retaining the process cap and live-journal allowance.
+
+- Keep empty change-journal rows compact while fully accounting for optional
+  key-retirement witnesses. The existing history counts and verification-memory
+  limits remain unchanged.
+
+- Keep pre-projection native log admission waiting across snapshot installation.
+  Closing still interrupts the wait, and the normal snapshot admission gate
+  remains authoritative after file backpressure clears.
+
+- `opc-persist`: missing mandatory configuration-history, machine, membership,
+  and audit rows are rejected before history reads and runtime apply. Typed
+  query errors in checkpoint row reads, retained catalog validation and backend
+  metadata probes preserve read outages as unavailable. Earlier SQLite open and
+  integrity-check result interpretation are unchanged. `create_rollback_point`
+  reports `RollbackNotFound` for an absent target.
+- `opc-key`, `opc-crypto`, `opc-key-vault`, `opc-session-store`,
+  `opc-config-bus`, `opc-persist`: only positive key/ciphertext evidence authorizes
+  protected-data rejection. The exhaustive `KeyError::is_definitive_rejection`
+  predicate keeps every custody state and unclassified failure nonterminal.
+  KMS verdicts require recognized structured reasons, never diagnostic text.
+  Malformed provider output, authentication/configuration faults and local
+  encryption failures retain rows and pending work. Vault configuration faults
+  avoid transient retries; TLS `internal_error` remains an outage. Checkpoint
+  sealing and reading emit repair diagnostics. Rollback alarms preserve actual
+  data evidence without inferring corruption from unavailable dependencies.
+  `EncryptedPayload` debug output redacts AAD and ciphertext. Refs #1197.
+- `opc-session-net`: custom `KeyProviderUnavailable` results remain non-definitive
+  across CAS, legacy mutations and expiry preflight. Positive deterministic store
+  results are explicit; unknown failures retain ambiguity rather than becoming
+  a cached final rejection. Refs #1197.
+
+### Added
+
+- `opc-proto-ikev2`: typed RFC 5685 REDIRECT_SUPPORTED, REDIRECT and
+  REDIRECTED_FROM Notify codecs, with IPv4/IPv6/FQDN identities, explicit
+  exchange direction, echoed peer nonce bounds, named malformed-input errors,
+  redacted diagnostics and bounded atomic support metadata. REDIRECTED_FROM
+  holds only IP identities; gateway, notification and error enums are
+  non-exhaustive. FQDN backslashes are rejected. Initial-exchange builders emit
+  zero-responder-SPI redirects; admission accepts either SPIr with original
+  support and nonce correlation. Callers retain initial support before sending any redirect, send
+  REDIRECTED_FROM after redirection, and own authentication, first/final
+  IKE_AUTH placement, target trust and redirect policy.
+
+- `opc-proto-gtpv2c`: add typed FQ-CSID support with bounded validated value
+  construction, IPv4/IPv6 and binary MCC/MNC Node-ID forms, canonical encoding
+  through the raw IE layer, and value-free decode errors with request Cause
+  classification (TS 29.274 V19.6.0 clauses 8.62, 7.7.7 and 7.7.8).
+
+- `opc-proto-ikev2`: PKCS#1 v1.5 and PSS signing blind the RSA private operation
+  with OS randomness; this hardening does not resolve RUSTSEC-2023-0071.
+
+- `opc-proto-ikev2`: a probe completes on any authenticated INFORMATIONAL
+  response carrying its Message ID, and `complete_empty_probe` returns that
+  response's payloads (RFC 7296 §1.4). Refs #1241.
+
+- `opc-ipsec-xfrm`: `EspTfcDummySender` submits Next Header 59 dummies through
+  the same kernel SA as ordinary traffic. Transport mode uses stock Linux;
+  tunnel mode requires the included versioned kernel patch and rejects an
+  unsupported kernel before opening the sender. Caller-owned egress fencing
+  must stop the sender before recovery, relocation or SA replacement. (#1344)
+
+- `opc-consensus`: expose `DURABLE_CONSENSUS_FAILOVER_PATIENCE`, derived from the
+  election lease plus stale-route grace; it schedules no election. Refs #1049.
+
+- `opc-gtpu-dataplane`: staged the RFC 017 mixed-selector-provenance codec and
+  preflight slice (internal; no public API or backend behavior change). Added
+  canonical `DrainQualificationCodecV1` (305 bytes) and `TransferEdgeCodecV1`
+  (289 bytes) codecs per RFC 017 section 4.2, and a mixed-provenance
+  composition preflight that builds the exact provenance partition and exactly
+  one transfer edge per retired atom. It refuses missing/duplicate/foreign/
+  stale drain qualifications, a changed predecessor set, same-group sources
+  cited as transfers, gaps, overlaps, duplicate predecessors, and fresh atoms
+  carrying predecessor lineage, before any durable or backend effect. Retired
+  sources must match resolved predecessor atoms still available for transfer,
+  the namespace epoch and a strictly increasing authority-generation schedule;
+  unused qualifications and duplicate qualification nonces are refused. The
+  one-CAS ledger-v2 admission, transfer-gate transitions, coordinator wiring
+  and loss-qualified same-group restore remain unimplemented; RFC 017 row
+  017-1 is now `partial`. Refs #663.
+
+- `opc-persist`: retained configuration provisioning publishes authenticated,
+  request-bound intent, a complete database and a completion witness using
+  atomic no-replacement links. Explicit resume finishes the same authorized
+  request after interruption without deleting or replacing existing artifacts;
+  ordinary reopen never initializes storage. Conflicting keys, requests and
+  unverifiable records are preserved and refused. Writer exclusion remains held
+  until SQLite and every extra database descriptor close. Subprocess crashes,
+  I/O faults, cancellation/join and public authority/member-repair resume paths
+  cover the lifecycle. Refs #1114.
+
+- `opc-gtpu-dataplane`: share the SDK-private canonical namespace-binding
+  and operation-stamp encoders with bounded format validation and golden-byte
+  regression coverage. The incomplete external `selector_adapter_codec` API
+  is not published: raw-byte decode and encode are not request-bound authority
+  leases. External codec leases and the RFC 016 section 14.11 conformance
+  harness remain unimplemented; external adapters remain `Unsupported`.
+  Refs #671.
+
+- `opc-ipsec-xfrm`:
+  `NamespaceBoundLinuxXfrmBackend::install_scoped_successor` installs a fresh
+  scoped Child SA while retaining its predecessor. Outbound successors use a
+  distinct reqid and atomically update the existing protective policy;
+  inbound successors share the reqid and policy so both SAs remain acceptable.
+  Exact retries resume retained progress, and lost replies never undo a
+  completed traffic move. `scoped_successor_status` reads current SA and policy
+  state while retaining the publication milestone. Published successors can
+  themselves be rekeyed. `remove_scoped` retires an unselected SA only, restores
+  a retained live generation when abandoning the selected one, and removes the
+  shared policy only with the final member. Expired groups clean up in either
+  order without manual repair. Each new successor requires its own committed
+  activation. Rekey-trigger ownership and peer signalling remain consumer
+  policy. Ordinary scoped installs also wait on an overlapping outbound SA
+  selection identity. Refs #1239.
+
+- `opc-proto-ikev2`: support RFC 3526 MODP groups 15–18 with exact-width
+  public/shared values and sealed private checkpoints; RFC 4434 AES-XCBC PRF
+  with the RFC 7296 initial SKEYSEED nonce rule; RFC 5282 AES-CCM-8; RFC 7634
+  ChaCha20-Poly1305; RFC 4754 fixed-width ECDSA AUTH methods 9–11; and RFC 7427
+  RSA-PSS plus RFC 8420 pure Ed25519/Ed448 signatures. RSA-PSS parameters are
+  parsed structurally and local self-verification can bind the actual signing
+  scheme. RSA/PSS verification is always available; signing retains its existing
+  `rsa-signing` feature. Newly executable groups participate in existing proposal
+  ordering, which prefers other admitted groups over group 1 without imposing a
+  strength ranking among the remaining groups. Every algorithm uses admitted
+  provider capability checks. Refs #1352, #1345.
+- `opc-gtpu-dataplane`: `LinuxGtpuDataplaneBackend` now opens an
+  attachment-bound control port over the userspace UDP/2152 socket retained by
+  an ordinary creation. The Linux `gtp` driver passes non-G-PDUs and G-PDUs
+  declined by the kernel back to that socket, including known TEIDs with a
+  wrong inner MS binding. `try_receive_downlink` requires stable PDP absence
+  before reporting `UnknownTunnel`; known or indeterminate contexts are
+  dropped. Controls remain available, and one consuming
+  `unknown_tunnel_error` plan sends an Error Indication through the same
+  retained socket with the Peer Address, TEID Data I and triggering UDP
+  source-port fields. Receipt grants no tunnel or peer authority; the caller
+  keeps tunnel lookup, peer admission, budgets and answer policy. A
+  kernel-owned recoverable attachment returns
+  `gtpu_control_port_kernel_owned`, no second socket is ever bound, and
+  removal, replacement, adoption or a descriptor generation change retires
+  old receive capabilities and plans. Reopening the same live generation
+  preserves plans; I/O rechecks live link and socket binding without waiting
+  on the PDP mutation mutex. Recoverable-socket support remains unimplemented.
+  Refs #1084.
+
+- `opc-session-net`: `PersistentSessionConsumerConfig::with_cooldown_admission`
+  selects the explicit reconnect-cooldown admission policy for a persistent
+  consumer client. The default `ReconnectCooldownPolicy::Wait` preserves the
+  existing single-peer behaviour (wait for the one coalesced cooldown edge or
+  the caller deadline). `ReconnectCooldownPolicy::FailOver` is the routed
+  policy: a foreground call that reaches a peer whose shared reconnect cooldown
+  is active or whose probe is already in flight returns the bounded, value-free pre-write
+  `SessionConsumerClientError::Cooldown` immediately (remaining cooldown and
+  gate wait in milliseconds) so the caller's routing loop can select another
+  voter without waiting for this peer's recovery edge. No request byte is
+  accepted before that outcome, so the unchanged request may be routed to
+  another peer; once a byte may have been accepted the existing
+  exact-identity/status recovery is unchanged. Both policies retain the shared
+  exponential backoff, the single serialized probe at cooldown expiry, and the
+  existing deadlines, retry and authority rules. Admission precedes DNS and
+  pool waits, and routed callers do not join another pending warm or retained
+  setup. Value-free physical-attempt spans record operation kind, canonical
+  voter/successor ordinals, gate time, cooldown and transmission classification.
+  `opc-session-store::SessionConsumerVoterAuthority::ordinal` exposes the
+  canonical roster position for those diagnostics without granting authority.
+  Refs #1248.
+- `opc-gtpu-dataplane`: ordinary inner-IPv6 PDP contexts can now opt into
+  in-tunnel RFC 4443 Packet Too Big. The family-tagged entry gains a versioned
+  opt-in downlink inner MTU profile (entry version 3, the 2-byte field at
+  bytes 73..74, byte 75 reserved); tc's
+  family-tagged decapsulation steers an over-MTU inner IPv6 packet to the
+  existing packet-too-big hand-off queue, and the consumer sends exactly one
+  RFC 4443 error on the subscriber's default-bearer uplink, quoting up to 1,232
+  octets with the same per-session rate limit, 255-second eviction grace and
+  never-answer-before-token order as the IPv4 opt-in. The IPv4
+  fragment-inner default remains refused for IPv6
+  (`downlink_inner_mtu_inner_ipv6_fragmentation`), and the IPv6 MTU must be at
+  least 1,280. The profile requires IPv4 outer endpoints and the legacy
+  UDP/2152 uplink source port; grouped and N3 APIs refuse it. The consumer
+  validates default-bearer authority and suppresses errors and Redirects
+  behind extension headers before consuming a rate-limit token. Refusal is
+  explicit rather than installing without enforcement.
+  Refs #1007.
+
+- `opc-session-net`: an issuer can now deliver one authenticated, typed boot
+  refusal to the exact proven candidate worker boot instead of a ticket notice.
+  `IssuerStartupSession::deliver_boot_refusal` takes a closed, value-free
+  `scope::BootRefusalReason` (`PlatformInvalid`, `PlatformChanged`,
+  `PrerequisiteRefused`) and sends one bounded revision-two frame on the
+  retained startup connection; the frame reuses the connection's existing
+  mutual-TLS issuer authentication and is bound to the exact candidate attempt
+  (header identity/scope/request digest plus attempt nonce) and the proved boot
+  (process nonce and boot key digest). The worker's
+  `StartupSession::receive_ticket_notice` returns the terminal typed
+  `StartupError::BootRefused(reason)`; a lost, truncated, mismatched or replayed
+  refusal remains an unavailable/invalid startup failure and is never treated
+  as a refusal. A refusal conveys no authority, no closure evidence and no
+  credential, identity, endpoint or key material, and never bypasses an
+  admitted worker's drain/close obligations; only candidate startup sessions
+  can carry it. The issuer-side observation-sandwich limit (two consistent
+  workload-record reads around the proof do not establish that the platform has
+  published the current container restart) is documented on the delivery API
+  and in the crate README. A refusal after any ticket-notice page is invalid;
+  RFC 026 and independent revision-two vectors specify its exact 81-byte body.
+  Normal predecessor exit releases the exclusion guard so a fresh boot can
+  start without deleting retained records. Refs #1245.
+- `opc-gtpu-dataplane`: the native TFT fragment-affinity table now partitions
+  its 16,384 buckets into 256 owner groups of 64 buckets selected by the
+  attachment and subscriber PAA, so one classified subscriber can occupy at
+  most 256 concurrent fragmented datagrams and cannot deny or reset another
+  owner group's entries. `TFT_FRAGMENT_OWNER_BUCKETS`,
+  `TFT_FRAGMENT_OWNER_GROUPS`, and `TFT_FRAGMENT_OWNER_MAX_DATAGRAMS` document
+  the bound. A saturated owner group now reports
+  `TftFragmentDisposition::Capacity` and the value-free
+  `COUNTER_TFT_CLASSIFIER_CAPACITY` (a new fourth pinned TFT drop-counter slot)
+  through the host model and tc; the host reason
+  `TftUplinkDropReason::CapacityExhausted` is additive in its non-exhaustive
+  enum. Colliding PAAs share one group's bound. Refs #1087.
+
+- `opc-proto-ikev2`: bounded empty INFORMATIONAL liveness probes require a
+  durably acknowledged unwritten-ID limit, then send and complete without a
+  window write. Exact retransmissions use exponential backoff under a fixed
+  deadline; expiry or clock failure requires scoped SA cleanup. The next commit
+  retains the live send floor and authenticated last-probe evidence, including
+  sync IV and request history. Restart requires synchronization beyond the full
+  unwritten bound or automatic SA retirement. Opposite-direction peer work stays
+  admissible, and peer sync fences probes without inventing an uncertain
+  application outcome. Idleness includes authenticated IKE and Child-SA ESP
+  traffic, excluding NAT keepalives. Refs #1241.
+- `opc-gtpu-dataplane`: `GtpuDownlinkCounters::inner_fragment_capacity_exhausted`
+  and `packet_too_big_capacity_exhausted`, plus the typed reasons
+  `GtpuDownlinkDrop::InnerFragmentCapacityExhausted` and
+  `GtpuPacketTooBigSignal::CapacityExhausted`, distinguish fail-closed
+  capacity refusals from per-key rate limiting. The added enum variants and
+  counter fields are additive: both enums and the counter struct are
+  `#[non_exhaustive]`. Refs #1018.
+
+- `opc-ipsec-xfrm`: `SaParameters::tfc_pad` configures Linux ESP tunnel-mode
+  Traffic Flow Confidentiality padding through `XFRMA_TFCPAD` (UAPI 22).
+  Exact binding/scoped readback and durable object/roster authentication include
+  the target; disabled TFC retains its previous encoding and seals.
+  `rekey_sa` verifies GETSA even when clearing TFC and reports indeterminate
+  state if Linux acknowledges an ignored update.
+  Stored records with enabled TFC from builds that omitted it from authentication
+  require a fresh install when crossing this format change. Refs #1344.
+
+- `opc-identity`: add general-PKI URI extraction and local validation through
+  `extract_spiffe_id_from_pki_cert_der`, `validate_local_pki_identity` and
+  `LocalPkiUsage`, plus `SpiffeSanError::MultipleSpiffeIds`. Transports retain
+  the strict SPIFFE SVID profile. Refs #1353.
+- `opc-diameter-transport`: add `DiameterTlsVersion::Tls12`, ECDHE-ECDSA/RSA
+  TLS 1.2 AES-GCM cipher evidence, and opt-in DTLS RSA/DHE cipher evidence.
+  `tls12_legacy_dhe_rsa` and the TLS/management builders' separate
+  `with_legacy_dhe_rsa` option expose the older Release 18 DHE-RSA exception;
+  normal compatibility excludes it under RFC 10015 / TS 33.210 Release 19.
+  Refs #1353.
+- `opc-sctp`: expose synchronous `SctpAssociationAbortHandle::abort_on_wire`
+  and `DiameterSctpAssociation::abort_handle` for RFC 6733 framing failure.
+  The legacy `abort()` operation retains SHUT_RDWR graceful-shutdown semantics.
+  Refs #1351.
+
+### Fixed
+
+- Portable snapshots validate retained notification rows against the committed
+  retirement frontier and physical watch head. Operator recovery invalidation
+  remains separate. Pre-format snapshots are refused; compatibility is not
+  required for this undeployed format. Every native store written by an earlier
+  build is refused and requires a fresh installation, regardless of its
+  notification count.
+- SQLite reads, local writes and replay require a decodable newest journal row.
+  An undecodable newest row requires `rebuild_replication_state` before those
+  operations can resume.
+
+- GTP-U N3 native and reassembled paths now reject BSSI/TTNBI conditional
+  fields consistently with the codec. Required RAN/PDCP extensions retain
+  Supported Extension Headers Notification authority despite known syntax.
+  Generic `UnknownIePolicy::Reject` applies endpoint comprehension and refuses
+  those required formats; `Preserve` and `Drop` retain their syntax decoding.
+  SCI send values are limited to 0–15. (#1520, #1529)
+- GTPv2-C ignores received Bearer QoS ARP spare bits and clears them on
+  canonical send; raw-preserving send retains the received octet. (#1354)
+- GTP-U control readiness covers IPv6-only and dual-stack retained sockets,
+  preserving shared-generation reopening and I/O without backend-wide mutexes.
+  (#1084, #341)
+
+- `opc-proto-gtpu`: reject unsupported downlink BSSI/TTNBI fields from
+  TS 38.415 V19.1.0 instead of silently discarding them as PPI spare bits
+  and padding; update the independent N3 reference vectors. (#1520)
+
+- `opc-session-store`: preserve V1 roster activation refusal when V2 has only
+  provisioned the shared witness, while keeping separately authorized mixed
+  profiles operational. Count successful maintenance service toward its existing
+  one-second cadence and keep the automatic shutdown handoff within its original
+  budget after joining maintenance. Measure signed maintenance under independent
+  ten-row-per-second arrivals. Gate cadence, the conditional 40-row bound and
+  its slow-service negative control under paused time, and compare backend work
+  at two retained-history sizes alongside controlled-turn progress checks.
+  Reduce duplicate history-proof persistence and frame authentication work while
+  retaining the full 131,073-row cold reopen,
+  all validators, and existing capacity, retention and deadline bounds. Refs #1307.
+
+- `opc-session-store`: complete bounded restore scans when only expired rows follow a full live-row
+  page, preserving the physical visit budget and all page-size limits.
+
+- `opc-session-store`: preserve observed record and lab-receipt expiry after
+  an injected fake-backend clock moves backward without using reader samples
+  to execute later writes. Commands sample time under the state lock, bounded
+  by earlier writer attempts and committed time; replay uses the committed entry
+  timestamp. Record changes replace their local expiry visibility, while unrelated commits keep
+  expired records and receipts hidden. Newly written zero-TTL records preserve
+  their exact boundary. Lease-only commands preserve lab restore cursors.
+
+- `opc-session-store`: carry native capacity rotations through application
+  replay and cold reloads, reject oversized fake journal batches before
+  publication, and skip expired restore rows within the source-work bound.
+
+- `opc-session-store`: align native and fake retirement at command boundaries.
+  Successful V1 fenced transitions include staged expiry cleanup; a CAS
+  conflict discards cleanup and cannot retire keys or rotate their epoch.
+
+- `opc-session-store`: rejected fake-backend writes and no-effect local batches
+  preserve committed expiry state. Successful local batches emit one replication
+  entry containing their successful write slots, and notify watchers after
+  publication. Lab transition failures retain their outcome receipt without
+  publishing unrelated cleanup.
+
+- `opc-session-store`: lab transition observations preserve committed expiry
+  and retirement state. Retained keys expose their exact fence and absent keys
+  expose the committed floor, so an uncontended acquire accepts the observed
+  fence at the same timestamp. Refs #1257.
+
+- `opc-session-store`: fake reads filter expired records without discarding
+  canonical replay state. Live replication and rebuild apply expiry at the
+  committed entry timestamp, so delayed releases, deletes, renewals and TTL
+  refreshes survive intervening follower reads. Duplicate delivery leaves
+  state unchanged, and lab restore cursors still reject expired scan views.
+  Refs #1257.
+
+- `opc-session-store`: create fresh native roots on the blocking opener pool,
+  keeping cold authentication off the asynchronous caller's stack. Queued and
+  running creation retain their connection, descriptor owner and verified
+  snapshots until ROOT writing completes, including caller cancellation after
+  SQL identity initialization. The complete initial root remains reopenable.
+
+- `opc-session-net`: preserve configured reconnect admission for the first
+  prepared-request warm flight, before shared prewarm permits and DNS. `FailOver`
+  immediately selects another voter when cooldown or existing setup prevents
+  admission; administrative prewarming keeps `Wait`. Authentication clock
+  examples now size the fixed budget for kernel error growth between daemon
+  updates. Refs #1248. Refs #1244.
+
+- `opc-persist`: release snapshot receipts when admission fails before engine
+  dispatch, so an identical single-chunk retry or a restarted transfer can
+  recover after transient contention. Dispatched work keeps its owned receipt.
+  Size both received-artifact sync budgets from the bounded descriptor length,
+  preserving finite metadata admission and storage-worker ownership. Refs #1339.
+
+- `opc-amf-lite`: await startup phase and readiness events within the existing
+  five-second product deadline. Timeout diagnostics capture the pre-shutdown
+  phase, readiness and closed session-store gate status/reason; controlled
+  regressions exercise the actual startup completion boundary. Refs #1195.
+
+- `opc-session-net`: isolate prepared-CAS reply-loss tests from host scheduling
+  while retaining real voter/storage work, the original attempt/caller budgets
+  and exactly-once assertions. Restore the terminal-watch reconnect observation
+  window and the original admission waits in unsupported global-Watch fixtures.
+  Historical connection attribution and the scoped Watch protocol remain open.
+  Refs #1147, #842, #1189.
+
+- `opc-persist`: checkpoint writes, provision and reopen retain a completed,
+  validated storage result when their observer resumes after the deadline.
+  Unfinished or unverified work remains bounded and indeterminate. The maximum
+  payload/minimum storage regression waits for actual blocking I/O with a scoped
+  test clock; deadline regressions preserve the original budgets and recovery
+  assertions without real-time sleeps. Refs #1336.
+
+- `opc-session-store` and `opc-persist`: retain the `Unplanned` shutdown reason
+  when an unplanned request races admission fencing or preparation completion.
+  Already published reports remain unchanged. (#1376)
+
+- `opc-consensus`, `opc-session-store` and `opc-persist`: voter-slot request
+  reads retain the original deadline while waiting for strict publication.
+  Control replies read state and evidence from one durable cut; post-dispatch
+  expiry remains an unknown outcome. The public session `voter_slot_state()`
+  observer now waits for publication up to the store's operation timeout.
+  The reader trait retains its original method and adds a defaulted bounded
+  method. (#1205)
+
+
+- `opc-session-store` / `opc-session-testkit`: consensus restore-scan caller
+  deadlines remain retryable across logical-time fencing, worker and connection
+  admission, and page scanning. Actual scan-work exhaustion and other terminal
+  errors keep their original class even if delivery is late. Standalone SQLite
+  retains its existing deadline contract. Tracing records the exact error
+  variant, phase and elapsed time without error payloads; qualification records
+  work exhaustion as its own terminal class. Server transport deadlines remain
+  retryable. No operation deadline, work limit or authority check changes.
+  Refs #1160.
+
+- `opc-persist`: large configuration snapshots keep progressing through bounded
+  file operations and SQLite work sized while its connection stays leased.
+  Repair retains the caller's deadline and resumes a verified reader across
+  retries; idle, obsolete and shutdown readers are released. Snapshot integrity
+  evidence belongs to its descriptor and is invalidated by writes. Purge waits
+  for one matching owned installation before checking durable application.
+  Exact final chunks, including data-bearing and single-chunk transfers, join
+  or replay the definitive installation result after RPC timeouts. Failed
+  inspections permit a fresh transfer. Replacement admission and shutdown
+  remain bounded, and successful inspection and installation share one digest
+  verification. Refs #1339.
+
+- `opc-session-store`: a store that receives only protected-roster commands now
+  reclaims eligible retained history through an owned local-leader maintenance
+  lane. Authenticated indexed eligibility prevents empty logical-time proposals
+  for young rows. Unknown occupancy is refreshed without overwriting a newer
+  admission projection. The lane keeps one proposal in flight, retains its
+  one-second cadence after applied work even when concurrent completions leave
+  occupancy flat, and backs off transient failures to 60 seconds. Leadership
+  changes wake observation promptly; shutdown stops and joins the lane before
+  handoff and Raft shutdown. Maintenance retains the 24-hour recovery boundary,
+  bounded mutation widths and existing authority checks. Completed history has
+  no count quota; ordinary live/byte capacity uses caller-deadline backpressure
+  with bounded jitter. Recovery-only retirement after provider loss (#1298)
+  and automatic unresolved-obligation discharge (#1306) remain separate work.
+  Refs #1307.
+
+- `opc-proto-ngap` / `opc-sctp`: retain wiping custody of received security
+  material through SCTP accumulation and growth, the last payload reference,
+  raw PDU storage, each decoded IE, coalesced fragments and error/policy discards.
+  The typed SecurityKey value remains intact for admission and reconstruction.
+  `SecurityKey::to_zeroizing()` provides an explicit protected provider handoff.
+  Live drop observers check every owner before release, with and without keys;
+  allocation-counter tests additionally check for retained allocations. Valid
+  fragmented SEQUENCE extension bitmaps remain accepted without copying their
+  additions. Non-canonical short bitmap lengths are rejected. Refs #1262.
+
+- `opc-gtpu-dataplane`: one subscriber can no longer monopolize the shared
+  inner-uplink IPv4 fragment-affinity table. Bucket selection is partitioned by
+  the attachment interface index and the subscriber PAA, so a subscriber is
+  bounded to 256 concurrent fragmented datagrams and only its own owner group
+  can be exhausted. A saturated owner group's packet is dropped fail closed
+  with a distinct capacity disposition/counter instead of being counted as
+  stale/invalid classifier state, and another subscriber's owner group keeps
+  admitting. Refs #1087.
+
+- `opc-session-store`: restore fail-stop local snapshot builds. A build error
+  reaches Openraft without retries or an unverified previous-snapshot fallback.
+  Build/install recovery (#1254/#1243) is deferred until retained-log admission
+  (#1249) exists and is qualified. The four build-fault scenarios now verify
+  engine termination, unchanged publication/purge frontiers and artifact
+  ownership under this contract.
+
+- `opc-persist`: a configuration-consensus leader-routed call is now bounded by
+  this replica's own leader view. Once the engine has observed a successor for
+  a lost leader, an unanswered forwarded mutation or linearizable read barrier
+  is abandoned after `DURABLE_CONSENSUS_STALE_LEADER_ROUTE_GRACE` (one heartbeat, 2 s) and
+  re-offered through that successor, instead of occupying the complete
+  operation deadline. A route with no observed successor keeps the existing
+  operation deadline and its typed ambiguous outcome; an abandoned forwarded
+  mutation is classified as possibly transmitted and retries on the same
+  request identity, so the configuration store still applies it exactly once.
+  Election, heartbeat and forwarded-mutation timing budgets are unchanged.
+  Redirects retain the local view under which they were chosen, changing or
+  unknown successor views do not renew retirement, and a later refusal cannot
+  erase an earlier transmitted attempt's unknown outcome. Refs #1049.
+- `opc-gtpu-dataplane`: the per-destination inner fragmentation budget and
+  the per-session in-tunnel Packet Too Big error budget no longer evict a
+  destination or session that was used within the last 255 seconds. The
+  bounded tables fail closed with a new typed reason instead of resetting an
+  active token bucket or Identification sequence, and eviction uses an O(1)
+  LRU instead of a full-table scan. Reclamation also requires full token-bucket
+  refill, preserving slow limits. Fragmentation limit replacements retain
+  tokens, including refill earned under the old rate, without repricing elapsed
+  time. Explicit PTB limit replacement preserves its existing full-burst restart
+  contract while retaining the tracked sessions and their eviction grace. A separate
+  bounded per-destination sliding count preserves the 65,535-admission ceiling
+  across all valid limit replacements without re-registering. New value-free counters
+  and typed outcomes are listed under "Added". Refs #1018.
+
+- `opc-gtpu-dataplane`: a PDP context whose outgoing peer TEID is the
+  TS 29.281 section 5.1 all-zero value is now installable on Linux kernel-GTP
+  and eBPF. Readback, reconciliation and retained-owner recovery preserve it,
+  and the rebuilt tc datapath and software G-PDU/End Marker encoders transmit
+  the peer TEID as zero. Locally allocated/received/map-key TEIDs remain
+  strictly nonzero (`Teid::new(0)` still returns `None`), with Debug redaction
+  unchanged. Before downgrading to an SDK without zero-peer support, remove zero-peer contexts or perform a fresh installation. Refs #1346.
+
+- `opc-proto-gtpv2c`: accept unknown extension octets after the required
+  Bearer QoS prefix while retaining 40-bit rate bounds and QoS validation.
+  Canonical encoding emits the known fields; raw-preserving message encoding
+  retains the extension. Refs #1356 (GTPv2-C item).
+
+- `opc-proto-gtpv2c`: S2b receive discards unexpected Update Bearer PCO,
+  non-S2b-U Create/Update Bearer F-TEIDs, and SGW-only Create/Update/Delete
+  Bearer control entries before typed decoding. Mandatory fields, TLIV framing,
+  strict sender validation and Create Bearer PCO compatibility are preserved.
+  Raw-preserving encoding retains the received bytes. Fixes #1441.
+
+- `opc-session-store`: cancelled current-snapshot admission retains publication
+  exclusion, the namespace lease and shutdown ownership through descriptor
+  opening, verification, metadata reads and rewind in both Dynamic and Fixed
+  profiles. Snapshot bytes, integrity checks and operation deadlines are
+  unchanged. Refs #1371.
+
+- `opc-proto-pfcp`: align Cause codes, UE IP Address flags and IPv6 prefix
+  fields, and F-TEID CHOOSE encoding with TS 29.244. Reject inconsistent
+  address flags and encoder fields while preserving the required tolerance
+  for unknown trailing extension octets. (#1512, #1513, #1514)
+
+- `opc-proto-nas`: interpret unused received registration type 0 as initial
+  registration and retain its raw octet for forwarding. Accept all defined
+  algorithm identifiers in the codec while the crypto providers continue to
+  reject unimplemented algorithms. (#1515, #1526)
+
+- `opc-proto-nas`: accept framed extensions and non-critical unknown IEs at all
+  validation levels unless an explicit rejection policy is selected. Preserve
+  raw table-driven extensions while exposing the known value prefix, and trim
+  excess authentication value/padding bytes consistently. (#1255)
+
+- `opc-proto-pfcp`: accept parameter-only/empty modifications, references to
+  existing rules in modification deltas, source-interface-only PDIs and FO
+  bundles; ignore received header spares. Enforce mandatory identities,
+  conflicting PDI fields and Apply Action combinations. Preserve assigned
+  unmodelled IEs under every unknown-IE policy and correct clause diagnostics.
+  (#1359, #1516, #1518, #1519, #1522, #1523, #1524, #1525)
+
+- `opc-proto-pfcp`: accept the original one-octet Apply Action and extended
+  IP Node IDs, permit Update FAR deltas without unchanged forwarding fields,
+  reject empty-family UE IP Address values and reserved Cause zero on encode,
+  clear typed spare bits, and enforce DFRT only with FORW in the profile.
+  (#1512, #1513, #1519, #1524)
+
+- `opc-sctp`: add explicit SHA-256-first SCTP-AUTH preference with the
+  mandatory SHA-1 fallback. Verify endpoint preference before association
+  setup and association-specific local chunk requirements after connect/accept.
+  Expose local chunk readback; retain ordinary/default transport behavior.
+  Linux accepted-socket HMAC defaults are not treated as negotiated policy.
+  (#1351)
+
+- Update Tokio to 1.53.3 for RUSTSEC-2026-0386. SCTP and timer registrations
+  consume owned descriptors through one narrow boundary that prevents replacing
+  them while registered. Boot-time timers transfer ownership without descriptor
+  duplication. The session-store runtime remains exactly pinned and retains its
+  queue, cancellation and shutdown ownership contracts. (#1532)
+
+- `opc-diameter-transport`: receive protected Diameter application records on
+  any negotiated SCTP stream, including unordered delivery, in sequential and
+  concurrent connections. Add `send_message_on_stream`; preserve ordered
+  stream-zero DTLS control, exact-generation admission and bounded record
+  correlation. (#1351)
+
+- Update vendored DTLS P-256/P-384/ECDSA dependencies above the
+  RUSTSEC-2026-0387 arithmetic floor and its standalone `time` dependency
+  above RUSTSEC-2026-0009. OS randomness failures propagate as errors;
+  uncompressed public points and wire signature formats remain unchanged.
+  The vendored minimum Rust version becomes 1.88, below the SDK's 1.89 floor.
+
+- Keep RSA client certificates and FFDHE groups out of default ECDSA-only
+  DTLS server/client policy. Explicit RSA authentication and legacy DHE remain
+  available through the configured allowlists. Refs #1353.
+- Abort malformed fixed Diameter framing on both cleartext DTLS/SCTP prelude
+  roles, and expose wire-abort authority to unprotected Diameter parsers.
+  Native regressions require COMM_LOST and retain graceful-close controls.
+  Refs #1351.
+- Remove the accepted RUSTSEC-2026-0386/0387 ignores after the owned Tokio
+  registration and vendored RustCrypto upgrades. Retain the audit of every
+  tracked lockfile and reject the former crypto-bigint 0.5.5 exception.
+
+### Changed
+
+- `opc-persist`: the retained configuration admission encoding now includes a
+  permanent intent and completion witness. Crossing this format boundary
+  requires a fresh installation. The Linux filesystem must support `O_TMPFILE`,
+  atomic hard links, file/directory synchronization and `flock`; procfs is also
+  required. Use `begin_resume_config_authority` or
+  `begin_resume_config_member_repair` for interrupted binding-based requests.
+  Explicit request IDs use the transaction provision/resume/reopen APIs and
+  must be retained independently of the destination database. Refs #1114.
+
+- `opc-proto-gtpv2c`: correct ARP capability and vulnerability wire polarity.
+  The public booleans mean "may pre-empt" and "may be pre-empted"; `true` now
+  maps to a clear PCI/PVI bit, as TS 29.212 requires. Callers that compensated
+  for the old inversion must remove that compensation. Priority levels remain
+  literal 1..=15; `cmp_priority` compares importance with level 1 highest.
+  Fixes #1354.
+
+- **Breaking — fresh install:** `opc-session-net` session cluster identity, consensus
+  node IDs and the configuration digest are installation-qualified. Every
+  `SessionReplicationManifest` constructor now requires the persisted non-zero
+  32-byte installation nonce; the consensus cluster ID derives through
+  `ConsensusClusterId::for_installation`, node IDs derive from that qualified
+  identity, and the configuration digest advances to
+  `opc-session-net/configuration/v2` with the nonce committed. The same
+  human-readable cluster name under a fresh nonce is a distinct authority
+  domain: retained session/consensus stores, scope identities and voter-slot
+  tables from an earlier installation are refused with typed
+  identity/replacement errors instead of joining the new installation. No
+  migration is provided; consumers must generate and persist the nonce with the
+  immutable manifest at first install, and changing it on existing storage is a
+  fresh installation. `opc-consensus` now reports
+  `ConsensusIdentityError::InvalidInstallationNonce` for a zero nonce passed to
+  `ConsensusClusterId::for_installation`. Qualification node manifests and their
+  rendered readiness probes derive the same installation-qualified voter IDs.
+  Refs #1187.
+
+- `opc-proto-nas`: optional-element decoding now selects the first occurrence
+  even when `DuplicateIePolicy::Last` is requested. `Reject` remains an explicit
+  diagnostic policy. This follows TS 24.501 §7.6.3, which is mandatory for the
+  UE and recommended for the network. (#1255)
+
+- `opc-proto-nas`: canonical Registration Request/Accept encoding uses typed
+  registration fields; set `EncodeContext::raw_preserving` to forward the
+  original octet or result LV. Canonical sending rejects an out-of-range ngKSI
+  and clears the Registration Accept spare bit. (#1515)
+
+- Strict SVID loading rejects a present EKU unless it contains both clientAuth
+  and serverAuth. TLS 1.2 compatibility now requires Extended Master Secret,
+  including management `TlsBootstrap::with_tls12_compat`; peers omitting EMS
+  are refused. `DiameterTlsPolicy::version()` reports the minimum admitted
+  version. The added `DiameterTlsPolicyError::CipherVersionMismatch` is a
+  source break for downstream exhaustive matches. Refs #1353.
+- Vendored DTLS signature capabilities include modern RSA schemes. Server
+  CertificateRequest types/schemes and CertificateVerify acceptance follow
+  configured cipher families, preserving ECDSA-only default client
+  authentication in the SDK. ClientHello suite offers no longer depend on
+  the client certificate's signing key. Refs #1353.
+
 ### Breaking
+
+- `opc-proto-ikev2`: added `Ikev2SaInitResponse::Redirect`,
+  `Ikev2SaInitInitiatorError::InvalidRedirect` and
+  `Ikev2SaInitNotifyBuildError::InvalidRedirect` to previously exhaustive public
+  enums. Those three enums are now `#[non_exhaustive]`; downstream matches
+  require a wildcard arm. `admit_ike_sa_init_response` now rejects REDIRECT
+  mixed into a success or other retry response. Alongside SA/KE/Nr it
+  previously remained in the accepted notification collection; alongside
+  COOKIE, INVALID_KE_PAYLOAD or NO_PROPOSAL_CHOSEN that retry was previously
+  returned. A standalone, nonce-correlated REDIRECT tolerates either responder
+  SPI value as for other no-SA outcomes in RFC 7296 §2.6; builders still emit zero.
+
+- `opc-ipsec-xfrm`: remove the unused `esp_dummy_payload` plaintext builder,
+  which never shipped in a release.
+  Use `EspTfcDummySender` to transmit through an existing kernel ESP SA;
+  the kernel retains encryption, sequence allocation and lifetime ownership.
+  (#1344)
+
+- `opc-proto-ikev2`: added variants to the exhaustive DH, PRF, encryption,
+  signature-method, signature-public-key and key-error enums require downstream matches to
+  be updated.
+  Persist explicit liveness metadata with every atomic window row; missing or
+  unknown format fields must be rejected. Crossing this stored-record change
+  requires a fresh install. Refs #1241, #1352.
+
+- `opc-gtpu-dataplane`: `GtpuControlDatagram::{local,peer}` and
+  `GtpuControlSendPlan::{source,destination}` now return `SocketAddr` to
+  support IPv6. Callers matching IPv4-only tuples must handle both families.
+  `opc-gtpu-ebpf-common::n3_downlink_psc_matches` now takes a four-byte prefix
+  to inspect BSSI/TTNBI when PPP is set. (#341, #1520)
+
+- `opc-gtpu-dataplane`: initialize the new
+  `GtpPdpContext::downlink_peer_source_policy` field with
+  `GtpuPeerSourcePolicy::BackendDefault` to preserve existing backend behavior.
+  `TeidAndLocal` enables eBPF multi-homing while retaining other packet and
+  ownership checks. Grouped/N3 entries expose `with_peer_source_policy`.
+  The opt-in has versioned, persistent encodings; default bytes stay unchanged.
+  Linux GTP rejects the explicit policy because netlink cannot retain it. (#1347)
+
+- GTP-U recognizes short/long PDCP and opaque RAN extension formats and adds
+  `GtpuTypedExtension` encode/decode. `is_supported_by_codec` reports format
+  support; generic `Reject` retains the endpoint comprehension boundary and
+  refuses required RAN/PDCP formats. `Preserve`/`Drop` still decode these formats. The comprehension scan and
+  `ProcedureAware` decode reject malformed fixed-width headers (0x03, 0x20,
+  0x40, 0x82, 0xC0) with `InvalidLength`. N3 retains its PSC-only endpoint profile. (#1529)
+
+- GTP-U adds typed Tunnel Status, its SPOC information element, and a separate
+  dataplane `TunnelStatus` classification. Exhaustive matches must handle the
+  new variants; unsupported consumers should ignore the message. (#1530)
+
+- `opc-proto-gtpu`: network control receive always skips unexpected IEs,
+  uses the first singleton occurrence, and treats unknown TLV `Reject` as
+  `Drop`, as required by TS 29.060 11.1.9–11.1.12. Framing, ordering and
+  resource bounds still apply to ignored elements. (#1517, #1521, #1528)
+
+- `opc-session-store`: format-five session stores now require the roster witness
+  from initialization. Stores created by earlier pre-release builds without the
+  witness are refused as corrupt and must be reinitialized. Formats up to four
+  retain their existing empty-witness recovery behavior. Refs #1307.
+- `opc-proto-ikev2` recovery supports negotiated RFC 7383 fragmentation. Exchange
+  records retain ordered `Ikev2ProtectedMessage` packet collections; callers
+  must persist and replay every `packets()` entry. Single-packet accessors now
+  return a `Result`. Persist the explicit `fragmentation` option when rebuilding
+  window records; the strict test consumer row format is version 4. Negotiated
+  consumers use `receive_peer_packet`, with bounded reassembly, scheduled expiry,
+  and authenticated fragment-1 response replay. (#1242)
+
+- `opc-session-store`: deterministic V1/V2 creates for keys with no retained
+  history use the store's published absent-key floor. Observe before preparing
+  and re-observe after a create-time `StaleFence`. The native and memory-only
+  fake backends keep an exact epoch window of recently retired keys and accept
+  exactly the current or previous absent floor after Async recovery. Fresh-zero
+  remains valid through epoch 1 without an Async recovery boundary.
+  Rotation occurs at 32,768 retirements or earlier when dead history exhausts
+  key capacity. Every rotation strictly raises the published floor and records
+  its trigger; an absent-key preparation survives one rotation and receives a
+  no-effect `StaleFence` after two. Rotation happens only inside the committing
+  command, after all batch children.
+  Application replication entries carry required producer-selected replay policy
+  independently of mutation shape: expiry cleanup, dead-key retirement, recovery
+  floor, capacity decisions, internal capacity and bounded command framing.
+  V2 replay preserves unrelated expired rows as native does, including
+  single-effect and cached-child batches. Explicit recovery transitions carry
+  the source floor and exact cursor predecessor. Portable snapshots, conversion
+  and rebuild preserve the policy; unsupported standalone replay policies are
+  refused atomically. Native portable images identify their policy profile even
+  at genesis. Missing policy is rejected, JSON mutations use `effects`, and peers
+  require matching schemas. Release replay preserves physical lease expiry and
+  the committed guard deadline separately. Coalesced delivery preserves each
+  notification's committed cursor across recovery boundaries, and watches accept
+  inclusive recovery resume cursors. Replay cleanup and lease checks use the
+  committed entry time. Local in-memory lease operations enforce recovered
+  authority floors. SQLite transition batches state their actual command framing;
+  replay validates continuations across reopen and rebuild. The non-journal
+  in-memory batch profile retains its existing write allowance. Operation and
+  lifetime bounds remain unchanged.
+
+- `opc-session-store`: native notification and ordinary-key retirement add committed replay
+  floors to roots `OPCNR003` (Durable) and `OPCNA005` (Async). Crossing this
+  storage boundary requires a fresh installation. Native stores created by
+  earlier pre-release builds are refused with `FreshInstallationRequired` and
+  must be reinitialized; there is no in-place migration.
+
+- `opc-gtpu-dataplane`: the pinned family-tagged grouped-session ABI advances
+  to schema marker `OPC-GROUP-IP-v7`. Family-tagged entries gain the versioned
+  opt-in downlink inner MTU profile (version 3, the 2-byte field at
+  bytes 73..74, byte 75 reserved); the
+  entry still occupies 80 bytes, but an old decoder rejects the new profile as
+  non-canonical. A retained version-6 graph is therefore refused and needs a
+  fresh attachment, and downgrading to an SDK that predates version 7 likewise
+  refuses the newer marker. Crossing schema generations requires a fresh
+  installation; no in-place migration is provided. Refs #1007.
+
+- `opc-proto-ngap`: `Pdu`, `PduKind`, `Message` and borrowed `ProtocolIe`
+  no longer implement cloning or equality over opaque key-bearing bytes.
+  `Pdu.raw`, unknown message bodies and decoded IE values use redacted
+  `SensitiveBytes` owners that clear storage on drop. `messages` exposes owned
+  containers with uniform `u16` IE identifiers and `Criticality`, replacing the
+  generated containers. Use borrowed bytes and explicit reconstruction instead
+  of cloning. `opc-sctp::InboundMessage` likewise loses cloning and equality;
+  its payload retains the `Bytes` API with wiping ownership through N2 handoff
+  and the final shared reference. Outbound message diagnostics expose payload
+  length only. Refs #1262.
+
+- `opc-proto-ngap`: uplink/downlink transport `address()` now returns
+  `TransportLayerAddress`, preserving IPv4, IPv6 or both addresses from a
+  160-bit NGAP value. Existing `new(IpAddr, teid)` constructors remain; use
+  `with_address` for combined values and match the address variant before
+  selecting a destination. Setup and Modify tunnel codecs preserve both
+  families in TS 38.414 order, including nested additional tunnels. Refs #1357.
+
+- `opc-session-net`: `StartupError` adds `BootRefused(BootRefusalReason)` for an
+  authenticated issuer refusal of one exact candidate boot attempt. It is
+  distinct from retryable `Unavailable`/`AuthTimeUnavailable` results and grants
+  no authority; downstream exhaustive matches must handle the new variant.
+  Refs #1245.
+- `opc-gtpu-dataplane`: the pinned TFT schema advances to
+  `OPC-TFT-IPv4-v6`. The `GTPU_TFT_DROP` per-CPU counter map widens from three
+  to four slots for the new fragment-affinity capacity counter, so its pinned
+  map definition changes even though the graph still has 35 maps. A retained
+  version-5 TFT graph (including its three-slot counter map) is refused and
+  needs a fresh attachment, exactly like every earlier pinned-ABI generation;
+  no in-place migration or packet continuity is provided. Downstream code that
+  enumerated `TftFragmentDisposition` exhaustively must handle the new capacity
+  outcome: `TftFragmentDisposition` is now `#[non_exhaustive]`, while the
+  already-`#[non_exhaustive]` `TftUplinkDropReason` gains the additive
+  `CapacityExhausted` variant. Refs #1087.
+
+- `opc-gtpu-dataplane`: `GtpPdpContext.peer_teid` is now `PeerTeid`, a new
+  public peer/outgoing-TEID type that admits the TS 29.281 section 5.1 all-zero
+  value; `Teid` remains the strictly nonzero local/received TEID type and its
+  `new(0) -> None` contract is unchanged. `ReceivedN3UplinkTnl::new` and
+  `ReceivedN3UplinkTnl::teid` now use `PeerTeid`. Its constructor accepts
+  either `PeerTeid` or an existing nonzero `Teid`. Construct peer values with
+  `PeerTeid::new`, `PeerTeid::ZERO`, or `PeerTeid::from(teid)`; `Teid` remains
+  for `local_teid` and every selector/map key. Downstream code that assigned a
+  `Teid` to `peer_teid` must convert or construct a `PeerTeid`. Refs #1346.
+- `opc-ipsec-xfrm`: `SaParameters` and `SaState` add a public
+  `tfc_pad: Option<u32>` field for Linux Traffic Flow Confidentiality padding.
+  Callers constructing either struct with a literal must add `tfc_pad: None`;
+  SAs that do not configure TFC emit byte-identical netlink and report `None`
+  on readback, so no installed-state behaviour changes. Downstream exhaustive
+  struct literals must be updated. Refs #1344.
+
+- `opc-session-net`: `StartupError` adds `PlatformInvalid`,
+  `PlatformChanged`, and `PrerequisiteRefused`. Issuer probe and retained-session
+  revalidation now preserve an invalid or changed installed
+  platform observation and a definitively refused discovery/key-set
+  prerequisite instead of collapsing them into retryable `Unavailable`;
+  transient reads and transport failures remain `Unavailable`. This is an
+  error-classification change only: no read absence, closed connection or
+  refusal becomes authority, evidence a worker ended, or an authenticated boot
+  refusal. Resource-version-only changes require re-probing the same boot.
+  Failed or cancelled key refreshes preserve their failure classification
+  through the shared one-second throttle and recover on a later successful
+  refresh. Downstream exhaustive matches must handle the new variants.
+  Refs #1246.
+
+- `opc-key`: add fieldless `KeyError::OperationFailed` and `ProviderUnusable`,
+  and the exhaustive positive-verdict predicate. Only `NotFound` and actual
+  key revocation/ciphertext rejection are definitive; every custody state and
+  unknown failure retains data. Custody now preserves positive `OperationFailed`
+  distinctly, and generic provider failures change from
+  `CustodyOperation(ProviderOperationFailed)` to `ProviderUnusable`. The SDK no
+  longer produces `ProviderOperationFailed` while converting provider errors.
+  JSON KMS `status: "error"` now requires exact `reason: "key_not_found"`,
+  `"key_revoked"`, or `"ciphertext_rejected"` (decrypt only) for a verdict.
+  Neither an `error` without a recognized reason nor any free-form `not found`
+  substring authorizes cleanup. Older providers lose precision until upgraded,
+  never retained data. Exact `status: "unavailable"` remains outage backpressure.
+  Newly rejected endpoint forms accepted by released versions are relative
+  `unix://` paths, `unix://\0` abstract sockets, repeated TCP/Unix prefixes and
+  existing non-socket paths. Refs #1197.
+- `opc-crypto`: add `ProviderUnavailable`, `ProviderUnusable` and `KeyRejected`
+  to `CryptoError` and `ConfigCapacityError`. Non-verdict provider failures no
+  longer become generic encryption/decryption rejection. Positive provider
+  verdicts use `KeyRejected`; local `EncryptionFailed` alone does not establish
+  rejected stored data. Callers use `CryptoError::is_definitive_rejection()`;
+  both enums remain non-exhaustive. `EncryptionFailureKind` and
+  `CryptoError::encryption_failure_kind()` expose the exhaustive classification
+  used for encryption diagnostics. Refs #1197.
+- `opc-session-store`: the new unreleased `KeyProviderUnavailable` variant keeps
+  its serialized position. Non-verdict key/custody failures and malformed remote
+  sealing responses return `BackendUnavailable`; positive key/data rejection
+  remains `Crypto`. Custom backend outages receive ambiguous mutation handling
+  in `opc-session-net`, including legacy preflight. No session wire positions
+  change. Refs #1197.
+- `opc-config-bus`: non-verdict provider failures change from `Crypto` to
+  `Unavailable`, so configuration watches retry instead of returning terminal
+  `ConfigWatchError::Integrity`. Unavailable dependencies and coarse failed or
+  unresolved commits use `ConfigApplyFailed` alarms; rollback retains a
+  `StorageCorruption` cause only when the original store error supplies positive
+  data evidence. Idempotency and retained-history unavailability return
+  `PersistFailed`; startup rollback preserves an already Critical source code
+  and otherwise retains its Critical recovery fence. Missing or revoked active
+  keys on new writes return `Unavailable`, without claiming
+  stored data damage. Coarse state-machine, recovery and startup task failures
+  use `ConfigApplyFailed`. Runtime append, reconciliation and recovery-marker
+  cleanup retain the source store code. Rejected stored JSON and metadata retain
+  `Crypto`; all store codes at startup rollback parent reads, appends and
+  marker clears retain Critical severity. Non-corruption codes retain
+  `ConfigApplyFailed`. A later read outage
+  does not replace stored-data evidence from an earlier append failure. Alarm
+  severity and recovery fencing remain intact.
+  Refs #1197.
+- `opc-persist`: checkpoint reopen/read-back provider failures change from
+  `Rejected` to `Unavailable`, preserving the checkpoint. Sealing and provisioning
+  also report repairable provider faults. Provisioning after storage preparation
+  retains its existing `Indeterminate` outcome. Config-history reads distinguish
+  rejected bytes (including SQLite corruption) from read outages at the storage
+  boundary, preserving the first read failure across transaction completion.
+  Missing mandatory authority rows remain corruption; missing live tables in
+  standalone stores are permanent invariant failures rather than retryable
+  outages. Consensus schema rejection remains corruption. Plain commits
+  refused by an initialized required-audit policy report a local conflict;
+  existing persisted rejection classes retain their meanings.
+  Refs #1197.
+- `opc-key-vault`: configuration/authentication, malformed-response and TLS
+  verification failures use `ProviderUnusable` and avoid transient retries.
+  Truncated response bodies retain outage retries except after successful
+  rotation responses: a truncated 2xx body is reported without replaying the
+  already-applied rotation POST. Rotation preserves
+  `Unavailable` versus `ProviderUnusable` instead of returning `RotationFailed`.
+  Outages, throttling and peer TLS internal errors remain `Unavailable`.
+  HTTP error messages cannot establish key or ciphertext rejection. Refs #1197.
+- `opc-session-store` and `opc-session-net`: protected-roster activation now
+  binds the admission capacity policy, and authenticated admissions distinguish
+  ordinary and emergency work. Crossing this storage boundary requires a fresh
+  installation; old activation authority and snapshots are refused.
+  Completed rosters no longer consume a fixed count quota. Ordinary admissions
+  wait on conclusive live or byte capacity pressure within their original
+  authority deadline (expiry reports `AuthorityRejected`); emergency admissions
+  bypass those policy limits while
+  preserving exact accounting and authority checks. Terminal evidence retains
+  its existing 24-hour recovery policy. Activation also binds bounded
+  retirement before newer reclaim work, so sustained arrivals cannot starve
+  tombstone removal. (#1307)
+- `opc-session-store`: protected-roster activation now requires a versioned
+  witness that retains the maximum original admission fence across V1/V2
+  terminal retirement. An absent V2 recovery above that maximum remains
+  conclusively missing after unrelated history retires; at or below it remains
+  inconclusive. Activation, cold reconstruction and snapshot replacement reject
+  missing, unsupported or regressed witness state. Crossing this stored-format
+  boundary requires a fresh installation. Automatic history-unavailable
+  discharge is not provided by this change. Refs #1306.
 
 - `opc-proto-diameter`: `DiameterRequestFailure` adds `RoutePolicy` and
   `DiameterRequestClassificationError` adds `RoutePolicyRequiresProxiableRequest`;
@@ -148,7 +1048,169 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   identifier. `PlainMm::decode_body` and `decode_mm_message_body` can now return
   an error for Configuration Update Command/Complete bodies.
 
+- `opc-proto-pfcp`: correct the `UeIpAddress` wire model. Remove `ipv4d`,
+  `ipv4_prefix_length`, and `ch` from struct literals; use `ipv6d` with
+  `ipv6_prefix_delegation_bits` for delegation and `ip6pl` with
+  `ipv6_prefix_length` for an explicit IPv6 prefix length. `CauseValue` adds
+  named acceptance and rejection variants; exhaustive matches must handle
+  them. See the crate's conformance migration notes. (#1512, #1513)
+
+- `opc-proto-nas`: add the defined SNPN/disaster-roaming registration types,
+  NIA/NEA identifiers 4–7, and twelve NSSAA/relay/service-level-authentication/
+  remote-UE message names. Exhaustive matches must handle the new variants.
+  Naming algorithms does not make them available for cryptography. (#1515,
+  #1526, #1527)
+
+- `opc-proto-pfcp`: require Node ID in establishment/release builders and UP
+  F-SEID for successful establishment responses. Add node/session-set message
+  names, `ApplyAction.fssm`/`mbsu`, `UserPlaneInactivityTimer` and a profile
+  combination-error variant. See crate migration notes. (#1359, #1516, #1524)
+
+- `opc-proto-pfcp`: `IeType` adds Node Report Type, User Plane Inactivity Timer
+  and PFCP Session Change Info. Exhaustive matches must handle these variants.
+  (#1516, #1518)
+
+- `opc-libsctp-sys::AddressFamily` adds `Ipv6DualStack`; exhaustive matches
+  must handle it. `opc-sctp` selects it for mixed IPv4/IPv6 static multihoming
+  sets and preserves each set's port, wildcard and count limits. IPv4-mapped
+  notifications reconcile with native IPv4 paths without losing port/scope
+  checks. Existing single-family socket policy is retained. (#1351)
+
+- `opc-peer-discovery`: DNS stale reuse is bounded (one day by default,
+  configurable with `with_stale_limit`). Authoritative negatives and service
+  withdrawals clear prior positive data; zero-TTL responses are not cached.
+  Oversized validated TC replies trigger TCP fallback; TCP connections are
+  reused and closed after one second idle. The bounded reuse window is an
+  explicit RFC 7766 idle-close deviation; EDNS keepalive is not negotiated.
+  Address queries reject invalid
+  host labels while SRV/S-NAPTR owners retain underscore support. (#1355, #1360)
+
+- `opc-proto-diameter::apps::rf` encodes Subscription-Id and PS-Information
+  inside Service-Information. Replace `multiple_services_credit_controls`,
+  `MultipleServicesCreditControl`, and `UsedServiceUnit` with
+  `PsInformation::service_data_containers` and `ServiceDataContainer`.
+  Supply separate uplink/downlink counts and elapsed time; there is no Rf
+  total-octet field. The former top-level charging groups are rejected when
+  mandatory. SGSN/GGSN address constants are now `AVP_SGSN_ADDRESS` (1228)
+  and `AVP_GGSN_ADDRESS` (847); Charging-Id/PDP-Type require M set under
+  TS 32.299 §7.2.0. Replace optional `sgsn_address`/`ggsn_address` fields with
+  the repeatable `sgsn_addresses`/`ggsn_addresses` vectors. The dictionary
+  admits repeated subscription IDs, address AVPs and usage containers. (#1361)
+
+- `opc-sbi` adds `SbiAuthError::InsufficientScope` (403); invalid credentials
+  return 401 with Bearer challenges and verifier failures return 503.
+  Errors use `application/problem+json`. The client requires negotiated `h2`
+  for TLS, validates URI/transport agreement, uses port 80 for plaintext,
+  and counts only transport/5xx failures toward circuit opening. Message
+  priorities 0–31 are accepted; the NSSF name is `nnssf-nsselection`. (#1362)
+
+- `opc-sbi` servers with an auth policy require `with_auth_service` configuration
+  for each API's trusted URI realm and required scopes. Challenges include the
+  API realm on 401/403 and scopes on 403; request Host headers cannot supply
+  those values. TLS clients accept IPv6-literal URI hosts. (#1362)
+
+- NRF registration/discovery now use standard JSON and query parameters.
+  `NfProfile` uses generated PLMN/S-NSSAI wrappers and `NfService` objects;
+  `DiscoveryQuery`/`CacheKey` require `requester_nf_type` and discovery results
+  carry `valid_for`. Server freshness caps stale reuse. Generated NRF models
+  omit absent optional fields and preserve digit-prefixed enum wire names.
+  A refresh failure rechecks expiry and invalidation before stale fallback.
+  Registration and heartbeats retain the negotiated interval when a response
+  omits `heartBeatTimer`. `NfStatus` is now the generated extensible enum;
+  handle `CanaryRelease`/`Other(String)` and use `Clone` instead of `Copy`.
+  The SMF event-exposure service is `nsmf-event-exposure`.
+  See `opc-sbi/README.md` for migration details. (#1362)
+
+- `opc-sbi` offers explicit `SbiTokenProfile::NrfAccessToken` validation for
+  TS 29.510 UUID subjects and optional `nbf`, retaining signature, issuer,
+  audience, expiry, scope and transport-peer binding. JWT-SVID remains the
+  default. Configure both trusted producer recipients with `with_nrf_audience`:
+  a scalar NF type or an array containing the local instance UUID is accepted.
+  JWT-SVID's audience policy stays separate. NRF mode never accepts mock-token
+  bypasses. (#1362)
+
+- `opc-yanggen`: `SchemaNode` retains optional `mandatory`, `min_elements`,
+  and `max_elements` fields. Initialize them explicitly or use
+  `..SchemaNode::default()` in Rust literals. Source ingestion rejects invalid
+  cardinality statements, and generated configuration validation enforces
+  required leaves and list bounds. Effective constraints enter the schema
+  digest. Partial patches and individual delta replay validate supplied scalar
+  values and uniqueness while deferring whole-config cardinality until commit.
+  (#1363)
+
+- Generated NETCONF edits distinguish `DataExists` and `DataMissing` for leaves,
+  containers, keyed lists and leaf-list entries. Handle the two new
+  `NetconfEditError` variants and regenerate bindings; `remove` remains
+  idempotent for absent data. (#1363)
+
+- gNMI ON_CHANGE and TARGET_DEFINED configuration streams report deleted
+  nodes. Redundant suppression emits only changed leaves; heartbeats retain
+  full refreshes. Partial notifications no longer assert complete atomic
+  subtree replacement. The malformed-subscription metric test retains its
+  complete RPC assertions in a separate process to isolate global counters.
+  (#1363)
+
+- `opc-yanggen`/`opc-mgmt-schema`: decimal64 carries mandatory `fraction_digits`
+  metadata and uses exact signed coefficients instead of floats. Generated
+  `YangDecimal64<F>` values are constructed with `"1.23".parse()` or
+  `YangDecimal64::<2>::from_scaled(123)`; `.scaled()` replaces float-field access.
+  Regenerate bindings and update `TypeRef::Decimal64`/`LeafType::Decimal64`
+  literals. `SubtreeScalar::Decimal` takes a validated `Decimal64` value.
+  Precision overflow, exponents, NaN, infinity and JSON numbers are rejected;
+  serialized decimals are canonical strings. Decimal list keys, leafrefs,
+  defaults and NETCONF edits preserve exact values. NETCONF `trim` omits values
+  equal to their defaults even when explicitly configured. (#1363)
+
 ### Added
+
+- `opc-session-net`: `scope::PlatformAuthenticationTimeSource` is the supported
+  production source for RFC 026 authentication freshness. It serializes paired,
+  read-only `clock_adjtime(CLOCK_REALTIME)` observations and uses the returned
+  atomic realtime instant. Its conservative symmetric bound includes maximum and
+  estimated error, precision, quantization, oscillator tolerance and sampling
+  elapsed time. Unknown, malformed, faulted or changing synchronization state,
+  an ambiguous leap second and over-budget bounds fail closed. Observed loss and
+  recovery increment the generation once; query failures do not forge recovery.
+  The default maximum remains 1 s and an explicit deployment budget stays fixed.
+  Refusal warnings report only reason changes, with one recovery event. Clock
+  failures and automatic recovery leave authority, receipts and held effects
+  unchanged. Linux requires a maintained kernel time estimate (chrony `rtcsync`)
+  and permission for the unprivileged read-only syscall. Refs #1244.
+
+- `opc-linux-clock-sys`: the narrow ADR 0017 unsafe boundary exposes a complete
+  raw realtime snapshot from one read-only `clock_adjtime(CLOCK_REALTIME)` call,
+  preserving signed error, precision and tolerance fields. Existing adjustment
+  accessors remain; synchronization classification also rejects unknown states,
+  `TIME_OOP` and kernel/PPS faults. Unsupported platforms fail explicitly with
+  no wall-clock fallback. Refs #1244.
+
+- `opc-gtpu-dataplane`: expose `control_port::GtpuControlPort::downlink_readiness`,
+  an SDK-owned readiness source for the backend-owned downlink queues. The
+  returned `GtpuControlReadiness` owns a private epoll instance in which the
+  port's UDP/2152, UDP/2153 and UDP/2154 sockets are registered; its `AsFd`
+  descriptor is that epoll instance, never a receive socket, so a consumer can
+  wait with `epoll(7)` or `tokio::io::unix::AsyncFd` instead of polling and
+  cannot read, close, duplicate or use it to bypass attachment invalidation.
+  Readiness is advisory: it consumes no datagram and does not change the
+  existing bounded service order (shared queue first for eight datagrams, then
+  the alternating hand-off queues). Attachment removal, replacement, fencing,
+  readback failure and backend loss permanently signal a private eventfd,
+  waking idle consumers to observe `Unavailable` without a polling timer.
+  Standalone sockets without a downlink consumer keep `Unsupported`. Refs #1021.
+
+- `opc-gtpu-dataplane`: expose IPv4 uplink FAR misses by passed and dropped
+  outcome, retaining `uplink_far_misses` as their sum. Reserved counter slots
+  preserve the map layout; forwarding behavior is unchanged. The public
+  `EbpfGtpuDatapathCounters` remains exhaustive: out-of-crate struct literals
+  and exhaustive destructurings must add `uplink_far_misses_passed` and
+  `uplink_far_misses_dropped`. When adopting a pre-split counter pin, the public
+  total starts from the new outcome slots; earlier raw-slot history cannot be
+  attributed to either outcome. (#1184)
+
+- `opc-session-net`: prepared V2 handles expose value-free failure diagnostics:
+  an extensible setup/send/reply stage and the remaining original caller budget.
+  Execution outcomes, receipt ownership and release rules are unchanged.
+  Refs #1129.
 
 - `opc-identity`: `WorkloadIdentity::from_cert_der_at` accepts an explicit
   verification time for certificate validity checks while preserving SPIFFE ID,
@@ -902,6 +1964,85 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- `opc-session-store`: retain exact fences for recently deleted and expired
+  in-memory keys through the current and previous retirement epochs, then reclaim
+  their rows below the previous published floor, preserving live authority and rejecting
+  stale credentials through request staging, ordered replay and rebuild.
+  Expired guards for retired missing keys retain `LeaseExpired`; a tracked
+  newer owner retains `StaleFence` priority. The
+  opaque transition-receipt lifetime remains unchanged; safe receipt deletion
+  still needs a caller-bound retry epoch or expiry. The receipt part of #1257
+  remains open.
+- `opc-session-store`: retain ordinary dead keys in a committed two-epoch window.
+  Rotation strictly advances the absent-key floor; deterministic acquisition of
+  a missing key accepts exactly the current or previous floor after Async recovery.
+  Retained rows keep their exact fence, preserving live credentials and rejecting stale credentials after
+  retirement and re-creation. Native checkpoints and portable snapshots retain
+  the namespace floor. Scope child and claim history retain their separate
+  lifecycles, and pure `FencedTransitionV2` traffic does not trigger the global
+  expiry prune. Those parts of #1252 remain open.
+
+- `opc-session-store`: retain ordinary request outcomes until a caller-bound
+  retry-lifetime contract permits safe deletion. Leader-assigned proposal time
+  cannot distinguish an old retry from new work; consumer binding and operation
+  outcomes retain their existing status semantics. #1251 remains open.
+
+- `opc-session-store`: native replay retains the latest 65,536 notifications
+  instead of accumulating every notification until the lifetime item limit.
+  Checkpoints, portable snapshots and restart preserve the committed floor;
+  older cursors return `ReplicationLogCursorCompacted`. (#1250)
+
+- `opc-gtpu-dataplane`: measured End Marker and redirect-delivery timeouts now
+  report redirect deltas, iteration, counters, tentative IPv6 addresses, and
+  neighbour/route state, including failed diagnostic reads. Packet counts and
+  measurement deadlines are unchanged. (#1188)
+
+- `opc-session-store`: run functional lease and late-CAS readback observations
+  with their logical-time supervisors on controlled clocks. Preserve the
+  original timeout, fencing and exactly-once assertions, reproduce stalled
+  runtimes, and verify the exact acquire deadline and rejection of expired
+  queued reads. (#1308, #1211)
+
+- `opc-session-net`: prepared V2 receipt handles can recover after a transient
+  local journal preflight failure by checking the exact original binding on
+  the next status call. Local failures still return immediately, and retries
+  cannot adopt a substituted row or restore mutation authority. (#1378)
+
+- `opc-session-store`: explicitly release WAL root locks when opening fails or
+  the writer exits, so duplicated descriptors cannot block a successor after
+  the owning store has released the root. (#1366)
+
+- `opc-session-store`: bound mixed business, roster and log verification journals
+  across checkpoints and cold replay without changing the 128 MiB process cap.
+  Pre-publication pressure waits preserve consumer progress, retirement hints
+  cover mixed receipt bindings, and waits require meaningful relief with a
+  fixed total bound. Recovery validates journal chunks and selects a fully
+  audited compact base before reopening. (#1130)
+
+- `opc-session-store`: compact native Durable and Async generation files in the
+  background while ordinary delta checkpoints continue. Selected suffix frames
+  retain canonical continuity and byte comparison through ordinary authenticated
+  reads. Durable CURRENT precedes reclaim; pinned readers remain valid, and
+  bounded background relocation never gates checkpoint start. Each build attempt
+  serializes its base once and authenticates synced readback. Old-file headroom
+  is the ceiling minus the selected cut's extent, including a trigger-crossing
+  frame; it supplies designed, recoverable admission backpressure, warned at 3/4. Async
+  waits before projection/reservation and excludes guard-only time from journal
+  pressure. Overflowing candidates are discarded before append and retried only
+  with cut progress. Capacity-only recovery can select a fully validated newer
+  pending-cut base without another delta. If even that base exceeds the existing
+  ceiling, admission remains held until internal retirement frees space.
+  Installation waits before claiming its application gate during that recovery
+  and yields an unarmed claim if capacity appears during drain. Resource waits
+  retry after memory refunds, and authenticated pressure journals can drain
+  without a new cut or repeated base encoding. Cancellation does not retry in
+  I/O adapters; shutdown and cancellation wake background owners. This allows
+  committed retirement to finish; shutdown interrupts the wait without
+  selecting partial state. Admission of client deletes while live data is at
+  capacity remains an open resident-state policy decision. This improves on
+  backlog's stop at the ceiling regardless of live-data size. No format, bound,
+  deadline, acknowledgement or authentication changes. Fixes #1253.
+
 - Go operators now require Go 1.26.10 for the `crypto/x509` fix GO-2026-6809.
 
 - `opc-session-store`: keep async SQLite worker deadlines on the caller's
@@ -1072,10 +2213,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - `opc-session-store` and `opc-persist`: add `shutdown_unplanned()` for an
   embedder with a failed replication listener. It fences admission, suppresses
-  leadership handoff, and retains clone-wide, cancellation-safe engine and
-  storage drain with the original caller bounds and native reopen-proof checks.
-  Config bus adapters expose the same lifecycle through their consensus store.
-  Planned shutdown keeps automatic bounded handoff. (#1370)
+  new handoff preparation, and cancels and joins an outstanding preparation
+  before the same clone-wide, cancellation-safe engine and storage drain with
+  the original caller bounds and native reopen-proof checks. Handoff RPCs
+  already dispatched cannot be retracted, so a successor may already be
+  campaigning; the retained report uses `PlannedShutdownFallback::Unplanned`
+  and does not certify a successor. Config bus adapters expose the same lifecycle
+  through their consensus store. Planned shutdown keeps automatic bounded
+  handoff. `opc-consensus` gains the non-breaking
+  `PlannedShutdownFallback::Unplanned` variant. (#1370, #1376)
 - `opc-proto-ikev2`: CREATE_CHILD_SA request/response construction, dedicated-bearer
   response decoding and correlation, and NWu creation responses validate the
   KE public-value width for the supplied DH group, including 96 octets for group 1.
@@ -1374,7 +2520,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   snapshot export, install, and restart without accumulating the full log history.
   Native persistence uses new root and generation formats; existing native roots
   require a fresh installation and are refused with `FreshInstallationRequired`.
-  Generation-file ceilings remain until file rollover is implemented. Refs #1249.
+  File rollover (#1253) now compacts generation files before the append-history
+  ceilings. Refs #1249.
 
 - `opc-ipsec-xfrm`: publish terminal composite and single-object staged-install
   ownership together with runner completion, so a fresh plan observed at
@@ -8588,7 +9735,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   coverage verifies strategy fields are persisted correctly on a real
   API server.
 - `opc-proto-ngap` (experimental v0): NGAP (3GPP TS 38.413) codec built on
-  `rasn` per ADR 0013 Option A. NGAP-PDU framing for all three outcome
+  `rasn` per ADR 0013's native Rust ASN.1 strategy. NGAP-PDU framing for all
+  three outcome
   classes with outcome-aware dispatch, typed APER decoding of
   NGSetupRequest (field-level external `asn1c`/libngap fixture) and
   InitialUEMessage, and raw-preserving encode so decode->encode

@@ -85,25 +85,112 @@ jobs:
           esac
           report="${RUNNER_TEMP}/gitleaks-report.json"
           log="${RUNNER_TEMP}/gitleaks.log"
-          status=0
-          # Exit 2 means findings. Any other non-zero status means the scan did not complete.
-          # gitleaks colours its log lines unless NO_COLOR is set, also when stderr is a file.
-          NO_COLOR=1 gitleaks detect --source . --redact --no-banner --exit-code 2 \
-            --report-format json --report-path "$report" --log-opts "$log_opts" 2> "$log" || status=$?
-          cat "$log" >&2
-          # gitleaks 8.30.1 exits 0 when its git log fails; it only logs the failure.
-          # A clean result has the scanner's "no leaks found" line and no error line.
-          if [[ "$status" -eq 0 ]]; then
-            if grep -q -E '^[^ ]+ (ERR|FTL) ' "$log"; then
-              echo "::error::The scanner logged an error; this is not a clean result."
-              status=1
-            elif ! grep -q -E '^[^ ]+ INF no leaks found$' "$log"; then
-              echo "::error::The scanner did not log \"no leaks found\"; this is not a clean result."
-              status=1
+          finding_reports=()
+          scan_pass() {
+            local pass_opts="$1" pass_report="$2" pass_log="$3" pass_status=0
+            rm -f -- "$pass_report" || return $?
+            # Exit 2 means findings. Any other non-zero status is an incomplete scan.
+            NO_COLOR=1 gitleaks detect --source . --redact --no-banner --exit-code 2 \
+              --report-format json --report-path "$pass_report" --log-opts "$pass_opts" \
+              2> "$pass_log" || pass_status=$?
+            cat "$pass_log" >&2 || return $?
+            # 8.30.1 can exit 0 after git log fails. Require its clean-result line.
+            if [[ "$pass_status" -eq 0 ]]; then
+              if grep -q -E '^[^ ]+ (ERR|FTL) ' "$pass_log"; then
+                echo "::error::The scanner logged an error; this is not a clean result."
+                pass_status=1
+              elif ! grep -q -E '^[^ ]+ INF no leaks found$' "$pass_log"; then
+                echo "::error::The scanner did not log \"no leaks found\"; this is not a clean result."
+                pass_status=1
+              fi
             fi
+            if [[ "$pass_status" -eq 2 ]]; then
+              finding_reports+=("$pass_report")
+            fi
+            return "$pass_status"
+          }
+
+          # Keep the ordinary walk and its original-commit ignore fingerprints.
+          status=0
+          scan_pass "$log_opts" "$report" "$log" || status=$?
+          if [[ "$status" -ne 0 && "$status" -ne 2 ]]; then
+            exit "$status"
           fi
+
+          # A clean automatic merge contains no resolution edits. Its parent
+          # additions were already scanned, so do not give them new fingerprints.
+          # Walk every merge, including nested merges on side branches.
+          read -r -a log_args <<< "$log_opts"
+          git rev-list --merges "${log_args[@]}" > "${RUNNER_TEMP}/gitleaks-merges.txt"
+          selected_merges=()
+          while read -r merge; do
+            merge_metadata="$(git show --no-patch --format='%T %P' "$merge")"
+            read -r -a metadata <<< "$merge_metadata"
+            if [[ "${#metadata[@]}" -eq 3 ]]; then
+              merge_status=0
+              git merge-tree --write-tree --allow-unrelated-histories \
+                "${metadata[1]}" "${metadata[2]}" \
+                > "${RUNNER_TEMP}/gitleaks-auto-merge.txt" \
+                2> "${RUNNER_TEMP}/gitleaks-auto-merge.log" || merge_status=$?
+              cat "${RUNNER_TEMP}/gitleaks-auto-merge.log" >&2
+              if [[ "$merge_status" -ne 0 && "$merge_status" -ne 1 ]]; then
+                echo "::error::Cannot classify merge ${merge}: git merge-tree exited ${merge_status}."
+                exit 1
+              fi
+              IFS= read -r automatic_tree < "${RUNNER_TEMP}/gitleaks-auto-merge.txt" || {
+                echo "::error::Cannot classify merge ${merge}: missing automatic tree."
+                exit 1
+              }
+              if [[ ! "$automatic_tree" =~ ^([0-9a-f]{40}|[0-9a-f]{64})$ ]]; then
+                echo "::error::Cannot classify merge ${merge}: invalid automatic tree."
+                exit 1
+              fi
+              if [[ "$merge_status" -eq 0 && "$automatic_tree" == "${metadata[0]}" ]]; then
+                continue
+              fi
+            elif [[ "${#metadata[@]}" -lt 4 ]]; then
+              echo "::error::Cannot classify merge ${merge}: missing parents."
+              exit 1
+            fi
+            # Always scan conflicts, edited automatic merges, and octopus merges.
+            selected_merges+=("$merge")
+          done < "${RUNNER_TEMP}/gitleaks-merges.txt"
+
+          # Bound argv size without dropping a commit. Each selected merge is
+          # scanned once; --no-walk prevents rescanning its ordinary ancestors.
+          for ((offset=0; offset<${#selected_merges[@]}; offset+=512)); do
+            batch=("${selected_merges[@]:offset:512}")
+            merge_scan_status=0
+            echo "Secret scan merge-resolution batch $((offset / 512 + 1))" >&2
+            scan_pass "--diff-merges=first-parent --no-walk ${batch[*]}" \
+              "${RUNNER_TEMP}/gitleaks-merge-${offset}.json" \
+              "${RUNNER_TEMP}/gitleaks-merge-${offset}.log" || merge_scan_status=$?
+            if [[ "$merge_scan_status" -ne 0 && "$merge_scan_status" -ne 2 ]]; then
+              exit "$merge_scan_status"
+            elif [[ "$merge_scan_status" -eq 2 ]]; then
+              status=2
+            fi
+          done
+
+          # Keep one complete report/count, including when ordinary commits leak.
+          # A pass rejected above never publishes a misleading partial count.
           if [[ "$status" -eq 2 ]]; then
-            count="$(python3 -c 'import json, sys; print(len(json.load(open(sys.argv[1]))))' "$report")"
+            count="$(python3 - "$report" "${finding_reports[@]}" <<'PY'
+          import json
+          import sys
+
+          findings = []
+          for path in sys.argv[2:]:
+              with open(path) as source:
+                  report = json.load(source)
+              if not isinstance(report, list):
+                  raise ValueError('scanner report is not a JSON array')
+              findings.extend(report)
+          with open(sys.argv[1], 'w') as output:
+              json.dump(findings, output)
+          print(len(findings))
+          PY
+            )"
             echo "findings=${count}" >> "$GITHUB_OUTPUT"
           fi
           exit "$status"
@@ -169,7 +256,60 @@ jobs:
         run: cargo install cargo-audit --locked
 
       - name: Run cargo audit
-        run: cargo audit --db "${RUNNER_TEMP}/cargo-advisory-db" --deny warnings
+        run: |
+          python3 - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+          import re
+          import subprocess
+          import tomllib
+
+          root = Path.cwd().resolve()
+          registry = "registry+https://github.com/rust-lang/crates.io-index"
+
+          def fail(lockfile, detail):
+              raise SystemExit(f"{lockfile}: {detail}")
+
+          def stable_version(value):
+              match = re.fullmatch(r"(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(?:\+[0-9A-Za-z.-]+)?", value)
+              return tuple(map(int, match.groups())) if match else None
+
+          # Library consumers resolve from the manifest, not this repository's lock.
+          ike = root / "crates/opc-proto-ikev2/Cargo.toml"
+          requirement = tomllib.loads(ike.read_text())["dependencies"]["crypto-bigint"]["version"]
+          floor = stable_version(requirement)
+          if floor is None or floor < (0, 7, 6):
+              fail(ike, "crypto-bigint must require a patched stable release (>= 0.7.6)")
+
+          tracked = subprocess.check_output(["git", "ls-files", "-z", "--", "Cargo.lock", "**/Cargo.lock",
+                                             ":(exclude)ci/fixtures/**"])
+          lockfiles = [Path(os.fsdecode(name)) for name in tracked.split(b"\0") if name]
+          if not lockfiles or Path("Cargo.lock") not in lockfiles:
+              raise SystemExit("no tracked root Cargo.lock to audit")
+          database = str(Path(os.environ["RUNNER_TEMP"]) / "cargo-advisory-db")
+          for index, lockfile in enumerate(lockfiles):
+              lock = tomllib.loads(lockfile.read_text())
+              for package in lock["package"]:
+                  if package["name"] != "crypto-bigint":
+                      continue
+                  version = stable_version(package["version"])
+                  if package.get("source") != registry:
+                      fail(lockfile, "crypto-bigint must use the reviewed registry source")
+                  if version is None or version < (0, 7, 6):
+                      fail(lockfile, f"RUSTSEC-2026-0387 is not accepted for crypto-bigint {package['version']}")
+              manifest = str(lockfile.with_name("Cargo.toml"))
+              subprocess.run(["cargo", "fetch", "--locked", "--manifest-path", manifest], check=True)
+              json.loads(subprocess.check_output([
+                  "cargo", "metadata", "--locked", "--offline", "--all-features", "--format-version", "1",
+                  "--manifest-path", manifest,
+              ]))
+              command = ["cargo", "audit", "--db", database, "--deny", "warnings", "--file", str(lockfile)]
+              if index:
+                  command.append("--no-fetch")
+              subprocess.run(command, check=True)
+          print(f"Audited {len(lockfiles)} tracked Cargo lockfiles; all crypto-bigint versions require the patched floor.")
+          PY
 
   cargo-deny:
     name: cargo-deny

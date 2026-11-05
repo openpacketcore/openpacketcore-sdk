@@ -209,7 +209,12 @@ fn ordinary_random_ivs(module: &CountingModule) {
                 assert_eq!(after[2], before[2], "ordinary CBC performs no PRF/KDF");
                 assert_eq!(after[4] - before[4], 1, "one encrypt, no inverse check");
                 assert_eq!(
-                    &record.outbound().unwrap().request()[32..48],
+                    &record
+                        .outbound()
+                        .unwrap()
+                        .request()
+                        .single_packet()
+                        .unwrap()[32..48],
                     &[iv_byte; 16]
                 );
                 drop(prepared);
@@ -217,8 +222,13 @@ fn ordinary_random_ivs(module: &CountingModule) {
                     .reconcile(profile, &f.keys, &record, &f.epoch)
                     .unwrap();
                 assert_eq!(
-                    window.replay_request().unwrap().unwrap().bytes(),
-                    record.outbound().unwrap().request()
+                    window.replay_request().unwrap().unwrap().bytes().unwrap(),
+                    record
+                        .outbound()
+                        .unwrap()
+                        .request()
+                        .single_packet()
+                        .unwrap()
                 );
                 assert_eq!(
                     f.restore(&record).record(),

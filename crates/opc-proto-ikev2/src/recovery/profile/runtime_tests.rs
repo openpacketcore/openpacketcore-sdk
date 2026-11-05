@@ -114,7 +114,12 @@ fn cbc_restore_and_readback_reject_every_immutable_epoch_change() {
                         &Domain::from_cbc_epoch(&epoch),
                         changed_profile,
                         &keys,
-                        record.outbound().unwrap().request(),
+                        record
+                            .outbound()
+                            .unwrap()
+                            .request()
+                            .single_packet()
+                            .unwrap(),
                         false
                     )
                     .is_ok());
@@ -159,13 +164,20 @@ fn cbc_ordinary_roundtrip_replay_and_restore_all_profiles_both_directions() {
             let stored = prepared.record().clone();
             let commit = prepared.commit_after_durable(&stored).unwrap();
             assert_eq!(sender.apply_committed(commit).unwrap(), None);
-            let request = sender.replay_request().unwrap().unwrap().bytes().to_vec();
+            let request = sender
+                .replay_request()
+                .unwrap()
+                .unwrap()
+                .bytes()
+                .unwrap()
+                .to_vec();
             assert_eq!(
                 a.restore(&stored)
                     .replay_request()
                     .unwrap()
                     .unwrap()
-                    .bytes(),
+                    .bytes()
+                    .unwrap(),
                 request
             );
             let opened = receiver.open_peer(profile, &b.keys, &request).unwrap();
@@ -188,12 +200,18 @@ fn cbc_ordinary_roundtrip_replay_and_restore_all_profiles_both_directions() {
                 receiver.apply_committed(commit).unwrap(),
                 Some(Bytes::from_static(b"result"))
             );
-            let response = receiver.replay_response(&opened).unwrap().bytes().to_vec();
+            let response = receiver
+                .replay_response(&opened)
+                .unwrap()
+                .bytes()
+                .unwrap()
+                .to_vec();
             assert_eq!(
                 b.restore(&received)
                     .replay_response(&opened)
                     .unwrap()
-                    .bytes(),
+                    .bytes()
+                    .unwrap(),
                 response
             );
             let opened_response = sender.open_peer(profile, &a.keys, &response).unwrap();

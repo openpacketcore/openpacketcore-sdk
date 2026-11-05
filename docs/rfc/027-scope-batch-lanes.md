@@ -21,10 +21,10 @@ The batch coordinator consumes `ScopeNamespace` and `ScopeAuthorityStamp`; it
 creates no authority, clock dependency or timeout-based ownership. Admission,
 process closure and retirement follow RFC 022. Coherent paged scans, scheduling
 and authenticated transport retain their own contracts.
-Stable scope binds the configured name-derived cluster identity from
-`ConsensusClusterId::new`; voter replacement changes neither worker authority
-nor lane identity. Reusing the cluster name reuses that identity; a separate
-installation-qualified identity is deferred to SDK #1187.
+Stable scope binds the installation-qualified cluster identity from
+`ConsensusClusterId::for_installation`; voter replacement within an installation
+changes neither worker authority nor lane identity. A fresh installation nonce
+creates a distinct identity even when the cluster name is reused.
 This proposal chooses bounded per-lane receipts over a global serialization
 point or an unbounded request journal.
 

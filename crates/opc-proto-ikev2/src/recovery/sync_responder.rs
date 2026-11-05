@@ -82,6 +82,8 @@ impl<P: RecoveryProfile> Window<P> {
         pending: Option<&Pending>,
         pending_inbound: Option<&Ordinary<P>>,
     ) -> Result<Ikev2AdmittedSyncResponse<'_, P>, Error> {
+        self.send.check_terminal()?;
+        self.fragments.ready()?;
         if self.quiescent {
             return Err(Error::CommitUncertain);
         }
@@ -110,10 +112,10 @@ impl<P: RecoveryProfile> Window<P> {
         let pending = durable_pending.as_ref().or(pending);
         let opened = sync_packet::open_request(&self.record.domain, profile, keys, wire)?;
         let mut counters = Counters::new(
-            self.record.next_send.unwrap_or(u32::MAX),
+            self.next_send().unwrap_or(u32::MAX),
             self.next_receive().unwrap_or(u32::MAX),
         );
-        counters.highest_local_request = state.highest_local_request;
+        counters.highest_local_request = state.highest_local_request.max(self.send.highest_probe());
         counters.highest_peer_request = state
             .highest_peer_request
             .max(self.observed_peer_request.get());
@@ -159,6 +161,7 @@ impl<P: RecoveryProfile> Window<P> {
             Disposition::Continue
         };
         let mut record = self.record.clone();
+        self.fold_live_send(&mut record);
         record.generation = record.generation.checked_add(1).ok_or(Error::Exhausted)?;
         P::retain_local_evidence(self, &mut record)?;
         record.next_send = Some(next.next_send);
@@ -278,6 +281,9 @@ impl<P: RecoveryProfile> Ikev2PreparedSyncResponse<'_, P> {
         self.window.witness = None;
         let disposition = self.record.sync.ok_or(Error::InvalidRecord)?.disposition;
         self.window.record = self.record;
+        self.window.send.adopt(&self.window.record, true);
+        self.window.fragments.cutover();
+        self.window.packet_evidence = P::SyncEvidence::default();
         self.window.observed_peer_request.set(None);
         self.window.quiescent = false;
         self.window.adopt_receive_boundary()?;

@@ -444,22 +444,23 @@ pub struct EbpfGtpuDatapathCounters {
     /// together on a healthy uplink, and the second stops while the first keeps
     /// rising when the outer destination becomes unreachable.
     pub uplink_encapsulated: u64,
-    /// Uplink packets for which no usable FAR was found.
-    ///
-    /// The datapath's own re-emitted outer frames are excluded. Their source
-    /// is the local S2b-U address rather than a UE PAA, so before the redirect
-    /// outcome was recognized this counter rose once per *successfully
-    /// delivered* uplink IPv4 packet and read a healthy uplink as session-state
-    /// corruption.
-    ///
-    /// That is the whole of the change. This is still a miss counter for every
-    /// mark-zero IPv4 frame leaving the S2b-U attachment whose source is not a
-    /// provisioned UE PAA, so locally originated traffic from that host still
-    /// lands here -- GTP-U echo and error indication among it, which the
-    /// re-entry check deliberately excludes from
-    /// [`Self::uplink_redirects_resolved`] by message type. A nonzero value is
-    /// a prompt to look, not by itself proof of session-state corruption.
+    /// Compatibility total of IPv4 FAR misses, equal to the saturating sum of
+    /// [`Self::uplink_far_misses_passed`] and [`Self::uplink_far_misses_dropped`].
+    /// The datapath's own re-emitted outer frames are excluded.
     pub uplink_far_misses: u64,
+    /// IPv4 FAR misses passed unencapsulated because the full packet mark is
+    /// zero, regardless of origin. Locally sent GTP-U Echo and Error Indication
+    /// datagrams can raise this counter during healthy operation.
+    pub uplink_far_misses_passed: u64,
+    /// IPv4 packets dropped for a missing nonzero-mark FAR or marked owner.
+    ///
+    /// This is not a count of every uplink drop. Grouped selector/graph failures,
+    /// malformed packets, reserved schema sources, invalid FAR/DSCP/commit/PDR/
+    /// binding state, mismatched or inactive marked owners, MTU rejection, and
+    /// encapsulation/redirect failures do not count here. The MTU counters report
+    /// their respective drops separately. A zero value does not prove that all
+    /// uplink packets forwarded successfully.
+    pub uplink_far_misses_dropped: u64,
     /// Downlink G-PDUs successfully decapsulated.
     pub downlink_decapsulated: u64,
     /// Downlink G-PDUs dropped because their TEID was unknown.
@@ -2909,7 +2910,8 @@ fn grouped_entry_to_ebpf(entry: &GtpuSessionEntry) -> Option<EbpfSessionEntry> {
         context.egress_dscp.map(crate::DscpCodepoint::get),
         context.downlink_source_port_policy,
         context.uplink_source_port_policy,
-    )?;
+    )?
+    .with_peer_source_policy(context.downlink_peer_source_policy);
     match entry.n3_qfi() {
         Some(qfi) => encoded.with_n3_qfi(qfi.get()),
         None => Some(encoded),
@@ -2945,13 +2947,20 @@ fn grouped_model_from_record(
         let Some(entry) = record.entry(family) else {
             continue;
         };
+        // The ordinary IPv6 path shares this wire layout, but the grouped
+        // API does not support its MTU policy. Never erase retained policy
+        // while projecting an authority record into the grouped model.
+        if entry.downlink_inner_mtu().is_some() {
+            return None;
+        }
         let mark = u32::from_be_bytes(entry.bearer_mark());
         let context = GtpPdpContext {
             local_teid: Teid::new(u32::from_be_bytes(entry.local_teid()))?,
-            peer_teid: Teid::new(u32::from_be_bytes(entry.peer_teid()))?,
+            peer_teid: crate::PeerTeid::new(u32::from_be_bytes(entry.peer_teid())),
             ms_address: ip_address(entry.inner_paa().canonical_address()),
             peer_address: ip_address(entry.peer_outer_address()),
             link_ifindex: device.ifindex,
+            downlink_peer_source_policy: entry.peer_source_policy(),
             downlink_source_port_policy: entry.downlink_source_port_policy(),
             gtp_version: GtpVersion::V1,
             bearer_mark: if mark == 0 {
@@ -3048,8 +3057,6 @@ impl fmt::Debug for GroupedObservation {
             .finish()
     }
 }
-
-const SELECTOR_OPERATION_STAMP_VERSION: u8 = 1;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum SelectorOperationStampPhase {
@@ -3259,108 +3266,57 @@ impl SelectorOperationStamp {
     }
 
     fn encode(self) -> [u8; GTPU_SESSION_SELECTOR_STAMP_VALUE_LEN] {
-        let mut output = [0_u8; GTPU_SESSION_SELECTOR_STAMP_VALUE_LEN];
-        output[0] = SELECTOR_OPERATION_STAMP_VERSION;
-        output[1] = self.phase as u8;
-        output[2] = self.operation as u8;
-        output[3] = self.outcome as u8;
-        output[8..16].copy_from_slice(&self.selector_generation.to_be_bytes());
-        output[16..32].copy_from_slice(&self.nonce);
-        output[32..48].copy_from_slice(&self.backend_epoch);
-        output[48..64].copy_from_slice(&self.transaction_id);
-        output[64..96].copy_from_slice(&self.namespace_binding);
-        output[96..128].copy_from_slice(&self.group_commitment);
-        output[128..160].copy_from_slice(&self.set_commitment);
-        output[160..192].copy_from_slice(&self.desired_commitment);
-        output[192..200].copy_from_slice(&self.dataplane_generation.to_be_bytes());
-        output
+        crate::selector_adapter_codec::encode_stamp_parts(
+            crate::selector_adapter_codec::StampParts {
+                phase: self.phase as u8,
+                operation: self.operation as u8,
+                outcome: self.outcome as u8,
+                selector_generation: self.selector_generation,
+                nonce: self.nonce,
+                backend_epoch: self.backend_epoch,
+                transaction_id: self.transaction_id,
+                namespace_binding: self.namespace_binding,
+                group_commitment: self.group_commitment,
+                set_commitment: self.set_commitment,
+                desired_commitment: self.desired_commitment,
+                dataplane_generation: self.dataplane_generation,
+            },
+        )
     }
 
     fn decode(value: &[u8; GTPU_SESSION_SELECTOR_STAMP_VALUE_LEN]) -> Option<Self> {
-        if value[0] != SELECTOR_OPERATION_STAMP_VERSION
-            || value[4..8] != [0; 4]
-            || value[200..208] != [0; 8]
-        {
-            return None;
-        }
-        let phase = match value[1] {
+        let parts = crate::selector_adapter_codec::decode_stamp_parts(value)?;
+        let phase = match parts.phase {
             1 => SelectorOperationStampPhase::Installing,
             2 => SelectorOperationStampPhase::Active,
             3 => SelectorOperationStampPhase::Retiring,
             4 => SelectorOperationStampPhase::Retired,
             _ => return None,
         };
-        let operation = match value[2] {
+        let operation = match parts.operation {
             1 => SelectorOperationStampKind::Install,
             2 => SelectorOperationStampKind::Remove,
             _ => return None,
         };
-        let outcome = match value[3] {
+        let outcome = match parts.outcome {
             1 => SelectorOperationStampOutcome::Pending,
             2 => SelectorOperationStampOutcome::Active,
             3 => SelectorOperationStampOutcome::Absent,
             _ => return None,
         };
-        let selector_generation = u64::from_be_bytes(value[8..16].try_into().ok()?);
-        let dataplane_generation = u64::from_be_bytes(value[192..200].try_into().ok()?);
-        let nonce = value[16..32].try_into().ok()?;
-        let backend_epoch = value[32..48].try_into().ok()?;
-        let transaction_id = value[48..64].try_into().ok()?;
-        let namespace_binding = value[64..96].try_into().ok()?;
-        let group_commitment = value[96..128].try_into().ok()?;
-        let set_commitment = value[128..160].try_into().ok()?;
-        let desired_commitment = value[160..192].try_into().ok()?;
-        if selector_generation == 0
-            || dataplane_generation == 0
-            || nonce == [0; 16]
-            || backend_epoch == [0; 16]
-            || namespace_binding == [0; 32]
-            || group_commitment == [0; 32]
-            || set_commitment == [0; 32]
-            || desired_commitment == [0; 32]
-        {
-            return None;
-        }
-        match (phase, operation, outcome, transaction_id == [0; 16]) {
-            (
-                SelectorOperationStampPhase::Installing,
-                SelectorOperationStampKind::Install,
-                SelectorOperationStampOutcome::Pending,
-                false,
-            )
-            | (
-                SelectorOperationStampPhase::Active,
-                SelectorOperationStampKind::Install,
-                SelectorOperationStampOutcome::Active,
-                true,
-            )
-            | (
-                SelectorOperationStampPhase::Retiring,
-                SelectorOperationStampKind::Remove,
-                SelectorOperationStampOutcome::Pending,
-                false,
-            )
-            | (
-                SelectorOperationStampPhase::Retired,
-                SelectorOperationStampKind::Remove,
-                SelectorOperationStampOutcome::Absent,
-                true,
-            ) => {}
-            _ => return None,
-        }
         Some(Self {
             phase,
             operation,
             outcome,
-            selector_generation,
-            nonce,
-            backend_epoch,
-            transaction_id,
-            namespace_binding,
-            group_commitment,
-            set_commitment,
-            desired_commitment,
-            dataplane_generation,
+            selector_generation: parts.selector_generation,
+            nonce: parts.nonce,
+            backend_epoch: parts.backend_epoch,
+            transaction_id: parts.transaction_id,
+            namespace_binding: parts.namespace_binding,
+            group_commitment: parts.group_commitment,
+            set_commitment: parts.set_commitment,
+            desired_commitment: parts.desired_commitment,
+            dataplane_generation: parts.dataplane_generation,
         })
     }
 
@@ -3879,6 +3835,17 @@ struct ResolvedCurrentSuccessorTarget {
 const MAX_TRAFFIC_PROOF_ATTEMPTS: usize = 256;
 const MAX_TRAFFIC_PROOF_DRAIN_BATCH: usize = MAX_RETAINED_EVENTS;
 const TRAFFIC_OBSERVATION_SEQUENCE_WINDOW: u64 = MAX_RETAINED_EVENTS as u64;
+
+/// Shared admission and renewal guard for the bounded live-attempt table.
+const fn traffic_attempt_capacity_available(current: usize) -> bool {
+    current < MAX_TRAFFIC_PROOF_ATTEMPTS
+}
+
+/// A full drain batch must report overflow rather than silently truncate.
+#[cfg(any(target_os = "linux", test))]
+const fn traffic_observation_batch_full(record_count: usize, budget: usize) -> bool {
+    record_count >= budget
+}
 
 /// Bounded, attachment-wide replay detector for one production observation
 /// source incarnation.
@@ -8920,9 +8887,7 @@ impl EbpfGtpuDataplaneBackend {
             .downlink_binding_get(ifindex, local_teid)?;
         let far_is_owned = far.is_none_or(|value| {
             let value = UplinkFar::decode(&value);
-            value.peer_ip != [0; 4]
-                && value.local_ip == commit.uplink_far().local_ip
-                && value.o_teid != [0; 4]
+            value.peer_ip != [0; 4] && value.local_ip == commit.uplink_far().local_ip
         });
         let binding_is_owned = binding.is_none_or(|value| {
             let value = DownlinkEndpointBinding::decode(&value);
@@ -11207,13 +11172,14 @@ impl EbpfGtpuDataplaneBackend {
         let uplink_source_port_policy = commit.uplink_source_port_policy();
         let downlink_inner_mtu = commit_downlink_inner_mtu(commit).ok_or_else(indeterminate)?;
         let local_teid = Teid::new(u32::from_be_bytes(local_teid)).ok_or_else(indeterminate)?;
-        let peer_teid = Teid::new(u32::from_be_bytes(far.o_teid)).ok_or_else(indeterminate)?;
+        let peer_teid = crate::PeerTeid::new(u32::from_be_bytes(far.o_teid));
         Ok(GtpPdpContext {
             local_teid,
             peer_teid,
             ms_address: IpAddr::V4(Ipv4Addr::from(pdr.ue_ip)),
             peer_address: IpAddr::V4(Ipv4Addr::from(far.peer_ip)),
             link_ifindex: ifindex,
+            downlink_peer_source_policy: binding.peer_source_policy(),
             downlink_source_port_policy: binding.source_port_policy(),
             gtp_version: GtpVersion::V1,
             bearer_mark: None,
@@ -11286,8 +11252,7 @@ impl EbpfGtpuDataplaneBackend {
         }
         let local_teid =
             Teid::new(u32::from_be_bytes(owner.local_teid)).ok_or_else(indeterminate)?;
-        let peer_teid =
-            Teid::new(u32::from_be_bytes(owner.uplink_far.o_teid)).ok_or_else(indeterminate)?;
+        let peer_teid = crate::PeerTeid::new(u32::from_be_bytes(owner.uplink_far.o_teid));
         let bearer_mark =
             GtpBearerMark::new(u32::from_be_bytes(key.bearer_mark)).ok_or_else(indeterminate)?;
         let egress_dscp = match owner.egress_dscp() {
@@ -11314,6 +11279,7 @@ impl EbpfGtpuDataplaneBackend {
             ms_address: IpAddr::V4(Ipv4Addr::from(key.ue_ip)),
             peer_address: IpAddr::V4(Ipv4Addr::from(owner.uplink_far.peer_ip)),
             link_ifindex: ifindex,
+            downlink_peer_source_policy: owner.downlink_binding.peer_source_policy(),
             downlink_source_port_policy: owner.downlink_binding.source_port_policy(),
             gtp_version: GtpVersion::V1,
             bearer_mark: Some(bearer_mark),
@@ -11833,6 +11799,7 @@ impl EbpfGtpuDataplaneBackend {
             request.link_ifindex,
             request.downlink_source_port_policy,
         )
+        .map(|endpoint| endpoint.with_peer_source_policy(request.downlink_peer_source_policy))
         .ok_or_else(|| {
             GtpuError::invalid_config(
                 "pdp.downlink_endpoint",
@@ -13523,7 +13490,7 @@ impl EbpfGtpuDataplaneBackend {
                     operation: "ebpf_traffic_renewal_predecessor",
                 });
             }
-            if attempts.len() >= MAX_TRAFFIC_PROOF_ATTEMPTS {
+            if !traffic_attempt_capacity_available(attempts.len()) {
                 return Err(GtpuError::StateIndeterminate {
                     operation: "ebpf_traffic_capacity",
                 });
@@ -13630,7 +13597,8 @@ impl EbpfGtpuDataplaneBackend {
             });
         }
         let mut attempts = self.traffic_attempts()?;
-        if attempts.len() == MAX_TRAFFIC_PROOF_ATTEMPTS || attempts.contains_key(&attempt_id) {
+        if !traffic_attempt_capacity_available(attempts.len()) || attempts.contains_key(&attempt_id)
+        {
             return Err(GtpuError::StateIndeterminate {
                 operation: "ebpf_traffic_capacity",
             });
@@ -15920,7 +15888,11 @@ fn encode_downlink_endpoint(
         endpoint.ingress_ifindex(),
         endpoint.source_port_policy(),
     )
-    .map(DownlinkEndpointBinding::encode)
+    .map(|binding| {
+        binding
+            .with_peer_source_policy(endpoint.peer_source_policy())
+            .encode()
+    })
     .ok_or_else(|| {
         GtpuError::invalid_config(
             "pdp.downlink_endpoint",
@@ -16275,8 +16247,8 @@ mod aya_runtime {
         COUNTER_DL_BINDING_PEER_MISMATCH, COUNTER_DL_BINDING_SOURCE_PORT_MISMATCH,
         COUNTER_DL_DECAP, COUNTER_DL_DST_MISMATCH, COUNTER_DL_MALFORMED,
         COUNTER_DL_MISSING_CONSUMER, COUNTER_DL_UNKNOWN_TEID, COUNTER_SLOTS, COUNTER_UL_ENCAP,
-        COUNTER_UL_FAR_MISS, COUNTER_UL_MTU_REJECT, COUNTER_UL_PMTU_CORRUPT,
-        COUNTER_UL_REDIRECT_RESOLVED, DOWNLINK_BINDING_COUNTER_SLOTS,
+        COUNTER_UL_FAR_MISS_DROPPED, COUNTER_UL_FAR_MISS_PASSED, COUNTER_UL_MTU_REJECT,
+        COUNTER_UL_PMTU_CORRUPT, COUNTER_UL_REDIRECT_RESOLVED, DOWNLINK_BINDING_COUNTER_SLOTS,
         DOWNLINK_ENDPOINT_BINDING_VALUE_LEN, DOWNLINK_PDR_VALUE_LEN, GTPU_SESSION_CONFIG_KEY,
         GTPU_SESSION_CONFIG_VALUE_LEN, GTPU_SESSION_DOWNLINK_KEY_LEN, GTPU_SESSION_GROUP_ID_LEN,
         GTPU_SESSION_GROUP_REF_LEN, GTPU_SESSION_GROUP_VALUE_LEN, GTPU_SESSION_SCHEMA_MARKER_LEN,
@@ -17163,7 +17135,10 @@ mod aya_runtime {
             map_type: bpf_map_type::BPF_MAP_TYPE_PERCPU_ARRAY as u32,
             key_size: 4,
             value_size: 8,
-            max_entries: TFT_CLASSIFIER_COUNTER_SLOTS,
+            // Frozen pre-selector generation: its counter map has three slots.
+            // Never follow the current constant here; the frozen map definition
+            // is historical recognition authority.
+            max_entries: 3,
         },
     ];
 
@@ -27916,6 +27891,9 @@ mod aya_runtime {
         ) -> Result<(u64, u64), GtpuError> {
             let stat = rustix::fs::statat(pin, leaf, rustix::fs::AtFlags::SYMLINK_NOFOLLOW)
                 .map_err(|error| GtpuError::io(operation, error.into()))?;
+            // Linux stat link counts differ in width between architectures.
+            #[allow(clippy::useless_conversion)]
+            let nlink = u64::from(stat.st_nlink);
             if !historical_25_pin_leaf_is_exact(
                 rustix::fs::FileType::from_raw_mode(stat.st_mode).is_file(),
                 stat.st_uid,
@@ -27923,7 +27901,7 @@ mod aya_runtime {
                 rustix::process::geteuid().as_raw(),
                 rustix::process::getegid().as_raw(),
                 stat.st_mode,
-                stat.st_nlink,
+                nlink,
             ) {
                 return Err(state_indeterminate(operation));
             }
@@ -32775,10 +32753,7 @@ mod aya_runtime {
                     match far.get(&ue_ip, 0) {
                         Ok(value) => {
                             let value = UplinkFar::decode(&value);
-                            if value.local_ip != local_ip
-                                || value.peer_ip == [0; 4]
-                                || value.o_teid == [0; 4]
-                            {
+                            if value.local_ip != local_ip || value.peer_ip == [0; 4] {
                                 return Err(invalid());
                             }
                         }
@@ -32847,10 +32822,7 @@ mod aya_runtime {
                     match marked_far.get(&selector, 0) {
                         Ok(value) => {
                             let value = UplinkFar::decode(&value);
-                            if value.local_ip != local_ip
-                                || value.peer_ip == [0; 4]
-                                || value.o_teid == [0; 4]
-                            {
+                            if value.local_ip != local_ip || value.peer_ip == [0; 4] {
                                 return Err(invalid());
                             }
                         }
@@ -33143,7 +33115,7 @@ mod aya_runtime {
                 };
                 let transitional_resources_owned = far.is_none_or(|value| {
                     let value = UplinkFar::decode(&value);
-                    value.local_ip == local_ip && value.peer_ip != [0; 4] && value.o_teid != [0; 4]
+                    value.local_ip == local_ip && value.peer_ip != [0; 4]
                 }) && dscp.is_none_or(|value| value[0] <= 63)
                     && pdr.is_none_or(|value| value == expected_pdr)
                     && binding.is_none_or(|value| {
@@ -49208,7 +49180,9 @@ mod aya_runtime {
                 let mut records = Vec::with_capacity(budget);
                 let mut overflowed = false;
                 while let Some(item) = ring.next() {
-                    if item.len() != GTPU_TRAFFIC_OBSERVATION_EVENT_LEN || records.len() == budget {
+                    if item.len() != GTPU_TRAFFIC_OBSERVATION_EVENT_LEN
+                        || super::traffic_observation_batch_full(records.len(), budget)
+                    {
                         overflowed = true;
                     } else {
                         let mut record = [0_u8; GTPU_TRAFFIC_OBSERVATION_EVENT_LEN];
@@ -49301,6 +49275,8 @@ mod aya_runtime {
                     .map_err(|error| map_error("ebpf_datapath_pmtu_counters", error))?;
                 Ok(values.iter().copied().fold(0_u64, u64::saturating_add))
             };
+            let uplink_far_misses_passed = aggregate(COUNTER_UL_FAR_MISS_PASSED)?;
+            let uplink_far_misses_dropped = aggregate(COUNTER_UL_FAR_MISS_DROPPED)?;
             let snapshot = EbpfGtpuDatapathSnapshot {
                 uplink_program_id: device.datapath_identity.uplink.program_id,
                 downlink_program_id: device.datapath_identity.downlink.program_id,
@@ -49312,7 +49288,10 @@ mod aya_runtime {
                 uplink_pmtu_counters_map_id: device.datapath_identity.pins.uplink_pmtu_counters,
                 counters: EbpfGtpuDatapathCounters {
                     uplink_encapsulated: aggregate(COUNTER_UL_ENCAP)?,
-                    uplink_far_misses: aggregate(COUNTER_UL_FAR_MISS)?,
+                    uplink_far_misses: uplink_far_misses_passed
+                        .saturating_add(uplink_far_misses_dropped),
+                    uplink_far_misses_passed,
+                    uplink_far_misses_dropped,
                     downlink_decapsulated: aggregate(COUNTER_DL_DECAP)?,
                     downlink_unknown_teid: aggregate(COUNTER_DL_UNKNOWN_TEID)?,
                     downlink_malformed: aggregate(COUNTER_DL_MALFORMED)?,
@@ -52791,6 +52770,52 @@ mod aya_runtime {
                     info.verified_instruction_count()
                 );
             }
+            // The real loader must refuse a retained v6 marker before any
+            // attachment can interpret the IPv6 MTU entry format as v6 state.
+            let config = GtpuSessionDeviceConfig::new(
+                opc_gtpu_ebpf_common::GtpuSessionDeviceId::new([0x42; 16]).unwrap(),
+                7,
+                Some([192, 0, 2, 1]),
+                None,
+            )
+            .unwrap();
+            AyaGtpuRuntime::grouped_config_write_verified(&mut ebpf, config.encode()).unwrap();
+            for (marker, current) in [
+                (*b"OPC-GROUP-IP-v6\0", false),
+                (*b"OPC-GROUP-IP-v7\0", true),
+            ] {
+                {
+                    let mut schema = Array::<_, [u8; GTPU_SESSION_SCHEMA_MARKER_LEN]>::try_from(
+                        ebpf.map_mut(MAP_SESSION_SCHEMA).unwrap(),
+                    )
+                    .unwrap();
+                    schema.set(0, marker, 0).unwrap();
+                }
+                let observed =
+                    AyaGtpuRuntime::grouped_schema_preflight(&pin_dir, BearerSchemaState::PmtuV5);
+                if current {
+                    assert!(
+                        matches!(observed, Ok(GroupedSchemaState::Retained { config: actual }) if actual == config)
+                    );
+                } else {
+                    assert!(matches!(
+                        observed,
+                        Err(GtpuError::StateIndeterminate {
+                            operation: "ebpf_grouped_schema"
+                        })
+                    ));
+                }
+                assert_eq!(
+                    AyaGtpuRuntime::grouped_schema_read(&ebpf).unwrap(),
+                    marker,
+                    "preflight must not rewrite retained schema state"
+                );
+                assert_eq!(
+                    AyaGtpuRuntime::grouped_config_read(&ebpf).unwrap(),
+                    config.encode()
+                );
+            }
+            println!("OPC_GTPU_RETAINED_GROUPED_SCHEMA_V6_REFUSAL_PROVEN");
             drop(ebpf);
             fs::remove_dir_all(&pin_dir).expect("remove live tag proof pins");
             println!("OPC_GTPU_TAG_PROOF_PROVEN");
@@ -57206,11 +57231,15 @@ mod tests {
     mod control_port_recovery;
     mod grouped_bearer_transition;
     #[cfg(target_os = "linux")]
+    mod ipv6_packet_too_big;
+    mod multihoming;
+    #[cfg(target_os = "linux")]
     mod n3_end_marker;
     mod ordinary_ipv6;
     #[cfg(target_os = "linux")]
     mod reassembled_downlink;
     mod retained_namespace_boundary;
+    mod traffic_capacity;
     // This fixture constructs real durable consensus, whose public platform
     // contract is Linux-only. The portable fake-runtime tests remain below.
     #[cfg(target_os = "linux")]
@@ -59878,7 +59907,7 @@ mod tests {
                 };
                 let resources_owned = far.is_none_or(|value| {
                     let value = UplinkFar::decode(&value);
-                    value.local_ip == local_ip && value.peer_ip != [0; 4] && value.o_teid != [0; 4]
+                    value.local_ip == local_ip && value.peer_ip != [0; 4]
                 }) && dscp.is_none_or(|value| value[0] <= 63)
                     && pdr.is_none_or(|value| value == expected_pdr)
                     && binding.is_none_or(|value| {
@@ -60133,7 +60162,7 @@ mod tests {
                 }
                 if state.far.get(&(*index, *ue_ip)).is_some_and(|value| {
                     let value = UplinkFar::decode(value);
-                    value.local_ip != local_ip || value.peer_ip == [0; 4] || value.o_teid == [0; 4]
+                    value.local_ip != local_ip || value.peer_ip == [0; 4]
                 }) || state
                     .dscp
                     .get(&(*index, *ue_ip))
@@ -60204,9 +60233,7 @@ mod tests {
                         .get(&(*index, *selector))
                         .is_some_and(|value| {
                             let value = UplinkFar::decode(value);
-                            value.local_ip != local_ip
-                                || value.peer_ip == [0; 4]
-                                || value.o_teid == [0; 4]
+                            value.local_ip != local_ip || value.peer_ip == [0; 4]
                         })
                     || state
                         .marked_dscp
@@ -66108,10 +66135,11 @@ mod tests {
     fn context() -> GtpPdpContext {
         GtpPdpContext {
             local_teid: teid(0x1000_0001),
-            peer_teid: teid(0x2000_0001),
+            peer_teid: teid(0x2000_0001).into(),
             ms_address: IpAddr::V4(Ipv4Addr::new(10, 45, 0, 2)),
             peer_address: IpAddr::V4(Ipv4Addr::new(192, 0, 2, 10)),
             link_ifindex: S2BU_IFINDEX,
+            downlink_peer_source_policy: crate::GtpuPeerSourcePolicy::BackendDefault,
             downlink_source_port_policy: crate::GtpuSourcePortPolicy::Any,
             gtp_version: GtpVersion::V1,
             bearer_mark: None,
@@ -66133,9 +66161,73 @@ mod tests {
     fn marked_context(mark: u32, local_teid: u32, peer_teid: u32) -> GtpPdpContext {
         let mut context = context();
         context.local_teid = teid(local_teid);
-        context.peer_teid = teid(peer_teid);
+        context.peer_teid = teid(peer_teid).into();
         context.bearer_mark = GtpBearerMark::new(mark);
         context
+    }
+
+    #[tokio::test]
+    async fn peer_teid_zero_installs_encapsulates_and_survives_restart() {
+        // TS 29.281 section 5.1: peer zero must survive every lifecycle boundary.
+        for mark in [None, GtpBearerMark::new(7)] {
+            let (backend, runtime) = backend_with_fake();
+            backend.create_device(create_request()).await.unwrap();
+            let mut desired = context();
+            desired.peer_teid = crate::PeerTeid::new(0);
+            desired.bearer_mark = mark;
+            assert_eq!(
+                backend
+                    .install_pdp_context_classified(desired.clone())
+                    .await
+                    .unwrap(),
+                PdpContextInstallOutcome::Installed,
+            );
+            let selector = PdpContextSelector::LocalTeid(
+                PdpContextLocalTeidSelector::from_context(&desired).unwrap(),
+            );
+            assert_eq!(
+                backend.read_pdp_context(selector.clone()).await.unwrap(),
+                PdpContextReadback::Present(desired.clone()),
+            );
+            let far = {
+                let state = runtime.state();
+                let encoded = match mark {
+                    None => state.far.get(&(S2BU_IFINDEX, [10, 45, 0, 2])).unwrap(),
+                    Some(mark) => state
+                        .marked_far
+                        .get(&(
+                            S2BU_IFINDEX,
+                            UplinkFarKey {
+                                ue_ip: [10, 45, 0, 2],
+                                bearer_mark: mark.get().to_be_bytes(),
+                            }
+                            .encode(),
+                        ))
+                        .unwrap(),
+                };
+                UplinkFar::decode(encoded)
+            };
+            let packet = opc_gtpu_ebpf_common::build_uplink_encap(&far, 28).unwrap();
+            assert_eq!(&packet[28..36], &[0x30, 0xff, 0, 28, 0, 0, 0, 0]);
+            simulate_process_loss(&runtime, false);
+            let restarted = EbpfGtpuDataplaneBackend::with_runtime(runtime.clone());
+            restarted.resolve_device("s2bu").await.unwrap();
+            assert_eq!(
+                restarted.read_pdp_context(selector).await.unwrap(),
+                PdpContextReadback::Present(desired.clone()),
+            );
+            assert_eq!(
+                restarted
+                    .install_pdp_context_classified(desired.clone())
+                    .await
+                    .unwrap(),
+                PdpContextInstallOutcome::ExactAlreadyPresent,
+            );
+            assert_eq!(
+                restarted.remove_pdp_context_exact(desired).await.unwrap(),
+                PdpContextRemovalOutcome::Removed,
+            );
+        }
     }
 
     fn commit_for_context(
@@ -66156,7 +66248,8 @@ mod tests {
             context.link_ifindex,
             context.downlink_source_port_policy,
         )
-        .expect("canonical test binding");
+        .expect("canonical test binding")
+        .with_peer_source_policy(context.downlink_peer_source_policy);
         PdpContextCommit::new(
             context.local_teid.get().to_be_bytes(),
             far,
@@ -69530,10 +69623,11 @@ mod tests {
         GtpuSessionEntry::new(
             GtpPdpContext {
                 local_teid: teid(local_teid),
-                peer_teid: teid(peer_teid),
+                peer_teid: crate::PeerTeid::new(peer_teid),
                 ms_address: IpAddr::V6(ipv6_inner()),
                 peer_address: IpAddr::V6(peer),
                 link_ifindex: S2BU_IFINDEX,
+                downlink_peer_source_policy: crate::GtpuPeerSourcePolicy::BackendDefault,
                 downlink_source_port_policy: crate::GtpuSourcePortPolicy::Any,
                 gtp_version: GtpVersion::V1,
                 bearer_mark: None,
@@ -69550,10 +69644,11 @@ mod tests {
         GtpuSessionEntry::new(
             GtpPdpContext {
                 local_teid: teid(local_teid),
-                peer_teid: teid(peer_teid),
+                peer_teid: crate::PeerTeid::new(peer_teid),
                 ms_address: IpAddr::V4(Ipv4Addr::new(10, 45, 0, 2)),
                 peer_address: IpAddr::V4(Ipv4Addr::new(192, 0, 2, 10)),
                 link_ifindex: S2BU_IFINDEX,
+                downlink_peer_source_policy: crate::GtpuPeerSourcePolicy::BackendDefault,
                 downlink_source_port_policy: crate::GtpuSourcePortPolicy::Any,
                 gtp_version: GtpVersion::V1,
                 bearer_mark: None,
@@ -69577,10 +69672,11 @@ mod tests {
         GtpuSessionEntry::new(
             GtpPdpContext {
                 local_teid: teid(local_teid),
-                peer_teid: teid(peer_teid),
+                peer_teid: crate::PeerTeid::new(peer_teid),
                 ms_address: inner,
                 peer_address: peer_outer,
                 link_ifindex: S2BU_IFINDEX,
+                downlink_peer_source_policy: crate::GtpuPeerSourcePolicy::BackendDefault,
                 downlink_source_port_policy: crate::GtpuSourcePortPolicy::Any,
                 gtp_version: GtpVersion::V1,
                 bearer_mark: bearer_mark.and_then(GtpBearerMark::new),
@@ -69599,6 +69695,84 @@ mod tests {
         entries: Vec<GtpuSessionEntry>,
     ) -> GtpuSessionGroup {
         GtpuSessionGroup::new(grouped_group_id(id), device_id, entries).unwrap()
+    }
+
+    #[tokio::test]
+    async fn grouped_peer_teids_survive_reconcile_readback_and_restart() {
+        for peer_teid in [0, 0x2000_0001] {
+            let runtime = Arc::new(FakeRuntime::new());
+            let device_id = grouped_device_id(0x42);
+            let endpoints = GtpuLocalEndpointSet::new(
+                IpAddr::V4(Ipv4Addr::new(192, 0, 2, 1)),
+                Some(IpAddr::V6(ipv6_local())),
+            )
+            .unwrap();
+            let backend = attach_grouped_fake(runtime.clone(), device_id, endpoints).await;
+            let group = grouped_group(
+                1,
+                device_id,
+                vec![
+                    grouped_v4_entry(0x1234_5678, peer_teid),
+                    grouped_v6_entry(0x1234_5679, peer_teid, ipv6_peer()),
+                ],
+            );
+            assert_eq!(
+                backend
+                    .reconcile_pdp_context_group(fresh_group_request(&backend, group.clone()))
+                    .await
+                    .unwrap(),
+                GtpuSessionGroupReconcileOutcome::Activated,
+            );
+            assert_eq!(
+                backend
+                    .read_pdp_context_group_authorized(&group, fresh_group_admission(&group))
+                    .await
+                    .unwrap(),
+                GtpuSessionGroupReadback::Active(group.clone()),
+            );
+            let restarted = restart_grouped_fake(runtime, device_id, endpoints).await;
+            assert_eq!(
+                restarted
+                    .read_pdp_context_group_authorized(&group, fresh_group_admission(&group))
+                    .await
+                    .unwrap(),
+                GtpuSessionGroupReadback::Active(group),
+            );
+        }
+    }
+
+    #[test]
+    fn grouped_readback_refuses_an_unmodeled_ordinary_mtu_profile() {
+        let model = grouped_entry_for_addresses(
+            IpAddr::V6("2001:db8:100:1::".parse().unwrap()),
+            IpAddr::V4(Ipv4Addr::new(192, 0, 2, 10)),
+            IpAddr::V4(Ipv4Addr::new(192, 0, 2, 1)),
+            0x1000_0001,
+            0x2000_0001,
+            None,
+        );
+        let entry = grouped_entry_to_ebpf(&model)
+            .unwrap()
+            .with_downlink_inner_mtu(
+                opc_gtpu_ebpf_common::DownlinkInnerMtu::in_tunnel_packet_too_big(1300).unwrap(),
+            )
+            .unwrap();
+        let record = GtpuSessionGroupRecord::active(
+            grouped_group_id(1),
+            grouped_device_id(2),
+            GtpuSessionGeneration::INITIAL,
+            None,
+            Some(entry),
+        )
+        .unwrap();
+        let device = GtpDevice {
+            name: "s2bu".into(),
+            ifindex: S2BU_IFINDEX,
+        };
+        assert!(
+            grouped_model_from_record(record, &device).is_none(),
+            "grouped readback must not silently erase an ordinary-only MTU policy"
+        );
     }
 
     fn selector_namespace_current() -> impl FnMut() -> Result<(), GtpuError> {
@@ -80308,6 +80482,8 @@ mod tests {
             counters: EbpfGtpuDatapathCounters {
                 uplink_encapsulated: 11,
                 uplink_far_misses: 12,
+                uplink_far_misses_passed: 5,
+                uplink_far_misses_dropped: 7,
                 downlink_decapsulated: 13,
                 downlink_unknown_teid: 14,
                 downlink_malformed: 15,
@@ -80968,7 +81144,7 @@ mod tests {
             backend.install_pdp_context(original.clone()).await.unwrap();
 
             let mut relocated = original.clone();
-            relocated.peer_teid = teid(0x3000_0003);
+            relocated.peer_teid = teid(0x3000_0003).into();
             relocated.peer_address = IpAddr::V4(Ipv4Addr::new(192, 0, 2, 20));
             relocated.downlink_source_port_policy = crate::GtpuSourcePortPolicy::Exact(21_152);
             relocated.egress_dscp = Some(crate::DscpCodepoint::new(46).unwrap());
@@ -81033,7 +81209,7 @@ mod tests {
             backend.install_pdp_context(original.clone()).await.unwrap();
 
             let mut relocated = original.clone();
-            relocated.peer_teid = teid(0x3000_0003);
+            relocated.peer_teid = teid(0x3000_0003).into();
             relocated.peer_address = IpAddr::V4(Ipv4Addr::new(192, 0, 2, 20));
             relocated.downlink_source_port_policy = crate::GtpuSourcePortPolicy::Exact(21_152);
             relocated.egress_dscp = Some(crate::DscpCodepoint::new(46).unwrap());
@@ -81292,7 +81468,7 @@ mod tests {
         // The same UE/local-TEID identity may relocate to a new peer. The
         // binding-map replacement is the downlink authorization cutover.
         let mut relocated = context();
-        relocated.peer_teid = teid(0x3000_0003);
+        relocated.peer_teid = teid(0x3000_0003).into();
         relocated.peer_address = IpAddr::V4(Ipv4Addr::new(192, 0, 2, 20));
         backend.install_pdp_context(relocated).await.unwrap();
         {
@@ -81446,7 +81622,7 @@ mod tests {
         let mut first = context();
         first.egress_dscp = Some(crate::DscpCodepoint::new(10).unwrap());
         let mut second = context();
-        second.peer_teid = teid(0x3000_0003);
+        second.peer_teid = teid(0x3000_0003).into();
         second.peer_address = IpAddr::V4(Ipv4Addr::new(192, 0, 2, 20));
         second.egress_dscp = Some(crate::DscpCodepoint::new(46).unwrap());
         let barrier = Arc::new(Barrier::new(3));
@@ -81509,7 +81685,7 @@ mod tests {
         backend.install_pdp_context(context()).await.unwrap();
 
         let mut replacement = context();
-        replacement.peer_teid = teid(0x3000_0003);
+        replacement.peer_teid = teid(0x3000_0003).into();
         replacement.egress_dscp = Some(crate::DscpCodepoint::new(46).unwrap());
         let barrier = Arc::new(Barrier::new(3));
         let install_task = {
@@ -82164,7 +82340,7 @@ mod tests {
         ));
         let mut default_on_marked_teid = default.clone();
         default_on_marked_teid.local_teid = first.local_teid;
-        default_on_marked_teid.peer_teid = teid(0x2000_0005);
+        default_on_marked_teid.peer_teid = teid(0x2000_0005).into();
         assert!(matches!(
             backend
                 .install_pdp_context(default_on_marked_teid)
@@ -82958,7 +83134,7 @@ mod tests {
 
             let mut desired = original.clone();
             match drift {
-                "far" => desired.peer_teid = teid(0x2000_0003),
+                "far" => desired.peer_teid = teid(0x2000_0003).into(),
                 "dscp" => desired.egress_dscp = Some(crate::DscpCodepoint::new(10).unwrap()),
                 "local_teid" => desired.local_teid = teid(0x1000_0003),
                 _ => desired.bearer_mark = GtpBearerMark::new(0x1002),
@@ -83306,7 +83482,7 @@ mod tests {
 
         let mut same_uplink = installed.clone();
         same_uplink.local_teid = teid(0x1000_0002);
-        same_uplink.peer_teid = teid(0x2000_0002);
+        same_uplink.peer_teid = teid(0x2000_0002).into();
         assert!(matches!(
             backend
                 .install_pdp_context_classified(same_uplink.clone())

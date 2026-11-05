@@ -251,6 +251,21 @@ def generate():
         )
         for item in [source["ticket_notice"], *source["ticket_notice_refreshes"]]
     ]
+    boot = source["executions"][0]
+    revised["refusal_binding"] = dict(
+        attempt_nonce_hex=source["caller_nonce_hex"],
+        process_nonce_hex=boot["process_hex"],
+        boot_key_digest_hex=boot["boot_key_digest_hex"],
+    )
+    revised["refusal_frames"] = [
+        frame(
+            "boot_refusal_" + reason, 6, 8,
+            unhex(candidate_request["request_id_hex"]), unhex(candidate_request["digest_hex"]),
+            unhex(source["caller_nonce_hex"]) + unhex(boot["process_hex"])
+            + unhex(boot["boot_key_digest_hex"]) + bytes([code]), source["scope"],
+        )
+        for code, reason in [(1, "platform_invalid"), (2, "platform_changed"), (3, "prerequisite_refused")]
+    ]
 
     revised_batch = copy.deepcopy(batches)
     revised_batch["transport_revision"] = 2

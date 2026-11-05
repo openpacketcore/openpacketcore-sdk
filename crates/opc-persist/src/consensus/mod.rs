@@ -23,17 +23,22 @@ pub(crate) mod history;
 mod raft_adapter;
 mod snapshot_file;
 mod snapshot_io;
+pub(crate) mod snapshot_timing;
 mod sqlite;
 pub(crate) use sqlite::run_backend_sqlite_with_timeout;
 mod storage;
+#[cfg(target_os = "linux")]
+pub(crate) use storage::ConfigConsensusStorageError;
 #[cfg(test)]
 pub(crate) use storage::SnapshotTestHooks;
+pub(crate) use storage::SnapshotWorkHooks;
 mod store;
 mod types;
 
 #[cfg(test)]
 mod capacity_tests;
 
+#[cfg(target_os = "linux")]
 pub(crate) use sqlite::{provision_retained_schema, validate_retained_schema};
 
 pub use history::{ConfigHistoryLimits, ConfigHistoryRetention};

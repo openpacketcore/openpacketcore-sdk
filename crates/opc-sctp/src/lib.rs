@@ -10,8 +10,9 @@
 //!
 //! Each Linux socket reuses one bounded 64 KiB receive scratch allocation.
 //! One-to-many callers share its async ownership gate; one-to-one associations
-//! retain their wider receive/event ordering gate. Returned payloads own only
-//! the received prefix, and that prefix is zeroized in the reusable scratch
+//! retain their wider receive/event ordering gate. Returned payloads keep a
+//! wiping owner until their final `Bytes` reference is dropped. Their received
+//! prefix is also zeroized in the reusable scratch
 //! before the receive operation completes. Partial DATA stays socket-owned
 //! across receive cancellation and non-lifecycle notifications, with the same
 //! cumulative byte bound. Close clears it without waiting for receive polling.
@@ -26,6 +27,8 @@
 
 mod data_chunk;
 mod lifecycle;
+mod receive_payload;
+use receive_payload::ReceivePayload;
 pub mod n2;
 pub use data_chunk::{DataChunk, DataChunkError, DataChunkFlags};
 pub use lifecycle::{
@@ -55,9 +58,9 @@ use zeroize::Zeroize;
 use zeroize::Zeroizing;
 
 #[cfg(target_os = "linux")]
-use std::os::fd::{AsFd, OwnedFd};
+use opc_tokio_fd_sys::AsyncOwnedFd;
 #[cfg(target_os = "linux")]
-use tokio::io::unix::AsyncFd;
+use std::os::fd::{AsFd, OwnedFd};
 
 #[cfg(any(target_os = "linux", test))]
 const SCTP_RECV_CHUNK_BYTES: usize = 64 * 1024;
@@ -199,6 +202,7 @@ impl SctpConnectProgressHandle {
         }
     }
 
+    #[cfg(any(target_os = "linux", test))]
     fn advance(&self, stage: SctpConnectStage) {
         let mut observed = self.stage.load(Ordering::Acquire);
         while observed < stage as u8 {
@@ -296,6 +300,7 @@ pub enum DeliveryOrder {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct SctpAuthenticationConfig {
     authenticate_forward_tsn: bool,
+    prefer_sha256: bool,
 }
 
 impl SctpAuthenticationConfig {
@@ -304,7 +309,18 @@ impl SctpAuthenticationConfig {
     pub const fn data() -> Self {
         Self {
             authenticate_forward_tsn: false,
+            prefer_sha256: false,
         }
+    }
+
+    /// Prefer HMAC-SHA-256 while retaining RFC 4895's required SHA-1 fallback.
+    ///
+    /// Applied and read back before association setup. The kernel must support
+    /// SHA-256; failure is returned rather than silently retaining its defaults.
+    #[must_use]
+    pub const fn with_sha256_preference(mut self) -> Self {
+        self.prefer_sha256 = true;
+        self
     }
 
     /// Also require FORWARD-TSN authentication for partial-reliability use.
@@ -335,6 +351,39 @@ fn validate_peer_authenticated_chunks(
         if !peer_chunks.contains(&chunk_type) {
             return Err(SctpError::PeerAuthenticationChunkUnavailable { chunk_type });
         }
+    }
+    Ok(())
+}
+
+#[cfg(any(target_os = "linux", test))]
+fn validate_local_authentication(
+    authentication: SctpAuthenticationConfig,
+    chunks: &[u8],
+    hmac_identifiers: &[u16],
+) -> io::Result<()> {
+    validate_local_authenticated_chunks(authentication, chunks)?;
+    if authentication.prefer_sha256 && hmac_identifiers != [3, 1] {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "SCTP authentication readback mismatch",
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(any(target_os = "linux", test))]
+fn validate_local_authenticated_chunks(
+    authentication: SctpAuthenticationConfig,
+    chunks: &[u8],
+) -> io::Result<()> {
+    if authentication
+        .chunk_types()
+        .any(|chunk| !chunks.contains(&chunk))
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "SCTP local authenticated chunk readback mismatch",
+        ));
     }
     Ok(())
 }
@@ -639,7 +688,7 @@ fn invalid_receive_scratch_error() -> SctpError {
 #[cfg(target_os = "linux")]
 struct ReceiveAccumulator {
     max_message_bytes: usize,
-    payload: BytesMut,
+    payload: ReceivePayload,
     first_received: Option<opc_libsctp_sys::Received>,
     payload_truncated: bool,
     control_truncated: bool,
@@ -650,7 +699,7 @@ impl ReceiveAccumulator {
     fn new(max_message_bytes: usize) -> Self {
         Self {
             max_message_bytes,
-            payload: BytesMut::new(),
+            payload: ReceivePayload::default(),
             first_received: None,
             payload_truncated: false,
             control_truncated: false,
@@ -753,8 +802,7 @@ impl ReceiveAccumulator {
             {
                 return Err(invalid_record_error());
             }
-            let mut notification = BytesMut::with_capacity(received.bytes);
-            notification.extend_from_slice(received_prefix);
+            let notification = ReceivePayload::copy_from_slice(received_prefix);
             return Ok(Some(map_recv(received, notification)));
         }
 
@@ -778,7 +826,8 @@ impl ReceiveAccumulator {
         let first = self.first_received.get_or_insert(received);
         self.payload_truncated |= received.flags.payload_truncated;
         self.control_truncated |= received.flags.control_truncated;
-        self.payload.extend_from_slice(received_prefix);
+        self.payload
+            .extend_from_slice(received_prefix, self.max_message_bytes);
 
         if received.flags.end_of_record {
             let mut complete = *first;
@@ -825,13 +874,6 @@ fn same_record_metadata(
         }
         (None, None) => true,
         _ => false,
-    }
-}
-
-#[cfg(target_os = "linux")]
-impl Drop for ReceiveAccumulator {
-    fn drop(&mut self) {
-        self.payload.as_mut().zeroize();
     }
 }
 
@@ -1131,15 +1173,15 @@ impl SctpConnectConfig {
         if !self.local_addrs.is_empty() {
             validate_address_set(&self.local_addrs, "local_addrs")?;
         }
-        if let (Some(local), Some(remote)) = (self.local_addrs.first(), self.remote_addrs.first()) {
-            validate_same_family(local, remote)?;
+        if !self.local_addrs.is_empty() {
+            validate_same_family(&self.local_addrs, &self.remote_addrs)?;
         }
         Ok(())
     }
 }
 
 /// Outbound SCTP message metadata and payload.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct OutboundMessage {
     /// Payload bytes.
     pub payload: Bytes,
@@ -1151,6 +1193,18 @@ pub struct OutboundMessage {
     pub order: DeliveryOrder,
     /// Target association for one-to-many sockets. Use zero for one-to-one.
     pub assoc_id: i32,
+}
+
+impl fmt::Debug for OutboundMessage {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("OutboundMessage")
+            .field("payload_len", &self.payload.len())
+            .field("stream_id", &self.stream_id)
+            .field("ppid", &self.ppid)
+            .field("order", &self.order)
+            .field("assoc_id", &self.assoc_id)
+            .finish()
+    }
 }
 
 impl OutboundMessage {
@@ -1779,6 +1833,18 @@ impl DiameterSctpAssociation {
         &self.peer
     }
 
+    /// Retain synchronous close authority for this association.
+    ///
+    /// This facade validates SCTP metadata and returns opaque payload bytes.
+    /// The caller that parses Diameter must call
+    /// [`SctpAssociationAbortHandle::abort_on_wire`] when a frame cannot be
+    /// parsed, as required by RFC 6733 section 2.1. The handle remains usable
+    /// while a receive is pending and closes all references to the association.
+    #[must_use]
+    pub fn abort_handle(&self) -> SctpAssociationAbortHandle {
+        self.association.abort_handle()
+    }
+
     /// Send one encoded Diameter payload with the peer's configured
     /// unprotected PPID.
     ///
@@ -2349,9 +2415,19 @@ impl fmt::Debug for SctpPathHealth {
 }
 
 /// Inbound SCTP message metadata and payload.
-#[derive(Clone, PartialEq, Eq)]
+///
+/// Diagnostics report only payload length. Live payload storage is cleared when
+/// its final Bytes reference is dropped, including references held across N2 admission.
+///
+/// ```compile_fail
+/// fn requires_clone<T: Clone>(_: &T) {}
+/// fn probe(message: &opc_sctp::InboundMessage) {
+///     requires_clone(message);
+/// }
+/// ```
 pub struct InboundMessage {
-    /// Payload bytes.
+    /// Payload bytes. Live receives retain a wiping owner until the last Bytes
+    /// reference is dropped. A caller-supplied Bytes retains its original owner.
     pub payload: Bytes,
     /// SCTP stream identifier.
     pub stream_id: u16,
@@ -2743,7 +2819,11 @@ fn same_sctp_path(left: SocketAddr, right: SocketAddr) -> bool {
                 && left.port() == right.port()
                 && left.scope_id() == right.scope_id()
         }
-        (SocketAddr::V4(_), SocketAddr::V6(_)) | (SocketAddr::V6(_), SocketAddr::V4(_)) => false,
+        (SocketAddr::V4(v4), SocketAddr::V6(v6)) | (SocketAddr::V6(v6), SocketAddr::V4(v4)) => {
+            v6.scope_id() == 0
+                && v6.ip().to_ipv4_mapped() == Some(*v4.ip())
+                && v6.port() == v4.port()
+        }
     }
 }
 
@@ -3048,9 +3128,21 @@ pub struct SctpAssociationAbortHandle {
 }
 
 impl SctpAssociationAbortHandle {
-    /// Abort both directions of the association immediately.
+    /// Close both local directions immediately and initiate SCTP shutdown.
+    /// This legacy terminal-close operation does not promise a wire ABORT.
     pub fn abort(&self) {
         self.imp.abort();
+    }
+
+    /// Abort the association on the wire and synchronously close its socket.
+    ///
+    /// Pending I/O is interrupted even while other handles remain alive. Queued
+    /// DATA is discarded. Linux uses RFC 6458 section 8.1.4 abortive close with
+    /// its User-Initiated Abort cause; custom cause bytes are not supported.
+    /// Repeated calls succeed. A socket-option error still closes the socket
+    /// but cannot guarantee ABORT emission. Non-Linux targets are unsupported.
+    pub fn abort_on_wire(&self) -> Result<(), SctpError> {
+        self.imp.abort_on_wire()
     }
 }
 
@@ -3259,6 +3351,11 @@ impl SctpAssociation {
     #[must_use]
     pub fn authenticates_data_chunks(&self) -> bool {
         self.imp.authenticates_data_chunks()
+    }
+
+    /// Read the kernel's local authenticated-chunk requirements for this association.
+    pub fn local_authenticated_chunks(&self) -> Result<Vec<u8>, SctpError> {
+        self.imp.local_authenticated_chunks()
     }
 
     /// Maximum reassembled user-message bytes accepted by this association.
@@ -3599,15 +3696,6 @@ fn validate_address_set(
     }
     if addresses
         .iter()
-        .any(|address| address.is_ipv4() != first.is_ipv4())
-    {
-        return Err(SctpError::InvalidConfig {
-            field: "address_family",
-            reason: "all addresses must use the same IP family",
-        });
-    }
-    if addresses
-        .iter()
         .any(|address| address.port() != first.port())
     {
         return Err(SctpError::InvalidConfig {
@@ -3628,13 +3716,17 @@ fn validate_address_set(
     Ok(())
 }
 
-fn validate_same_family(left: &SocketAddr, right: &SocketAddr) -> Result<(), SctpError> {
-    if left.is_ipv4() == right.is_ipv4() {
+fn validate_same_family(left: &[SocketAddr], right: &[SocketAddr]) -> Result<(), SctpError> {
+    if left.iter().any(|local| {
+        right.iter().any(|remote| {
+            local.ip().to_canonical().is_ipv4() == remote.ip().to_canonical().is_ipv4()
+        })
+    }) {
         Ok(())
     } else {
         Err(SctpError::InvalidConfig {
             field: "address_family",
-            reason: "local and remote addresses must use the same IP family",
+            reason: "local and remote address sets must share an IP family",
         })
     }
 }
@@ -3650,11 +3742,19 @@ fn sys_init(init: InitConfig) -> opc_libsctp_sys::InitMsg {
 }
 
 #[cfg(target_os = "linux")]
-fn sys_family(addr: &SocketAddr) -> opc_libsctp_sys::AddressFamily {
-    if addr.is_ipv4() {
-        opc_libsctp_sys::AddressFamily::Ipv4
+fn sys_family(local: &[SocketAddr], remote: &[SocketAddr]) -> opc_libsctp_sys::AddressFamily {
+    if local.iter().chain(remote).any(SocketAddr::is_ipv6) {
+        if local
+            .iter()
+            .chain(remote)
+            .any(|address| address.ip().to_canonical().is_ipv4())
+        {
+            opc_libsctp_sys::AddressFamily::Ipv6DualStack
+        } else {
+            opc_libsctp_sys::AddressFamily::Ipv6
+        }
     } else {
-        opc_libsctp_sys::AddressFamily::Ipv6
+        opc_libsctp_sys::AddressFamily::Ipv4
     }
 }
 
@@ -3682,7 +3782,7 @@ fn sys_send_info(message: &OutboundMessage) -> opc_libsctp_sys::SendInfo {
 }
 
 #[cfg(target_os = "linux")]
-fn map_recv(received: opc_libsctp_sys::Received, buffer: BytesMut) -> InboundMessage {
+fn map_recv(received: opc_libsctp_sys::Received, buffer: ReceivePayload) -> InboundMessage {
     let info = received.info.unwrap_or(opc_libsctp_sys::RecvInfo {
         stream_id: 0,
         ssn: 0,
@@ -3699,12 +3799,12 @@ fn map_recv(received: opc_libsctp_sys::Received, buffer: BytesMut) -> InboundMes
         DeliveryOrder::Ordered
     };
     let event = if received.flags.notification {
-        parse_sctp_event(&buffer)
+        parse_sctp_event(buffer.as_ref())
     } else {
         None
     };
     InboundMessage {
-        payload: buffer.freeze(),
+        payload: buffer.into_bytes(),
         stream_id: info.stream_id,
         ppid: PayloadProtocolIdentifier::from_network_order(info.ppid_network_order),
         order,
@@ -3920,8 +4020,13 @@ fn sender_dry_io_err(operation: &'static str, source: io::Error) -> SctpError {
 mod lifecycle_tests;
 
 #[cfg(target_os = "linux")]
+mod socket_descriptor;
+
+#[cfg(target_os = "linux")]
 mod platform {
+    use super::socket_descriptor::SocketDescriptor;
     use super::*;
+    use tokio::io::Interest;
 
     #[derive(Debug)]
     pub struct Endpoint {
@@ -3947,7 +4052,7 @@ mod platform {
 
     #[derive(Debug)]
     struct SctpSocket {
-        fd: AsyncFd<OwnedFd>,
+        fd: SocketDescriptor,
         max_message_bytes: usize,
         recv_owner: ReceiveOwner,
         metrics: SctpMetrics,
@@ -3984,8 +4089,11 @@ mod platform {
         authentication: Option<SctpAuthenticationConfig>,
     ) -> Result<Endpoint, SctpError> {
         let local = config.local_addrs[0];
-        let fd = opc_libsctp_sys::open_socket(sys_family(&local), sys_style(config.mode))
-            .map_err(|source| io_err("socket", source))?;
+        let fd = opc_libsctp_sys::open_socket(
+            sys_family(&config.local_addrs, &[]),
+            sys_style(config.mode),
+        )
+        .map_err(|source| io_err("socket", source))?;
         configure_fd(
             fd.as_fd(),
             config.init,
@@ -4001,10 +4109,10 @@ mod platform {
                 .map_err(|source| multihoming_io_err("bind_addresses", source))?;
         }
         opc_libsctp_sys::listen(fd.as_fd(), 128).map_err(|source| io_err("listen", source))?;
-        let async_fd = AsyncFd::new(fd).map_err(|source| io_err("async_fd", source))?;
+        let async_fd = AsyncOwnedFd::new(fd).map_err(|source| io_err("async_fd", source))?;
         Ok(Endpoint {
             socket: Arc::new(SctpSocket {
-                fd: async_fd,
+                fd: SocketDescriptor::new(async_fd),
                 max_message_bytes: config.max_message_bytes,
                 recv_owner: ReceiveOwner::new(),
                 metrics: SctpMetrics::default(),
@@ -4022,8 +4130,10 @@ mod platform {
     ) -> Result<Association, SctpError> {
         let remote = config.remote_addrs[0];
         let peer_paths = SctpPathTracker::new(&config.remote_addrs);
-        let fd_result =
-            opc_libsctp_sys::open_socket(sys_family(&remote), sys_style(SctpMode::OneToOne));
+        let fd_result = opc_libsctp_sys::open_socket(
+            sys_family(&config.local_addrs, &config.remote_addrs),
+            sys_style(SctpMode::OneToOne),
+        );
         progress.advance(SctpConnectStage::SocketCreationAttempted);
         let fd = fd_result.map_err(|source| io_err("socket", source))?;
         progress.advance(SctpConnectStage::SocketCreationSucceeded);
@@ -4060,23 +4170,23 @@ mod platform {
         let status = record_remote_submission_result(&progress, status_result)?;
         record_connect_status(&progress, status);
         let async_fd = register_async_fd(fd)?;
+        if status == opc_libsctp_sys::ConnectStatus::InProgress {
+            wait_connected(&async_fd, &progress).await?;
+        }
+        if let Some(authentication) = authentication {
+            require_peer_authentication(async_fd.get_ref().as_fd(), authentication)?;
+        }
+        if let Ok(primary_peer) = opc_libsctp_sys::peer_primary_address(async_fd.get_ref().as_fd())
+        {
+            peer_paths.initialize_primary_reachable(primary_peer);
+        }
         let socket = Arc::new(SctpSocket {
-            fd: async_fd,
+            fd: SocketDescriptor::new(async_fd),
             max_message_bytes: config.max_message_bytes,
             recv_owner: ReceiveOwner::new(),
             metrics: SctpMetrics::default(),
             closed: AtomicBool::new(false),
         });
-        if status == opc_libsctp_sys::ConnectStatus::InProgress {
-            wait_connected(&socket, &progress).await?;
-        }
-        if let Some(authentication) = authentication {
-            require_peer_authentication(socket.fd.get_ref().as_fd(), authentication)?;
-        }
-        if let Ok(primary_peer) = opc_libsctp_sys::peer_primary_address(socket.fd.get_ref().as_fd())
-        {
-            peer_paths.initialize_primary_reachable(primary_peer);
-        }
         progress.advance(SctpConnectStage::Established);
         let (auth_events, _auth_events_receiver) = tokio::sync::broadcast::channel(16);
         Ok(Association {
@@ -4102,65 +4212,60 @@ mod platform {
                     reason: "accept is valid only for one-to-one sockets",
                 });
             }
-            loop {
-                let mut guard = self
-                    .socket
-                    .fd
-                    .readable()
-                    .await
-                    .map_err(|source| io_err("accept_ready", source))?;
-                match guard.try_io(|inner| opc_libsctp_sys::accept(inner.get_ref().as_fd())) {
-                    Ok(Ok((fd, peer))) => {
-                        if let Some(authentication) = self.authentication {
-                            require_peer_authentication(fd.as_fd(), authentication)?;
-                        }
-                        let mut peer_addrs = match opc_libsctp_sys::peer_addresses(fd.as_fd(), 0) {
-                            Ok(peer_addrs) if !peer_addrs.is_empty() => peer_addrs,
-                            Ok(_) | Err(_) => vec![peer],
-                        };
-                        if let Some(peer_index) = peer_addrs
-                            .iter()
-                            .position(|peer_addr| same_sctp_path(*peer_addr, peer))
-                        {
-                            peer_addrs.swap(0, peer_index);
-                        } else {
-                            peer_addrs.insert(0, peer);
-                            peer_addrs.truncate(MAX_STATIC_MULTIHOMING_ADDRESSES);
-                        }
-                        let peer_paths = SctpPathTracker::new(&peer_addrs);
-                        peer_paths.initialize_primary_reachable(peer);
-                        let async_fd =
-                            AsyncFd::new(fd).map_err(|source| io_err("async_fd", source))?;
-                        self.socket.metrics.record_accept();
-                        let (auth_events, _auth_events_receiver) =
-                            tokio::sync::broadcast::channel(16);
-                        return Ok(Association {
-                            socket: Arc::new(SctpSocket {
-                                fd: async_fd,
-                                max_message_bytes: self.socket.max_message_bytes,
-                                recv_owner: ReceiveOwner::new(),
-                                metrics: self.socket.metrics.clone(),
-                                closed: AtomicBool::new(false),
-                            }),
-                            mode: SctpMode::OneToOne,
-                            peer_paths,
-                            recv_gate: tokio::sync::Mutex::new(()),
-                            path_control_gate: Mutex::new(()),
-                            writer_control_gate: tokio::sync::Mutex::new(()),
-                            sender_drain: SctpSenderDrainTracker::default(),
-                            auth_keys: auth_key_ledger(self.authentication),
-                            auth_events,
-                            authentication: self.authentication,
-                            user_data_observed: AtomicBool::new(false),
-                        });
+            let accepted = self
+                .socket
+                .fd
+                .io(Interest::READABLE, opc_libsctp_sys::accept)
+                .await
+                .map_err(|source| io_err("accept_ready", source))?;
+            match accepted {
+                Ok((fd, peer)) => {
+                    if let Some(authentication) = self.authentication {
+                        require_peer_authentication(fd.as_fd(), authentication)?;
                     }
-                    Ok(Err(source)) if source.kind() == io::ErrorKind::Interrupted => continue,
-                    Ok(Err(source)) => {
-                        self.socket.mark_closed();
-                        self.socket.metrics.record_io_error();
-                        return Err(io_err("accept", source));
+                    let mut peer_addrs = match opc_libsctp_sys::peer_addresses(fd.as_fd(), 0) {
+                        Ok(peer_addrs) if !peer_addrs.is_empty() => peer_addrs,
+                        Ok(_) | Err(_) => vec![peer],
+                    };
+                    if let Some(peer_index) = peer_addrs
+                        .iter()
+                        .position(|peer_addr| same_sctp_path(*peer_addr, peer))
+                    {
+                        peer_addrs.swap(0, peer_index);
+                    } else {
+                        peer_addrs.insert(0, peer);
+                        peer_addrs.truncate(MAX_STATIC_MULTIHOMING_ADDRESSES);
                     }
-                    Err(_would_block) => continue,
+                    let peer_paths = SctpPathTracker::new(&peer_addrs);
+                    peer_paths.initialize_primary_reachable(peer);
+                    let async_fd =
+                        AsyncOwnedFd::new(fd).map_err(|source| io_err("async_fd", source))?;
+                    self.socket.metrics.record_accept();
+                    let (auth_events, _auth_events_receiver) = tokio::sync::broadcast::channel(16);
+                    Ok(Association {
+                        socket: Arc::new(SctpSocket {
+                            fd: SocketDescriptor::new(async_fd),
+                            max_message_bytes: self.socket.max_message_bytes,
+                            recv_owner: ReceiveOwner::new(),
+                            metrics: self.socket.metrics.clone(),
+                            closed: AtomicBool::new(false),
+                        }),
+                        mode: SctpMode::OneToOne,
+                        peer_paths,
+                        recv_gate: tokio::sync::Mutex::new(()),
+                        path_control_gate: Mutex::new(()),
+                        writer_control_gate: tokio::sync::Mutex::new(()),
+                        sender_drain: SctpSenderDrainTracker::default(),
+                        auth_keys: auth_key_ledger(self.authentication),
+                        auth_events,
+                        authentication: self.authentication,
+                        user_data_observed: AtomicBool::new(false),
+                    })
+                }
+                Err(source) => {
+                    self.socket.mark_closed();
+                    self.socket.metrics.record_io_error();
+                    Err(io_err("accept", source))
                 }
             }
         }
@@ -4198,7 +4303,9 @@ mod platform {
         }
 
         pub fn local_addresses(&self) -> Result<Vec<SocketAddr>, SctpError> {
-            opc_libsctp_sys::local_addresses(self.socket.fd.get_ref().as_fd(), 0)
+            self.socket
+                .fd
+                .with_fd(|fd| opc_libsctp_sys::local_addresses(fd, 0))
                 .map_err(|source| io_err("local_addresses", source))
         }
     }
@@ -4208,8 +4315,21 @@ mod platform {
             self.terminal_close();
         }
 
+        pub fn abort_on_wire(&self) -> Result<(), SctpError> {
+            let result = self.socket.fd.abort_on_wire();
+            self.mark_terminal();
+            result.map_err(|source| io_err("abort_on_wire", source))
+        }
+
         pub fn authenticates_data_chunks(&self) -> bool {
             self.authentication.is_some()
+        }
+
+        pub fn local_authenticated_chunks(&self) -> Result<Vec<u8>, SctpError> {
+            self.socket
+                .fd
+                .with_fd(|fd| opc_libsctp_sys::local_authenticated_chunks(fd, 0))
+                .map_err(|source| auth_io_err("local_authenticated_chunks", source))
         }
 
         pub fn max_message_bytes(&self) -> usize {
@@ -4221,7 +4341,9 @@ mod platform {
                 return Err(SctpError::Closed);
             }
             for kind in [0x8006, 0x800a, 0x800b, 0x800c] {
-                opc_libsctp_sys::set_event(self.socket.fd.get_ref().as_fd(), 0, kind, true)
+                self.socket
+                    .fd
+                    .with_fd(|fd| opc_libsctp_sys::set_event(fd, 0, kind, true))
                     .map_err(|source| {
                         path_control_io_err(
                             "enable_lifecycle_notifications",
@@ -4304,7 +4426,12 @@ mod platform {
                     &self.path_control_gate,
                     &self.peer_paths,
                     event,
-                    || opc_libsctp_sys::peer_primary_address(self.socket.fd.get_ref().as_fd()).ok(),
+                    || {
+                        self.socket
+                            .fd
+                            .with_fd(opc_libsctp_sys::peer_primary_address)
+                            .ok()
+                    },
                 );
             }
         }
@@ -4320,13 +4447,12 @@ mod platform {
                     reason: "key identifier is already installed",
                 });
             }
-            opc_libsctp_sys::install_auth_key(
-                self.socket.fd.get_ref().as_fd(),
-                0,
-                key.key_id.get(),
-                &key.material,
-            )
-            .map_err(|source| auth_io_err("install_auth_key", source))?;
+            self.socket
+                .fd
+                .with_fd(|fd| {
+                    opc_libsctp_sys::install_auth_key(fd, 0, key.key_id.get(), &key.material)
+                })
+                .map_err(|source| auth_io_err("install_auth_key", source))?;
             keys.insert(key.key_id.get(), AuthKeyLifecycle::Inactive);
             Ok(())
         }
@@ -4351,7 +4477,9 @@ mod platform {
                     })
                 }
             }
-            opc_libsctp_sys::set_active_auth_key(self.socket.fd.get_ref().as_fd(), 0, key_id.get())
+            self.socket
+                .fd
+                .with_fd(|fd| opc_libsctp_sys::set_active_auth_key(fd, 0, key_id.get()))
                 .map_err(|source| auth_io_err("activate_auth_key", source))?;
             for lifecycle in keys.values_mut() {
                 if *lifecycle == AuthKeyLifecycle::Active {
@@ -4435,11 +4563,11 @@ mod platform {
             {
                 let mut keys = self.lock_auth_keys();
                 keys.insert(key_id, AuthKeyLifecycle::DeactivationPending);
-                if let Err(source) = opc_libsctp_sys::deactivate_auth_key(
-                    self.socket.fd.get_ref().as_fd(),
-                    0,
-                    key_id,
-                ) {
+                if let Err(source) = self
+                    .socket
+                    .fd
+                    .with_fd(|fd| opc_libsctp_sys::deactivate_auth_key(fd, 0, key_id))
+                {
                     drop(keys);
                     self.terminal_close();
                     return Err(auth_io_err("deactivate_auth_key", source));
@@ -4452,7 +4580,9 @@ mod platform {
             self.wait_for_auth_key_free_until(key_id, deadline, &mut auth_events)
                 .await?;
             retirement.pending = false;
-            opc_libsctp_sys::delete_auth_key(self.socket.fd.get_ref().as_fd(), 0, key_id)
+            self.socket
+                .fd
+                .with_fd(|fd| opc_libsctp_sys::delete_auth_key(fd, 0, key_id))
                 .map_err(|source| auth_io_err("delete_auth_key", source))?;
             self.lock_auth_keys().remove(&key_id);
             Ok(())
@@ -4480,7 +4610,9 @@ mod platform {
                     reason: "key is not confirmed deactivated",
                 });
             }
-            opc_libsctp_sys::delete_auth_key(self.socket.fd.get_ref().as_fd(), 0, key_id)
+            self.socket
+                .fd
+                .with_fd(|fd| opc_libsctp_sys::delete_auth_key(fd, 0, key_id))
                 .map_err(|source| auth_io_err("delete_auth_key", source))?;
             keys.remove(&key_id);
             Ok(())
@@ -4524,13 +4656,17 @@ mod platform {
                 association: self,
                 armed: true,
             };
-            opc_libsctp_sys::set_event(
-                self.socket.fd.get_ref().as_fd(),
-                0,
-                opc_libsctp_sys::SCTP_SENDER_DRY_EVENT_NOTIFICATION,
-                true,
-            )
-            .map_err(|source| sender_dry_io_err("enable_sender_dry_event", source))?;
+            self.socket
+                .fd
+                .with_fd(|fd| {
+                    opc_libsctp_sys::set_event(
+                        fd,
+                        0,
+                        opc_libsctp_sys::SCTP_SENDER_DRY_EVENT_NOTIFICATION,
+                        true,
+                    )
+                })
+                .map_err(|source| sender_dry_io_err("enable_sender_dry_event", source))?;
             let result =
                 SctpSenderDrainTracker::wait_for_dry_or_shutdown_until(receiver, deadline).await;
             match result {
@@ -4566,7 +4702,11 @@ mod platform {
         }
 
         fn terminal_close(&self) {
-            let _ = opc_libsctp_sys::shutdown_both(self.socket.fd.get_ref().as_fd());
+            let _ = self.socket.fd.with_fd(opc_libsctp_sys::shutdown_both);
+            self.mark_terminal();
+        }
+
+        fn mark_terminal(&self) {
             self.socket.mark_closed();
             self.sender_drain.mark_closed();
             let _ = self.auth_events.send(AuthLifecycleSignal::Closed);
@@ -4658,22 +4798,24 @@ mod platform {
                 &self.peer_paths,
                 peer_addr,
                 || {
-                    opc_libsctp_sys::peer_addresses(self.socket.fd.get_ref().as_fd(), 0)
+                    self.socket
+                        .fd
+                        .with_fd(|fd| opc_libsctp_sys::peer_addresses(fd, 0))
                         .map_err(|source| io_err("peer_addresses", source))
                 },
                 |canonical_peer_addr| {
-                    opc_libsctp_sys::set_primary_peer_address(
-                        self.socket.fd.get_ref().as_fd(),
-                        0,
-                        &canonical_peer_addr,
-                    )
-                    .map_err(|source| {
-                        path_control_io_err(
-                            "set_primary_peer_address",
-                            "primary_path_selection",
-                            source,
-                        )
-                    })
+                    self.socket
+                        .fd
+                        .with_fd(|fd| {
+                            opc_libsctp_sys::set_primary_peer_address(fd, 0, &canonical_peer_addr)
+                        })
+                        .map_err(|source| {
+                            path_control_io_err(
+                                "set_primary_peer_address",
+                                "primary_path_selection",
+                                source,
+                            )
+                        })
                 },
             )
         }
@@ -4683,12 +4825,16 @@ mod platform {
         }
 
         pub fn local_addresses(&self) -> Result<Vec<SocketAddr>, SctpError> {
-            opc_libsctp_sys::local_addresses(self.socket.fd.get_ref().as_fd(), 0)
+            self.socket
+                .fd
+                .with_fd(|fd| opc_libsctp_sys::local_addresses(fd, 0))
                 .map_err(|source| io_err("local_addresses", source))
         }
 
         pub fn peer_addresses(&self) -> Result<Vec<SocketAddr>, SctpError> {
-            opc_libsctp_sys::peer_addresses(self.socket.fd.get_ref().as_fd(), 0)
+            self.socket
+                .fd
+                .with_fd(|fd| opc_libsctp_sys::peer_addresses(fd, 0))
                 .map_err(|source| io_err("peer_addresses", source))
         }
     }
@@ -4700,13 +4846,18 @@ mod platform {
 
     impl SenderDrySubscription<'_> {
         fn disarm(&mut self) -> Result<(), SctpError> {
-            opc_libsctp_sys::set_event(
-                self.association.socket.fd.get_ref().as_fd(),
-                0,
-                opc_libsctp_sys::SCTP_SENDER_DRY_EVENT_NOTIFICATION,
-                false,
-            )
-            .map_err(|source| sender_dry_io_err("disable_sender_dry_event", source))?;
+            self.association
+                .socket
+                .fd
+                .with_fd(|fd| {
+                    opc_libsctp_sys::set_event(
+                        fd,
+                        0,
+                        opc_libsctp_sys::SCTP_SENDER_DRY_EVENT_NOTIFICATION,
+                        false,
+                    )
+                })
+                .map_err(|source| sender_dry_io_err("disable_sender_dry_event", source))?;
             self.association.sender_drain.reset_idle();
             self.armed = false;
             Ok(())
@@ -4718,12 +4869,14 @@ mod platform {
             if !self.armed {
                 return;
             }
-            let _ = opc_libsctp_sys::set_event(
-                self.association.socket.fd.get_ref().as_fd(),
-                0,
-                opc_libsctp_sys::SCTP_SENDER_DRY_EVENT_NOTIFICATION,
-                false,
-            );
+            let _ = self.association.socket.fd.with_fd(|fd| {
+                opc_libsctp_sys::set_event(
+                    fd,
+                    0,
+                    opc_libsctp_sys::SCTP_SENDER_DRY_EVENT_NOTIFICATION,
+                    false,
+                )
+            });
             self.association.terminal_close();
         }
     }
@@ -4757,35 +4910,31 @@ mod platform {
     impl SctpSocket {
         async fn send(&self, message: OutboundMessage) -> Result<usize, SctpError> {
             let info = sys_send_info(&message);
-            loop {
-                let mut guard = self
-                    .fd
-                    .writable()
-                    .await
-                    .map_err(|source| io_err("send_ready", source))?;
-                match guard.try_io(|inner| {
-                    opc_libsctp_sys::send_msg(inner.get_ref().as_fd(), &message.payload, info)
-                }) {
-                    Ok(Ok(bytes)) => {
-                        if bytes != message.payload.len() {
-                            self.mark_closed();
-                            self.metrics.record_io_error();
-                            return Err(SctpError::ShortSend {
-                                expected: message.payload.len(),
-                                actual: bytes,
-                            });
-                        }
-                        self.metrics.record_tx(bytes);
-                        tracing::trace!(bytes, stream_id = message.stream_id, ppid = %message.ppid, "sctp message sent");
-                        return Ok(bytes);
-                    }
-                    Ok(Err(source)) if source.kind() == io::ErrorKind::Interrupted => continue,
-                    Ok(Err(source)) => {
+            let sent = self
+                .fd
+                .io(Interest::WRITABLE, |fd| {
+                    opc_libsctp_sys::send_msg(fd, &message.payload, info)
+                })
+                .await
+                .map_err(|source| io_err("send_ready", source))?;
+            match sent {
+                Ok(bytes) => {
+                    if bytes != message.payload.len() {
                         self.mark_closed();
                         self.metrics.record_io_error();
-                        return Err(io_err("send", source));
+                        return Err(SctpError::ShortSend {
+                            expected: message.payload.len(),
+                            actual: bytes,
+                        });
                     }
-                    Err(_would_block) => continue,
+                    self.metrics.record_tx(bytes);
+                    tracing::trace!(bytes, stream_id = message.stream_id, ppid = %message.ppid, "sctp message sent");
+                    Ok(bytes)
+                }
+                Err(source) => {
+                    self.mark_closed();
+                    self.metrics.record_io_error();
+                    Err(io_err("send", source))
                 }
             }
         }
@@ -4880,21 +5029,15 @@ mod platform {
                + Send
                + 'a {
             async move {
-                loop {
-                    let mut guard = self.fd.readable().await.map_err(|source| {
+                self.fd
+                    .io(Interest::READABLE, |fd| {
+                        opc_libsctp_sys::recv_msg(fd, buffer)
+                    })
+                    .await
+                    .map_err(|source| {
                         ReceiveFailure::preserve_socket(io_err("recv_ready", source))
-                    })?;
-                    match guard
-                        .try_io(|inner| opc_libsctp_sys::recv_msg(inner.get_ref().as_fd(), buffer))
-                    {
-                        Ok(Ok(received)) => return Ok(received),
-                        Ok(Err(source)) if source.kind() == io::ErrorKind::Interrupted => continue,
-                        Ok(Err(source)) => {
-                            return Err(ReceiveFailure::close_socket(io_err("recv", source)));
-                        }
-                        Err(_would_block) => continue,
-                    }
-                }
+                    })?
+                    .map_err(|source| ReceiveFailure::close_socket(io_err("recv", source)))
             }
         }
     }
@@ -4909,7 +5052,11 @@ mod platform {
                + Send
                + 'a {
             std::future::ready(loop {
-                match opc_libsctp_sys::recv_msg(self.0.fd.get_ref().as_fd(), buffer) {
+                match self
+                    .0
+                    .fd
+                    .with_fd(|fd| opc_libsctp_sys::recv_msg(fd, buffer))
+                {
                     Ok(received) => break Ok(received),
                     Err(source) if source.kind() == io::ErrorKind::Interrupted => continue,
                     Err(source) if source.kind() == io::ErrorKind::WouldBlock => {
@@ -4940,10 +5087,15 @@ mod platform {
         if let Some(authentication) = authentication {
             opc_libsctp_sys::set_authentication_enabled(fd, true)
                 .map_err(|source| auth_io_err("enable_authentication", source))?;
+            if authentication.prefer_sha256 {
+                opc_libsctp_sys::set_hmac_identifiers(fd, &[3, 1])
+                    .map_err(|source| auth_io_err("set_hmac_identifiers", source))?;
+            }
             for chunk_type in authentication.chunk_types() {
                 opc_libsctp_sys::require_authenticated_chunk(fd, chunk_type)
                     .map_err(|source| auth_io_err("require_authenticated_chunk", source))?;
             }
+            require_local_authentication(fd, authentication)?;
         }
         opc_libsctp_sys::set_initmsg(fd, sys_init(init))
             .map_err(|source| io_err("set_initmsg", source))?;
@@ -5003,7 +5155,25 @@ mod platform {
         }?;
         let peer_chunks = opc_libsctp_sys::peer_authenticated_chunks(fd, 0)
             .map_err(|source| auth_io_err("peer_authenticated_chunks", source))?;
-        validate_peer_authenticated_chunks(authentication, &peer_chunks)
+        validate_peer_authenticated_chunks(authentication, &peer_chunks)?;
+        let local_chunks = opc_libsctp_sys::local_authenticated_chunks(fd, 0)
+            .map_err(|source| auth_io_err("local_authenticated_chunks", source))?;
+        // Linux accept creates a fresh endpoint; HMAC_IDENT there is not the
+        // association's inherited HMAC list. That list was verified before listen.
+        validate_local_authenticated_chunks(authentication, &local_chunks)
+            .map_err(|source| auth_io_err("local_authenticated_chunks", source))
+    }
+
+    fn require_local_authentication(
+        fd: std::os::fd::BorrowedFd<'_>,
+        authentication: SctpAuthenticationConfig,
+    ) -> Result<(), SctpError> {
+        let chunks = opc_libsctp_sys::local_authenticated_chunks(fd, 0)
+            .map_err(|source| auth_io_err("local_authenticated_chunks", source))?;
+        let identifiers = opc_libsctp_sys::hmac_identifiers(fd)
+            .map_err(|source| auth_io_err("hmac_identifiers", source))?;
+        validate_local_authentication(authentication, &chunks, &identifiers)
+            .map_err(|source| auth_io_err("authentication_readback", source))
     }
 
     pub(super) fn record_remote_submission_result(
@@ -5024,17 +5194,16 @@ mod platform {
         });
     }
 
-    pub(super) fn register_async_fd(fd: OwnedFd) -> Result<AsyncFd<OwnedFd>, SctpError> {
-        AsyncFd::new(fd).map_err(|source| io_err("async_fd", source))
+    pub(super) fn register_async_fd(fd: OwnedFd) -> Result<AsyncOwnedFd, SctpError> {
+        AsyncOwnedFd::new(fd).map_err(|source| io_err("async_fd", source))
     }
 
     async fn wait_connected(
-        socket: &SctpSocket,
+        fd: &AsyncOwnedFd,
         progress: &SctpConnectProgressHandle,
     ) -> Result<(), SctpError> {
         loop {
-            let mut guard = socket
-                .fd
+            let mut guard = fd
                 .writable()
                 .await
                 .map_err(|source| io_err("connect_ready", source))?;
@@ -5046,14 +5215,10 @@ mod platform {
                 }
                 Ok(Ok(Some(source))) => {
                     progress.advance(SctpConnectStage::SocketErrorChecked);
-                    socket.mark_closed();
-                    socket.metrics.record_io_error();
                     return Err(io_err("connect", source));
                 }
                 Ok(Err(source)) if source.kind() == io::ErrorKind::Interrupted => continue,
                 Ok(Err(source)) => {
-                    socket.mark_closed();
-                    socket.metrics.record_io_error();
                     return Err(io_err("connect", source));
                 }
                 Err(_would_block) => continue,
@@ -5128,6 +5293,10 @@ mod platform {
             let _ = self;
         }
 
+        pub fn abort_on_wire(&self) -> Result<(), SctpError> {
+            Err(SctpError::UnsupportedPlatform)
+        }
+
         pub async fn recv_buffered(&self) -> Result<Option<InboundMessage>, SctpError> {
             Err(SctpError::UnsupportedPlatform)
         }
@@ -5135,6 +5304,10 @@ mod platform {
         pub fn authenticates_data_chunks(&self) -> bool {
             let _ = self;
             false
+        }
+
+        pub fn local_authenticated_chunks(&self) -> Result<Vec<u8>, SctpError> {
+            Err(SctpError::UnsupportedPlatform)
         }
 
         pub fn max_message_bytes(&self) -> usize {
@@ -5567,6 +5740,31 @@ mod tests {
     }
 
     #[test]
+    fn local_authentication_readback_requires_chunks_and_exact_requested_hmac_order() {
+        let ordinary = SctpAuthenticationConfig::data();
+        let preferred = ordinary.with_forward_tsn().with_sha256_preference();
+        assert!(validate_local_authentication(ordinary, &[0], &[1]).is_ok());
+        assert!(validate_local_authentication(preferred, &[0, 192], &[3, 1]).is_ok());
+        assert!(validate_local_authentication(preferred, &[192, 0, 193], &[3, 1]).is_ok());
+        for chunks in [&[][..], &[0], &[192]] {
+            assert_eq!(
+                validate_local_authentication(preferred, chunks, &[3, 1])
+                    .unwrap_err()
+                    .kind(),
+                io::ErrorKind::InvalidData
+            );
+        }
+        for hmac in [&[][..], &[1], &[1, 3], &[3]] {
+            assert_eq!(
+                validate_local_authentication(preferred, &[0, 192], hmac)
+                    .unwrap_err()
+                    .kind(),
+                io::ErrorKind::InvalidData
+            );
+        }
+    }
+
+    #[test]
     fn notification_receive_capacity_is_independent_of_payload_cap() {
         assert_eq!(
             sctp_recv_chunk_capacity(1),
@@ -5594,6 +5792,137 @@ mod tests {
         let _ = endpoint as fn(&SctpEndpoint);
         let _ = association as fn(&SctpAssociation);
         let _ = receive_half as fn(&mut SctpAssociationReceiveHalf);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn security_key_ownership_received_payload_keeps_its_zeroizing_owner() {
+        for payload in [vec![0xab; 32], b"ngap-without-key".to_vec()] {
+            let mut accumulator = ReceiveAccumulator::new(1024);
+            let message = accumulator
+                .push(
+                    synthetic_received(
+                        payload.len(),
+                        1,
+                        NGAP_PPID,
+                        7,
+                        synthetic_recv_flags(false, true, false, false),
+                    ),
+                    &payload,
+                )
+                .unwrap()
+                .unwrap();
+            assert_eq!(message.payload.as_ref(), payload.as_slice());
+            // An owner-backed Bytes cannot shed its wiping destructor by
+            // becoming an ordinary uniquely-owned BytesMut.
+            assert!(message.payload.try_into_mut().is_err());
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn security_key_ownership_sctp_and_n2_handoff_wipe_the_last_payload_owner() {
+        for payload in [vec![0xab; 32], b"ngap-without-key".to_vec()] {
+            receive_payload::audit::take();
+            let mut accumulator = ReceiveAccumulator::new(1024);
+            let message = accumulator
+                .push(
+                    synthetic_received(
+                        payload.len(),
+                        1,
+                        NGAP_PPID,
+                        7,
+                        synthetic_recv_flags(false, true, false, false),
+                    ),
+                    &payload,
+                )
+                .unwrap()
+                .unwrap();
+            receive_payload::audit::take();
+            let pointer = message.payload.as_ptr() as usize;
+            let n2::N2Inbound::Payload(admitted) = n2::UnprotectedN2Profile::new(1024)
+                .unwrap()
+                .admit(message)
+                .unwrap()
+            else {
+                panic!("DATA payload");
+            };
+            let bytes = admitted.into_payload();
+            let retained = bytes.clone();
+            drop(bytes);
+            assert!(receive_payload::audit::take().is_empty());
+            assert_eq!(retained.as_ref(), payload.as_slice());
+            drop(retained);
+            assert_eq!(
+                receive_payload::audit::take(),
+                vec![(pointer, payload.len(), true)]
+            );
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn security_key_ownership_partial_receive_growth_and_rejection_wipe_storage() {
+        receive_payload::audit::take();
+        let mut accumulator = ReceiveAccumulator::new(128);
+        let first = [0xab; 32];
+        assert!(accumulator
+            .push(
+                synthetic_received(
+                    32,
+                    1,
+                    NGAP_PPID,
+                    7,
+                    synthetic_recv_flags(false, false, false, false)
+                ),
+                &first,
+            )
+            .unwrap()
+            .is_none());
+        let old_pointer = accumulator.payload.as_ref().as_ptr() as usize;
+        receive_payload::audit::take();
+        let message = accumulator
+            .push(
+                synthetic_received(
+                    64,
+                    1,
+                    NGAP_PPID,
+                    7,
+                    synthetic_recv_flags(false, true, false, false),
+                ),
+                &[0xcd; 64],
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            receive_payload::audit::take(),
+            vec![(old_pointer, 32, true)]
+        );
+        let pointer = message.payload.as_ptr() as usize;
+        assert!(n2::UnprotectedN2Profile::new(32)
+            .unwrap()
+            .admit(message)
+            .is_err());
+        assert_eq!(receive_payload::audit::take(), vec![(pointer, 96, true)]);
+
+        let mut partial = ReceiveAccumulator::new(128);
+        assert!(partial
+            .push(
+                synthetic_received(
+                    32,
+                    1,
+                    NGAP_PPID,
+                    7,
+                    synthetic_recv_flags(false, false, false, false)
+                ),
+                &first,
+            )
+            .unwrap()
+            .is_none());
+        let pointer = partial.payload.as_ref().as_ptr() as usize;
+        receive_payload::audit::take();
+        drop(partial);
+        assert_eq!(receive_payload::audit::take(), vec![(pointer, 32, true)]);
     }
 
     #[cfg(target_os = "linux")]
@@ -7151,13 +7480,7 @@ mod tests {
         assert!(config.validate().is_ok());
 
         config.local_addrs.push("[::1]:38412".parse().unwrap());
-        assert!(matches!(
-            config.validate(),
-            Err(SctpError::InvalidConfig {
-                field: "address_family",
-                ..
-            })
-        ));
+        assert!(config.validate().is_ok());
     }
 
     #[test]
@@ -7311,13 +7634,34 @@ mod tests {
         ]);
         assert!(config.validate().is_ok());
 
-        config.remote_addrs.push("[::1]:38412".parse().unwrap());
+        config.remote_addrs.push("[::1]:38413".parse().unwrap());
         assert!(matches!(
             config.validate(),
             Err(SctpError::InvalidConfig {
-                field: "address_family",
+                field: "remote_addrs",
                 ..
             })
+        ));
+    }
+
+    #[test]
+    fn mapped_ipv4_path_identity_preserves_port_and_scope_checks() {
+        let v4 = "192.0.2.1:38412".parse().unwrap();
+        let mapped = "[::ffff:192.0.2.1]:38412".parse().unwrap();
+        assert!(same_sctp_path(v4, mapped));
+        assert!(same_sctp_path(mapped, v4));
+        assert!(!same_sctp_path(
+            v4,
+            "[::ffff:192.0.2.1]:38413".parse().unwrap()
+        ));
+        assert!(!same_sctp_path(
+            v4,
+            "[::ffff:192.0.2.1%3]:38412".parse().unwrap()
+        ));
+        assert!(!same_sctp_path(v4, "[::192.0.2.1]:38412".parse().unwrap()));
+        assert!(!same_sctp_path(
+            v4,
+            "[::ffff:192.0.2.2]:38412".parse().unwrap()
         ));
     }
 
@@ -7743,7 +8087,7 @@ mod tests {
     #[tokio::test]
     #[ignore = "requires Linux kernel SCTP-AUTH and sender-dry support"]
     async fn loopback_authenticated_association_switches_keys_and_drains() {
-        let authentication = SctpAuthenticationConfig::data();
+        let authentication = SctpAuthenticationConfig::data().with_sha256_preference();
         let mut server_config = SctpEndpointConfig::one_to_one("127.0.0.1:0".parse().unwrap());
         // Lifecycle notifications must remain intact even when the caller's
         // DATA cap is smaller than every typed notification.
@@ -7765,6 +8109,12 @@ mod tests {
             .unwrap();
         assert!(client.is_pristine_rfc6083_auth_state());
         assert!(accepted.is_pristine_rfc6083_auth_state());
+        for association in [&client, &accepted] {
+            assert!(association
+                .local_authenticated_chunks()
+                .unwrap()
+                .contains(&SCTP_DATA_CHUNK_TYPE));
+        }
 
         let first_key_id = SctpAuthKeyId::new(1).unwrap();
         client
@@ -8004,6 +8354,75 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     #[tokio::test]
+    #[ignore = "requires Linux kernel SCTP and IPv6 loopback support"]
+    async fn loopback_dual_stack_multihoming_selects_both_families() {
+        for ipv6_first in [false, true] {
+            let mut server_config = SctpEndpointConfig::one_to_one("127.0.0.1:0".parse().unwrap());
+            server_config.local_addrs.push("[::1]:0".parse().unwrap());
+            if ipv6_first {
+                server_config.local_addrs.reverse();
+            }
+            let server = SctpEndpoint::bind(server_config).unwrap();
+            let mut addresses = server.local_addresses().unwrap();
+            addresses.sort_unstable();
+            assert_eq!(addresses.len(), 2);
+            assert_eq!(addresses[0].ip().to_string(), "127.0.0.1");
+            assert_eq!(addresses[1].ip().to_string(), "::1");
+            assert_ne!(addresses[0].port(), 0);
+            assert_eq!(addresses[0].port(), addresses[1].port());
+            if ipv6_first {
+                addresses.reverse();
+            }
+            let mut config = SctpConnectConfig::new(addresses[0]);
+            config.remote_addrs = addresses.clone();
+            config.local_addrs = vec!["127.0.0.2:0".parse().unwrap(), "[::1]:0".parse().unwrap()];
+            let client =
+                tokio::time::timeout(Duration::from_secs(5), SctpAssociation::connect(config))
+                    .await
+                    .unwrap()
+                    .unwrap();
+            let accepted = tokio::time::timeout(Duration::from_secs(5), server.accept())
+                .await
+                .unwrap()
+                .unwrap();
+            let mut peer_addresses = client.peer_addresses().unwrap();
+            peer_addresses.sort_unstable();
+            let mut expected = addresses.clone();
+            expected.sort_unstable();
+            assert_eq!(peer_addresses, expected);
+            let mut client_addresses = client.local_addresses().unwrap();
+            client_addresses.sort_unstable();
+            assert_eq!(client_addresses.len(), 2);
+            assert_eq!(client_addresses[0].ip().to_string(), "127.0.0.2");
+            assert_eq!(client_addresses[1].ip().to_string(), "::1");
+
+            for address in addresses {
+                client.set_primary_peer_path(address).unwrap();
+                let paths = client.peer_path_health();
+                assert_eq!(paths.len(), 2);
+                let primary: Vec<_> = paths.iter().filter(|path| path.primary).collect();
+                assert_eq!(primary.len(), 1);
+                assert!(same_sctp_path(primary[0].peer_addr, address));
+                client
+                    .send(OutboundMessage::ordered(
+                        Bytes::from_static(b"dual-stack"),
+                        1,
+                        NGAP_PPID,
+                    ))
+                    .await
+                    .unwrap();
+                let received = tokio::time::timeout(Duration::from_secs(5), recv_data(&accepted))
+                    .await
+                    .unwrap();
+                assert_eq!(received.payload, Bytes::from_static(b"dual-stack"));
+                assert_eq!(received.stream_id, 1);
+                assert_eq!(received.ppid, NGAP_PPID);
+            }
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
     #[ignore = "requires Linux kernel SCTP multihoming support"]
     async fn loopback_diameter_uses_explicit_multihoming_config() {
         let mut server_config = SctpEndpointConfig::one_to_one("127.0.0.1:0".parse().unwrap());
@@ -8169,7 +8588,7 @@ mod tests {
         server_addr: SocketAddr,
     ) -> (SctpEndpoint, DiameterSctpAssociation, SctpAssociation) {
         let server = SctpEndpoint::bind(SctpEndpointConfig::one_to_one(server_addr)).unwrap();
-        let client = DiameterSctpPeer::new_unprotected(server_addr)
+        let client = DiameterSctpPeer::new_unprotected(server.local_addresses().unwrap()[0])
             .connect_association()
             .await
             .unwrap();
@@ -8384,5 +8803,141 @@ mod tests {
             DiameterSctpError::SctpRecv(SctpError::Closed)
         ));
         assert_eq!(error.as_str(), "diameter_sctp_recv_error");
+
+        // Both close(2) and SHUT_RDWR preserve queued sends before SHUTDOWN.
+        for explicit_shutdown in [false, true] {
+            let (_server, client, accepted) =
+                diameter_loopback("127.0.0.1:0".parse().unwrap()).await;
+            for value in 0..8_u8 {
+                accepted
+                    .send(OutboundMessage::ordered(
+                        Bytes::from(vec![value; 1024]),
+                        0,
+                        DIAMETER_SCTP_PPID,
+                    ))
+                    .await
+                    .expect("queue final response");
+            }
+            if explicit_shutdown {
+                accepted.abort_handle().abort();
+                assert!(!accepted.health().socket_open);
+            }
+            drop(accepted);
+            for value in 0..8_u8 {
+                let payload =
+                    tokio::time::timeout(Duration::from_secs(5), client.recv_diameter_payload())
+                        .await
+                        .expect("bounded queued delivery")
+                        .expect("queued response survives close");
+                assert_eq!(payload, Bytes::from(vec![value; 1024]));
+            }
+            assert!(matches!(
+                tokio::time::timeout(Duration::from_secs(5), client.recv_diameter_payload())
+                    .await
+                    .expect("bounded shutdown"),
+                Err(DiameterSctpError::SctpRecv(SctpError::Closed))
+            ));
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    #[ignore = "requires Linux kernel SCTP support"]
+    async fn loopback_wire_abort_closes_with_live_handles_and_pending_receive() {
+        use std::future::Future;
+        let (_server, client, accepted) = diameter_loopback("127.0.0.1:0".parse().unwrap()).await;
+        // Drain COMM_UP before suspending a read on the association we abort.
+        while accepted
+            .imp
+            .recv_buffered()
+            .await
+            .expect("buffered events")
+            .is_some()
+        {}
+        let abort = accepted.abort_handle();
+        let mut pending = Box::pin(accepted.recv());
+        std::future::poll_fn(|cx| {
+            assert!(pending.as_mut().poll(cx).is_pending());
+            std::task::Poll::Ready(())
+        })
+        .await;
+        abort
+            .abort_on_wire()
+            .expect("abort established association");
+        assert!(!accepted.health().socket_open);
+        let event = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let received = client
+                    .association
+                    .recv()
+                    .await
+                    .expect("peer terminal notification");
+                if !matches!(
+                    received.event,
+                    Some(SctpEvent::AssociationChange { state: 0, .. })
+                ) {
+                    break received.event;
+                }
+            }
+        })
+        .await
+        .expect("bounded peer abort");
+        assert!(
+            matches!(event, Some(SctpEvent::AssociationChange { state: 1, .. })),
+            "ABORT must produce COMM_LOST, not graceful shutdown: {event:?}"
+        );
+        assert!(tokio::time::timeout(Duration::from_secs(1), pending)
+            .await
+            .expect("pending read interrupted")
+            .is_err());
+        abort.abort_on_wire().expect("idempotent abort");
+        assert!(matches!(
+            accepted
+                .send(OutboundMessage::ordered(
+                    Bytes::from_static(b"after abort"),
+                    0,
+                    DIAMETER_SCTP_PPID
+                ))
+                .await,
+            Err(SctpError::Closed)
+        ));
+
+        // The payload facade leaves Diameter parsing to its caller. That caller
+        // must retain the same wire-abort authority as a raw association.
+        let (_listener, facade, peer) = diameter_loopback("127.0.0.1:0".parse().unwrap()).await;
+        peer.send(OutboundMessage::ordered(
+            Bytes::from_static(b"bad"),
+            0,
+            DIAMETER_SCTP_PPID,
+        ))
+        .await
+        .expect("malformed Diameter payload");
+        assert_eq!(
+            facade.recv_diameter_payload().await.unwrap(),
+            Bytes::from_static(b"bad")
+        );
+        let facade_abort = facade.abort_handle();
+        facade_abort
+            .abort_on_wire()
+            .expect("caller aborts unparseable Diameter");
+        assert!(!facade.health().socket_open);
+        let event = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let message = peer.recv().await.expect("peer terminal notification");
+                if matches!(message.event, Some(SctpEvent::AssociationChange { state, .. }) if state != 0)
+                    || matches!(message.event, Some(SctpEvent::Shutdown { .. })) {
+                    break message.event;
+                }
+            }
+        })
+        .await
+        .expect("bounded facade abort");
+        assert!(
+            matches!(event, Some(SctpEvent::AssociationChange { state: 1, .. })),
+            "facade caller must produce COMM_LOST: {event:?}"
+        );
+        facade_abort
+            .abort_on_wire()
+            .expect("idempotent facade abort");
     }
 }

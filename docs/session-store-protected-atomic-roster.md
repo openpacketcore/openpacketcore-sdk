@@ -244,7 +244,7 @@ have separate commitments beneath the same stable roster identity. A higher
 execution fence authorizes takeover but does not alter that immutable body,
 reseal protected bytes, or create another operation ID.
 
-The V1 validated bounds are fixed by the profile:
+The validated field bounds and current shared admission policy are:
 
 | Item | Bound |
 | --- | ---: |
@@ -254,11 +254,38 @@ The V1 validated bounds are fixed by the profile:
 | Exact protected terminal result | 16 KiB |
 | Member descriptor | 16 KiB each |
 | Provider evidence | 4 KiB each |
-| Live rosters | 1,024 |
-| Live plus retained terminal rosters | 131,072 |
+| Ordinary live-admission threshold | 1,024 |
+| Ordinary roster logical charge budget, including reserved completion | 256 GiB |
+| Completed admissions / retained history count | No policy quota |
 | Operational target | 100,000 |
 | Reclaim operation | oldest `min(1024, eligible)` |
 | Terminal retention | 24 hours from terminal commit |
+
+The immutable `AdmissionClass` defaults to `Ordinary`. Trusted consumers select
+`Emergency` before the first attempt through `AdmissionInput::new_with_class`,
+`FencedMutationRosterClient::prepare_with_class`, or
+`prepare_absent_with_class`. Canonical admission framing and its signed body
+commitment bind the class; a pending input cannot change it. Emergency bypasses
+ordinary live/byte admission thresholds and local authority/provider shares.
+It keeps authority, business preconditions, per-member serialization and checked
+arithmetic. Terminal readback guards have no policy count quota because the
+verified class is learned from the read itself; guards end with their callers.
+
+Ordinary admission waits on a conclusive live/byte-capacity response, releases
+its exact local reservation, and retries the same request within the original
+lease. It creates no detached waiter and dispatches no provider work while
+waiting. Ambiguous transport results still require recovery. `HistoryFull`
+now describes irreversible epoch/floor rejection and is not retried as capacity.
+Emergency never waits for an admission-policy quota or converts it into a
+capacity deadline. Physical resource, authority and quorum failures remain
+real failures.
+
+The 131,072 constant and quota literals in the frozen V1 descriptor remain only
+for compatibility; the separately authenticated shared capacity policy
+supersedes them. Both profiles bind that policy into activation authority, and
+V2 also binds it into its profile digest. This requires a fresh installation:
+old activation certificates, old snapshots and mixed-policy voters cannot
+establish the new policy. The ordinary V1 payload and profile digest are unchanged.
 
 V1 admission validates every bound, ordinal, ID, descriptor, expected version,
 profile, authority component, current business generation, established

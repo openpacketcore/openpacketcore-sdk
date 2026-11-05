@@ -62,22 +62,6 @@ pub(super) fn unique(seen: &mut u64, qfi: QosFlowId) -> Result<(), DecodeError> 
     *seen |= bit;
     Ok(())
 }
-fn write_octets(
-    writer: &mut dyn super::reset_fields::Sink,
-    bytes: &[u8],
-) -> Result<(), EncodeError> {
-    for byte in bytes {
-        writer.bits(u16::from(*byte), 8)?;
-    }
-    Ok(())
-}
-fn read_octets<const N: usize>(reader: &mut Reader<'_>) -> Result<[u8; N], DecodeError> {
-    let mut bytes = [0; N];
-    for byte in &mut bytes {
-        *byte = reader.bits(8)? as u8;
-    }
-    Ok(bytes)
-}
 pub(super) fn cause_width(class: CauseClass) -> usize {
     match class {
         CauseClass::RadioNetwork => 6,

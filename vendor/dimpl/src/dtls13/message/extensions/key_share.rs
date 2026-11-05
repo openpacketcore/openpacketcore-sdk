@@ -50,7 +50,7 @@ impl KeyShareEntry {
 /// KeyShare extension in ClientHello (RFC 8446 Section 4.2.8).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct KeyShareClientHello {
-    pub entries: ArrayVec<KeyShareEntry, { NamedGroup::supported().len() }>,
+    pub entries: ArrayVec<KeyShareEntry, { NamedGroup::supported_dtls13().len() }>,
 }
 
 impl KeyShareClientHello {
@@ -71,7 +71,7 @@ impl KeyShareClientHello {
             let entry_offset =
                 entries_base_offset + (rest.as_ptr() as usize - entries_data.as_ptr() as usize);
             let (r, entry) = KeyShareEntry::parse(rest, entry_offset)?;
-            if entry.group.is_supported() {
+            if NamedGroup::supported_dtls13().contains(&entry.group) {
                 entries
                     .try_push(entry)
                     .map_err(|_| Err::Failure(Error::new(rest, ErrorKind::LengthValue)))?;
@@ -194,8 +194,8 @@ mod tests {
     #[test]
     fn distinct_supported_key_shares_are_accepted() {
         let mut message = Vec::new();
-        message.extend_from_slice(&(NamedGroup::supported().len() as u16 * 5).to_be_bytes());
-        for group in NamedGroup::supported() {
+        message.extend_from_slice(&(NamedGroup::supported_dtls13().len() as u16 * 5).to_be_bytes());
+        for group in NamedGroup::supported_dtls13() {
             message.extend_from_slice(&group.as_u16().to_be_bytes());
             message.extend_from_slice(&1u16.to_be_bytes());
             message.push(0x42);
@@ -203,7 +203,7 @@ mod tests {
 
         let (rest, parsed) = KeyShareClientHello::parse(&message, 0).unwrap();
         assert!(rest.is_empty());
-        assert_eq!(parsed.entries.len(), NamedGroup::supported().len());
+        assert_eq!(parsed.entries.len(), NamedGroup::supported_dtls13().len());
 
         let mut serialized = Buf::new();
         parsed.serialize(&message, &mut serialized);
@@ -213,7 +213,7 @@ mod tests {
     #[test]
     fn too_many_duplicate_supported_key_shares_are_rejected() {
         let mut message = Vec::new();
-        let count = NamedGroup::supported().len() + 1;
+        let count = NamedGroup::supported_dtls13().len() + 1;
         message.extend_from_slice(&(count as u16 * 5).to_be_bytes());
         for _ in 0..count {
             message.extend_from_slice(&NamedGroup::X25519.as_u16().to_be_bytes());

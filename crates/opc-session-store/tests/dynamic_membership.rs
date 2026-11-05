@@ -20,7 +20,7 @@ use opc_key::{
 };
 #[cfg(feature = "test-control")]
 use opc_session_store::test_support::{
-    assert_mixed_compacted_roster_status_and_terminal_conflict_for_test,
+    assert_mixed_retired_roster_status_and_terminal_conflict_for_test,
     assert_stale_predecessor_signed_fresh_roster_admission_rejected_for_test,
     close_consensus_application_admission_for_test, consensus_local_durable_progress_for_test,
     is_replayed_joint_voting_for_test, observe_next_unstage_supervisor_for_test,
@@ -1923,12 +1923,6 @@ async fn root_preserving_three_to_five_reactivates_profile_and_accepts_successor
         .copied()
         .find(|candidate| *candidate != successor_leader)
         .expect("successor follower for real snapshot installation");
-    let target_old_applied = fleet.stores[snapshot_target]
-        .status()
-        .applied_index
-        .expect("isolated follower has an applied predecessor index");
-    let install_snapshot_baseline = fleet.network.install_snapshot_count_to(snapshot_target);
-    fleet.network.isolate(snapshot_target);
     let mut predecessor_terminal = terminalize_signed_fresh_roster_admission_for_test(
         &fleet.stores[successor_leader],
         0xD5,
@@ -1941,7 +1935,6 @@ async fn root_preserving_three_to_five_reactivates_profile_and_accepts_successor
         expand.desired_identity(),
         "the immutable predecessor admission and current successor terminal must both authenticate"
     );
-    advance_consensus_past_snapshot_retention_for_test(&fleet.stores[successor_leader]).await;
     let retention_time = fleet
         .clock
         .now_utc()
@@ -1955,7 +1948,7 @@ async fn root_preserving_three_to_five_reactivates_profile_and_accepts_successor
     )
     .await
     .expect("higher-fence recovery advances replicated time and production reclaim");
-    assert_mixed_compacted_roster_status_and_terminal_conflict_for_test(
+    assert_mixed_retired_roster_status_and_terminal_conflict_for_test(
         &fleet.stores[successor_leader],
         0xD5,
         &predecessor_live,
@@ -1963,9 +1956,26 @@ async fn root_preserving_three_to_five_reactivates_profile_and_accepts_successor
         false,
     )
     .await
-    .expect(
-        "mixed tombstone keeps authenticated status Compacted and terminal conflict non-definitive",
-    );
+    .expect("the autonomous lane retires D5 with durable authority and non-definitive status");
+    assert_mixed_retired_roster_status_and_terminal_conflict_for_test(
+        &fleet.stores[snapshot_target],
+        0xD5,
+        &predecessor_live,
+        &predecessor_terminal,
+        false,
+    )
+    .await
+    .expect("the snapshot target validates the same D5 retirement before isolation");
+    // This fixture covers retired-to-retired snapshot installation and reopen.
+    // A follower isolated before retirement is a separately tracked recovery
+    // design case, outside this fixture's scope.
+    let target_old_applied = fleet.stores[snapshot_target]
+        .status()
+        .applied_index
+        .expect("isolated follower has an applied predecessor index");
+    let install_snapshot_baseline = fleet.network.install_snapshot_count_to(snapshot_target);
+    fleet.network.isolate(snapshot_target);
+    advance_consensus_past_snapshot_retention_for_test(&fleet.stores[successor_leader]).await;
     trigger_consensus_snapshot_for_test(&fleet.stores[successor_leader])
         .await
         .expect("capture a post-rollover mixed-identity roster snapshot");
@@ -1998,7 +2008,7 @@ async fn root_preserving_three_to_five_reactivates_profile_and_accepts_successor
         .await
         .expect("post-rollover snapshot recovery authenticates mixed roster history");
     wait_ready_labeled(&fleet.stores, &expanded, "post-snapshot-restart").await;
-    assert_mixed_compacted_roster_status_and_terminal_conflict_for_test(
+    assert_mixed_retired_roster_status_and_terminal_conflict_for_test(
         &fleet.stores[snapshot_target],
         0xD5,
         &predecessor_live,
@@ -2007,7 +2017,7 @@ async fn root_preserving_three_to_five_reactivates_profile_and_accepts_successor
     )
     .await
     .expect(
-        "snapshot target retains the exact D5 tombstone and authenticates its compacted status and terminal conflict",
+        "snapshot target retains exact D5 retirement authority and authenticates non-definitive status and terminal refusal",
     );
     let verified_authority_identity =
         submit_signed_fresh_roster_cycle_for_test(&fleet.stores[successor_leader], 0xD7)

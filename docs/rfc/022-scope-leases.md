@@ -243,13 +243,20 @@ inventory. It decodes candidate scope rows after filtering tenant, network
 function and reserved key type. SQLite filters those columns in its query.
 
 `ScopeId` uses the
-existing name-derived cluster ID produced by `ConsensusClusterId::new`, as
-used by `SessionReplicationManifest`; it remains independent of membership
-epochs. This profile leaves consensus identity, node IDs and configuration
-digests unchanged. Reusing a cluster name reuses its cluster identity; a fresh
-installation with the same name does not create a separate authority domain.
-Installation-qualified identity requires a separate, explicitly approved
-breaking change, tracked in #1187.
+installation-qualified cluster ID produced by
+`ConsensusClusterId::for_installation(name, installation_nonce)`, as used by
+`SessionReplicationManifest`; it remains independent of membership epochs.
+Every manifest constructor requires the non-zero installation nonce, and the
+manifest configuration digest (v2) commits that nonce together with the cluster
+name, generation and complete descriptor fingerprints. Consensus cluster
+identity, fixed durable quorum identity, configuration digest and consensus
+node IDs are therefore all installation-qualified. Reusing the persisted nonce
+with the same cluster name reuses the installation; a fresh nonce with the same
+name is a different authority domain, so a retained scope/consensus store from
+the earlier installation fails its typed store-identity admission instead of
+joining. #1187 is that explicitly approved breaking change: it is a
+fresh-install boundary with no migration, and consumers generate and persist the
+nonce at first install with the immutable manifest.
 
 Profile 4 does not reserve a retirement command. Retirement requires a new
 format and fresh installation (planned profile 5). Until that profile supplies

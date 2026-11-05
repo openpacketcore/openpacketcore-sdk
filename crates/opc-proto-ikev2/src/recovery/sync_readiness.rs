@@ -19,7 +19,7 @@ impl<P: RecoveryProfile> Window<P> {
     /// The capability binds profile/keys/SPIs/original role, requires currently
     /// admitted encryption and entropy, and is consumed by the production offer
     /// wrapper. It is not proof of consumer durability, full peer authentication,
-    /// DPD support or fragmented recovery.
+    /// empty-probe liveness support or fragmented recovery.
     /// Both runtime directions and their
     /// storage/clock contracts must be wired by the consumer before advertising.
     /// # Errors

@@ -10,8 +10,8 @@ use crate::buffer::{Buf, TmpBuf, ToBuf};
 use crate::crypto;
 use crate::crypto::SrtpProfile;
 use crate::crypto::{Aad, Iv, Nonce};
-use crate::dtls12::message::DigitallySigned;
 use crate::dtls12::message::{CurveType, Dtls12CipherSuite, HashAlgorithm};
+use crate::dtls12::message::{DigitallySigned, SignatureAndHashAlgorithm};
 use crate::dtls12::message::{NamedGroup, SignatureAlgorithm};
 
 #[derive(Debug)]
@@ -517,13 +517,25 @@ impl CryptoContext {
     pub fn sign_data(
         &mut self,
         data: &[u8],
-        hash_alg: HashAlgorithm,
+        algorithm: SignatureAndHashAlgorithm,
         out: &mut Buf,
     ) -> Result<(), CryptoError> {
         let AuthMode::Certificate { private_key, .. } = &mut self.auth else {
             return Err(CryptoError::NoPrivateKeyConfigured);
         };
-        private_key.sign(data, hash_alg, out)
+        private_key.sign_with_scheme(
+            data,
+            crate::types::SignatureScheme::from_u16(algorithm.as_u16()),
+            out,
+        )
+    }
+
+    pub fn supports_signature(&self, algorithm: SignatureAndHashAlgorithm) -> bool {
+        match &self.auth {
+            AuthMode::Certificate { private_key, .. } => private_key
+                .supports_scheme(crate::types::SignatureScheme::from_u16(algorithm.as_u16())),
+            _ => false,
+        }
     }
 
     /// Generate verify data for a Finished message using PRF
@@ -707,7 +719,7 @@ impl CryptoContext {
         Some((CurveType::NamedCurve, ke.group()))
     }
 
-    /// Check if the client's private key is compatible with a given cipher suite.
+    /// Check whether a server's key can authenticate the selected cipher suite.
     pub fn is_cipher_suite_compatible(&self, cipher_suite: Dtls12CipherSuite) -> bool {
         match (&self.auth, cipher_suite.signature_algorithm()) {
             // Certificate-based suite needs a matching private key
@@ -719,6 +731,15 @@ impl CryptoContext {
             // Mismatch: cert context + PSK suite, or PSK context + cert suite
             _ => false,
         }
+    }
+
+    /// Client certificates authenticate CertificateVerify, independently of the
+    /// server's cipher-suite authentication algorithm (RFC 5246 section 7.4.6).
+    pub fn is_client_cipher_suite_compatible(&self, cipher_suite: Dtls12CipherSuite) -> bool {
+        matches!(
+            (&self.auth, cipher_suite.signature_algorithm()),
+            (AuthMode::Certificate { .. }, Some(_)) | (AuthMode::Psk, None)
+        )
     }
 
     /// Get the client write IV if derived.
@@ -739,12 +760,11 @@ impl CryptoContext {
         signature_buf: &[u8],
         cert_der: &[u8],
     ) -> Result<(), CryptoError> {
-        self.provider().signature_verification.verify_signature(
+        self.provider().signature_verification.verify_with_scheme(
             cert_der,
             data,
             signature.signature(signature_buf),
-            signature.algorithm.hash,
-            signature.algorithm.signature,
+            crate::types::SignatureScheme::from_u16(signature.algorithm.as_u16()),
         )
     }
 }

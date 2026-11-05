@@ -55,6 +55,8 @@ fn configured(signed: &RosterV2PersistenceFixture) -> NativeState {
         voters: protected_roster_profile_v2_voter_set_digest(signed.identity, &state.members),
         profile: crate::fenced_mutation_roster::Profile::v2().digest(),
     });
+    state.roster.witness =
+        Some(crate::fenced_mutation_roster_storage::GlobalChargeWitness::empty());
     state.admit_business().unwrap();
     let origin = SessionConsensusNodeId::new(7).unwrap();
     state
@@ -519,6 +521,7 @@ fn native_roster_publication_activation_profiles_and_missing_root_remain_indepen
         );
         assert!(!state.frontiers.roster_v1_namespace);
         assert!(state.protected_roster_v2_activation_matches(signed.identity, &state.members));
+        assert_eq!(state.roster.witness, Some(GlobalChargeWitness::empty()));
         let admission = state.apply(&[q1(&signed, 2)]).unwrap();
         if root_configured {
             assert!(matches!(
@@ -571,6 +574,34 @@ fn native_roster_publication_activation_profiles_and_missing_root_remain_indepen
             .unwrap()
             .validate_captured(&|| Ok(()))
             .unwrap();
+    }
+}
+
+#[test]
+fn retired_admission_witness_native_rootless_activation_keeps_only_virgin_history() {
+    let signed = crate::consensus::types::roster_v2_persistence_fixture();
+    let mut state = configured(&signed).clone();
+    state.roster_root = None;
+    state.admit_business().unwrap();
+    assert_eq!(state.roster.witness, Some(GlobalChargeWitness::empty()));
+    for (witness, reason) in [
+        (None, "native activated roster witness is missing"),
+        (
+            Some(
+                GlobalChargeWitness::empty()
+                    .retired_through_terminal_sequence_for_test(1, 1)
+                    .unwrap(),
+            ),
+            "native roster state lacks its configured trust root",
+        ),
+    ] {
+        let mut damaged = state.clone();
+        damaged.roster.witness = witness;
+        assert!(damaged
+            .admit_business()
+            .unwrap_err()
+            .to_string()
+            .contains(reason));
     }
 }
 
@@ -742,4 +773,53 @@ fn scope_authority_commands_do_not_trigger_unrelated_roster_maintenance() {
         state.roster.rows[&binding].canonical().unwrap(),
         sql_row(&sql, binding)
     );
+}
+
+// Admission headroom belongs to snapshot verification as well as live edits.
+// Isolate the real process counter so parallel tests cannot spend this probe.
+#[test]
+fn native_empty_roster_snapshot_validation_uses_checkpoint_headroom() {
+    crate::test_process::with_completion_deadline(std::time::Duration::from_secs(300), || {
+        const CHILD: &str = "OPC_NATIVE_CHECKPOINT_HEADROOM_TEST_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            let name = format!(
+                "{}::native_empty_roster_snapshot_validation_uses_checkpoint_headroom",
+                module_path!().split_once("::").unwrap().1,
+            );
+            use crate::test_process::CommandExt as _;
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", &name, "--nocapture", "--test-threads=1"])
+                .env(CHILD, "1")
+                .test_output_with_deadline(std::time::Duration::from_secs(1800))
+                .unwrap();
+            let stdout = String::from_utf8(output.stdout).unwrap();
+            assert!(
+                output.status.success(),
+                "checkpoint headroom child must pass: {} {}",
+                stdout,
+                String::from_utf8_lossy(&output.stderr),
+            );
+            assert!(
+                stdout.contains(&format!("test {name} ... ok"))
+                    && stdout.contains("test result: ok. 1 passed; 0 failed; 0 ignored;"),
+                "the exact enabled child test must execute",
+            );
+            return;
+        }
+        use crate::consensus::verified_snapshot::{VerificationMemory, PROCESS_VERIFICATION_BYTES};
+        let (storage, _, _) = crate::consensus::native::changes::tests::fixture();
+        assert!(storage.business.roster_root.is_none());
+        assert!(storage.business.roster.rows.is_empty());
+        let used = VerificationMemory::used_bytes();
+        let occupied = PROCESS_VERIFICATION_BYTES * 7 / 8 + 64 * 1024;
+        let _held = VerificationMemory::reserve(occupied.checked_sub(used).unwrap()).unwrap();
+        storage
+            .validate_image()
+            .expect("snapshot validation must use its reserved checkpoint headroom");
+        assert_eq!(VerificationMemory::used_bytes(), occupied);
+        let admitted = storage.business.admit_full_roster(&|| Ok(())).unwrap();
+        assert_eq!(admitted.certificate().unwrap().counts(), [0, 0]);
+        assert_eq!(admitted.witness, storage.business.roster.witness);
+        assert_eq!(VerificationMemory::used_bytes(), occupied);
+    });
 }

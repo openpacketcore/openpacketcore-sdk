@@ -483,6 +483,11 @@ fn mixed_delivery_retains_full_reservation(void: bool) {
         }
     }
     let hint = storage.business.reclaim_candidate_bytes(&entries).unwrap();
+    assert_eq!(
+        hint,
+        FENCED_TRANSITION_V2_RECLAIM_BATCH * 72,
+        "new bindings before maintenance must reserve its complete bounded deletion candidate"
+    );
     let mut delta = storage.business.prepare(&entries).unwrap();
     delta.reclaim_memory = Some(VerificationMemory::reserve(hint).unwrap());
     let publication = Publication::prepare(delta).unwrap();

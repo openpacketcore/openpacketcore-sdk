@@ -17,6 +17,11 @@ GTP-U encapsulation/classification helpers.
   endpoint identity plus explicit `Any`, exact, or inclusive-range UDP source
   authorization. `validate_ipv4_downlink_binding_wire` and the owner wire
   helpers provide allocation-free verifier-facing checks over map-owned bytes.
+- `GtpuPeerSourcePolicy` preserves the exact peer check by default and adds an
+  explicit TEID/local multi-homing policy. Opt-in bindings use version 2;
+  ordinary/N3/MTU session entries use versions 4/5/6. Older versions retain exact
+  bytes and unsupported version/policy combinations are rejected. Policy bytes
+  participate in owner/commit equality and typed/borrowed checks agree.
 - `DownlinkBindingMismatch` defines the fixed invalid/family/peer/local/
   ingress/source-port counter cardinality; map names and indexes are shared by
   userspace and the tc object.
@@ -34,7 +39,7 @@ GTP-U encapsulation/classification helpers.
   extension rule between both tc parsers and the host reassembly parser. The
   complete chain must validate before a control-plane handoff.
 - `ipv4_header_checksum` computes an option-free IPv4 header checksum.
-- The TFT v5 ABI defines classifier metadata and precedence-ranked filters for
+- The TFT v6 ABI defines classifier metadata and precedence-ranked filters for
   the IPv4 uplink path. `TftClassifierIpv4Packet::parse` remains a strict
   packet-only parser that rejects fragments. `parse_first_fragment` accepts a
   fully visible fragment-zero header solely for stateful affinity; ESP exposes
@@ -65,9 +70,24 @@ GTP-U encapsulation/classification helpers.
   `/32` or `/128` endpoints, generation/slot index candidates, one normal HASH
   authority value, exact device configuration, and a bounded in-flight
   transaction journal.
-  Entry version 2 binds one six-bit N3 QFI at byte 72; version 1 retains its
-  exact legacy encoding. Both occupy 80 bytes inside the same 208-byte group
-  authority, and typed/zero-copy readers enforce the same canonical contract.
+  Entry version 1 retains its exact legacy encoding; version 2 binds one
+  six-bit N3 QFI at byte 72. Version 3 adds a canonical `DownlinkInnerMtu`
+  field at bytes 73..74 for ordinary inner IPv6 over outer IPv4, using the
+  legacy UDP/2152 source port and an in-tunnel Packet Too Big MTU of at least
+  1,280. The constructor returns `None` for unsupported profiles, and both
+  readers reject unsupported N3/MTU combinations. Versions 4, 5 and 6 carry
+  the ordinary, N3 and MTU profiles with explicit `TeidAndLocal` policy in byte 3.
+  Default-policy versions 1–3 still require byte 3 zero. Version 0 and bytes
+  75..79 stay reserved. Every profile occupies 80 bytes inside the same
+  208-byte group authority, and typed/zero-copy readers enforce the same
+  canonical contract. The grouped schema marker advances to
+  `OPC-GROUP-IP-v7`; crossing from version 6 requires a fresh installation.
+  Grouped-session APIs still refuse MTU policies; the ordinary IPv6 path
+  shares their wire layout without granting those APIs an unenforced policy.
+
+Outgoing peer TEIDs admit zero under TS 29.281 section 5.1. Local TEIDs,
+receive keys and required endpoint addresses remain nonzero. Owner and
+authority comparisons still require the exact committed peer TEID, including zero.
 
 All multi-byte wire and map fields are network byte order unless noted in the
 Rust docs.
@@ -147,13 +167,19 @@ authority-store lease API from `opc-gtpu-dataplane`.
   and 64 range checks, without helpers or allocations.
 - Each fragment slot is 392 bytes; a bucket is 1,568 bytes, or 1,572 bytes with
   the tc BTF spin lock. The kernel ARRAY uses a 1,576-byte aligned stride,
-  totaling 24.625 MiB of value storage per attachment before map metadata. These
-  limits are shared by all datagrams on an attachment, with no per-PAA capacity
-  guarantee. Classifier replacement invalidates identities; it does not
-  delete live slots or extend their deadlines.
+  totaling 24.625 MiB of value storage per attachment before map metadata. The
+  classifier identity (attachment and subscriber PAA) selects one of 256 owner
+  groups of 64 buckets, so one subscriber is bounded to 256 concurrent
+  fragmented datagrams and cannot consume another owner group's capacity.
+  Colliding PAAs share one group's bound; the partition costs no memory.
+  Classifier replacement invalidates identities; it does not delete live slots
+  or extend their deadlines.
 - The additional pinned map advances the current graph to 35 maps and TFT
-  marker to `OPC-TFT-IPv4-v5`. The loader refuses retained TFT v4 or incomplete
-  TFT graphs before attachment mutation; current recovery proof/WAL formats
+  marker to `OPC-TFT-IPv4-v6`. Version 6 adds the fourth pinned TFT drop-counter
+  slot (fragment-affinity capacity refusal), so its counter-map definition
+  differs from version 5 even though the pin count is unchanged. The loader
+  refuses retained TFT v5, TFT v4, or incomplete TFT graphs before attachment
+  mutation; current recovery proof/WAL formats
   also advance. Upgrade and rollback require a drain, compatible-version exact
   cleanup, and fresh attachment. Incompatible retained proofs, WALs, or
   finalized receipts continue to fence the namespace after graph cleanup. No
@@ -163,7 +189,7 @@ authority-store lease API from `opc-gtpu-dataplane`.
   The separate frozen shipped-25 ABI retains its literal TFT v4 recognition.
 - The grouped-session ABI is used by the current loader and tc programs without
   changing legacy key bytes. The independent `GTPU_SCHEMA6` marker prevents a
-  v5 graph from being mistaken for the grouped schema. Each attachment owns
+  v6 graph from being mistaken for the grouped schema. Each attachment owns
   exact configuration, authority, transaction-journal, uplink-index, and
   downlink-index maps; tc retains one selected index and validates it against
   the matching whole-value authority before that packet is authorized.

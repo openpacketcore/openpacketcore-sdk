@@ -341,17 +341,35 @@ fn native_slot_intent_cannot_be_missing_displaced_or_smuggled_into_an_old_format
         .unwrap(),
     );
     assert!(displaced.validate_image().is_err());
-    let mut image = Vec::new();
-    storage.write_image(&mut image, [6; 32], 1).unwrap();
-    assert_eq!(&image[..8], b"OPCNAT05");
-    image[..8].copy_from_slice(b"OPCNAT04");
-    assert!(NativeStorage::read_image(
-        &mut image.as_slice(),
-        [6; 32],
-        1,
-        storage.business.identity
-    )
-    .is_err());
+    for version in [5, 7] {
+        let mut image = Vec::new();
+        if version == 5 {
+            storage
+                .write_legacy_v5_image_for_test(&mut image, [6; 32], 1)
+                .unwrap();
+        } else {
+            storage.write_image(&mut image, [6; 32], 1).unwrap();
+        }
+        assert_eq!(
+            &image[..8],
+            if version == 5 {
+                b"OPCNAT05"
+            } else {
+                b"OPCNAT07"
+            }
+        );
+        for fixed in [b"OPCNAT04", b"OPCNAT06"] {
+            let mut mislabeled = image.clone();
+            mislabeled[..8].copy_from_slice(fixed);
+            assert!(NativeStorage::read_image(
+                &mut mislabeled.as_slice(),
+                [6; 32],
+                1,
+                storage.business.identity
+            )
+            .is_err());
+        }
+    }
     storage
         .log
         .project(&Operation::Truncate(cut(1)), &storage.business, None)

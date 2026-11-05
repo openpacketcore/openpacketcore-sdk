@@ -31,6 +31,7 @@ use sha2::{Digest, Sha256};
 
 use super::storage::ConfigConsensusStorageError;
 use super::types::{CONFIG_CONSENSUS_STORAGE_VERSION, LEGACY_CONFIG_CONSENSUS_COMMAND_VERSION};
+use super::SnapshotWorkHooks;
 use super::{
     ApprovedLegacyConfigRecovery, ConfigConsensusResponse, ConfigMutationFailure,
     ConfigMutationIntent, ConfigRaftTypeConfig,
@@ -176,6 +177,7 @@ enum SqliteWorkDeadline {
         at: tokio::time::Instant,
         clock: tokio::runtime::Handle,
     },
+    #[cfg(any(target_os = "linux", test))]
     RealTime(std::time::Instant),
 }
 
@@ -195,6 +197,7 @@ impl SqliteWorkDeadline {
                 let _entered = clock.enter();
                 tokio::time::Instant::now() >= *at
             }
+            #[cfg(any(target_os = "linux", test))]
             Self::RealTime(at) => std::time::Instant::now() >= *at,
         }
     }
@@ -369,6 +372,8 @@ pub(crate) struct ConfigConsensusCore {
     pub(crate) snapshot_build_gate: Arc<tokio::sync::Mutex<()>>,
     #[cfg(test)]
     pub(crate) snapshot_test_hooks: Arc<super::storage::SnapshotTestHooks>,
+    /// Always-compiled snapshot work accounting shared with the backend.
+    pub(crate) snapshot_work_hooks: Arc<SnapshotWorkHooks>,
     pub(crate) audit_key: Arc<AuditKey>,
     pub(crate) management_audit_keys: Option<Arc<crate::audit_authority::continuity::AuditKeyRing>>,
     pub(crate) _snapshot_dir_guard: Arc<std::fs::File>,
@@ -603,6 +608,7 @@ impl ConfigConsensusCore {
             snapshot_build_gate: Arc::new(tokio::sync::Mutex::new(())),
             #[cfg(test)]
             snapshot_test_hooks: Arc::clone(&backend.consensus_snapshot_test_hooks),
+            snapshot_work_hooks: backend.snapshot_work_hooks(),
             audit_key: Arc::new(backend.audit_key().clone()),
             management_audit_keys: backend.management_audit_keys(),
             _snapshot_dir_guard: snapshot_dir_guard,
@@ -655,6 +661,51 @@ impl ConfigConsensusCore {
             operation,
         )
         .await
+    }
+
+    /// Admit snapshot work separately from its size-dependent execution budget.
+    /// Keep the connection leased from sizing through execution so another
+    /// writer cannot enlarge the database after its size has been measured.
+    pub(crate) async fn run_snapshot_sqlite_cancellable<T, F>(
+        &self,
+        incoming_bytes: u64,
+        operation: F,
+    ) -> io::Result<T>
+    where
+        T: Send + 'static,
+        F: FnOnce(&Connection, &Arc<SqliteWorkCancellation>) -> io::Result<T> + Send + 'static,
+    {
+        let admission_deadline = tokio::time::Instant::now()
+            .checked_add(super::storage::SNAPSHOT_OPERATION_TIMEOUT)
+            .ok_or_else(|| invalid_data("config snapshot SQLite deadline overflow"))?;
+        let lease = acquire_sqlite_worker(
+            self.sqlite_worker_gate.clone(),
+            self.conn.clone(),
+            Some(self.storage_owner.clone()),
+            admission_deadline,
+        )
+        .await?;
+        // These two fixed metadata reads run on the blocking pool too. The
+        // lease (including shutdown ownership) survives cancellation and is
+        // returned intact; this preflight cannot mutate authority.
+        let mut sizing = tokio::task::spawn_blocking(move || {
+            let budget = snapshot_sqlite_budget(&lease.connection, incoming_bytes);
+            (lease, budget)
+        });
+        let (lease, budget) = match tokio::time::timeout_at(admission_deadline, &mut sizing).await {
+            Ok(result) => result.map_err(|_| invalid_data("config snapshot sizing failed"))?,
+            Err(_) => {
+                let _ = sizing.await;
+                return Err(timed_out("config snapshot SQLite admission timed out"));
+            }
+        };
+        if tokio::time::Instant::now() >= admission_deadline {
+            return Err(timed_out("config snapshot SQLite admission timed out"));
+        }
+        let deadline = tokio::time::Instant::now()
+            .checked_add(budget?)
+            .ok_or_else(|| invalid_data("config snapshot SQLite deadline overflow"))?;
+        run_sqlite_worker_owned(lease, deadline, operation).await
     }
 
     #[cfg(test)]
@@ -732,10 +783,27 @@ where
     T: Send + 'static,
     F: FnOnce(&Connection, &Arc<SqliteWorkCancellation>) -> io::Result<T> + Send + 'static,
 {
+    let lease = acquire_sqlite_worker(worker_gate, conn, storage_owner, deadline).await?;
+    run_sqlite_worker_owned(lease, deadline, operation).await
+}
+
+struct SqliteWorkerLease {
+    // Fields drop in declaration order: release the connection and permit
+    // before reporting that the last storage owner has drained.
+    connection: tokio::sync::OwnedMutexGuard<crate::backend::BackendConnection>,
+    _permit: tokio::sync::OwnedSemaphorePermit,
+    _storage_owner: Option<tokio::sync::watch::Sender<()>>,
+}
+
+async fn acquire_sqlite_worker(
+    worker_gate: Arc<tokio::sync::Semaphore>,
+    conn: Arc<tokio::sync::Mutex<crate::backend::BackendConnection>>,
+    storage_owner: Option<tokio::sync::watch::Sender<()>>,
+    deadline: tokio::time::Instant,
+) -> io::Result<SqliteWorkerLease> {
     if deadline <= tokio::time::Instant::now() {
         return Err(timed_out("config consensus SQLite deadline elapsed"));
     }
-    let worker_deadline = SqliteWorkDeadline::tokio(deadline);
     let permit = tokio::time::timeout_at(deadline, worker_gate.acquire_owned())
         .await
         .map_err(|_| timed_out("config consensus SQLite admission timed out"))?
@@ -743,16 +811,43 @@ where
     let conn = tokio::time::timeout_at(deadline, conn.lock_owned())
         .await
         .map_err(|_| timed_out("config consensus SQLite connection timed out"))?;
+    Ok(SqliteWorkerLease {
+        connection: conn,
+        _permit: permit,
+        _storage_owner: storage_owner,
+    })
+}
+
+fn snapshot_sqlite_budget(conn: &Connection, incoming_bytes: u64) -> io::Result<Duration> {
+    let bytes = database_storage_bytes_sync(conn)?
+        .checked_add(incoming_bytes)
+        .ok_or_else(|| invalid_data("config snapshot SQLite size overflow"))?;
+    // Fixed setup allowance plus one second per MiB of actual input. Install
+    // also charges the destination, whose old history must be replaced. This
+    // remains an absolute, finite work bound even if SQLite stops progressing.
+    super::storage::SNAPSHOT_OPERATION_TIMEOUT
+        .checked_add(Duration::from_secs(bytes.div_ceil(1024 * 1024)))
+        .ok_or_else(|| invalid_data("config snapshot SQLite budget overflow"))
+}
+
+async fn run_sqlite_worker_owned<T, F>(
+    lease: SqliteWorkerLease,
+    deadline: tokio::time::Instant,
+    operation: F,
+) -> io::Result<T>
+where
+    T: Send + 'static,
+    F: FnOnce(&Connection, &Arc<SqliteWorkCancellation>) -> io::Result<T> + Send + 'static,
+{
+    let worker_deadline = SqliteWorkDeadline::tokio(deadline);
     let cancellation = Arc::new(SqliteWorkCancellation::with_deadline(worker_deadline));
     let mut cancel_on_drop = SqliteWorkCancelOnDrop::new(cancellation.clone());
     let worker_cancellation = cancellation.clone();
     let mut worker = tokio::task::spawn_blocking(move || {
-        // An aborted awaiting future cannot release storage ownership while
-        // the blocking worker still holds its connection. Locals drop in
-        // reverse order, including early errors and unwinding.
-        let _storage_owner = storage_owner;
-        let _permit = permit;
-        let worker_conn = conn;
+        // Retain connection and shutdown ownership through cancellation,
+        // early errors, and unwinding, until the physical worker finishes.
+        let lease = lease;
+        let worker_conn = &lease.connection;
         let commit_cancellation = worker_cancellation.clone();
         worker_conn
             .commit_hook(Some(move || {
@@ -768,7 +863,7 @@ where
                 }),
             )
             .map_err(db_error)?;
-        let result = operation(&worker_conn, &worker_cancellation);
+        let result = operation(worker_conn, &worker_cancellation);
         worker_conn
             .commit_hook(None::<fn() -> bool>)
             .expect("installed SQLite hook belongs to an owned connection");
@@ -809,6 +904,7 @@ where
 }
 
 /// Provision consensus schema without starting an engine, listener or voter.
+#[cfg(target_os = "linux")]
 pub(crate) fn provision_retained_schema(
     conn: &Connection,
     topology: &super::ConfigConsensusTopology,
@@ -829,6 +925,7 @@ pub(crate) fn provision_retained_schema(
 }
 
 /// Read existing schema and authenticated history without any initialization.
+#[cfg(target_os = "linux")]
 pub(crate) fn validate_retained_schema(
     conn: &Connection,
     topology: &super::ConfigConsensusTopology,
@@ -845,6 +942,7 @@ pub(crate) fn validate_retained_schema(
     )
 }
 
+#[cfg(any(target_os = "linux", test))]
 fn initialize_schema(
     conn: &Connection,
     identity: ConsensusIdentity,
@@ -1317,26 +1415,29 @@ fn validate_existing_schema(
 ) -> Result<(), ConfigConsensusStorageError> {
     // The format marker is authoritative before inspecting a schema or identity
     // belonging to another format. Crossing this boundary requires a fresh install.
+    if !table_exists(conn, "config_raft_identity").map_err(storage_sqlite_read_error)? {
+        return Err(ConfigConsensusStorageError::CorruptState);
+    }
     let version: i64 = conn
         .query_row(
             "SELECT schema_version FROM config_raft_identity WHERE singleton = 1",
             [],
             |row| row.get(0),
         )
-        .map_err(|_| ConfigConsensusStorageError::CorruptState)?;
+        .optional()
+        .map_err(storage_sqlite_read_error)?
+        .ok_or(ConfigConsensusStorageError::CorruptState)?;
     if version != i64::from(CONFIG_CONSENSUS_STORAGE_VERSION) {
         return Err(ConfigConsensusStorageError::SchemaVersionMismatch);
     }
     for table in RAFT_TABLES {
         cancellation.check()?;
-        if !table_exists(conn, table)
-            .map_err(|_| ConfigConsensusStorageError::BackendUnavailable)?
-        {
+        if !table_exists(conn, table).map_err(storage_sqlite_read_error)? {
             return Err(ConfigConsensusStorageError::CorruptState);
         }
     }
-    let schema_manifest_digest = config_schema_manifest_digest(conn, cancellation)
-        .map_err(|_| ConfigConsensusStorageError::CorruptState)?;
+    let schema_manifest_digest =
+        config_schema_manifest_digest(conn, cancellation).map_err(storage_read_error)?;
     let row = conn
         .query_row(
             "SELECT schema_version, cluster_id, configuration_id, configuration_epoch, audit_key_epoch, audit_key_fingerprint, schema_manifest_digest FROM config_raft_identity WHERE singleton = 1",
@@ -1344,7 +1445,7 @@ fn validate_existing_schema(
             |row| Ok((row.get::<_, i64>(0)?, row.get::<_, Vec<u8>>(1)?, row.get::<_, Vec<u8>>(2)?, row.get::<_, i64>(3)?, row.get::<_, i64>(4)?, row.get::<_, Vec<u8>>(5)?, row.get::<_, Vec<u8>>(6)?)),
         )
         .optional()
-        .map_err(|_| ConfigConsensusStorageError::BackendUnavailable)?
+        .map_err(storage_sqlite_read_error)?
         .ok_or(ConfigConsensusStorageError::CorruptState)?;
     if row.0 != i64::from(CONFIG_CONSENSUS_STORAGE_VERSION) {
         return Err(ConfigConsensusStorageError::SchemaVersionMismatch);
@@ -1364,23 +1465,21 @@ fn validate_existing_schema(
         .query_row("SELECT COUNT(*) FROM config_raft_machine", [], |row| {
             row.get(0)
         })
-        .map_err(|_| ConfigConsensusStorageError::BackendUnavailable)?;
+        .map_err(storage_sqlite_read_error)?;
     let membership_rows: i64 = conn
         .query_row("SELECT COUNT(*) FROM config_raft_membership", [], |row| {
             row.get(0)
         })
-        .map_err(|_| ConfigConsensusStorageError::BackendUnavailable)?;
+        .map_err(storage_sqlite_read_error)?;
     if machine_rows != 1 || membership_rows != 1 {
         return Err(ConfigConsensusStorageError::CorruptState);
     }
-    let membership = read_membership_unchecked_sync(conn, identity)
-        .map_err(|_| ConfigConsensusStorageError::CorruptState)?;
+    let membership = read_membership_unchecked_sync(conn, identity).map_err(storage_read_error)?;
     if !is_pristine_membership(&membership) {
         voter_slots::validate_membership_sync(conn, &membership, expected_members, false)
-            .map_err(|_| ConfigConsensusStorageError::CorruptState)?;
+            .map_err(storage_read_error)?;
     }
-    read_vote_sync(conn, identity, expected_members)
-        .map_err(|_| ConfigConsensusStorageError::CorruptState)?;
+    read_vote_sync(conn, identity, expected_members).map_err(storage_read_error)?;
     cancellation.check()?;
     validate_durable_log_state_sync(
         conn,
@@ -1389,9 +1488,8 @@ fn validate_existing_schema(
         allow_detached_snapshot,
         cancellation,
     )
-    .map_err(|_| ConfigConsensusStorageError::CorruptState)?;
-    validate_sealed_state_sync(conn, audit_key, cancellation)
-        .map_err(|_| ConfigConsensusStorageError::CorruptState)
+    .map_err(storage_read_error)?;
+    validate_sealed_state_sync(conn, audit_key, cancellation).map_err(storage_read_error)
 }
 
 const CONFIG_SCHEMA_OBJECTS: &str = "SELECT type, name, tbl_name, sql FROM main.sqlite_schema \
@@ -1405,7 +1503,7 @@ fn config_schema_manifest(
 ) -> io::Result<Vec<(String, String, String, String)>> {
     let mut statement = conn
         .prepare(&format!("{CONFIG_SCHEMA_OBJECTS} ORDER BY type, name"))
-        .map_err(db_error)?;
+        .map_err(crate::error::sqlite_read_io_error)?;
     let rows = statement
         .query_map([], |row| {
             Ok((
@@ -1415,11 +1513,11 @@ fn config_schema_manifest(
                 row.get::<_, String>(3)?,
             ))
         })
-        .map_err(db_error)?;
+        .map_err(crate::error::sqlite_read_io_error)?;
     let mut manifest = Vec::new();
     for row in rows {
         cancellation.check_io()?;
-        manifest.push(row.map_err(db_error)?);
+        manifest.push(row.map_err(crate::error::sqlite_read_io_error)?);
     }
     Ok(manifest)
 }
@@ -1429,10 +1527,10 @@ fn config_schema_manifest_digest(
     cancellation: &SqliteWorkCancellation,
 ) -> io::Result<[u8; 32]> {
     cancellation.check_io()?;
-    let expected = Connection::open_in_memory().map_err(db_error)?;
+    let expected = Connection::open_in_memory().map_err(crate::error::sqlite_reference_io_error)?;
     expected
         .execute_batch(CONFIG_RAFT_SCHEMA)
-        .map_err(db_error)?;
+        .map_err(crate::error::sqlite_reference_io_error)?;
     let expected_manifest = config_schema_manifest(&expected, cancellation)?;
     let live_count: i64 = conn
         .query_row(
@@ -1440,7 +1538,7 @@ fn config_schema_manifest_digest(
             [],
             |row| row.get(0),
         )
-        .map_err(db_error)?;
+        .map_err(crate::error::sqlite_read_io_error)?;
     if usize::try_from(live_count).ok() != Some(expected_manifest.len()) {
         return Err(invalid_data(
             "config consensus owned schema manifest does not match",
@@ -1456,7 +1554,7 @@ fn config_schema_manifest_digest(
             "SELECT EXISTS(SELECT 1 FROM main.sqlite_schema WHERE type = ?1 AND name = ?2 AND tbl_name = ?3 AND sql = ?4)",
             params![kind, name, table, sql],
             |row| row.get(0),
-        ).map_err(db_error)?;
+        ).map_err(crate::error::sqlite_read_io_error)?;
         if !matches {
             return Err(invalid_data(
                 "config consensus owned schema manifest does not match",
@@ -1484,12 +1582,12 @@ pub(super) fn validate_live_history_schema_sync(
     let unexpected: bool = conn.query_row(
         "SELECT EXISTS(SELECT 1 FROM main.sqlite_schema WHERE type = 'trigger') OR EXISTS(SELECT 1 FROM sqlite_temp_schema)",
         [], |row| row.get(0),
-    ).map_err(db_error)?;
+    ).map_err(crate::error::sqlite_read_io_error)?;
     if unexpected {
         return Err(invalid_data("config history schema is not admitted"));
     }
     crate::schema::validate_retained_base_schema(conn)
-        .map_err(|_| invalid_data("config history base schema does not match"))?;
+        .map_err(crate::error::persist_read_io_error)?;
     config_schema_manifest_digest(conn, cancellation)?;
     cancellation.check_io()
 }
@@ -1523,6 +1621,40 @@ pub(crate) fn invalid_data(message: &'static str) -> io::Error {
 
 fn timed_out(message: &'static str) -> io::Error {
     io::Error::new(io::ErrorKind::TimedOut, message)
+}
+
+fn storage_read_error(error: io::Error) -> ConfigConsensusStorageError {
+    match crate::error::history_read_error(error).kind() {
+        crate::PersistErrorKind::CorruptBlob => ConfigConsensusStorageError::CorruptState,
+        crate::PersistErrorKind::Unavailable
+        | crate::PersistErrorKind::PreflightFailed(_)
+        | crate::PersistErrorKind::RollbackNotFound
+        | crate::PersistErrorKind::WalRecoveryFailed
+        | crate::PersistErrorKind::AuditChainBroken
+        | crate::PersistErrorKind::InconsistentState(_)
+        | crate::PersistErrorKind::ForeignKeyViolation
+        | crate::PersistErrorKind::ConstraintViolation(_)
+        | crate::PersistErrorKind::RequestIdCollision
+        | crate::PersistErrorKind::ConfigHistoryCompacted
+        | crate::PersistErrorKind::ConfigHistoryFull
+        | crate::PersistErrorKind::ConfigHistoryProtected
+        | crate::PersistErrorKind::OutcomeUnknown
+        | crate::PersistErrorKind::PathNotWritable(_)
+        | crate::PersistErrorKind::DatabaseLocked
+        | crate::PersistErrorKind::OutOfSpace { .. }
+        | crate::PersistErrorKind::Io(_)
+        | crate::PersistErrorKind::SchemaVersionMismatch { .. }
+        | crate::PersistErrorKind::SchemaDigestMismatch { .. }
+        | crate::PersistErrorKind::Sqlite(_) => ConfigConsensusStorageError::BackendUnavailable,
+    }
+}
+
+fn storage_sqlite_read_error(error: rusqlite::Error) -> ConfigConsensusStorageError {
+    storage_read_error(read_db_error(error))
+}
+
+fn read_db_error(error: rusqlite::Error) -> io::Error {
+    crate::error::sqlite_read_io_error(error)
 }
 
 fn db_error(_: rusqlite::Error) -> io::Error {
@@ -1657,7 +1789,7 @@ pub(crate) fn read_vote_sync(
             |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?, row.get::<_, Option<i64>>(2)?, row.get::<_, Vec<u8>>(3)?)),
         )
         .optional()
-        .map_err(db_error)?;
+        .map_err(read_db_error)?;
     let Some((epoch, term, node_id, encoded)) = row else {
         return Ok(None);
     };
@@ -1744,7 +1876,7 @@ fn read_log_pointer(
             ))
         })
         .optional()
-        .map_err(db_error)?;
+        .map_err(read_db_error)?;
     let Some((epoch, term, index, encoded)) = row else {
         return Ok(None);
     };
@@ -1914,7 +2046,7 @@ fn read_log_id_at_sync(
             },
         )
         .optional()
-        .map_err(db_error)?;
+        .map_err(read_db_error)?;
     let Some((epoch, term, encoded)) = row else {
         return Ok(None);
     };
@@ -2031,7 +2163,7 @@ fn validate_durable_log_state_sync(
             [],
             |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
         )
-        .map_err(db_error)?;
+        .map_err(read_db_error)?;
     match (minimum, maximum, count) {
         (None, None, 0) => {}
         (Some(minimum), Some(maximum), count) if count > 0 => {
@@ -2151,7 +2283,7 @@ fn read_log_rows_unchecked_sync(
         .prepare(
             "SELECT configuration_epoch, term, log_index, entry_json FROM config_raft_log WHERE log_index >= ?1 AND (?2 IS NULL OR log_index < ?2) ORDER BY log_index ASC LIMIT ?3",
         )
-        .map_err(db_error)?;
+        .map_err(read_db_error)?;
     let rows = statement
         .query_map(params![start, end, limit], |row| {
             Ok((
@@ -2161,7 +2293,7 @@ fn read_log_rows_unchecked_sync(
                 row.get::<_, Vec<u8>>(3)?,
             ))
         })
-        .map_err(db_error)?;
+        .map_err(read_db_error)?;
     let mut entries = Vec::new();
     let mut batch = read
         .append_entries_batch
@@ -2170,7 +2302,7 @@ fn read_log_rows_unchecked_sync(
         if let Some(cancellation) = read.cancellation {
             cancellation.check_io()?;
         }
-        let (epoch, term, index, encoded) = row.map_err(db_error)?;
+        let (epoch, term, index, encoded) = row.map_err(read_db_error)?;
         validate_epoch(epoch, identity)?;
         if encoded.len() > CONFIG_CONSENSUS_LOG_ENTRY_MAX_BYTES {
             return Err(invalid_data(
@@ -2474,7 +2606,7 @@ fn read_membership_unchecked_sync(
             [],
             |row| Ok((row.get(0)?, row.get(1)?)),
         )
-        .map_err(db_error)?;
+        .optional().map_err(read_db_error)?.ok_or_else(|| invalid_data("missing required config consensus row"))?;
     validate_epoch(epoch, identity)?;
     decode_json(&encoded)
 }
@@ -2520,7 +2652,7 @@ pub(crate) fn read_machine_sync(
             [],
             |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
         )
-        .map_err(db_error)?;
+        .optional().map_err(read_db_error)?.ok_or_else(|| invalid_data("missing required config consensus row"))?;
     validate_epoch(epoch, identity)?;
     let digest: [u8; 32] = digest
         .try_into()
@@ -3286,7 +3418,9 @@ pub(crate) fn apply_entries_cancellable_sync(
                                 && (audit_keys.is_some()
                                     || super::audit::read_sync(&tx, audit_key, identity)?.is_some())
                             {
-                                Err(ConfigMutationFailure::InvalidInput)
+                                // An unaudited command conflicts with the admitted
+                                // policy; no stored bytes have been rejected.
+                                Err(ConfigMutationFailure::Conflict)
                             } else {
                                 execute_intent_sync(
                                     &tx,
@@ -3404,7 +3538,7 @@ fn validate_sealed_state_sync(
         .prepare(
             "SELECT tx_id, parent_tx_id, version, committed_at, principal, schema_digest, plaintext_digest, encrypted_blob, audit_count, audit_terminal_hash FROM config_history ORDER BY version ASC",
         )
-        .map_err(db_error)?;
+        .map_err(read_db_error)?;
     let rows = statement
         .query_map([], |row| {
             Ok((
@@ -3420,7 +3554,7 @@ fn validate_sealed_state_sync(
                 row.get::<_, Vec<u8>>(9)?,
             ))
         })
-        .map_err(db_error)?;
+        .map_err(read_db_error)?;
     for row in rows {
         cancellation.check_io()?;
         let (
@@ -3434,7 +3568,7 @@ fn validate_sealed_state_sync(
             encrypted_blob,
             audit_count,
             terminal_hash,
-        ) = row.map_err(db_error)?;
+        ) = row.map_err(read_db_error)?;
         let parent_tx_id =
             super::history::original_parent_sync(conn, audit_key, &tx_id, version, parent_tx_id)?;
         if tx_id.len() != 16
@@ -3506,7 +3640,7 @@ fn validate_sealed_state_sync(
             .prepare(
                 "SELECT sequence, yang_path, op_type, previous_value, new_value, redaction_applied, previous_hash, entry_hmac FROM audit_trail WHERE tx_id = ?1 ORDER BY sequence ASC",
             )
-            .map_err(db_error)?;
+            .map_err(read_db_error)?;
         let rows = audit
             .query_map([tx_id.as_slice()], |row| {
                 Ok((
@@ -3520,13 +3654,13 @@ fn validate_sealed_state_sync(
                     row.get::<_, Vec<u8>>(7)?,
                 ))
             })
-            .map_err(db_error)?;
+            .map_err(read_db_error)?;
         let mut previous = [0_u8; 32];
         let mut seen = 0_usize;
         for row in rows {
             cancellation.check_io()?;
             let (sequence, yang_path, op_type, old, new, redacted, previous_hash, entry_hmac) =
-                row.map_err(db_error)?;
+                row.map_err(read_db_error)?;
             let previous_hash: [u8; 32] = previous_hash
                 .try_into()
                 .map_err(|_| invalid_data("config consensus audit predecessor is invalid"))?;
@@ -3587,16 +3721,16 @@ fn validate_sealed_state_sync(
 
     let mut statement = conn
         .prepare("SELECT applied_sequence, response_json FROM config_raft_request_outcomes")
-        .map_err(db_error)?;
+        .map_err(read_db_error)?;
     let rows = statement
         .query_map([], |row| {
             Ok((row.get::<_, i64>(0)?, row.get::<_, Vec<u8>>(1)?))
         })
-        .map_err(db_error)?;
+        .map_err(read_db_error)?;
     let mut outcome_count = 0_u64;
     for row in rows {
         cancellation.check_io()?;
-        let (applied_sequence, encoded) = row.map_err(db_error)?;
+        let (applied_sequence, encoded) = row.map_err(read_db_error)?;
         let response: ConfigConsensusResponse = decode_json(&encoded)?;
         if checked_positive_u64(applied_sequence)? != response.sequence {
             return Err(invalid_data(
@@ -3627,7 +3761,7 @@ fn validate_history_chain_cancellable_sync(
         .prepare(
             "SELECT tx_id, parent_tx_id, version FROM config_history ORDER BY version ASC, tx_id ASC",
         )
-        .map_err(db_error)?;
+        .map_err(read_db_error)?;
     let rows = statement
         .query_map([], |row| {
             Ok((
@@ -3636,11 +3770,11 @@ fn validate_history_chain_cancellable_sync(
                 row.get::<_, i64>(2)?,
             ))
         })
-        .map_err(db_error)?;
+        .map_err(read_db_error)?;
     let mut head: Option<(Vec<u8>, u64)> = None;
     for row in rows {
         cancellation.check_io()?;
-        let (tx_id, parent_tx_id, version) = row.map_err(db_error)?;
+        let (tx_id, parent_tx_id, version) = row.map_err(read_db_error)?;
         if tx_id.len() != 16
             || parent_tx_id
                 .as_ref()
@@ -3713,6 +3847,11 @@ pub(crate) fn build_snapshot_database_cancellable_sync(
     {
         let backup = rusqlite::backup::Backup::new(conn, &mut destination).map_err(db_error)?;
         loop {
+            #[cfg(test)]
+            super::snapshot_file::test_io::blocking_step(
+                path,
+                super::snapshot_file::test_io::Phase::Backup,
+            );
             cancellation.check_io()?;
             match backup.step(128).map_err(db_error)? {
                 rusqlite::backup::StepResult::Done => break,
@@ -4074,6 +4213,25 @@ pub(crate) type CurrentSnapshot = (
     u64,
 );
 
+/// Byte size of the main SQLite database file, derived from page metadata.
+///
+/// Snapshot sizing and backup share one connection lease, excluding concurrent writes.
+pub(crate) fn database_storage_bytes_sync(conn: &Connection) -> io::Result<u64> {
+    let page_count: i64 = conn
+        .query_row("PRAGMA page_count", [], |row| row.get(0))
+        .map_err(db_error)?;
+    let page_size: i64 = conn
+        .query_row("PRAGMA page_size", [], |row| row.get(0))
+        .map_err(db_error)?;
+    let page_count =
+        u64::try_from(page_count).map_err(|_| invalid_data("invalid SQLite page count"))?;
+    let page_size =
+        u64::try_from(page_size).map_err(|_| invalid_data("invalid SQLite page size"))?;
+    page_count
+        .checked_mul(page_size)
+        .ok_or_else(|| invalid_data("SQLite database size overflow"))
+}
+
 pub(crate) fn read_current_snapshot_sync(
     conn: &Connection,
     identity: ConsensusIdentity,
@@ -4086,7 +4244,7 @@ pub(crate) fn read_current_snapshot_sync(
             |row| Ok((row.get::<_, i64>(0)?, row.get::<_, Vec<u8>>(1)?, row.get::<_, String>(2)?, row.get::<_, Vec<u8>>(3)?, row.get::<_, i64>(4)?)),
         )
         .optional()
-        .map_err(db_error)?;
+        .map_err(read_db_error)?;
     let Some((epoch, encoded, file_name, checksum, length)) = row else {
         return Ok(None);
     };
@@ -4434,6 +4592,66 @@ mod tests {
             rollback_point: false,
             confirmed_deadline: None,
         }
+    }
+
+    async fn missing_required_state_row(table: &str) {
+        let temp = tempfile::tempdir().expect("config consensus directory");
+        let backend = SqliteBackend::open_with_audit_key(
+            temp.path().join("missing-state.sqlite"),
+            true,
+            0,
+            AuditKey::new([0x57; 32]).expect("audit key"),
+        )
+        .await
+        .expect("open config database");
+        let shared = backend.conn();
+        let conn = shared.lock().await;
+        initialize_schema(
+            &conn,
+            identity(),
+            &expected_members(),
+            backend.audit_key(),
+            None,
+            &Arc::new(SqliteWorkCancellation::new()),
+            None,
+        )
+        .expect("config consensus schema");
+        // A pristine vote is optional. The persistent machine and membership
+        // rows are required even before any configuration was committed.
+        assert!(read_vote_sync(&conn, identity(), &expected_members())
+            .unwrap()
+            .is_none());
+        assert_eq!(
+            conn.execute(&format!("DELETE FROM {table}"), []).unwrap(),
+            1
+        );
+        let error = match table {
+            "config_raft_machine" => read_machine_sync(&conn, identity()).map(|_| ()),
+            "config_raft_membership" => {
+                read_membership_unchecked_sync(&conn, identity()).map(|_| ())
+            }
+            _ => unreachable!(),
+        }
+        .expect_err("missing mandatory state must fail");
+        assert_eq!(
+            error.kind(),
+            io::ErrorKind::InvalidData,
+            "{table}: {error:?}"
+        );
+        assert!(matches!(
+            crate::error::history_read_error(error).kind(),
+            crate::PersistErrorKind::CorruptBlob
+        ));
+    }
+
+    #[tokio::test]
+    async fn mandatory_consensus_machine_absence_is_corruption() {
+        missing_required_state_row("config_raft_machine").await;
+    }
+
+    #[tokio::test]
+    async fn mandatory_consensus_membership_absence_is_corruption() {
+        missing_required_state_row("config_raft_membership").await;
     }
 
     #[tokio::test]

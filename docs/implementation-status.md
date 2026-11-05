@@ -612,14 +612,14 @@ qualification remain product and deployment responsibilities.
 
 `opc-proto-gtpu` now models the TS 29.281 Release 18 codec boundary for Echo
 Request/Response, Recovery, Error Indication, Supported Extension Headers
-Notification, and End Marker. The typed decoder enforces message flags and
-TEIDs, mandatory/singleton IE cardinality, ascending IE order, exact fixed and
+Notification, Tunnel Status, and End Marker. The typed decoder enforces message flags and
+TEIDs, mandatory IE presence, first-wins singleton handling, ascending IE order, exact fixed and
 TLV lengths, IPv4/IPv6 peer-address widths, unique supported-header lists
 (including the specification-permitted empty list), and configured message/IE
 limits. Recovery and receiver-ignored
 sequence values are not promoted into application state; canonical Echo
-Response always emits `Recovery=0`. Unknown TLVs follow the shared
-preserve/drop/reject policy, while unknown TV IEs fail closed because there is
+Response always emits `Recovery=0`. Unknown TLVs are preserved or skipped
+(`Reject` behaves as `Drop`); unexpected defined IEs are skipped. Unknown TV IEs fail closed because there is
 no safe length boundary. TEIDs, peer addresses, private/unknown values, and raw
 extension data are redacted from typed diagnostics.
 
@@ -1156,7 +1156,7 @@ required before an implementation PR can rely on it.
 
 | AC | Criterion | Crate(s) | Tests | Status | Known Gaps |
 |:---|:---|:---|:---|:---|:---|
-| 017-1 | One protected selector-ledger CAS admits an exact partition of SDK-derived never-published atoms and subsets from multiple fully retired, drain-qualified predecessors. | `opc-gtpu-dataplane`, `opc-session-store` | Planned codec, model, CAS-race, restart, fix-removal, and mutation tests | **not-implemented** | RFC 016 supports only uniform fresh or one whole retired predecessor. |
+| 017-1 | One protected selector-ledger CAS admits an exact partition of SDK-derived never-published atoms and subsets from multiple fully retired, drain-qualified predecessors. | `opc-gtpu-dataplane`, `opc-session-store` | Staged `selector_namespace_v2` codec/preflight unit tests; durable CAS-race, restart, fix-removal and mutation tests planned | **partial** | `DrainQualificationCodecV1`/`TransferEdgeCodecV1` and the mixed-partition preflight (exact coverage, gap/overlap, stale/foreign/duplicate qualification, same-group-as-transfer refusal) are implemented and unit-tested; the one-CAS ledger-v2 admission, transfer gates and coordinator wiring remain unimplemented. |
 | 017-2 | Durable atom rows and bounded immutable lineage reject gaps, overlap, contradictory provenance, stale authority, partial drain, and replay before any backend effect. | `opc-gtpu-dataplane`, `opc-session-store` | Planned public-API, coverage, lineage, capacity, stale-fence, and fault-injection tests | **not-implemented** | No RFC 017 ledger-v2 codec, stamp-v2 ABI, or explicit stopped migration exists. |
 | 017-3 | Exact retained state is adopted, while same-group republish requires opaque qualified total mutable-backend loss and one fenced whole-namespace restore that preserves the marker, binding, epoch, desired graph, and lineage. | `opc-gtpu-dataplane`, `opc-gtpu-dataplane-ebpf` | Planned adoption, total-loss, restore, restart, replacement, and privileged isolated-eBPF tests | **not-implemented** | The built-in eBPF restore profile remains unsupported until the privileged qualification is implemented and passes. |
 | 017-4 | Backend authority and diagnostics remain SDK-owned, affine, bounded, and non-identifying; structural convergence, semantic absence, mocks, and traffic cannot qualify provenance or loss. | `opc-gtpu-dataplane`, `opc-evidence`, `opc-redaction` | Planned compile-fail, conformance, redaction, and adversarial-mutation tests | **not-implemented** | External adapters remain unsupported until #671 publishes the SDK-owned codec and conformance boundary. |

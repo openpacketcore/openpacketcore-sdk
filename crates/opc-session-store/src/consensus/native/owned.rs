@@ -458,19 +458,23 @@ pub(super) fn notification(value: &ReplicationEntry) -> io::Result<ReplicationEn
             }
         })
     }
-    let op = if let ReplicationOp::Batch { ops } = &value.op {
-        let mut copied = Vec::new();
-        copied
-            .try_reserve_exact(2)
-            .map_err(|_| invalid("native owned notification allocation failed"))?;
-        for op in ops {
-            copied.push(effect(op)?);
+    let op = match &value.op {
+        ReplicationOp::Batch { ops } => {
+            // notification_payload already checked the one- or two-effect
+            // native shape. Copy each leaf without a recursive container path.
+            let mut copied = Vec::new();
+            copied
+                .try_reserve_exact(ops.len())
+                .map_err(|_| invalid("native owned notification allocation failed"))?;
+            for op in ops {
+                copied.push(effect(op)?);
+            }
+            ReplicationOp::Batch { ops: copied }
         }
-        ReplicationOp::Batch { ops: copied }
-    } else {
-        effect(&value.op)?
+        op => effect(op)?,
     };
     Ok(ReplicationEntry {
+        replay_policy: value.replay_policy,
         sequence: value.sequence,
         tx_id: value.tx_id.clone(),
         op,

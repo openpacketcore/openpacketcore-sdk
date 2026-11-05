@@ -1021,6 +1021,10 @@ Before applying a `PEER` Load report, call `actionable_for_peer` with the
 authenticated connection's DiameterIdentity; a mismatched SourceID is ignored
 as RFC 8583 requires. Consumers still own overload state, expiry timers,
 routing decisions, and authenticated transport identity.
+An application must supply that runtime before advertising an
+`OC-Supported-Features` offer: typed AVP support alone does not implement a
+reacting node. The transport does not automatically insert an offer or apply
+DRMP scheduling, overload abatement, or redirect caching to its bounded queues.
 
 OC AVPs accept the application-controlled M bit and require V/P clear. Builders
 emit M clear. Load builders also emit M clear, while received Load ignores a

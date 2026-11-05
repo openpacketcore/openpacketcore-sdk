@@ -6,6 +6,277 @@ use opc_key::{KeyId, KeyPurpose, MemoryKeyProvider};
 use std::collections::BTreeMap;
 use std::str::FromStr;
 
+#[test]
+fn checkpoint_heap_outage_is_unavailable_without_changing_bytes() {
+    const CHILD: &str = "OPC_CHECKPOINT_HEAP_CHILD";
+    if let Some(directory) = std::env::var_os(CHILD) {
+        let path = Path::new(&directory).join("checkpoint.sqlite");
+        tokio::runtime::Runtime::new().unwrap().block_on(async {
+            ConsumerCheckpointStore::provision(options(&path), keys(0x51))
+                .await
+                .unwrap()
+                .shutdown()
+                .await
+                .unwrap();
+        });
+        let conn = Connection::open(&path).unwrap();
+        read_row(&conn, &options(&path)).unwrap();
+        let before = std::fs::read(&path).unwrap();
+        let wal = path.with_extension("sqlite-wal");
+        let wal_before = std::fs::read(&wal).unwrap_or_default();
+        let _pressure = crate::error::exhaust_sqlite_heap(&conn);
+        let probe = conn
+            .query_row("SELECT COUNT(*) FROM consumer_checkpoint", [], |row| {
+                row.get::<_, i64>(0)
+            })
+            .unwrap_err();
+        assert_eq!(
+            probe.sqlite_error_code(),
+            Some(rusqlite::ErrorCode::OutOfMemory)
+        );
+        let failure = read_row(&conn, &options(&path)).err().unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+        assert_eq!(std::fs::read(&wal).unwrap_or_default(), wal_before);
+        assert_eq!(failure, ConsumerCheckpointError::Unavailable);
+        return;
+    }
+    let directory = tempfile::tempdir().unwrap();
+    let child = std::process::Command::new(std::env::current_exe().unwrap())
+        .args(["--exact", "consumer_checkpoint::tests::checkpoint_heap_outage_is_unavailable_without_changing_bytes", "--test-threads=1", "--nocapture"])
+        .env(CHILD, directory.path()).output().unwrap();
+    assert!(
+        child.status.success(),
+        "{}\n{}",
+        String::from_utf8_lossy(&child.stdout),
+        String::from_utf8_lossy(&child.stderr)
+    );
+    assert!(String::from_utf8_lossy(&child.stdout)
+        .contains("test result: ok. 1 passed; 0 failed; 0 ignored;"));
+    tokio::runtime::Runtime::new().unwrap().block_on(async {
+        let mut repaired = ConsumerCheckpointStore::reopen(
+            options(&directory.path().join("checkpoint.sqlite")),
+            keys(0x51),
+        )
+        .await
+        .unwrap();
+        let (_, payload) = repaired.read_back().await.unwrap().into_parts();
+        assert!(payload.is_empty());
+        repaired.shutdown().await.unwrap();
+    });
+}
+
+#[derive(Clone, Default)]
+struct CapturedDiagnostics(Arc<Mutex<Vec<String>>>);
+impl tracing::Subscriber for CapturedDiagnostics {
+    fn enabled(&self, _: &tracing::Metadata<'_>) -> bool {
+        true
+    }
+    fn new_span(&self, _: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+        tracing::span::Id::from_u64(1)
+    }
+    fn record(&self, _: &tracing::span::Id, _: &tracing::span::Record<'_>) {}
+    fn record_follows_from(&self, _: &tracing::span::Id, _: &tracing::span::Id) {}
+    fn event(&self, event: &tracing::Event<'_>) {
+        struct Visitor(String);
+        impl tracing::field::Visit for Visitor {
+            fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+                use std::fmt::Write;
+                let _ = write!(self.0, "{field}={value:?};");
+            }
+        }
+        let mut visitor = Visitor(String::new());
+        event.record(&mut visitor);
+        self.0.lock().unwrap().push(visitor.0);
+    }
+    fn enter(&self, _: &tracing::span::Id) {}
+    fn exit(&self, _: &tracing::span::Id) {}
+}
+impl CapturedDiagnostics {
+    fn repair_reported(&self) -> bool {
+        self.0.lock().unwrap().iter().any(|report| {
+            report.contains("checkpoint key provider configuration unavailable")
+                && report.contains("retain checkpoint")
+                && report.contains("provider repair")
+        })
+    }
+    fn assert_repair_report(&self) {
+        assert!(
+            self.repair_reported(),
+            "missing operator diagnostic: {:?}",
+            self.0.lock().unwrap()
+        );
+        assert!(
+            !self
+                .0
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|report| report.contains("checkpoint-private-canary")),
+            "diagnostic must be redacted"
+        );
+    }
+}
+
+struct SwitchingProvider {
+    inner: Arc<MemoryKeyProvider>,
+    error: Mutex<Option<opc_key::KeyError>>,
+}
+#[async_trait::async_trait]
+impl KeyProvider for SwitchingProvider {
+    async fn get_active_key(
+        &self,
+        purpose: KeyPurpose,
+        tenant: &TenantId,
+    ) -> Result<opc_key::KeyHandle, opc_key::KeyError> {
+        if let Some(error) = self.error.lock().unwrap().clone() {
+            return Err(error);
+        }
+        self.inner.get_active_key(purpose, tenant).await
+    }
+    async fn get_key_by_id(&self, id: &KeyId) -> Result<opc_key::KeyHandle, opc_key::KeyError> {
+        if let Some(error) = self.error.lock().unwrap().clone() {
+            return Err(error);
+        }
+        self.inner.get_key_by_id(id).await
+    }
+    async fn rotate_key(
+        &self,
+        purpose: KeyPurpose,
+        tenant: &TenantId,
+    ) -> Result<KeyId, opc_key::KeyError> {
+        self.inner.rotate_key(purpose, tenant).await
+    }
+}
+#[tokio::test]
+async fn checkpoint_read_back_retains_rows_and_reports_provider_repair() {
+    use tracing::instrument::WithSubscriber;
+    for error in [
+        opc_key::KeyError::ProviderUnusable,
+        opc_key::KeyCustodyOperationError::CapabilityWithdrawn.into(),
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        let provider = Arc::new(SwitchingProvider {
+            inner: keys(0x51),
+            error: Mutex::new(None),
+        });
+        let mut store = ConsumerCheckpointStore::provision(
+            options(&dir.path().join("checkpoint.sqlite")),
+            provider.clone(),
+        )
+        .await
+        .unwrap();
+        let (generation, _) = store.read_back().await.unwrap().into_parts();
+        let payload = b"checkpoint-private-canary".to_vec();
+        let (generation, _) = store
+            .compare_and_set(generation, Zeroizing::new(payload.clone()))
+            .await
+            .unwrap()
+            .into_parts();
+        *provider.error.lock().unwrap() = Some(error);
+        let reports = CapturedDiagnostics::default();
+        assert_eq!(
+            store
+                .read_back()
+                .with_subscriber(reports.clone())
+                .await
+                .unwrap_err(),
+            ConsumerCheckpointError::Unavailable
+        );
+        reports.assert_repair_report();
+        *provider.error.lock().unwrap() = None;
+        let (actual, recovered) = store.read_back().await.unwrap().into_parts();
+        assert_eq!(actual, generation);
+        assert_eq!(*recovered, payload);
+        store.shutdown().await.unwrap();
+    }
+}
+#[tokio::test]
+async fn checkpoint_seal_and_provision_report_provider_repair() {
+    use tracing::instrument::WithSubscriber;
+    let dir = tempfile::tempdir().unwrap();
+    let provider = Arc::new(SwitchingProvider {
+        inner: keys(0x51),
+        error: Mutex::new(None),
+    });
+    let mut store = ConsumerCheckpointStore::provision(
+        options(&dir.path().join("checkpoint.sqlite")),
+        provider.clone(),
+    )
+    .await
+    .unwrap();
+    let (generation, _) = store.read_back().await.unwrap().into_parts();
+    *provider.error.lock().unwrap() = Some(opc_key::KeyError::ProviderUnusable);
+    let seal_reports = CapturedDiagnostics::default();
+    let seal_error = store
+        .compare_and_set(
+            generation,
+            Zeroizing::new(b"checkpoint-private-canary".to_vec()),
+        )
+        .with_subscriber(seal_reports.clone())
+        .await
+        .unwrap_err();
+    assert_eq!(seal_error, ConsumerCheckpointError::Unavailable);
+    // Record both diagnostics before asserting, so a baseline run exposes both gaps.
+    let provision_reports = CapturedDiagnostics::default();
+    let provision_error = ConsumerCheckpointStore::provision(
+        options(&dir.path().join("new.sqlite")),
+        provider.clone(),
+    )
+    .with_subscriber(provision_reports.clone())
+    .await
+    .unwrap_err();
+    // Provisioning has already prepared storage, so the public result keeps
+    // its existing indeterminate-write classification. It still needs the
+    // provider repair diagnostic from the original encryption failure.
+    assert_eq!(provision_error, ConsumerCheckpointError::Indeterminate);
+    *provider.error.lock().unwrap() = None;
+    let (actual, payload) = store.read_back().await.unwrap().into_parts();
+    assert_eq!(actual, generation);
+    assert!(payload.is_empty());
+    store.shutdown().await.unwrap();
+    assert_eq!(
+        (
+            seal_reports.repair_reported(),
+            provision_reports.repair_reported()
+        ),
+        (true, true),
+        "seal and provision both need an operator diagnostic"
+    );
+    seal_reports.assert_repair_report();
+    provision_reports.assert_repair_report();
+}
+
+#[test]
+fn checkpoint_local_encryption_failure_is_not_evidence_against_stored_data() {
+    // This no-subscriber call must not race the diagnostic-capture test at
+    // the same tracing callsite. Keep the assertion in an isolated process.
+    const CHILD: &str = "OPC_CHECKPOINT_LOCAL_FAILURE_CHILD";
+    if std::env::var_os(CHILD).is_none() {
+        let child = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "consumer_checkpoint::tests::checkpoint_local_encryption_failure_is_not_evidence_against_stored_data",
+                "--test-threads=1",
+                "--nocapture",
+            ])
+            .env(CHILD, "1")
+            .output().unwrap();
+        assert!(
+            child.status.success(),
+            "{}\n{}",
+            String::from_utf8_lossy(&child.stdout),
+            String::from_utf8_lossy(&child.stderr)
+        );
+        assert!(String::from_utf8_lossy(&child.stdout)
+            .contains("test result: ok. 1 passed; 0 failed; 0 ignored;"));
+        return;
+    }
+    assert_eq!(
+        checkpoint_decrypt_error(opc_crypto::CryptoError::EncryptionFailed),
+        ConsumerCheckpointError::Unavailable
+    );
+}
+
 fn options(path: &Path) -> ConsumerCheckpointOptions {
     let scope = ConfigConsensusIdentity::new(
         ConfigConsensusClusterId::from_bytes([0x21; 32]),
@@ -42,6 +313,61 @@ fn keys(seed: u8) -> Arc<MemoryKeyProvider> {
         )
         .unwrap();
     provider
+}
+
+/// Test-only checkpoint failures, scoped to one store path so parallel
+/// unit tests cannot perturb each other through the blocking storage thread.
+static STORAGE_FAULTS: Mutex<Vec<(PathBuf, &'static str, ConsumerCheckpointError)>> =
+    Mutex::new(Vec::new());
+static INDETERMINATE_STAGES: Mutex<Vec<(PathBuf, &'static str)>> = Mutex::new(Vec::new());
+
+pub(super) fn inject_storage_failure(path: &Path, stage: &'static str) {
+    STORAGE_FAULTS
+        .lock()
+        .expect("checkpoint storage fault registry")
+        .push((
+            path.to_path_buf(),
+            stage,
+            ConsumerCheckpointError::Unavailable,
+        ));
+}
+
+pub(super) fn clear_storage_faults(path: &Path) {
+    STORAGE_FAULTS
+        .lock()
+        .expect("checkpoint storage fault registry")
+        .retain(|(registered, _, _)| registered != path);
+}
+
+/// Return one configured injected storage failure exactly once.
+pub(super) fn storage_failure(path: &Path, stage: &str) -> Result<(), ConsumerCheckpointError> {
+    let mut faults = STORAGE_FAULTS
+        .lock()
+        .expect("checkpoint storage fault registry");
+    let Some(index) = faults.iter().position(|(registered, registered_stage, _)| {
+        registered == path && *registered_stage == stage
+    }) else {
+        return Ok(());
+    };
+    Err(faults.remove(index).2)
+}
+
+/// Failure-only diagnostic: retain which stage produced an Indeterminate.
+pub(super) fn record_indeterminate_stage(path: &Path, stage: &'static str) {
+    INDETERMINATE_STAGES
+        .lock()
+        .expect("checkpoint indeterminate stage registry")
+        .push((path.to_path_buf(), stage));
+}
+
+pub(super) fn take_indeterminate_stage(path: &Path) -> Option<&'static str> {
+    let mut stages = INDETERMINATE_STAGES
+        .lock()
+        .expect("checkpoint indeterminate stage registry");
+    let index = stages
+        .iter()
+        .position(|(registered, _)| registered == path)?;
+    Some(stages.remove(index).1)
 }
 
 fn files(path: &Path) -> BTreeMap<std::ffi::OsString, Vec<u8>> {
@@ -112,6 +438,54 @@ async fn checkpoint_drop_and_shutdown_hold_admission_through_sqlite_close() {
             .await
             .expect("release");
     }
+}
+
+#[tokio::test]
+async fn provider_configuration_during_checkpoint_reopen_preserves_the_row() {
+    provider_failure_during_checkpoint_reopen_preserves_the_row("unix://".into()).await;
+}
+
+#[tokio::test]
+async fn provider_outage_during_checkpoint_reopen_preserves_the_row() {
+    provider_failure_during_checkpoint_reopen_preserves_the_row(format!(
+        "/tmp/absent-kms-{}-checkpoint",
+        std::process::id()
+    ))
+    .await;
+}
+
+async fn provider_failure_during_checkpoint_reopen_preserves_the_row(endpoint: String) {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("checkpoint.sqlite");
+    let options = options(&path);
+    let working = keys(0x51);
+    let mut store = ConsumerCheckpointStore::provision(options.clone(), working.clone())
+        .await
+        .unwrap();
+    let (generation, _) = store.read_back().await.unwrap().into_parts();
+    let payload = b"retain-the-checkpoint".to_vec();
+    let (generation, _) = store
+        .compare_and_set(generation, Zeroizing::new(payload.clone()))
+        .await
+        .unwrap()
+        .into_parts();
+    store.shutdown().await.unwrap();
+    let provider = Arc::new(opc_key::KmsKeyProvider::new(
+        endpoint,
+        None,
+        Duration::from_secs(1),
+    ));
+    let error = ConsumerCheckpointStore::reopen(options.clone(), provider)
+        .await
+        .unwrap_err();
+    assert_eq!(error, ConsumerCheckpointError::Unavailable);
+    let mut restored = ConsumerCheckpointStore::reopen(options, working)
+        .await
+        .unwrap();
+    let (actual, recovered) = restored.read_back().await.unwrap().into_parts();
+    assert_eq!(actual, generation);
+    assert_eq!(*recovered, payload);
+    restored.shutdown().await.unwrap();
 }
 
 #[tokio::test]
@@ -520,12 +894,12 @@ fn minimum_budget_options(path: &Path, maximum_payload: usize) -> ConsumerCheckp
     candidate(accepted).unwrap()
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn maximum_payload_fits_the_minimum_accepted_storage_budget() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("checkpoint.sqlite");
     let maximum_payload = 16 * 1024 * 1024;
-    let options = minimum_budget_options(&path, maximum_payload);
+    let options = controlled_storage_clock(minimum_budget_options(&path, maximum_payload));
     let accepted = options.max_storage_bytes;
     let mut store = ConsumerCheckpointStore::provision(options.clone(), keys(0x60))
         .await
@@ -537,7 +911,25 @@ async fn maximum_payload_fits_the_minimum_accepted_storage_budget() {
     {
         let generation = index as u64 + 1;
         let payload = Zeroizing::new(vec![generation as u8; size]);
-        let result = store.compare_and_set(generation, payload.clone()).await;
+        let result = if generation == 2 {
+            let held = HeldCheckpointIo::at("before-mutation");
+            store.options.io_hook = Some(held.hook);
+            let mut write = Box::pin(store.compare_and_set(generation, payload.clone()));
+            tokio::select! {
+                // The progress signal wins even if both branches are ready.
+                biased;
+                entered = held.entered => assert!(!entered.unwrap()),
+                result = &mut write => panic!("write completed before held storage: {result:?}"),
+            }
+            // Capacity depends on actual storage completion, not host speed.
+            // Deadline expiry is exercised separately while this same stage is held.
+            held.release.send(()).unwrap();
+            let result = write.await;
+            store.options.io_hook = None;
+            result
+        } else {
+            store.compare_and_set(generation, payload.clone()).await
+        };
         assert!(
             result.is_ok(),
             "accepted storage budget {accepted} cannot store maximum payload at generation {generation}: {result:?}"
@@ -553,6 +945,89 @@ async fn maximum_payload_fits_the_minimum_accepted_storage_budget() {
     assert_eq!(generation, 4);
     assert_eq!(&**payload, vec![3; maximum_payload]);
     reopened.shutdown().await.unwrap();
+}
+
+/// A fully validated replacement retains its known success when the observer
+/// resumes after the unchanged operation budget.
+#[test]
+fn slow_post_commit_checkpoint_settlement_reports_known_success() {
+    checkpoint_runtime().block_on(async {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("checkpoint.sqlite");
+        let template = options(&path);
+        let operation_budget = Duration::from_millis(200);
+        let options = controlled_storage_clock(
+            ConsumerCheckpointOptions::new(
+                &path,
+                template.binding.clone(),
+                template.durability,
+                template.max_payload_bytes,
+                template.max_storage_bytes,
+                operation_budget,
+            )
+            .unwrap(),
+        );
+        let mut store = ConsumerCheckpointStore::provision(options.clone(), keys(0x61))
+            .await
+            .unwrap();
+        store.read_back().await.unwrap();
+        let payload = Zeroizing::new(vec![0x61; 64 * 1024]);
+        let held = HeldCheckpointIo::at("readback-complete");
+        store.options.io_hook = Some(held.hook);
+        let mut write = Box::pin(store.compare_and_set(1, payload.clone()));
+        tokio::select! {
+            biased;
+            entered = held.entered => assert!(entered.unwrap()),
+            result = &mut write => panic!("write completed before held validation: {result:?}"),
+        }
+        tokio::time::advance(operation_budget * 2).await;
+        release_checkpoint_worker(held.release).await;
+        let result = write.await;
+        store.options.io_hook = None;
+        let read = result.expect("a slow but fully validated write reports known success");
+        assert_eq!(*read.into_parts().1, *payload);
+        assert_eq!(take_indeterminate_stage(&path), None);
+        assert_eq!(
+            store.read_back().await.unwrap().into_parts().0,
+            2,
+            "the committed replacement remains the verified generation"
+        );
+        store.shutdown().await.unwrap();
+    });
+}
+
+/// A failure after durable replacement work started but before commit keeps the
+/// conservative indeterminate outcome, and the failure-only diagnostic names the
+/// exact stage rather than a generic settle/decrypt/verification guess.
+#[tokio::test]
+async fn pre_commit_storage_failure_stays_indeterminate_with_its_stage() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("checkpoint.sqlite");
+    let options = options(&path);
+    let mut store = ConsumerCheckpointStore::provision(options.clone(), keys(0x62))
+        .await
+        .unwrap();
+    store.read_back().await.unwrap();
+    inject_storage_failure(&path, "before-commit");
+    let result = store
+        .compare_and_set(1, Zeroizing::new(vec![0x62; 4096]))
+        .await;
+    clear_storage_faults(&path);
+    assert_eq!(
+        result.unwrap_err(),
+        ConsumerCheckpointError::Indeterminate,
+        "a failure after mutation started but before commit remains indeterminate"
+    );
+    assert_eq!(
+        take_indeterminate_stage(&path),
+        Some("storage-operation"),
+        "failure-only diagnostics identify the storage-operation stage"
+    );
+    // Actual storage resolves the abandoned attempt: no replacement committed.
+    let (generation, payload) = store.read_back().await.unwrap().into_parts();
+    assert_eq!(generation, 1);
+    assert!(payload.is_empty());
+    store.shutdown().await.unwrap();
 }
 
 #[tokio::test]
@@ -632,4 +1107,332 @@ async fn cancellation_retains_owned_io_and_requires_readback_before_retry() {
         .shutdown()
         .await
         .unwrap();
+}
+
+struct HeldCheckpointIo {
+    hook: CheckpointIoHook,
+    entered: tokio::sync::oneshot::Receiver<bool>,
+    release: std::sync::mpsc::Sender<()>,
+}
+
+impl HeldCheckpointIo {
+    fn at(stage: &'static str) -> Self {
+        let (entered_tx, entered) = tokio::sync::oneshot::channel();
+        let entered_tx = Mutex::new(Some(entered_tx));
+        let (release, release_rx) = std::sync::mpsc::channel();
+        let release_rx = Mutex::new(release_rx);
+        let hook = Arc::new(move |work: &Work, current| {
+            if current == stage {
+                if let Some(entered) = entered_tx.lock().unwrap().take() {
+                    let _ = entered.send(work.mutated.load(Ordering::Acquire));
+                    // Sender drop also releases the worker if an assertion unwinds.
+                    let _ = release_rx.lock().unwrap().recv();
+                }
+            }
+        });
+        Self {
+            hook,
+            entered,
+            release,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+enum BlockedCheckpointWait {
+    CompareAndSet,
+    ReadBack,
+    Shutdown,
+}
+
+async fn assert_blocked_checkpoint_wait_keeps_its_deadline(operation: BlockedCheckpointWait) {
+    let dir = tempfile::tempdir().unwrap();
+    let options = options(&dir.path().join("checkpoint.sqlite"));
+    let mut store = ConsumerCheckpointStore::provision(options.clone(), keys(0x63))
+        .await
+        .unwrap();
+    store.read_back().await.unwrap();
+    let held = HeldCheckpointIo::at("before-mutation");
+    store.options.io_hook = Some(held.hook);
+    let mut write = Box::pin(store.compare_and_set(1, Zeroizing::new(vec![0x63])));
+    tokio::select! {
+        biased;
+        entered = held.entered => assert!(!entered.unwrap()),
+        result = &mut write => panic!("write completed before the owned worker was held: {result:?}"),
+    }
+
+    let observed = match operation {
+        BlockedCheckpointWait::CompareAndSet => {
+            tokio::time::advance(options.timeout).await;
+            let result = tokio::time::timeout(Duration::ZERO, &mut write).await;
+            drop(write);
+            result.map(|result| result.map(|_| ()))
+        }
+        BlockedCheckpointWait::ReadBack => {
+            drop(write);
+            assert!(store.pending.is_some());
+            let mut read = Box::pin(store.read_back());
+            assert!(futures_util::poll!(read.as_mut()).is_pending());
+            tokio::time::advance(options.timeout).await;
+            let result = tokio::time::timeout(Duration::ZERO, &mut read).await;
+            drop(read);
+            result.map(|result| result.map(|_| ()))
+        }
+        BlockedCheckpointWait::Shutdown => {
+            drop(write);
+            assert!(store.pending.is_some());
+            let mut shutdown = Box::pin(store.shutdown());
+            assert!(futures_util::poll!(shutdown.as_mut()).is_pending());
+            tokio::time::advance(options.timeout).await;
+            tokio::time::timeout(Duration::ZERO, &mut shutdown).await
+        }
+    };
+
+    // The worker stays held through deadline observation. Release before the
+    // assertion so a failing control never strands the blocking thread.
+    held.release.send(()).unwrap();
+    assert!(
+        matches!(observed, Ok(Err(ConsumerCheckpointError::Indeterminate))),
+        "{operation:?} must return at its original deadline while retaining unfinished I/O: {observed:?}"
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn blocked_checkpoint_compare_and_set_keeps_its_deadline() {
+    assert_blocked_checkpoint_wait_keeps_its_deadline(BlockedCheckpointWait::CompareAndSet).await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn blocked_checkpoint_read_back_keeps_its_deadline() {
+    assert_blocked_checkpoint_wait_keeps_its_deadline(BlockedCheckpointWait::ReadBack).await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn blocked_checkpoint_shutdown_keeps_its_deadline() {
+    assert_blocked_checkpoint_wait_keeps_its_deadline(BlockedCheckpointWait::Shutdown).await;
+}
+
+// Keep the operation's original budget in one clock domain, including its
+// blocking SQLite progress handler. A paused Tokio clock does not auto-advance
+// while spawn_blocking is active: the actual worker wakes its waiting caller.
+fn controlled_storage_clock(mut options: ConsumerCheckpointOptions) -> ConsumerCheckpointOptions {
+    options.clock = Some(|| tokio::time::Instant::now().into_std());
+    options
+}
+
+#[tokio::test(start_paused = true)]
+async fn pending_checkpoint_write_still_times_out_and_requires_readback() {
+    let dir = tempfile::tempdir().unwrap();
+    let options = controlled_storage_clock(options(&dir.path().join("checkpoint.sqlite")));
+    let mut store = ConsumerCheckpointStore::provision(options.clone(), keys(0x59))
+        .await
+        .unwrap();
+    store.read_back().await.unwrap();
+    let held = HeldCheckpointIo::at("before-mutation");
+    store.options.io_hook = Some(held.hook);
+    let mut write = Box::pin(store.compare_and_set(1, Zeroizing::new(vec![1])));
+    tokio::select! {
+        biased;
+        entered = held.entered => assert!(!entered.unwrap()),
+        result = &mut write => panic!("write completed before held I/O: {result:?}"),
+    }
+    tokio::time::advance(options.timeout).await;
+    let result = tokio::time::timeout(Duration::ZERO, write).await;
+    // Release before assertions; the channel also releases on unwind.
+    held.release.send(()).unwrap();
+    let result = result.expect("unfinished storage returns at its original deadline");
+    assert_eq!(result.unwrap_err(), ConsumerCheckpointError::Indeterminate);
+    assert!(store.pending.is_some());
+    assert_eq!(
+        store
+            .compare_and_set(1, Zeroizing::new(vec![2]))
+            .await
+            .unwrap_err(),
+        ConsumerCheckpointError::Conflict
+    );
+    store.options.io_hook = None;
+    let (generation, payload) = store.read_back().await.unwrap().into_parts();
+    assert_eq!(generation, 1);
+    assert!(payload.is_empty());
+    store.shutdown().await.unwrap();
+}
+
+// The queued probe cannot run before the checkpoint worker on this pool.
+// This lets a late observer see an actually completed result, with no sleep.
+fn checkpoint_runtime() -> tokio::runtime::Runtime {
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .start_paused(true)
+        .max_blocking_threads(1)
+        .build()
+        .unwrap()
+}
+
+async fn release_checkpoint_worker(release: std::sync::mpsc::Sender<()>) {
+    release.send(()).unwrap();
+    tokio::task::spawn_blocking(|| ()).await.unwrap();
+}
+
+#[test]
+fn completed_checkpoint_write_keeps_its_known_outcome_after_storage_latency() {
+    checkpoint_runtime().block_on(async {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("checkpoint.sqlite");
+        let maximum_payload = 16 * 1024 * 1024;
+        let options = controlled_storage_clock(minimum_budget_options(&path, maximum_payload));
+        let mut store = ConsumerCheckpointStore::provision(options.clone(), keys(0x60))
+            .await
+            .unwrap();
+        store.read_back().await.unwrap();
+        store
+            .compare_and_set(1, Zeroizing::new(vec![1; maximum_payload]))
+            .await
+            .unwrap();
+
+        let held = HeldCheckpointIo::at("readback-complete");
+        store.options.io_hook = Some(held.hook);
+        let payload = Zeroizing::new(vec![2; maximum_payload / 2]);
+        let mut write = Box::pin(store.compare_and_set(2, payload.clone()));
+        tokio::select! {
+            biased;
+            entered = held.entered => assert!(entered.unwrap()),
+            result = &mut write => panic!("write completed before held readback: {result:?}"),
+        }
+        tokio::time::advance(options.timeout).await;
+        release_checkpoint_worker(held.release).await;
+        let result = write.await;
+        assert!(
+            result.is_ok(),
+            "completed checkpoint write lost its known outcome: {result:?}"
+        );
+        let (generation, stored) = result.unwrap().into_parts();
+        assert_eq!(generation, 3);
+        assert_eq!(*stored, *payload);
+        check_storage_size(&options).unwrap();
+
+        store.options.io_hook = None;
+        let final_payload = Zeroizing::new(vec![3; maximum_payload]);
+        let result = store
+            .compare_and_set(3, final_payload.clone())
+            .await
+            .unwrap();
+        assert_eq!(result.into_parts().1, final_payload);
+        check_storage_size(&options).unwrap();
+        store.shutdown().await.unwrap();
+        let mut reopened = ConsumerCheckpointStore::reopen(options, keys(0x60))
+            .await
+            .unwrap();
+        let (generation, payload) = reopened.read_back().await.unwrap().into_parts();
+        assert_eq!(generation, 4);
+        assert_eq!(&**payload, vec![3; maximum_payload]);
+        reopened.shutdown().await.unwrap();
+    });
+}
+
+#[test]
+fn committed_checkpoint_expiring_before_readback_requires_recovery() {
+    checkpoint_runtime().block_on(async {
+        let dir = tempfile::tempdir().unwrap();
+        let options = controlled_storage_clock(options(&dir.path().join("checkpoint.sqlite")));
+        let mut store = ConsumerCheckpointStore::provision(options.clone(), keys(0x61))
+            .await
+            .unwrap();
+        store.read_back().await.unwrap();
+        let held = HeldCheckpointIo::at("before-readback");
+        store.options.io_hook = Some(held.hook);
+        let payload = Zeroizing::new(vec![0x61]);
+        let mut write = Box::pin(store.compare_and_set(1, payload.clone()));
+        tokio::select! {
+            biased;
+            entered = held.entered => assert!(entered.unwrap()),
+            result = &mut write => panic!("write completed before held readback: {result:?}"),
+        }
+        tokio::time::advance(options.timeout).await;
+        release_checkpoint_worker(held.release).await;
+        assert_eq!(
+            write.await.unwrap_err(),
+            ConsumerCheckpointError::Indeterminate
+        );
+        assert_eq!(
+            store
+                .compare_and_set(1, Zeroizing::new(vec![2]))
+                .await
+                .unwrap_err(),
+            ConsumerCheckpointError::Conflict
+        );
+        store.options.io_hook = None;
+        let (generation, stored) = store.read_back().await.unwrap().into_parts();
+        assert_eq!(generation, 2);
+        assert_eq!(*stored, *payload);
+        store.shutdown().await.unwrap();
+    });
+}
+
+#[test]
+fn completed_checkpoint_open_keeps_its_known_outcome_after_storage_latency() {
+    checkpoint_runtime().block_on(async {
+        let dir = tempfile::tempdir().unwrap();
+        let options = controlled_storage_clock(options(&dir.path().join("checkpoint.sqlite")));
+        let payload = Zeroizing::new(vec![0x62]);
+        for provision in [true, false] {
+            let held = HeldCheckpointIo::at("open-complete");
+            let mut opening_options = options.clone();
+            opening_options.io_hook = Some(held.hook);
+            let mut open = Box::pin(ConsumerCheckpointStore::open(opening_options, keys(0x62), provision));
+            tokio::select! {
+                biased;
+                entered = held.entered => assert!(entered.unwrap()),
+                result = &mut open => panic!("open completed before held validation: {result:?}"),
+            }
+            tokio::time::advance(options.timeout).await;
+            release_checkpoint_worker(held.release).await;
+            let result = open.await;
+            assert!(result.is_ok(), "completed checkpoint open lost its known outcome (provision={provision}): {result:?}");
+            let mut store = result.unwrap();
+            store.options.io_hook = None;
+            let (generation, stored) = store.read_back().await.unwrap().into_parts();
+            if provision {
+                assert_eq!(generation, 1);
+                assert!(stored.is_empty());
+                let read = store.compare_and_set(1, payload.clone()).await.unwrap();
+                let (generation, stored) = read.into_parts();
+                assert_eq!(generation, 2);
+                assert_eq!(*stored, *payload);
+            } else {
+                assert_eq!(generation, 2);
+                assert_eq!(*stored, *payload);
+            }
+            store.shutdown().await.unwrap();
+        }
+    });
+}
+
+fn assert_checkpoint_write_diagnostic(
+    error: opc_crypto::CryptoError,
+    expected: &str,
+    forbidden: &str,
+) {
+    let diagnostics = CapturedDiagnostics::default();
+    let result =
+        tracing::subscriber::with_default(diagnostics.clone(), || checkpoint_encrypt_error(error));
+    assert_eq!(result, ConsumerCheckpointError::Unavailable);
+    let reports = diagnostics.0.lock().unwrap().join("\n");
+    assert!(reports.contains(expected), "{reports}");
+    assert!(!reports.contains(forbidden), "{reports}");
+}
+#[test]
+fn checkpoint_write_rejection_reports_provider_repair() {
+    assert_checkpoint_write_diagnostic(
+        opc_crypto::CryptoError::KeyRejected,
+        "checkpoint key provider configuration unavailable",
+        "local encryption",
+    );
+}
+#[test]
+fn checkpoint_local_write_failure_reports_local_fault() {
+    assert_checkpoint_write_diagnostic(
+        opc_crypto::CryptoError::EncryptionFailed,
+        "checkpoint local encryption failed",
+        "provider repair",
+    );
 }

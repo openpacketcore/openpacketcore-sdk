@@ -2,7 +2,8 @@
 """Independent, synthetic N3 packet vectors; no SDK codec/catalog imports.
 
 Wire authority: TS 29.281 V18.4.0 sections 5.1, 5.2.1, 5.2.2.7 and
-TS 38.415 V18.2.0 sections 5.5.2, 5.5.3.1-7. The refusal of an empty
+TS 38.415 V18.2.0 sections 5.5.2, 5.5.3.1-7, with V19.1.0 BSSI/TTNBI
+flags rejected as unsupported conditional fields. The refusal of an empty
 T-PDU is the SDK forwarding-input policy, not generic GTP-U conformance.
 This authors packet bytes independently; it is not a live peer oracle.
 """
@@ -102,10 +103,10 @@ def rows():
     for bit in (6, 7):
         add(f"ul-conditional-second-{bit}", "ul", packet([(0x85, bytes([1, 0x10, 9 | (1 << bit), 0]))]))
     add("ppi-missing", "dl", packet([(0x85, bytes([1, 0, 0x89, 0]))]))
-    # Spare DL bits and padding are not interpreted by the receiver.
+    # Spare DL bits and padding are ignored; R19 BSSI/TTNBI are unsupported.
     for spare in range(32):
         wire = bytes([2, 1, 0xC9, 0xE0 | spare, 0xA1, 0xB2, 0xC3, 0])
-        add(f"dl-spares-{spare}", "dl", packet([(0x85, wire)]), True, 9, True, 7)
+        add(f"dl-spares-{spare}", "dl", packet([(0x85, wire)]), spare & 3 == 0, 9, True, 7)
     assert len({row[0] for row in result}) == len(result)
     return result
 

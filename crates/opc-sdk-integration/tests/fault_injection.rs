@@ -1,6 +1,6 @@
 use bytes::Bytes;
 use opc_alarm::{ProbableCause, ReadinessImpact, Severity};
-use opc_crypto::{decrypt_envelope, encrypt_envelope_with_nonce, CryptoEnvelopeV1, CryptoError};
+use opc_crypto::{decrypt_envelope, encrypt_envelope_with_nonce, CryptoError};
 use opc_evidence::{compute_digest, EvidenceError, Manifest, ManifestEntry};
 use opc_key::{ConfigAad, EnvelopeAad, KeyId, KeyPurpose, MemoryKeyProvider, Zeroizing};
 use opc_nacm::{
@@ -114,19 +114,16 @@ async fn fault_injection_missing_key_fails_closed_without_secret_leak() {
     .await
     .expect("encrypt test payload");
 
-    let mut decoded = CryptoEnvelopeV1::decode(&envelope).expect("decode envelope");
-    decoded.key_id = KeyId::new("config-key-2026-missing").expect("missing key id");
+    // Keep the stored binding intact: a genuine missing key is a provider
+    // verdict, whereas changing only the header is local binding damage.
+    let missing = MemoryKeyProvider::new();
+    let err = decrypt_envelope(&missing, &aad, &envelope)
+        .await
+        .expect_err("missing key must fail closed");
 
-    let err = decrypt_envelope(
-        &provider,
-        &aad,
-        &decoded.encode().expect("re-encode envelope"),
-    )
-    .await
-    .expect_err("missing key must fail closed");
-
-    assert_eq!(err, CryptoError::DecryptionFailed);
-    assert_eq!(err.to_string(), "envelope decryption failed");
+    assert_eq!(err, CryptoError::KeyRejected);
+    assert_eq!(err.to_string(), "key or ciphertext rejected");
+    assert!(err.is_definitive_rejection());
     assert!(!err.to_string().contains(leak_probe_payload));
 }
 

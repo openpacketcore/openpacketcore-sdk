@@ -40,6 +40,20 @@ mod tests {
     }
 
     #[test]
+    fn digit_prefixed_nf_types_keep_their_standard_wire_names() {
+        for (value, wire) in [
+            (NfType::FiveGEir, "5G_EIR"),
+            (NfType::FiveGDdnmf, "5G_DDNMF"),
+        ] {
+            assert_eq!(serde_json::to_value(&value).unwrap(), wire);
+            assert_eq!(
+                serde_json::from_value::<NfType>(serde_json::json!(wire)).unwrap(),
+                value
+            );
+        }
+    }
+
+    #[test]
     fn extensible_enum_unknown_variant() {
         let json = r#""UNKNOWN_STATUS""#;
         let status: NfStatus = serde_json::from_str(json).unwrap();

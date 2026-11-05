@@ -3,7 +3,7 @@
 //! Default decoding follows the receiver rules in TS 24.007 and TS 24.501 §7:
 //! optional presence is not enforced, malformed optional values are ignored,
 //! and excess fixed-length/EAP padding is discarded. Strict and ProcedureAware
-//! additionally enforce table order, exact lengths and sender presence rules.
+//! additionally enforce table order, minimum lengths and sender presence rules.
 //! Mandatory IEs and resource bounds are always checked. Procedure state, AKA
 //! verification and EAP method processing belong to the caller. Unknown comprehension-required IEs
 //! fail closed. Other unknown IEs follow [`UnknownIePolicy`]. Repeated IEs use
@@ -119,8 +119,8 @@ impl EapMessage {
         validate_eap(&value)?;
         Ok(Self(value))
     }
-    fn from_slice(value: &[u8], ctx: DecodeContext) -> Result<Self, DecodeError> {
-        Ok(Self(Bytes::copy_from_slice(eap_value(value, ctx)?)))
+    fn from_slice(value: &[u8]) -> Result<Self, DecodeError> {
+        Ok(Self(Bytes::copy_from_slice(eap_value(value)?)))
     }
     /// Complete EAP packet, including its EAP header.
     pub fn as_bytes(&self) -> &[u8] {
@@ -132,18 +132,14 @@ impl EapMessage {
     }
 }
 
-fn eap_value(value: &[u8], ctx: DecodeContext) -> Result<&[u8], DecodeError> {
-    let packet = if strict(ctx) {
-        value
-    } else {
-        let header = value
-            .get(..4)
-            .ok_or_else(|| invalid("EAP header is truncated", "9.11.2.2"))?;
-        let length = usize::from(u16::from_be_bytes([header[2], header[3]]));
-        value
-            .get(..length)
-            .ok_or_else(|| invalid("EAP packet exceeds IE length", "9.11.2.2"))?
-    };
+fn eap_value(value: &[u8]) -> Result<&[u8], DecodeError> {
+    let header = value
+        .get(..4)
+        .ok_or_else(|| invalid("EAP header is truncated", "9.11.2.2"))?;
+    let length = usize::from(u16::from_be_bytes([header[2], header[3]]));
+    let packet = value
+        .get(..length)
+        .ok_or_else(|| invalid("EAP packet exceeds IE length", "9.11.2.2"))?;
     validate_eap(packet)?;
     Ok(packet)
 }
@@ -396,7 +392,7 @@ impl Optionals {
     }
 }
 
-fn known_value(iei: u8, value: &[u8], ctx: DecodeContext) -> Result<&[u8], DecodeError> {
+fn known_value(iei: u8, value: &[u8]) -> Result<&[u8], DecodeError> {
     let (length, clause) = match iei {
         0x20 => (16, "9.11.3.15"),
         0x21 => (16, "9.11.3.16"),
@@ -404,10 +400,10 @@ fn known_value(iei: u8, value: &[u8], ctx: DecodeContext) -> Result<&[u8], Decod
         0x30 => (14, "9.11.3.14"),
         0x38 if (2..=255).contains(&value.len()) => return Ok(value),
         0x38 => (2, "9.11.3.10"),
-        0x78 => return eap_value(value, ctx),
+        0x78 => return eap_value(value),
         _ => return Ok(value),
     };
-    if value.len() < length || (strict(ctx) && value.len() != length) {
+    if value.len() < length {
         return Err(invalid("authentication IE value length is invalid", clause));
     }
     Ok(&value[..length])
@@ -488,7 +484,7 @@ fn optionals(
                 }
                 continue;
             }
-            let value = match known_value(iei, value, ctx) {
+            let value = match known_value(iei, value) {
                 Ok(value) => value,
                 Err(error) if strict(ctx) => return Err(error),
                 Err(_) => continue,
@@ -702,7 +698,7 @@ impl Body for AuthenticationResult {
     const KIND: Kind = Kind::Result;
     fn read(cursor: &mut Cursor<'_>, ctx: DecodeContext) -> Result<Self, DecodeError> {
         let ng_ksi = cursor.ng_ksi()?;
-        let eap_message = EapMessage::from_slice(cursor.lv(true)?, ctx)?;
+        let eap_message = EapMessage::from_slice(cursor.lv(true)?)?;
         let ies = optionals(cursor, Self::KIND, ctx)?;
         let abba = ies.value(0x38).map(Abba::from_slice).transpose()?;
         Ok(Self {

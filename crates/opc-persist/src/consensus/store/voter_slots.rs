@@ -29,7 +29,7 @@ pub(super) struct ConfigVoterProfile {
     pub(super) admission: Arc<ConfigVoterAdmission>,
     pub(super) transport: Arc<ConfigVoterTransport>,
     core: super::super::sqlite::ConfigConsensusCore,
-    incoming: tokio::sync::Mutex<Option<IncomingSnapshot>>,
+    incoming: tokio::sync::Mutex<Option<IncomingSnapshotState>>,
 }
 
 // One coordinator owns accepted work through completion. This cache is keyed
@@ -72,7 +72,26 @@ struct SnapshotDelivery {
     artifact: Snapshot<ConfigRaftTypeConfig>,
     evidence: VoterSnapshotEvidence,
     offset: u64,
+    length: u64,
     finishing: bool,
+}
+
+async fn read_replacement_chunk(
+    file: &mut super::super::snapshot_file::ConfigSnapshotFile,
+    offset: u64,
+) -> Result<Vec<u8>, VoterReplacementError> {
+    storage::snapshot_io_step(tokio::io::AsyncSeekExt::seek(
+        file,
+        std::io::SeekFrom::Start(offset),
+    ))
+    .await
+    .map_err(|_| VoterReplacementError::Unavailable)?;
+    let mut bytes = vec![0_u8; 128 * 1024];
+    let read = storage::snapshot_io_step(file.read(&mut bytes))
+        .await
+        .map_err(|_| VoterReplacementError::Unavailable)?;
+    bytes.truncate(read);
+    Ok(bytes)
 }
 
 struct IncomingSnapshot {
@@ -82,6 +101,55 @@ struct IncomingSnapshot {
     replacement: Option<[u8; 32]>,
     offset: u64,
     data: Box<super::super::snapshot_file::ConfigSnapshotFile>,
+}
+
+enum IncomingSnapshotState {
+    Receiving(IncomingSnapshot),
+    Accepted {
+        key: FinalizedSnapshot,
+        completion: tokio::sync::watch::Receiver<
+            Option<Result<ConsensusWireResponse, VoterReplacementError>>,
+        >,
+    },
+}
+
+#[derive(PartialEq, Eq)]
+struct FinalizedSnapshot {
+    source: ConsensusNodeId,
+    vote: Vote<ConsensusNodeId>,
+    meta: SnapshotMeta<ConsensusNodeId, EmptyNode>,
+    replacement: Option<[u8; 32]>,
+    offset: u64,
+    length: usize,
+    digest: [u8; 32],
+}
+
+impl FinalizedSnapshot {
+    fn new(
+        source: ConsensusNodeId,
+        rpc: &InstallSnapshotRequest<ConfigRaftTypeConfig>,
+        replacement: Option<[u8; 32]>,
+    ) -> Self {
+        use sha2::Digest;
+        Self {
+            source,
+            vote: rpc.vote,
+            meta: rpc.meta.clone(),
+            replacement,
+            offset: rpc.offset,
+            length: rpc.data.len(),
+            digest: sha2::Sha256::digest(&rpc.data).into(),
+        }
+    }
+}
+
+fn finalized_matches(
+    marker: &FinalizedSnapshot,
+    source: ConsensusNodeId,
+    rpc: &InstallSnapshotRequest<ConfigRaftTypeConfig>,
+    replacement: Option<[u8; 32]>,
+) -> bool {
+    rpc.done && marker == &FinalizedSnapshot::new(source, rpc, replacement)
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -282,41 +350,57 @@ impl ConfigVoterProfile {
 
     async fn wait_candidate_ack(
         &self,
-        raft: &ConfigRaft,
-        local: ConsensusNodeId,
+        store: &ConsensusConfigStore,
         deadline: tokio::time::Instant,
     ) -> Result<(), VoterReplacementError> {
+        // Established voters must keep acknowledging replication during the
+        // planned handoff. Only an unresolved candidate wait is interrupted.
         if self.admission.local_voting_admitted() {
             return Ok(());
         }
-        let is_voter = raft
-            .with_raft_state(move |state| {
-                state
-                    .membership_state
-                    .effective()
-                    .membership()
-                    .voter_ids()
-                    .any(|node| node == local)
-            })
-            .await
-            .map_err(|_| VoterReplacementError::Unavailable)?;
-        if !is_voter {
-            return Ok(());
-        }
-        let mut changed = self.core.durable_progress.subscribe_applied();
-        loop {
-            // Never await admission's serial coordinator while holding the
-            // incoming request guard; publication has its own independent task.
-            let state = Reader(self.core.clone()).read_voter_slot_state().await?;
-            if state.table().slots.iter().any(|slot| {
-                slot.member.identity.node_id() == local && slot.phase == VoterSlotPhase::Voting
-            }) {
+        let raft = &store.inner.raft;
+        let local = store.inner.local_node_id;
+        let operation = async {
+            let is_voter = raft
+                .with_raft_state(move |state| {
+                    state
+                        .membership_state
+                        .effective()
+                        .membership()
+                        .voter_ids()
+                        .any(|node| node == local)
+                })
+                .await
+                .map_err(|_| VoterReplacementError::Unavailable)?;
+            if !is_voter {
                 return Ok(());
             }
-            tokio::time::timeout_at(deadline, changed.changed())
-                .await
-                .map_err(|_| VoterReplacementError::Deadline)?
-                .map_err(|_| VoterReplacementError::Unavailable)?;
+            let mut changed = self.core.durable_progress.subscribe_applied();
+            loop {
+                // Never await admission's serial coordinator while holding the
+                // incoming request guard; publication has its own independent task.
+                // Keep the caller's original deadline while acquiring and
+                // reading the serialized SQLite connection.
+                let state = Reader(self.core.clone())
+                    .read_voter_slot_state_until(deadline)
+                    .await?;
+                if state.table().slots.iter().any(|slot| {
+                    slot.member.identity.node_id() == local && slot.phase == VoterSlotPhase::Voting
+                }) {
+                    return Ok(());
+                }
+                tokio::time::timeout_at(deadline, changed.changed())
+                    .await
+                    .map_err(|_| VoterReplacementError::Deadline)?
+                    .map_err(|_| VoterReplacementError::Unavailable)?;
+            }
+        };
+        tokio::select! {
+            biased;
+            _ = store.inner.shutdown.wait_started() => Err(VoterReplacementError::Unavailable),
+            result = tokio::time::timeout_at(deadline, operation) => {
+                result.map_err(|_| VoterReplacementError::Deadline)?
+            }
         }
     }
 
@@ -355,12 +439,13 @@ impl ConfigVoterProfile {
             return Err(VoterReplacementError::Deadline);
         }
         let unavailable = |_| VoterReplacementError::Unavailable;
-        let current_vote = store
-            .inner
-            .raft
-            .with_raft_state(|state| *state.vote_ref())
-            .await
-            .map_err(unavailable)?;
+        let current_vote = tokio::time::timeout_at(
+            deadline,
+            store.inner.raft.with_raft_state(|state| *state.vote_ref()),
+        )
+        .await
+        .map_err(|_| VoterReplacementError::Deadline)?
+        .map_err(unavailable)?;
         if !matches!(
             rpc.vote.partial_cmp(&current_vote),
             Some(std::cmp::Ordering::Greater | std::cmp::Ordering::Equal)
@@ -375,9 +460,42 @@ impl ConfigVoterProfile {
                 }),
             );
         }
-        let mut incoming = self.incoming.lock().await;
+        let mut incoming = tokio::time::timeout_at(deadline, self.incoming.lock())
+            .await
+            .map_err(|_| VoterReplacementError::Deadline)?;
+        if let Some(IncomingSnapshotState::Accepted { key, completion }) = incoming.as_ref() {
+            let abandoned = completion.borrow().is_none() && completion.has_changed().is_err();
+            if finalized_matches(key, source, &rpc, replacement) && !abandoned {
+                let completion = completion.clone();
+                drop(incoming);
+                return self
+                    .await_snapshot_receipt(store, completion, deadline)
+                    .await;
+            }
+            if rpc.offset != 0 {
+                return Err(VoterReplacementError::InvalidTransition);
+            }
+            if rpc.done
+                && !abandoned
+                && key.source == source
+                && key.vote == rpc.vote
+                && key.meta == rpc.meta
+                && key.replacement == replacement
+            {
+                return Err(VoterReplacementError::InvalidTransition);
+            }
+            if completion.borrow().is_none() && completion.has_changed().is_ok() {
+                // Keep the single accepted install owned; another transfer
+                // cannot replace its receipt while it is still running.
+                return Err(VoterReplacementError::Unavailable);
+            }
+            *incoming = None;
+        }
         if rpc.offset == 0
-            && incoming.as_ref().is_none_or(|assembly| {
+            && incoming.as_ref().is_none_or(|state| {
+                let IncomingSnapshotState::Receiving(assembly) = state else {
+                    return true;
+                };
                 assembly.source != source
                     || assembly.vote != rpc.vote
                     || assembly.meta != rpc.meta
@@ -386,23 +504,24 @@ impl ConfigVoterProfile {
         {
             // A new authenticated transfer owns a new file; stale chunks cannot
             // finish a predecessor leader's transfer.
-            *incoming = Some(IncomingSnapshot {
+            *incoming = Some(IncomingSnapshotState::Receiving(IncomingSnapshot {
                 source,
                 vote: rpc.vote,
                 meta: rpc.meta.clone(),
                 replacement,
                 offset: 0,
-                data: store
-                    .inner
-                    .raft
-                    .begin_receiving_snapshot()
-                    .await
-                    .map_err(|_| VoterReplacementError::Unavailable)?,
-            });
+                data: tokio::time::timeout_at(
+                    deadline,
+                    store.inner.raft.begin_receiving_snapshot(),
+                )
+                .await
+                .map_err(|_| VoterReplacementError::Deadline)?
+                .map_err(|_| VoterReplacementError::Unavailable)?,
+            }));
         }
-        let assembly = incoming
-            .as_mut()
-            .ok_or(VoterReplacementError::InvalidTransition)?;
+        let Some(IncomingSnapshotState::Receiving(assembly)) = incoming.as_mut() else {
+            return Err(VoterReplacementError::InvalidTransition);
+        };
         if assembly.source != source
             || assembly.vote != rpc.vote
             || assembly.meta != rpc.meta
@@ -421,25 +540,49 @@ impl ConfigVoterProfile {
                 return Err(VoterReplacementError::InvalidTransition);
             }
             let mut retained = vec![0; rpc.data.len()];
-            tokio::io::AsyncSeekExt::seek(&mut assembly.data, std::io::SeekFrom::Start(rpc.offset))
-                .await
-                .map_err(|_| VoterReplacementError::Unavailable)?;
-            let read = assembly.data.read_exact(&mut retained).await;
-            tokio::io::AsyncSeekExt::seek(
-                &mut assembly.data,
-                std::io::SeekFrom::Start(assembly.offset),
+            tokio::time::timeout_at(
+                deadline,
+                tokio::io::AsyncSeekExt::seek(
+                    &mut assembly.data,
+                    std::io::SeekFrom::Start(rpc.offset),
+                ),
             )
             .await
+            .map_err(|_| VoterReplacementError::Deadline)?
             .map_err(|_| VoterReplacementError::Unavailable)?;
-            read.map_err(|_| VoterReplacementError::Unavailable)?;
+            let read =
+                tokio::time::timeout_at(deadline, assembly.data.read_exact(&mut retained)).await;
+            tokio::time::timeout_at(
+                deadline,
+                tokio::io::AsyncSeekExt::seek(
+                    &mut assembly.data,
+                    std::io::SeekFrom::Start(assembly.offset),
+                ),
+            )
+            .await
+            .map_err(|_| VoterReplacementError::Deadline)?
+            .map_err(|_| VoterReplacementError::Unavailable)?;
+            read.map_err(|_| VoterReplacementError::Deadline)?
+                .map_err(|_| VoterReplacementError::Unavailable)?;
             if retained != rpc.data {
                 return Err(VoterReplacementError::InvalidTransition);
             }
         } else {
-            assembly
-                .data
-                .write_all(&rpc.data)
+            // A bounded write can stop partway through a chunk. The saved
+            // offset names the last complete chunk and is safe to overwrite.
+            tokio::time::timeout_at(
+                deadline,
+                tokio::io::AsyncSeekExt::seek(
+                    &mut assembly.data,
+                    std::io::SeekFrom::Start(assembly.offset),
+                ),
+            )
+            .await
+            .map_err(|_| VoterReplacementError::Deadline)?
+            .map_err(|_| VoterReplacementError::Unavailable)?;
+            tokio::time::timeout_at(deadline, assembly.data.write_all(&rpc.data))
                 .await
+                .map_err(|_| VoterReplacementError::Deadline)?
                 .map_err(|_| VoterReplacementError::Unavailable)?;
             assembly.offset = next;
         }
@@ -454,60 +597,128 @@ impl ConfigVoterProfile {
                 }),
             );
         }
-        let mut assembly = incoming.take().ok_or(VoterReplacementError::Unavailable)?;
+        let Some(IncomingSnapshotState::Receiving(mut assembly)) = incoming.take() else {
+            return Err(VoterReplacementError::Unavailable);
+        };
+        let (completed, completion) = tokio::sync::watch::channel(None);
+        *incoming = Some(IncomingSnapshotState::Accepted {
+            key: FinalizedSnapshot::new(source, &rpc, replacement),
+            completion: completion.clone(),
+        });
         drop(incoming);
-        let table = storage::inspect_voter_snapshot(
-            &self.core,
-            &mut assembly.data,
-            &assembly.meta,
-            deadline,
+        // run_peer_request owns this future through inspection and installation.
+        // Publish the engine result before candidate acknowledgement: a retry
+        // joins/replays that result, but gets a fresh bounded acknowledgement.
+        let dispatched = Arc::new(AtomicBool::new(false));
+        let result = async {
+            let table = storage::inspect_voter_snapshot(
+                &self.core,
+                &mut assembly.data,
+                &assembly.meta,
+                deadline,
+            )
+            .await
+            .map_err(|_| VoterReplacementError::InvalidTransition)?;
+            if table.is_retired(source)
+                || table
+                    .replacement
+                    .as_ref()
+                    .map(|operation| operation.attestation.request_digest)
+                    != replacement
+            {
+                return Err(VoterReplacementError::UnauthorizedReplacement);
+            }
+            let members = assembly
+                .meta
+                .last_membership
+                .nodes()
+                .map(|(node, _)| *node)
+                .collect();
+            let raft = store.inner.raft.clone();
+            // Inspection and accepted installation remain owned if the chunk's
+            // caller times out. Give the verified artifact its own admission budget.
+            let deadline = tokio::time::Instant::now() + admission_budget;
+            let dispatch_started = dispatched.clone();
+            let response = self
+                .admission
+                .run_snapshot_to_completion(table, members, deadline, move || {
+                    dispatch_started.store(true, Ordering::Release);
+                    async move {
+                        Ok(raft
+                            .install_full_snapshot(
+                                assembly.vote,
+                                Snapshot {
+                                    meta: assembly.meta,
+                                    snapshot: assembly.data,
+                                },
+                            )
+                            .await)
+                    }
+                })
+                .await?;
+            let result: Result<
+                InstallSnapshotResponse<ConsensusNodeId>,
+                RaftError<ConsensusNodeId, InstallSnapshotError>,
+            > = response.map(Into::into).map_err(RaftError::Fatal);
+            Ok(
+                encode_engine_result(&result).map_or_else(rejected, |payload| {
+                    ConsensusWireResponse {
+                        result: Ok(payload),
+                    }
+                }),
+            )
+        }
+        .await;
+        if !dispatched.load(Ordering::Acquire) && result.is_err() {
+            // Inspection, authorization and queued admission cannot install
+            // anything. Release a definitely undispatched failure so a fresh
+            // transfer can retry. Existing waiters still receive this result.
+            // Once dispatch starts, retain its possibly ambiguous receipt.
+            let mut incoming = self.incoming.lock().await;
+            if matches!(incoming.as_ref(), Some(IncomingSnapshotState::Accepted {
+                completion: retained, ..
+            }) if retained.same_channel(&completion))
+            {
+                *incoming = None;
+            }
+        }
+        completed.send_replace(Some(result));
+        self.await_snapshot_receipt(
+            store,
+            completion,
+            tokio::time::Instant::now() + admission_budget,
         )
         .await
-        .map_err(|_| VoterReplacementError::InvalidTransition)?;
-        if table.is_retired(source)
-            || table
-                .replacement
-                .as_ref()
-                .map(|operation| operation.attestation.request_digest)
-                != replacement
-        {
-            return Err(VoterReplacementError::UnauthorizedReplacement);
+    }
+
+    async fn await_snapshot_receipt(
+        &self,
+        store: &ConsensusConfigStore,
+        mut completion: tokio::sync::watch::Receiver<
+            Option<Result<ConsensusWireResponse, VoterReplacementError>>,
+        >,
+        deadline: tokio::time::Instant,
+    ) -> Result<ConsensusWireResponse, VoterReplacementError> {
+        let operation = async {
+            let response = loop {
+                if let Some(result) = completion.borrow_and_update().clone() {
+                    break result?;
+                }
+                completion
+                    .changed()
+                    .await
+                    .map_err(|_| VoterReplacementError::Unavailable)?;
+            };
+            self.wait_candidate_ack(store, deadline).await?;
+            Ok(response)
+        };
+        tokio::select! {
+            biased;
+            _ = store.inner.shutdown.wait_started() => Err(VoterReplacementError::Unavailable),
+            result = tokio::time::timeout_at(deadline, operation) => {
+                result.map_err(|_| VoterReplacementError::Deadline)?
+            }
         }
-        let members = assembly
-            .meta
-            .last_membership
-            .nodes()
-            .map(|(node, _)| *node)
-            .collect();
-        let raft = store.inner.raft.clone();
-        // Inspection and accepted installation remain owned if the chunk's
-        // caller times out. Give the verified artifact its own admission budget.
-        let deadline = tokio::time::Instant::now() + admission_budget;
-        let response = self
-            .admission
-            .run_snapshot(table, members, deadline, move || async move {
-                Ok(raft
-                    .install_full_snapshot(
-                        assembly.vote,
-                        Snapshot {
-                            meta: assembly.meta,
-                            snapshot: assembly.data,
-                        },
-                    )
-                    .await)
-            })
-            .await?;
-        let result: Result<
-            InstallSnapshotResponse<ConsensusNodeId>,
-            RaftError<ConsensusNodeId, InstallSnapshotError>,
-        > = response.map(Into::into).map_err(RaftError::Fatal);
-        self.wait_candidate_ack(&store.inner.raft, store.inner.local_node_id, deadline)
-            .await?;
-        Ok(
-            encode_engine_result(&result).map_or_else(rejected, |payload| ConsensusWireResponse {
-                result: Ok(payload),
-            }),
-        )
     }
 }
 
@@ -556,6 +767,9 @@ impl ConsensusConfigStore {
     }
 
     /// Read one atomically published bounded table and provisional intent.
+    ///
+    /// This observer read does not start a publication wait; caller-budgeted
+    /// paths use the deadline-aware reader instead.
     pub async fn voter_slot_state(&self) -> Result<VoterSlotDurableState, VoterReplacementError> {
         let profile = self
             .inner
@@ -1042,7 +1256,7 @@ impl ConsensusConfigStore {
         &self,
         required: u64,
         vote: Vote<ConsensusNodeId>,
-    ) -> Result<(Snapshot<ConfigRaftTypeConfig>, VoterSnapshotEvidence), VoterReplacementError>
+    ) -> Result<(Snapshot<ConfigRaftTypeConfig>, VoterSnapshotEvidence, u64), VoterReplacementError>
     {
         let deadline = tokio::time::Instant::now() + self.inner.operation_timeout;
         self.wait_for_snapshot_cut(Some(required), vote, deadline)
@@ -1058,7 +1272,7 @@ impl ConsensusConfigStore {
         // cannot cancel verification and would queue another whole-file read
         // on every coordinator retry. Await this one read; storage bounds gate
         // acquisition and individual I/O stalls, allowing healthy large files.
-        let mut snapshot = self
+        let snapshot = self
             .inner
             .raft
             .get_snapshot()
@@ -1075,15 +1289,12 @@ impl ConsensusConfigStore {
             .meta
             .last_log_id
             .ok_or(VoterReplacementError::InvalidTransition)?;
-        let owner = self
-            .inner
-            .snapshot_directory_owner
-            .upgrade()
+        let verified = snapshot
+            .snapshot
+            .verified_envelope()
             .ok_or(VoterReplacementError::Unavailable)?;
-        let (_, digest, _) =
-            storage::verify_open_snapshot_envelope(snapshot.snapshot.as_mut(), owner)
-                .await
-                .map_err(|_| VoterReplacementError::Unavailable)?;
+        let digest = verified.checksum;
+        let length = verified.total_length;
         let evidence = VoterSnapshotEvidence {
             cut: VoterSlotLogId {
                 term: cut.leader_id.term,
@@ -1092,7 +1303,7 @@ impl ConsensusConfigStore {
             snapshot_id: snapshot.meta.snapshot_id.clone(),
             digest,
         };
-        Ok((snapshot, evidence))
+        Ok((snapshot, evidence, length))
     }
 
     async fn deliver_initial_snapshot(
@@ -1103,13 +1314,14 @@ impl ConsensusConfigStore {
         progress: &mut ReplacementProgress,
     ) -> Result<VoterSnapshotEvidence, VoterReplacementError> {
         if progress.snapshot.is_none() {
-            let (snapshot, evidence) = self
+            let (snapshot, evidence, length) = self
                 .read_replacement_snapshot(operation.evidence.prepare.index, vote)
                 .await?;
             progress.snapshot = Some(SnapshotDelivery {
                 artifact: snapshot,
                 evidence,
                 offset: 0,
+                length,
                 finishing: false,
             });
         }
@@ -1155,22 +1367,19 @@ impl ConsensusConfigStore {
             {
                 return Err(VoterReplacementError::NoSurvivingQuorum);
             }
-            let deadline = tokio::time::Instant::now() + self.inner.operation_timeout;
-            tokio::io::AsyncSeekExt::seek(
-                &mut delivery.artifact.snapshot,
-                std::io::SeekFrom::Start(delivery.offset),
-            )
-            .await
-            .map_err(|_| VoterReplacementError::Unavailable)?;
-            let mut bytes = vec![0_u8; 128 * 1024];
-            let read = delivery
-                .artifact
-                .snapshot
-                .read(&mut bytes)
-                .await
-                .map_err(|_| VoterReplacementError::Unavailable)?;
-            bytes.truncate(read);
-            let done = read == 0;
+            let bytes =
+                read_replacement_chunk(&mut delivery.artifact.snapshot, delivery.offset).await?;
+            let read = bytes.len();
+            let done = bytes.is_empty();
+            let chunk_budget = if done {
+                super::super::snapshot_timing::snapshot_transfer_budget(
+                    self.inner.operation_timeout,
+                    delivery.length,
+                )
+            } else {
+                self.inner.operation_timeout
+            };
+            let deadline = tokio::time::Instant::now() + chunk_budget;
             delivery.finishing = done;
             let rpc = InstallSnapshotRequest::<ConfigRaftTypeConfig> {
                 vote,
@@ -1361,7 +1570,9 @@ pub(super) async fn handle(
                 ConsensusRpcFamily::AppendEntries => {
                     let mut rpc = append.ok_or(VoterReplacementError::UnauthorizedReplacement)?;
                     let original_last = rpc.entries.last().map(|entry| entry.log_id);
-                    let state = Reader(profile.core.clone()).read_voter_slot_state().await?;
+                    let state = Reader(profile.core.clone())
+                        .read_voter_slot_state_until(deadline)
+                        .await?;
                     if state.table().slots.iter().any(|slot| {
                         slot.member.identity.node_id() == store.inner.local_node_id
                             && slot.phase == VoterSlotPhase::Pending
@@ -1475,9 +1686,7 @@ pub(super) async fn handle(
                     } else {
                         raft.append_entries(rpc).await
                     };
-                    profile
-                        .wait_candidate_ack(&store.inner.raft, store.inner.local_node_id, deadline)
-                        .await?;
+                    profile.wait_candidate_ack(&store, deadline).await?;
                     if original_last != accepted_last
                         && matches!(response, Ok(AppendEntriesResponse::Success))
                     {
@@ -1604,6 +1813,25 @@ impl VoterSlotStateReader for Reader {
             .run_sqlite(super::super::sqlite::voter_slots::read_sync)
             .await
             .map_err(|_| VoterReplacementError::Unavailable)?
+            .ok_or(VoterReplacementError::IncompatibleProfile)
+    }
+
+    async fn read_voter_slot_state_until(
+        &self,
+        deadline: tokio::time::Instant,
+    ) -> Result<VoterSlotDurableState, VoterReplacementError> {
+        self.0
+            .run_sqlite_cancellable_until(deadline, |conn, _| {
+                super::super::sqlite::voter_slots::read_sync(conn)
+            })
+            .await
+            .map_err(|error| {
+                if error.kind() == std::io::ErrorKind::TimedOut {
+                    VoterReplacementError::Deadline
+                } else {
+                    VoterReplacementError::Unavailable
+                }
+            })?
             .ok_or(VoterReplacementError::IncompatibleProfile)
     }
 }

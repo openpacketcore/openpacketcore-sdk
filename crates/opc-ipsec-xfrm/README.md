@@ -877,6 +877,31 @@ Readback rejects mixed, duplicated, or flag-inconsistent replay
 representations. Dynamic counters and last-used timestamps are permitted, but
 unmodeled semantic SA or policy attributes fail closed.
 
+Linux Traffic Flow Confidentiality padding is modeled through
+`SaParameters::tfc_pad`: `Some(n)` emits the `XFRMA_TFCPAD` attribute (UAPI
+attribute 22, `__u32`) so Linux ESP output pads the protected packet to at
+least `n` bytes when it is shorter, capped at the SA's path MTU. Validation
+rejects a zero length, non-ESP SAs, and non-tunnel modes before any netlink
+mutation, matching the kernel's `verify_newsa_info`. `None` emits no attribute
+and keeps the pre-TFC request bytes unchanged. `SaState::tfc_pad` reports the
+value from `GETSA` readback; zero-valued, non-ESP and non-tunnel attributes
+are rejected. Binding and scoped-receipt validation compare the exact presence
+and value with the requested configuration. Linux may acknowledge an in-place
+`UPDSA` without changing TFC, so `rekey_sa` verifies the target (including
+absence) and reports `StateIndeterminate` when readback does not match.
+
+`EspTfcDummySender` transmits dummy packets through the installed kernel SA;
+see the [sender contract](#esp-dummy-sender). The caller must honor the peer's
+direction-specific `ESP_TFC_PADDING_NOT_SUPPORTED` notification
+([RFC 7296 §1.3.1](https://www.rfc-editor.org/rfc/rfc7296.html#section-1.3.1)).
+Peer negotiation and the decision to enable TFC padding remain caller-owned.
+
+Durable object/roster authentication and outbound-binding IDs include enabled
+TFC targets as a tagged extension; absent targets retain all pre-TFC bytes and
+seals. Records and binding IDs written by a build that omitted an enabled TFC
+target are incompatible with the corrected encoding; crossing that change
+requires deleting the affected volumes and a fresh install, one site at a time.
+
 Binding and inbound peer-observation readback recognize the Linux 6.10+
 `XFRMA_SA_DIR` attribute at its UAPI number 33 and validate its one-byte
 direction against the requested role. Number 34 is
@@ -1017,6 +1042,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         output_mark: None,
         if_id: None,
         egress_dscp: None,
+        tfc_pad: None,
     };
 
     backend.install_sa(InstallSaRequest { parameters: sa }).await?;
@@ -1809,6 +1835,33 @@ roles, retained by the lifecycle across authority-adapter rebuilds. Completed
 effects cannot be reinstalled by replaying a token, and the actor retains no
 history proportional to session churn.
 
+`install_scoped_successor` rekeys one live scoped flow under a distinct
+committed activation. Every successor uses a fresh SPI. Outbound generations
+use different reqids and one atomic policy update; inbound generations share a
+reqid and the unchanged policy, preserving predecessor inbound acceptance
+([RFC 7296 §2.8](https://www.rfc-editor.org/rfc/rfc7296.html#section-2.8)).
+Selectors, outer addresses, UDP encapsulation, marks, DSCP, mode and policy
+priority remain fixed. Published generations can themselves be rekeyed.
+
+`read_scoped` checks the receipt's own SA and policy: it returns `false` for an
+outbound predecessor after selection moves, while that predecessor's SA remains
+retained. Inbound predecessors remain readable through their shared policy.
+`scoped_successor_status` freshly checks the installed SA, current selection and
+predecessor absence, including during an unpublished transition. Publication is
+an actor decision that survives reply loss. An exact install retry recovers the
+published receipt before checking predecessor liveness or consuming authority.
+
+Removing an unselected member deletes only that SA. Removing the selected
+member first restores another live member and verifies selection before deleting
+it, so a newly created Child SA can be abandoned as required by
+[RFC 7296 §2.8.1](https://www.rfc-editor.org/rfc/rfc7296.html#section-2.8.1).
+A refusal to drop the last live path releases its operation guard; expired
+members can be removed, then final cleanup deletes the last SA and policy.
+Groups whose SAs have all expired also clean up in either order. Uncertain
+operations retain their exact intent and reservation for supervised readback;
+observer loss alone never reverses a traffic move. Rekey scheduling and peer
+signalling remain caller policy.
+
 The scoped actor refuses `allocate_spi` and legacy mutation/reset entry points;
 generic `remove_sa_exact` remains unsupported. It adds no persistent object
 journal. The native expiration/ACQUIRE and readback tests qualify only the
@@ -1849,3 +1902,41 @@ record, and publish only after complete readback. Interrupted moves stay gated
 for exact-target reconciliation. This bounded profile requires the upstream
 MIGRATE_STATE capability and has no delete/reinstall fallback. See the
 [public contract and supported-kernel evidence](../../docs/n3-child-sa-mobike.md).
+
+## ESP dummy sender
+
+`EspTfcDummySender::open_current_namespace(source, destination, template)`
+opens a namespace-pinned protocol-59 socket with a mandatory per-socket ESP
+policy. `send(payload_len)` submits 1–65,495 zero filler bytes through the
+existing SA; the kernel owns sequence/nonce allocation, encryption and
+lifetime enforcement alongside ordinary traffic. The length excludes IP/ESP
+overhead and kernel TFC padding, and path-MTU limits still apply. Submission
+success is not a delivery acknowledgement.
+
+Transport mode works on stock Linux. Tunnel mode requires the included
+[versioned kernel patch and qualification profile](../../kernel/xfrm-tfc-dummy/README.md).
+Tunnel dummies are qualified only on the pinned patched kernel; other kernels
+need their own port and qualification. The matrix covers matching inner and
+outer families; mixed-family tunnels have not been qualified. NAT rules in the
+sender namespace must not rewrite protocol-59 flows, because rerouting can
+bypass the per-socket policy. ESP-in-UDP support does not qualify local NAT.
+It fails with `UnsupportedFeature { feature: "esp_tunnel_tfc_dummy_v1" }`
+on an unpatched kernel before opening a raw sender. Sending an inner IP
+protocol-59 packet through an ordinary tunnel SA produces ESP Next Header
+4/41, so it cannot substitute for this capability. The patch retains the
+native sequence allocator; there is no userspace ESP encryption or counter
+reservation path.
+
+The sender selects through lookup mark zero and interface ID zero, requires
+a fixed ESP SPI, and supports software transport/tunnel transforms. Keep the
+selected public tuple unique, including overlapping mark masks. The SA
+selector must admit the inner addresses and protocol 59. Scoped IPv6
+addresses, hardware offload and stacked transforms are outside the qualified
+profile. Opening checks the installed SA with GETSA and rejects offload in both
+modes; the metadata buffer is zeroized. The tunnel patch also checks offload and
+stacked transforms on each send. The caller owns SA lifecycle, negotiation, rate and scheduling.
+Fence this producer along with other egress before counter recovery,
+relocation or SA replacement, then recreate it against the new SA. A sender
+is an ephemeral socket, not durable installation or incarnation authority.
+See [RFC 4303 §2.6](https://www.rfc-editor.org/rfc/rfc4303.html#section-2.6)
+and the [small sender example](examples/esp_tfc_dummy.rs).

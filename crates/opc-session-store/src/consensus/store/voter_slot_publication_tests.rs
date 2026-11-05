@@ -295,3 +295,585 @@ async fn voter_publication_wait_honors_deadline_and_storage_failure() {
     }
     result.unwrap();
 }
+
+async fn hold_vote_publication(
+    store: &ConsensusSessionStore,
+    publication: &SnapshotArtifactGate,
+) -> tokio::task::JoinHandle<Result<(), opc_consensus::engine::StorageError<SessionConsensusNodeId>>>
+{
+    let vote = store.inner.raft.metrics().borrow().vote;
+    let mut log = crate::sqlite::consensus::wal::adapter::WalLogStore::new(
+        store.inner.private_wal.as_ref().unwrap().clone(),
+    );
+    publication.arm();
+    let write = tokio::spawn(async move { log.save_vote(&vote).await });
+    tokio::time::timeout(Duration::from_secs(5), publication.wait_started())
+        .await
+        .unwrap();
+    assert_eq!(
+        store
+            .inner
+            .private_wal
+            .as_ref()
+            .unwrap()
+            .native_voter_slot_state()
+            .unwrap_err()
+            .kind(),
+        std::io::ErrorKind::WouldBlock,
+    );
+    write
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn voter_state_and_replacement_wait_for_strict_publication() {
+    let (fleet, publication) = publication_fleet_on_slot(1).await;
+    let result = AssertUnwindSafe(async {
+        let _release = ReleasePublication(publication.clone());
+        let leader = &fleet.nodes[0];
+        let write = hold_vote_publication(leader, &publication).await;
+        let state = leader.voter_slot_state();
+        let replacement = leader.replace_voter(fleet.verified_request(&fleet.genesis(), 3));
+        tokio::pin!(state, replacement);
+        assert!(
+            state.as_mut().now_or_never().is_none(),
+            "state must wait for strict publication"
+        );
+        assert!(
+            replacement.as_mut().now_or_never().is_none(),
+            "replacement must wait before deciding intent absence"
+        );
+        publication.release();
+        assert_eq!(state.await.unwrap().table(), &fleet.genesis());
+        assert_eq!(
+            replacement.await,
+            Err(VoterReplacementError::TargetStillLive)
+        );
+        write.await.unwrap().unwrap();
+    })
+    .catch_unwind()
+    .await;
+    fleet.close().await;
+    result.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn voter_control_replies_wait_for_strict_publication() {
+    use super::super::voter_slots::{ControlReply, ControlRequest};
+    let (fleet, publication) = publication_fleet_on_slot(1).await;
+    let result = AssertUnwindSafe(async {
+        let _release = ReleasePublication(publication.clone());
+        let leader = &fleet.nodes[0];
+        let profile = leader.inner.voter_profile.as_ref().unwrap();
+        let write = hold_vote_publication(leader, &publication).await;
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        let marker = VoterSlotLogId { term: 1, index: 1 };
+        let snapshot = profile.control(
+            leader,
+            ControlRequest::SnapshotInstalled {
+                request_digest: [1; 32],
+                evidence: VoterSnapshotEvidence {
+                    cut: marker,
+                    snapshot_id: "unselected".into(),
+                    digest: [2; 32],
+                },
+            },
+            deadline,
+        );
+        let applied = profile.control(
+            leader,
+            ControlRequest::AppliedMarker {
+                request_digest: [1; 32],
+                marker,
+            },
+            deadline,
+        );
+        tokio::pin!(snapshot, applied);
+        assert!(
+            snapshot.as_mut().now_or_never().is_none(),
+            "snapshot proof must wait before evaluating its state"
+        );
+        assert!(
+            applied.as_mut().now_or_never().is_none(),
+            "marker proof must wait before evaluating its state"
+        );
+        publication.release();
+        // Invalid evidence is still refused, but only after reading a complete
+        // publication. A transient interval is not a storage failure.
+        for reply in [snapshot.await, applied.await] {
+            assert!(
+                matches!(reply, Err(VoterReplacementError::InvalidTransition)),
+                "{reply:?}"
+            );
+            assert!(!matches!(
+                reply,
+                Ok(ControlReply::SnapshotInstalled(_) | ControlReply::AppliedMarker(_))
+            ));
+        }
+        write.await.unwrap().unwrap();
+    })
+    .catch_unwind()
+    .await;
+    fleet.close().await;
+    result.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn voter_leader_preflight_waits_for_strict_publication() {
+    let (fleet, publication) = publication_fleet_on_slot(1).await;
+    let result = AssertUnwindSafe(async {
+        let _release = ReleasePublication(publication.clone());
+        let leader = &fleet.nodes[0];
+        let admission = leader
+            .inner
+            .voter_profile
+            .as_ref()
+            .unwrap()
+            .admission
+            .clone();
+        let request = fleet
+            .verified_request(&fleet.genesis(), 3)
+            .request()
+            .clone();
+        let write = hold_vote_publication(leader, &publication).await;
+        let (entered, mut probe) = tokio::sync::oneshot::channel();
+        let call = admission.run_leader_intent(
+            request,
+            tokio::time::Instant::now() + Duration::from_secs(5),
+            move || async move {
+                entered.send(()).unwrap();
+                Err(VoterReplacementError::TargetStillLive)
+            },
+            || async { panic!("a refused preflight cannot dispatch") },
+        );
+        tokio::pin!(call);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), &mut call)
+                .await
+                .is_err(),
+            "leader admission must wait before probing liveness"
+        );
+        assert!(matches!(
+            probe.try_recv(),
+            Err(tokio::sync::oneshot::error::TryRecvError::Empty)
+        ));
+        publication.release();
+        assert_eq!(
+            call.await,
+            Err::<(), _>(VoterReplacementError::TargetStillLive)
+        );
+        probe.await.unwrap();
+        write.await.unwrap().unwrap();
+    })
+    .catch_unwind()
+    .await;
+    fleet.close().await;
+    result.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn voter_snapshot_admission_waits_for_strict_publication() {
+    let (fleet, publication) = publication_fleet_on_slot(1).await;
+    let result = AssertUnwindSafe(async {
+        let _release = ReleasePublication(publication.clone());
+        let leader = &fleet.nodes[0];
+        let admission = leader
+            .inner
+            .voter_profile
+            .as_ref()
+            .unwrap()
+            .admission
+            .clone();
+        let write = hold_vote_publication(leader, &publication).await;
+        let table = fleet.genesis();
+        let members = table
+            .current_configuration()
+            .members
+            .iter()
+            .map(|member| member.identity.node_id())
+            .collect();
+        let call = admission.run_snapshot(
+            table,
+            members,
+            tokio::time::Instant::now() + Duration::from_secs(5),
+            || async { Ok(()) },
+        );
+        tokio::pin!(call);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), &mut call)
+                .await
+                .is_err(),
+            "snapshot admission must wait for strict publication"
+        );
+        publication.release();
+        call.await.unwrap();
+        write.await.unwrap().unwrap();
+    })
+    .catch_unwind()
+    .await;
+    fleet.close().await;
+    result.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn voter_intent_recheck_waits_for_strict_publication_after_liveness() {
+    let (mut fleet, publication) = publication_fleet_on_slot(1).await;
+    let old = fleet.nodes.pop().unwrap();
+    fleet.network.disconnect_and_shutdown(&old).await;
+    drop(old);
+    tokio::time::sleep(VOTER_RECENT_TRAFFIC_WINDOW + Duration::from_millis(100)).await;
+    let result = AssertUnwindSafe(async {
+        let _release = ReleasePublication(publication.clone());
+        let leader = fleet.nodes[0].clone();
+        let admission = leader
+            .inner
+            .voter_profile
+            .as_ref()
+            .unwrap()
+            .admission
+            .clone();
+        let request = fleet
+            .verified_request(&fleet.genesis(), 3)
+            .request()
+            .clone();
+        let (entered, ready) = tokio::sync::oneshot::channel();
+        let held = publication.clone();
+        let call = admission.run_leader_intent(
+            request,
+            tokio::time::Instant::now() + Duration::from_secs(5),
+            move || async move {
+                let write = hold_vote_publication(&leader, &held).await;
+                entered.send(write).unwrap();
+                Ok(())
+            },
+            || async { Ok(()) },
+        );
+        tokio::pin!(call);
+        let write = tokio::select! {
+            result = &mut call => panic!("intent completed before liveness: {result:?}"),
+            write = ready => write.unwrap(),
+        };
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), &mut call)
+                .await
+                .is_err(),
+            "the second intent read must wait within the same request budget"
+        );
+        publication.release();
+        call.await.unwrap();
+        write.await.unwrap().unwrap();
+    })
+    .catch_unwind()
+    .await;
+    fleet.close().await;
+    result.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn voter_snapshot_completion_waits_for_strict_publication_after_dispatch() {
+    let (fleet, publication) = publication_fleet_on_slot(1).await;
+    let result = AssertUnwindSafe(async {
+        let _release = ReleasePublication(publication.clone());
+        let leader = fleet.nodes[0].clone();
+        let admission = leader
+            .inner
+            .voter_profile
+            .as_ref()
+            .unwrap()
+            .admission
+            .clone();
+        let table = fleet.genesis();
+        let members = table
+            .current_configuration()
+            .members
+            .iter()
+            .map(|member| member.identity.node_id())
+            .collect();
+        let (entered, ready) = tokio::sync::oneshot::channel();
+        let held = publication.clone();
+        let task_admission = admission.clone();
+        let mut call = tokio::spawn(async move {
+            task_admission
+                .run_snapshot(
+                    table,
+                    members,
+                    tokio::time::Instant::now() + Duration::from_secs(5),
+                    move || async move {
+                        let write = hold_vote_publication(&leader, &held).await;
+                        entered.send(write).unwrap();
+                        Ok(())
+                    },
+                )
+                .await
+        });
+        let write = ready.await.unwrap();
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), &mut call)
+                .await
+                .is_err(),
+            "completion must reconcile a strict publication after dispatch"
+        );
+        call.abort();
+        assert!(call.await.unwrap_err().is_cancelled());
+        assert!(
+            !write.is_finished(),
+            "caller cancellation cannot cancel accepted WAL work"
+        );
+        publication.release();
+        write.await.unwrap().unwrap();
+        tokio::time::timeout(Duration::from_secs(5), admission.reconcile())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(admission.local_voting_admitted());
+    })
+    .catch_unwind()
+    .await;
+    fleet.close().await;
+    result.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn voter_control_publication_preserves_original_deadline_and_failure() {
+    use super::super::voter_slots::ControlRequest;
+    let (fleet, publication) = publication_fleet_on_slot(2).await;
+    let result = AssertUnwindSafe(async {
+        let _release = ReleasePublication(publication.clone());
+        let node = &fleet.nodes[1];
+        let profile = node.inner.voter_profile.as_ref().unwrap();
+        let write = hold_vote_publication(node, &publication).await;
+        let marker = || ControlRequest::AppliedMarker {
+            request_digest: [1; 32],
+            marker: VoterSlotLogId { term: 1, index: 1 },
+        };
+        let deadline = tokio::time::Instant::now() + Duration::from_millis(50);
+        let result = tokio::time::timeout(
+            Duration::from_secs(1),
+            profile.control(node, marker(), deadline),
+        )
+        .await
+        .unwrap();
+        assert!(
+            matches!(result, Err(VoterReplacementError::Deadline)),
+            "{result:?}"
+        );
+        assert!(tokio::time::Instant::now() >= deadline);
+        let waiting = profile.control(
+            node,
+            marker(),
+            tokio::time::Instant::now() + Duration::from_secs(5),
+        );
+        tokio::pin!(waiting);
+        assert!(waiting.as_mut().now_or_never().is_none());
+        node.inner
+            .private_wal
+            .as_ref()
+            .unwrap()
+            .fence_for_test()
+            .unwrap();
+        let result = tokio::time::timeout(Duration::from_secs(1), waiting)
+            .await
+            .unwrap();
+        assert!(
+            matches!(result, Err(VoterReplacementError::Unavailable)),
+            "{result:?}"
+        );
+        publication.release();
+        assert!(
+            write.await.unwrap().is_err(),
+            "the fenced writer cannot acknowledge the held vote"
+        );
+    })
+    .catch_unwind()
+    .await;
+    fleet.network.handlers.write().unwrap().clear();
+    for (index, node) in fleet.nodes.into_iter().enumerate() {
+        let closed = node.shutdown().await;
+        if index != 1 {
+            closed.unwrap();
+        }
+    }
+    result.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn voter_candidate_ack_waits_for_strict_publication_without_the_coordinator_lock() {
+    let (fleet, publication) = publication_fleet_on_slot(2).await;
+    let result = AssertUnwindSafe(async {
+        let _release = ReleasePublication(publication.clone());
+        let target = fleet.nodes[1].clone();
+        let profile = target.inner.voter_profile.as_ref().unwrap().clone();
+        let mut incoming = fleet.genesis();
+        incoming
+            .apply_control(
+                &VoterSlotControl::Begin(Box::new(
+                    fleet
+                        .verified_request(&fleet.genesis(), 2)
+                        .request()
+                        .clone(),
+                )),
+                VoterSlotLogId {
+                    term: 10,
+                    index: 100,
+                },
+            )
+            .unwrap();
+        let members = fleet
+            .genesis()
+            .current_configuration()
+            .members
+            .iter()
+            .map(|member| member.identity.node_id())
+            .collect();
+        let (entered, ready) = tokio::sync::oneshot::channel();
+        let (release_dispatch, dispatched) = tokio::sync::oneshot::channel();
+        let held = publication.clone();
+        let installer = target.clone();
+        let admission = profile.admission.clone();
+        let snapshot = tokio::spawn(async move {
+            admission
+                .run_snapshot(
+                    incoming,
+                    members,
+                    tokio::time::Instant::now() + Duration::from_secs(5),
+                    move || async move {
+                        // The verified snapshot barrier closes local admission while
+                        // the engine still lists this identity. Keep its coordinator
+                        // lock held so the acknowledgement must use publication only.
+                        assert!(!installer
+                            .inner
+                            .voter_profile
+                            .as_ref()
+                            .unwrap()
+                            .admission
+                            .local_voting_admitted());
+                        let write = hold_vote_publication(&installer, &held).await;
+                        entered.send(write).unwrap();
+                        let _ = dispatched.await;
+                        Ok(())
+                    },
+                )
+                .await
+        });
+        let write = ready.await.unwrap();
+        let ack = profile.wait_candidate_ack(
+            &target.inner.raft,
+            target.inner.local_node_id,
+            tokio::time::Instant::now() + Duration::from_secs(5),
+        );
+        tokio::pin!(ack);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), &mut ack)
+                .await
+                .is_err(),
+            "candidate acknowledgement must wait for its durable table"
+        );
+        publication.release();
+        tokio::time::timeout(Duration::from_secs(1), ack)
+            .await
+            .unwrap()
+            .unwrap();
+        write.await.unwrap().unwrap();
+        assert!(
+            !snapshot.is_finished(),
+            "acknowledgement cannot require the snapshot coordinator lock"
+        );
+        release_dispatch.send(()).unwrap();
+        snapshot.await.unwrap().unwrap();
+        assert!(profile.admission.local_voting_admitted());
+    })
+    .catch_unwind()
+    .await;
+    fleet.close().await;
+    result.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn voter_snapshot_control_keeps_one_cut_when_another_publication_starts() {
+    use super::super::voter_slots::ControlRequest;
+    let (mut fleet, _leader, prepared) = super::progress_tests::prepared_fleet().await;
+    let read_gate = Arc::new(SnapshotArtifactGate::new());
+    let publication = Arc::new(SnapshotArtifactGate::new());
+    let control_thread = Arc::new(std::sync::Mutex::new(None));
+    let directory = fleet.candidate_directory(3, 2);
+    let backend = SqliteSessionBackend::open(directory.path().join("session.sqlite")).unwrap();
+    let read_hook = read_gate.clone();
+    let write_hook = publication.clone();
+    let thread_hook = control_thread.clone();
+    backend
+        .native_owner
+        .as_ref()
+        .unwrap()
+        .set_io_hook_for_test(Arc::new(move |point| {
+            if point == Point::AfterNativeVoterRead
+                && *thread_hook.lock().unwrap() == Some(std::thread::current().id())
+            {
+                read_hook.block_if_armed_blocking();
+            }
+            if point == Point::AfterCutPublish {
+                write_hook.block_if_armed_blocking();
+            }
+            Ok(())
+        }));
+    let candidate = ConsensusSessionStore::open_with_voter_slots_and_integrity(
+        fleet.topology(3),
+        prepared.table().clone(),
+        member(3, 2).identity.node_id(),
+        backend,
+        directory.path().join("snapshots"),
+        Arc::new(Resolver(fleet.network.clone())),
+        crate::consensus::SnapshotIntegrityPolicy::PortableVerified,
+    )
+    .await
+    .unwrap();
+    // Keep the candidate disconnected: its durable Prepared table is valid,
+    // but no snapshot has been installed or attested yet.
+    fleet.nodes.push(candidate.clone());
+    fleet.directories.push(directory);
+    let result = AssertUnwindSafe(async {
+        let _release_read = ReleasePublication(read_gate.clone());
+        let _release_write = ReleasePublication(publication.clone());
+        assert!(candidate.inner.raft.get_snapshot().await.unwrap().is_none());
+        let operation = prepared.table().replacement.as_ref().unwrap();
+        let request = ControlRequest::SnapshotInstalled {
+            request_digest: operation.attestation.request_digest,
+            evidence: VoterSnapshotEvidence {
+                cut: operation.evidence.prepare,
+                snapshot_id: "not-installed".into(),
+                digest: [0xA3; 32],
+            },
+        };
+        let observer = candidate.clone();
+        read_gate.arm();
+        let call = tokio::task::spawn_blocking(move || {
+            *control_thread.lock().unwrap() = Some(std::thread::current().id());
+            observer
+                .inner
+                .voter_profile
+                .as_ref()
+                .unwrap()
+                .control(
+                    &observer,
+                    request,
+                    tokio::time::Instant::now() + Duration::from_secs(5),
+                )
+                .now_or_never()
+                .expect("the selected publication is already durable")
+        });
+        tokio::time::timeout(Duration::from_secs(5), read_gate.wait_started())
+            .await
+            .expect("control must capture the first durable publication");
+        let write = hold_vote_publication(&candidate, &publication).await;
+        read_gate.release();
+        let observed = call.await.unwrap();
+        publication.release();
+        write.await.unwrap().unwrap();
+        assert!(
+            matches!(observed, Err(VoterReplacementError::InvalidTransition)),
+            "missing snapshot evidence belongs to the captured cut; a later publication cannot turn it into a storage refusal: {observed:?}"
+        );
+    })
+    .catch_unwind()
+    .await;
+    fleet.close().await;
+    result.unwrap();
+}

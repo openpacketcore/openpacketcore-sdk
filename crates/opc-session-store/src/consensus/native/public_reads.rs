@@ -156,8 +156,19 @@ impl NativeState {
         check: &dyn Fn() -> io::Result<()>,
     ) -> Result<Vec<ReplicationEntry>, StoreError> {
         let original = crate::backend::ReplicationLogRange::try_new(start, limit)?;
+        if original.is_empty() {
+            return Ok(Vec::new());
+        }
         let floor = self.frontiers.async_fence_floor();
-        original.ensure_not_compacted(floor)?;
+        let retired = self.frontiers.retention.watch_retired_through;
+        let outward_floor = if retired > self.frontiers.async_watch_before() {
+            self.frontiers
+                .outward_watch(retired)
+                .map_err(|_| unavailable())?
+        } else {
+            floor
+        };
+        original.ensure_not_compacted(outward_floor)?;
         let first = (original.first_sequence() - floor)
             .checked_add(self.frontiers.async_watch_before())
             .ok_or_else(unavailable)?;
@@ -167,7 +178,10 @@ impl NativeState {
         }
         check().map_err(|_| unavailable())?;
         self.require_business_proof().map_err(|_| unavailable())?;
-        let first = usize::try_from(range.first_sequence() - 1).map_err(|_| unavailable())?;
+        let first = self
+            .frontiers
+            .notification_position(range.first_sequence())
+            .ok_or_else(unavailable)?;
         let count = self
             .notifications
             .len()
@@ -180,7 +194,7 @@ impl NativeState {
         let mut output_bytes = 0_usize;
         for position in first..first + count {
             check().map_err(|_| unavailable())?;
-            let sequence = u64::try_from(position).map_err(|_| unavailable())? + 1;
+            let sequence = retired + u64::try_from(position).map_err(|_| unavailable())? + 1;
             let row = self.notifications.get(position).ok_or_else(unavailable)?;
             if row.sequence() != sequence {
                 return Err(unavailable());
@@ -210,7 +224,7 @@ impl NativeState {
         for position in first..first + count {
             check().map_err(|_| unavailable())?;
             let row = self.notifications.get(position).ok_or_else(unavailable)?;
-            let sequence = u64::try_from(position).map_err(|_| unavailable())? + 1;
+            let sequence = retired + u64::try_from(position).map_err(|_| unavailable())? + 1;
             row.validate(sequence, &self.frontiers)
                 .map_err(|_| unavailable())?;
             rows.push(row);

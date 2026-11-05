@@ -10,18 +10,72 @@ use super::reset_fields::encode_root;
 use super::setup_fields::Reader;
 use super::*;
 
+/// Advertised GTP transport address, preserving every supplied IP family.
+///
+/// TS 38.413 9.3.2.4 and TS 38.414 5.3 encode IPv4 in 32 bits, IPv6 in 128
+/// bits, or IPv4 followed by IPv6 in 160 bits. Selecting a usable address and
+/// authorizing the endpoint belong to the caller.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum TransportLayerAddress {
+    /// One IPv4 address.
+    Ipv4(std::net::Ipv4Addr),
+    /// One IPv6 address.
+    Ipv6(std::net::Ipv6Addr),
+    /// Both addresses for the same advertised transport endpoint.
+    Ipv4v6 {
+        /// First 32 bits of the combined wire address.
+        ipv4: std::net::Ipv4Addr,
+        /// Last 128 bits of the combined wire address.
+        ipv6: std::net::Ipv6Addr,
+    },
+}
+redacted!(TransportLayerAddress);
+
+impl TransportLayerAddress {
+    const fn from_ip(address: IpAddr) -> Self {
+        match address {
+            IpAddr::V4(value) => Self::Ipv4(value),
+            IpAddr::V6(value) => Self::Ipv6(value),
+        }
+    }
+
+    pub(super) const fn bit_len(self) -> u16 {
+        match self {
+            Self::Ipv4(_) => 32,
+            Self::Ipv6(_) => 128,
+            Self::Ipv4v6 { .. } => 160,
+        }
+    }
+}
+
+impl From<IpAddr> for TransportLayerAddress {
+    fn from(address: IpAddr) -> Self {
+        Self::from_ip(address)
+    }
+}
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 struct TunnelEndpoint {
-    address: IpAddr,
+    address: TransportLayerAddress,
     teid: u32,
 }
 impl TunnelEndpoint {
     fn encode(self, ctx: EncodeContext) -> Result<EncodedValue, EncodeError> {
-        let length = if self.address.is_ipv4() { 4 } else { 16 };
+        let length = usize::from(self.address.bit_len() / 8);
         capacity(2 + length + 4, ctx)?;
         let address = match self.address {
-            IpAddr::V4(value) => rasn::types::BitString::from_slice(&value.octets()),
-            IpAddr::V6(value) => rasn::types::BitString::from_slice(&value.octets()),
+            TransportLayerAddress::Ipv4(value) => {
+                rasn::types::BitString::from_slice(&value.octets())
+            }
+            TransportLayerAddress::Ipv6(value) => {
+                rasn::types::BitString::from_slice(&value.octets())
+            }
+            TransportLayerAddress::Ipv4v6 { ipv4, ipv6 } => {
+                let mut bytes = [0; 20];
+                bytes[..4].copy_from_slice(&ipv4.octets());
+                bytes[4..].copy_from_slice(&ipv6.octets());
+                rasn::types::BitString::from_slice(&bytes)
+            }
         };
         encode_leaf(
             &asn::UPTransportLayerInformation::gTPTunnel(asn::GTPTunnel::new(
@@ -44,7 +98,7 @@ impl TunnelEndpoint {
         }
         let bit_count =
             usize::from((u16::from(header[0] & 15) << 4) | u16::from(header[1] >> 4)) + 1;
-        if !matches!(bit_count, 32 | 128) {
+        if !matches!(bit_count, 32 | 128 | 160) {
             return Err(unsupported());
         }
         if header[1] & 15 != 0 || input.len() != 2 + bit_count / 8 + 4 {
@@ -55,12 +109,27 @@ impl TunnelEndpoint {
         };
         let bytes = value.transport_layer_address.0.as_raw_slice();
         let address = match bit_count {
-            32 => IpAddr::V4(std::net::Ipv4Addr::from(
+            32 => TransportLayerAddress::Ipv4(std::net::Ipv4Addr::from(
                 <[u8; 4]>::try_from(bytes).map_err(|_| invalid("transport address size"))?,
             )),
-            _ => IpAddr::V6(std::net::Ipv6Addr::from(
+            128 => TransportLayerAddress::Ipv6(std::net::Ipv6Addr::from(
                 <[u8; 16]>::try_from(bytes).map_err(|_| invalid("transport address size"))?,
             )),
+            160 => {
+                let bytes =
+                    <[u8; 20]>::try_from(bytes).map_err(|_| invalid("transport address size"))?;
+                TransportLayerAddress::Ipv4v6 {
+                    ipv4: std::net::Ipv4Addr::from(
+                        <[u8; 4]>::try_from(&bytes[..4])
+                            .map_err(|_| invalid("transport address size"))?,
+                    ),
+                    ipv6: std::net::Ipv6Addr::from(
+                        <[u8; 16]>::try_from(&bytes[4..])
+                            .map_err(|_| invalid("transport address size"))?,
+                    ),
+                }
+            }
+            _ => return Err(unsupported()),
         };
         let octets: &[u8] = value.g_tp_teid.0.as_ref();
         let teid = u32::from_be_bytes(
@@ -82,10 +151,14 @@ macro_rules! directional_transport {
             /// Bind an IP address and 32-bit TEID. All wire values, including
             /// zero, are representable; endpoint authorization is caller-owned.
             pub const fn new(address: IpAddr, teid: u32) -> Self {
+                Self::with_address(TransportLayerAddress::from_ip(address), teid)
+            }
+            /// Bind a single-family or combined address without selecting a family.
+            pub const fn with_address(address: TransportLayerAddress, teid: u32) -> Self {
                 Self(TunnelEndpoint { address, teid })
             }
-            /// Explicit access to the advertised IP address.
-            pub const fn address(self) -> IpAddr {
+            /// Explicit access to all advertised IP addresses.
+            pub const fn address(self) -> TransportLayerAddress {
                 self.0.address
             }
             /// Explicit wire TEID for handoff to the caller's GTP-U boundary.
@@ -96,8 +169,8 @@ macro_rules! directional_transport {
             pub fn encode(self, ctx: EncodeContext) -> Result<EncodedValue, EncodeError> {
                 self.0.encode(ctx)
             }
-            /// Decode IPv4/IPv6 roots with depth three. Dual-address bit
-            /// strings, choice/SEQUENCE extensions and trailing bytes fail.
+            /// Decode 32-, 128- or 160-bit address roots with depth three.
+            /// Choice/SEQUENCE extensions and trailing bytes fail.
             pub fn decode(input: &[u8], ctx: DecodeContext) -> Result<Self, DecodeError> {
                 TunnelEndpoint::decode(input, ctx).map(Self)
             }
@@ -111,7 +184,7 @@ directional_transport!(
 
 /// One to three additional core-side endpoints, in peer-supplied order.
 /// Repeated endpoints are preserved; matching, availability and allocation are
-/// caller-owned. Root IPv4/IPv6 items carry no extension fields.
+/// caller-owned. Single-family and combined roots carry no extension fields.
 #[derive(Clone, PartialEq, Eq)]
 pub struct UplinkTransportList(Vec<UplinkTransport>);
 redacted!(UplinkTransportList);
@@ -159,7 +232,7 @@ fn scan_uplink_list(
     for _ in 0..count {
         reader.flags(2)?;
         let (address, teid) = read_transport(&mut reader)?;
-        emit(UplinkTransport::new(address, teid));
+        emit(UplinkTransport::with_address(address, teid));
     }
     reader.finish()?;
     Ok(count)

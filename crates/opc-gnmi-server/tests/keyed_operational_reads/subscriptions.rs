@@ -881,7 +881,9 @@ async fn expanded_sample_suppresses_reordered_values_including_updates_only() {
             vec![peer("b", "up", "false"), peer("a", "up", "false")];
         tokio::time::advance(Duration::from_millis(100)).await;
         let data = notification(stream.next().await.unwrap().unwrap());
-        assert_eq!(data.update.len(), 2);
+        // gNMI 3.5.1.5.2 suppresses each unchanged leaf, even when another
+        // leaf in the same selected subtree changes.
+        assert_eq!(data.update.len(), 1);
         assert_eq!(
             data.update[0].path.as_ref().unwrap().elem[1].key["ex:name"],
             "a"
@@ -890,10 +892,12 @@ async fn expanded_sample_suppresses_reordered_values_including_updates_only() {
             data.update[0].val.as_ref().unwrap().value,
             Some(gnmi::typed_value::Value::JsonIetfVal(b"false".to_vec()))
         );
-        assert_eq!(
-            data.update[1].path.as_ref().unwrap().elem[1].key["ex:name"],
-            "b"
-        );
+        assert!(data
+            .update
+            .iter()
+            .all(|update| update.path.as_ref().unwrap().elem[1].key["ex:name"] != "b"));
+        assert!(data.delete.is_empty());
+        assert!(!data.atomic);
         assert!(
             std::future::poll_fn(|cx| std::task::Poll::Ready(
                 stream.as_mut().poll_next(cx).is_pending()

@@ -7,6 +7,10 @@
 //! - `NfProfile`, `DiscoveryQuery`, `DiscoveryResult`: typed TS 29.510 data
 //!   structures used by both production code and the testkit.
 
+pub use opc_api_nnrf::{
+    NfService, NfServiceStatus, NfServiceVersion, NfStatus, NnrfPlmnId, NnrfSnssai,
+};
+
 pub mod cache;
 pub mod client;
 pub mod services;
@@ -16,17 +20,6 @@ pub use client::{CachedDiscoveryClient, HeartbeatDriver, NrfClient, NrfOperation
 
 use opc_types::{NfInstanceId, NfType, PlmnId, Snssai};
 use serde::{Deserialize, Serialize};
-
-/// Status of a registered NF instance per TS 29.510.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
-pub enum NfStatus {
-    /// NF is registered and discoverable.
-    Registered,
-    /// NF is temporarily suspended.
-    Suspended,
-    /// NF should not be returned in discovery.
-    Undiscoverable,
-}
 
 /// Minimal NF profile for discovery caching and testkit fixtures.
 ///
@@ -39,43 +32,52 @@ pub struct NfProfile {
     /// the key under which the NF registers and heartbeats with the NRF.
     pub nf_instance_id: NfInstanceId,
     /// NF type (e.g. `amf`, `smf`); the primary discovery filter.
+    #[serde(with = "nf_type_wire")]
     pub nf_type: NfType,
     /// Registration status; only `Registered` instances are returned by
     /// discovery (the mock NRF filters on this too).
     pub nf_status: NfStatus,
     /// IPv4 endpoint addresses, as dotted-quad strings, that consumers may
     /// dial when no FQDN is advertised.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub ipv4_addresses: Vec<String>,
     /// Fully qualified domain name of the NF, when it prefers DNS-based
     /// dialing over raw addresses.
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub fqdn: Option<String>,
     /// PLMNs this NF serves; discovery with a PLMN filter only matches
     /// profiles whose list contains that PLMN.
-    pub plmn_list: Vec<PlmnId>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub plmn_list: Vec<NnrfPlmnId>,
     /// Network slices (S-NSSAIs) this NF serves; used for slice-filtered
     /// discovery.
-    pub s_nssais: Vec<Snssai>,
-    /// Advertised SBI service names (e.g. `nnrf-disc`, `nnssf-nsselection`).
-    pub nf_services: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub s_nssais: Vec<NnrfSnssai>,
+    /// Advertised service instances with mandatory version and transport metadata.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub nf_services: Vec<NfService>,
     /// Selection priority per TS 29.510: **lower values are preferred**;
     /// used as the primary sort key when ranking discovery results.
+    #[serde(default)]
     pub priority: u16,
     /// Relative static capacity per TS 29.510: higher means more capacity;
     /// the tie-breaker (descending) after `priority` when ranking results.
+    #[serde(default)]
     pub capacity: u16,
 }
 
 /// Query parameters for NRF discovery (TS 29.510 NFDiscovery).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DiscoveryQuery {
-    /// NF type being looked up (`target-nf-type` query parameter); the only
-    /// mandatory filter.
+    /// NF type being looked up (`target-nf-type` query parameter).
     pub target_nf_type: NfType,
+    /// NF type of the requester (`requester-nf-type`); mandatory and cache-keyed.
+    pub requester_nf_type: NfType,
     /// Identity of the requesting NF, when the NRF applies
     /// requester-specific visibility rules; part of the cache key so
     /// different requesters never share results.
     pub requester_nf_instance_id: Option<NfInstanceId>,
-    /// Restrict results to NFs serving this PLMN (`target-plmn`).
+    /// Restrict results to NFs serving this PLMN (`target-plmn-list`).
     pub plmn: Option<PlmnId>,
     /// Restrict results to NFs serving this network slice.
     pub s_nssai: Option<Snssai>,
@@ -92,6 +94,8 @@ pub struct DiscoveryQuery {
 pub struct CacheKey {
     /// NF type filter copied from the originating query.
     pub target_nf_type: NfType,
+    /// NF type of the requester (`requester-nf-type`); mandatory and cache-keyed.
+    pub requester_nf_type: NfType,
     /// Requester identity from the query; kept as a distinct field (rather
     /// than folded into a string) so it cannot collide with service names.
     pub requester_nf_instance_id: Option<NfInstanceId>,
@@ -112,8 +116,10 @@ impl DiscoveryQuery {
     pub fn to_cache_key(&self) -> CacheKey {
         let mut service_names = self.service_names.clone();
         service_names.sort();
+        service_names.dedup();
         CacheKey {
             target_nf_type: self.target_nf_type.clone(),
+            requester_nf_type: self.requester_nf_type.clone(),
             requester_nf_instance_id: self.requester_nf_instance_id.clone(),
             plmn: self.plmn.clone(),
             s_nssai: self.s_nssai.clone(),
@@ -126,9 +132,17 @@ impl DiscoveryQuery {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DiscoveryResult {
     /// One or more matching NF profiles.
-    Found(Vec<NfProfile>),
+    Found {
+        /// Matching profiles.
+        profiles: Vec<NfProfile>,
+        /// Remaining server-authorized cache lifetime, including stale reuse.
+        valid_for: std::time::Duration,
+    },
     /// Explicit not-found response from NRF.
-    NotFound,
+    NotFound {
+        /// Remaining negative-cache lifetime; zero prevents storage.
+        valid_for: std::time::Duration,
+    },
     /// NRF returned an error (e.g. 503, timeout).
     Error(String),
 }
@@ -227,6 +241,20 @@ impl NrfRuntimeBuilderExt for opc_runtime::Builder {
     }
 }
 
+mod nf_type_wire {
+    use opc_types::NfType;
+    use serde::{Deserialize, Deserializer, Serializer};
+
+    pub fn serialize<S: Serializer>(value: &NfType, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(&value.as_str().replace('-', "_").to_ascii_uppercase())
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(deserializer: D) -> Result<NfType, D::Error> {
+        let value = String::deserialize(deserializer)?;
+        NfType::new(value.replace('_', "-").to_ascii_lowercase()).map_err(serde::de::Error::custom)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -237,6 +265,7 @@ mod tests {
         // These two queries must NOT produce the same cache key.
         let q1 = DiscoveryQuery {
             target_nf_type: NfType::new("amf").unwrap(),
+            requester_nf_type: NfType::new("smf").unwrap(),
             requester_nf_instance_id: Some(NfInstanceId::new("req1").unwrap()),
             plmn: None,
             s_nssai: None,
@@ -244,6 +273,7 @@ mod tests {
         };
         let q2 = DiscoveryQuery {
             target_nf_type: NfType::new("amf").unwrap(),
+            requester_nf_type: NfType::new("smf").unwrap(),
             requester_nf_instance_id: None,
             plmn: None,
             s_nssai: None,
@@ -262,17 +292,25 @@ mod tests {
     fn nrf_cache_key_service_name_order_is_normalized() {
         let q1 = DiscoveryQuery {
             target_nf_type: NfType::smf(),
+            requester_nf_type: NfType::new("smf").unwrap(),
             requester_nf_instance_id: None,
             plmn: None,
             s_nssai: None,
-            service_names: vec!["nsmf-pdusession".into(), "nsmf-eventexposure".into()],
+            service_names: vec![
+                "nsmf-pdusession".into(),
+                services::NSMF_EVENTEXPOSURE.into(),
+            ],
         };
         let q2 = DiscoveryQuery {
             target_nf_type: NfType::smf(),
+            requester_nf_type: NfType::new("smf").unwrap(),
             requester_nf_instance_id: None,
             plmn: None,
             s_nssai: None,
-            service_names: vec!["nsmf-eventexposure".into(), "nsmf-pdusession".into()],
+            service_names: vec![
+                services::NSMF_EVENTEXPOSURE.into(),
+                "nsmf-pdusession".into(),
+            ],
         };
 
         assert_eq!(

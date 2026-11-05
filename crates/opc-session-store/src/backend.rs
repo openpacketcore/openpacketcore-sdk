@@ -81,7 +81,8 @@ pub const MAX_REPLICATION_OPERATION_DEPTH: usize = 16;
 
 /// Maximum number of operation nodes in one replication entry.
 ///
-/// Every leaf and every [`ReplicationOp::Batch`] container counts as one node.
+/// Every leaf and every batch container, including [`ReplicationOp::Batch`],
+/// counts as one node.
 /// The limit is fixed across the SDK so all replicas make the same admission
 /// decision and a nested entry cannot trigger unbounded provider calls.
 pub const MAX_REPLICATION_OPERATIONS_PER_ENTRY: usize = 256;
@@ -522,6 +523,7 @@ pub enum SessionOpResult {
 /// caches, watches, and restore consumers use it as a domain cursor. It is not
 /// a second election or consensus log.
 #[derive(Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ReplicationEntry {
     /// 1-based, gap-free committed application position. Local adapters reject
     /// entries that would create a gap or diverge from an already-applied
@@ -532,11 +534,17 @@ pub struct ReplicationEntry {
     /// collides on `sequence`.
     pub tx_id: ReplicationTxId,
     /// The fenced mutation to replay when applying this entry.
+    /// Encoded as `effects` so older readers requiring implicit-policy `op`
+    /// entries refuse this policy-bearing format.
+    #[serde(rename = "effects")]
     pub op: ReplicationOp,
-    /// Coordinator wall-clock time when the entry was created. Informational;
-    /// ordering authority is `sequence`, never this timestamp — no wall-clock
-    /// last-writer-wins.
+    /// Committed command time used for cleanup and TTL verification.
+    /// Ordering authority is `sequence`, never a wall-clock last-writer-wins
+    /// comparison.
     pub timestamp: Timestamp,
+    /// Producer-selected cleanup, retirement, recovery and command framing.
+    /// This policy is required and never inferred from the mutation tree.
+    pub replay_policy: crate::ReplicationReplayPolicy,
 }
 
 impl fmt::Debug for ReplicationEntry {
@@ -559,7 +567,36 @@ impl ReplicationEntry {
     /// logical time.
     pub fn validate(&self) -> Result<(), StoreError> {
         self.validate_sequence()?;
+        self.replay_policy.validate()?;
         self.op.validate_ttls_at(self.timestamp)
+    }
+
+    /// Whether this validated entry follows an exact outward replication cursor.
+    ///
+    /// Ordinary entries are contiguous. A recovery entry may bridge only its
+    /// explicitly recorded predecessor to the committed recovery floor plus one.
+    /// This checks ordering, not the authority of the caller supplying an entry.
+    pub fn is_successor_of(&self, previous: u64) -> Result<bool, StoreError> {
+        self.validate()?;
+        replication_entry_follows(previous, self)
+    }
+
+    /// Whether this entry satisfies an inclusive outward watch cursor.
+    ///
+    /// The exact requested row is valid, including a recovery row at its own
+    /// resume cursor. A recovery jump must name the preceding delivered cursor.
+    /// Replication append validation uses [`Self::is_successor_of`].
+    pub fn matches_watch_cursor(&self, expected: u64) -> Result<bool, StoreError> {
+        self.validate()?;
+        if matches!(
+            self.replay_policy.recovery,
+            crate::ReplicationRecoveryBoundary::Recover { .. }
+        ) && self.replay_policy.async_fence_floor.checked_add(1) != Some(self.sequence)
+        {
+            return Ok(false);
+        }
+        let expected = expected.max(1);
+        Ok(self.sequence == expected || replication_entry_follows(expected - 1, self)?)
     }
 
     /// Consume and return this entry only when all replication invariants hold.
@@ -678,8 +715,8 @@ pub(crate) fn enforce_replication_watch_cursor(
                 Some(expected) => match result {
                     Err(error) => Some(Err(error)),
                     Ok(entry) => match entry.into_validated() {
-                        Ok(entry) if entry.sequence == expected => {
-                            *next_sequence = expected.checked_add(1);
+                        Ok(entry) if entry.matches_watch_cursor(expected).unwrap_or(false) => {
+                            *next_sequence = entry.sequence.checked_add(1);
                             Some(Ok(entry))
                         }
                         Ok(entry) => {
@@ -837,22 +874,36 @@ pub fn next_replication_sequence(current: u64) -> Result<u64, StoreError> {
 
 /// Validate a complete replication-log prefix before rebuilding state.
 ///
-/// Empty input is valid. Non-empty input must start at one and contain every
-/// subsequent position exactly once, in order.
+/// Empty input is valid. Non-empty input starts at one and contains each
+/// subsequent position once, in order, except an explicitly anchored recovery
+/// transition to its committed cursor floor.
 pub fn validate_replication_prefix(entries: &[ReplicationEntry]) -> Result<(), StoreError> {
-    let mut expected = 1_u64;
-    let mut entries = entries.iter().peekable();
-    while let Some(entry) = entries.next() {
+    let mut previous = 0;
+    for entry in entries {
         entry.validate()?;
-        if entry.sequence != expected {
+        if !replication_entry_follows(previous, entry)
+            .map_err(|_| StoreError::InvalidReplicationSequence)?
+        {
             return Err(StoreError::InvalidReplicationSequence);
         }
-        if entries.peek().is_some() {
-            expected = next_replication_sequence(expected)
-                .map_err(|_| StoreError::InvalidReplicationSequence)?;
-        }
+        previous = entry.sequence;
     }
     Ok(())
+}
+
+pub(crate) fn replication_entry_follows(
+    previous: u64,
+    entry: &ReplicationEntry,
+) -> Result<bool, StoreError> {
+    match entry.replay_policy.recovery {
+        crate::ReplicationRecoveryBoundary::None => {
+            Ok(entry.sequence == next_replication_sequence(previous)?)
+        }
+        crate::ReplicationRecoveryBoundary::Recover { previous_sequence } => Ok(previous_sequence
+            == previous
+            && entry.replay_policy.async_fence_floor > previous
+            && entry.sequence == entry.replay_policy.async_fence_floor + 1),
+    }
 }
 
 /// Consume and validate a complete replication-log prefix.
@@ -882,9 +933,9 @@ pub fn validate_replication_page(entries: &[ReplicationEntry]) -> Result<(), Sto
     for entry in entries {
         entry.validate()?;
         if let Some(sequence) = previous {
-            let expected = next_replication_sequence(sequence)
-                .map_err(|_| StoreError::InvalidReplicationSequence)?;
-            if entry.sequence != expected {
+            if !replication_entry_follows(sequence, entry)
+                .map_err(|_| StoreError::InvalidReplicationSequence)?
+            {
                 return Err(StoreError::InvalidReplicationSequence);
             }
         }
@@ -1116,8 +1167,9 @@ impl ReplicationOp {
                 return Err(StoreError::ReplicationOperationLimitExceeded);
             }
 
-            let Self::Batch { ops } = op else {
-                continue;
+            let ops = match op {
+                Self::Batch { ops } => ops,
+                _ => continue,
             };
             if !ops.is_empty() && depth >= MAX_REPLICATION_OPERATION_DEPTH {
                 return Err(StoreError::ReplicationOperationLimitExceeded);
@@ -1325,8 +1377,10 @@ where
         tx_id,
         op,
         timestamp,
+        replay_policy,
     } = entry;
     Ok(ReplicationEntry {
+        replay_policy,
         sequence,
         tx_id,
         op: transform_replication_op(op, transform_record).await?,
@@ -5582,5 +5636,136 @@ mod record_expiry_preflight_default_tests {
             state_class: crate::model::StateClass::AuthoritativeSession,
         };
         assert_eq!(backend.preflight_record_expiry(&[nonfinite]).await, Ok(()));
+    }
+}
+
+#[cfg(test)]
+mod key_retention_replication_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn key_retention_batch_record_transform_preserves_committed_rotations() {
+        let record = StoredSessionRecord {
+            key: SessionKey {
+                tenant: opc_types::TenantId::new("retention-transform").unwrap(),
+                nf_kind: opc_types::NetworkFunctionKind::from_static("smf"),
+                key_type: crate::SessionKeyType::PduSession,
+                stable_id: bytes::Bytes::from_static(b"synthetic-transform-key")
+                    .try_into()
+                    .unwrap(),
+            },
+            generation: crate::Generation::new(1),
+            owner: crate::OwnerId::new("transform-owner").unwrap(),
+            fence: crate::FenceToken::new(1),
+            state_class: crate::StateClass::AuthoritativeSession,
+            state_type: crate::StateType::new("transform-state").unwrap(),
+            expires_at: None,
+            payload: crate::EncryptedSessionPayload::new(b"before".as_slice()),
+        };
+        let operation = ReplicationOp::Batch {
+            ops: vec![ReplicationOp::CompareAndSet {
+                key: record.key.clone(),
+                expected_generation: None,
+                credential_id: 1,
+                guard_expires_at: Timestamp::now_utc().add_seconds(60).unwrap(),
+                new_record: record.clone(),
+            }],
+        };
+        let mut policy = crate::ReplicationReplayPolicy::preserve();
+        policy.capacity_rotations = 2;
+        policy.async_fence_floor = 100;
+        policy.internal_key_count = 17;
+        policy.command = crate::ReplicationCommandBoundary::Start {
+            id: [0x61; 16],
+            following_entries: 255,
+        };
+        let entry = ReplicationEntry {
+            sequence: 1,
+            tx_id: ReplicationTxId::new("transform").unwrap(),
+            op: operation,
+            timestamp: Timestamp::now_utc(),
+            replay_policy: policy,
+        };
+        entry.validate().unwrap();
+        let transformed = transform_replication_entry(entry, |mut record| async move {
+            record.payload = crate::EncryptedSessionPayload::new(b"after".as_slice());
+            Ok(record)
+        })
+        .await
+        .unwrap();
+        assert_eq!(transformed.replay_policy, policy);
+        let ReplicationOp::Batch { ops } = transformed.op else {
+            panic!("batch effects survive transform")
+        };
+        assert_eq!(ops.len(), 1);
+        let ReplicationOp::CompareAndSet { new_record, .. } = &ops[0] else {
+            panic!("mutation shape must survive transformation");
+        };
+        let mut expected = record;
+        expected.payload = crate::EncryptedSessionPayload::new(b"after".as_slice());
+        assert_eq!(*new_record, expected);
+    }
+
+    #[tokio::test]
+    async fn key_retention_boundary_record_transform_preserves_all_command_metadata() {
+        let record = StoredSessionRecord {
+            key: SessionKey {
+                tenant: opc_types::TenantId::new("retention-transform").unwrap(),
+                nf_kind: opc_types::NetworkFunctionKind::from_static("smf"),
+                key_type: crate::SessionKeyType::PduSession,
+                stable_id: bytes::Bytes::from_static(b"synthetic-transform-key")
+                    .try_into()
+                    .unwrap(),
+            },
+            generation: crate::Generation::new(1),
+            owner: crate::OwnerId::new("transform-owner").unwrap(),
+            fence: crate::FenceToken::new(1),
+            state_class: crate::StateClass::AuthoritativeSession,
+            state_type: crate::StateType::new("transform-state").unwrap(),
+            expires_at: None,
+            payload: crate::EncryptedSessionPayload::new(b"before".as_slice()),
+        };
+        let operation = ReplicationOp::Batch {
+            ops: vec![ReplicationOp::CompareAndSet {
+                key: record.key.clone(),
+                expected_generation: None,
+                credential_id: 1,
+                guard_expires_at: Timestamp::now_utc().add_seconds(60).unwrap(),
+                new_record: record.clone(),
+            }],
+        };
+        let mut policy = crate::ReplicationReplayPolicy::preserve();
+        policy.capacity_rotations = 2;
+        policy.async_fence_floor = 100;
+        policy.internal_key_count = 17;
+        policy.command = crate::ReplicationCommandBoundary::Start {
+            id: [0x61; 16],
+            following_entries: 255,
+        };
+        let entry = ReplicationEntry {
+            sequence: 1,
+            tx_id: ReplicationTxId::new("transform").unwrap(),
+            op: operation,
+            timestamp: Timestamp::now_utc(),
+            replay_policy: policy,
+        };
+        entry.validate().unwrap();
+        let transformed = transform_replication_entry(entry, |mut record| async move {
+            record.payload = crate::EncryptedSessionPayload::new(b"after".as_slice());
+            Ok(record)
+        })
+        .await
+        .unwrap();
+        assert_eq!(transformed.replay_policy, policy);
+        let ReplicationOp::Batch { ops } = transformed.op else {
+            panic!("batch effects survive transform")
+        };
+        assert_eq!(ops.len(), 1);
+        let ReplicationOp::CompareAndSet { new_record, .. } = &ops[0] else {
+            panic!("mutation shape must survive transformation");
+        };
+        let mut expected = record;
+        expected.payload = crate::EncryptedSessionPayload::new(b"after".as_slice());
+        assert_eq!(*new_record, expected);
     }
 }

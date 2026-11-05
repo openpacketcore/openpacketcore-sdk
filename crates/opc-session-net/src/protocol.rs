@@ -125,8 +125,10 @@ pub const SESSION_CONSENSUS_TRANSPORT_REVISION: u16 = 6;
 /// `SessionMutationIntent` Postcard tag 27, while the merged roster profile
 /// uses tags 27 through 30 and moves recovery to tag 31. There is no fallback
 /// or negotiation: bootstrap requires this exact value before a connection can
-/// carry any consensus command.
-pub const SESSION_CONSENSUS_APPLICATION_REVISION: u16 = 4;
+/// carry any consensus command. Revision 5 binds the explicit application-entry
+/// replay policy and context notifications, so applying voters cannot silently
+/// disagree about cleanup, command boundaries or outward cursors.
+pub const SESSION_CONSENSUS_APPLICATION_REVISION: u16 = 5;
 
 /// Exact resource and semantic profile for consensus-only connections.
 ///
@@ -188,7 +190,7 @@ pub const CURRENT_SESSION_CONSENSUS_CONTRACT_PROFILE: SessionConsensusContractPr
 // `ProtectedRosterEstablishedCreate` adds a replication-node discriminant.
 // Keep old revision-7 peers out at bootstrap, before either side can decode
 // or emit a replication operation tree containing that variant.
-const WIRE_SCHEMA_REVISION: u16 = 8;
+const WIRE_SCHEMA_REVISION: u16 = 9;
 const ERROR_SET_REVISION: u16 = 9;
 
 /// Exact semantic and resource-bound contract required by protocol v5.
@@ -944,7 +946,7 @@ pub enum Response {
     ReplicateEntry(Result<(), opc_session_store::error::StoreError>),
     RebuildReplicationState(Result<(), opc_session_store::error::StoreError>),
     WatchStream,
-    WatchEntry(Result<ReplicationEntry, opc_session_store::error::StoreError>),
+    WatchEntry(Result<Box<ReplicationEntry>, opc_session_store::error::StoreError>),
     NextLeaseInfo(Result<(u64, u64), opc_session_store::error::StoreError>),
     AcquireLease(Result<LeaseGuard, opc_session_store::error::LeaseError>),
     RenewLease(Result<LeaseGuard, opc_session_store::error::LeaseError>),
@@ -958,6 +960,15 @@ pub enum Response {
     Error {
         message: String,
     },
+}
+
+impl Response {
+    /// Wrap one watch result without enlarging every response envelope.
+    pub fn watch_entry(
+        result: Result<ReplicationEntry, opc_session_store::error::StoreError>,
+    ) -> Self {
+        Self::WatchEntry(result.map(Box::new))
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1931,6 +1942,9 @@ impl<'a> TryFrom<&'a StoreError> for WireStoreErrorRef<'a> {
             }
             StoreError::LeaseHeld => Self::LeaseHeld,
             StoreError::LeaseExpired => Self::LeaseExpired,
+            StoreError::KeyProviderUnavailable(_) => {
+                Self::BackendUnavailable("key provider unavailable")
+            }
             StoreError::Crypto(_) => Self::Crypto("cryptographic operation failed"),
             StoreError::Serialization(_) => Self::Serialization("serialization failed"),
             StoreError::PayloadTooLarge { actual, max } => Self::PayloadTooLarge {
@@ -2456,6 +2470,7 @@ struct WireReplicationEntryRef<'a> {
     tx_id: &'a str,
     operation_nodes: Vec<WireReplicationNodeRef<'a>>,
     timestamp: &'a Timestamp,
+    replay_policy: &'a opc_session_store::ReplicationReplayPolicy,
 }
 
 #[derive(Deserialize)]
@@ -2465,6 +2480,7 @@ struct WireReplicationEntry {
     tx_id: ReplicationTxId,
     operation_nodes: WireReplicationNodes,
     timestamp: Timestamp,
+    replay_policy: opc_session_store::ReplicationReplayPolicy,
 }
 
 impl<'a> TryFrom<&'a ReplicationEntry> for WireReplicationEntryRef<'a> {
@@ -2607,6 +2623,7 @@ impl<'a> TryFrom<&'a ReplicationEntry> for WireReplicationEntryRef<'a> {
             tx_id: entry.tx_id.as_str(),
             operation_nodes,
             timestamp: &entry.timestamp,
+            replay_policy: &entry.replay_policy,
         })
     }
 }
@@ -2656,6 +2673,7 @@ impl TryFrom<WireReplicationEntry> for ReplicationEntry {
             "replication operation tree is malformed",
         ))?;
         Ok(ReplicationEntry {
+            replay_policy: entry.replay_policy,
             sequence: entry.sequence,
             tx_id: entry.tx_id,
             op: operation,
@@ -3454,7 +3472,7 @@ impl<'a> TryFrom<&'a Response> for WireResponseRef<'a> {
             }
             Response::WatchStream => Self::WatchStream,
             Response::WatchEntry(result) => Self::WatchEntry(match result {
-                Ok(entry) => Ok(WireReplicationEntryRef::try_from(entry)?),
+                Ok(entry) => Ok(WireReplicationEntryRef::try_from(entry.as_ref())?),
                 Err(error) => Err(WireStoreErrorRef::try_from(error)?),
             }),
             Response::NextLeaseInfo(result) => Self::NextLeaseInfo(wire_store_result_ref(result)?),
@@ -3541,7 +3559,7 @@ impl TryFrom<WireResponse> for Response {
             }
             WireResponse::WatchStream => Self::WatchStream,
             WireResponse::WatchEntry(result) => Self::WatchEntry(match result {
-                Ok(entry) => Ok(validated_replication_entry_from_wire(entry)?),
+                Ok(entry) => Ok(Box::new(validated_replication_entry_from_wire(entry)?)),
                 Err(error) => Err(StoreError::try_from(error)?),
             }),
             WireResponse::NextLeaseInfo(result) => {
@@ -5476,20 +5494,20 @@ mod tests {
         );
         assert_eq!(SESSION_CONSENSUS_ALPN, b"opc-session-consensus/2");
         assert_eq!(SESSION_CONSENSUS_TRANSPORT_REVISION, 6);
-        assert_eq!(SESSION_CONSENSUS_APPLICATION_REVISION, 4);
+        assert_eq!(SESSION_CONSENSUS_APPLICATION_REVISION, 5);
         assert_eq!(
             serde_json::to_value(CURRENT_SESSION_CONSENSUS_CONTRACT_PROFILE)
                 .expect("consensus contract serializes"),
             serde_json::json!({
                 "wire_schema_revision": 6,
-                "application_revision": 4,
+                "application_revision": 5,
                 "error_set_revision": 6,
                 "max_rpc_payload_bytes": SESSION_CONSENSUS_MAX_RPC_PAYLOAD_BYTES,
                 "max_roster_rpc_payload_bytes": CONSENSUS_MAX_ROSTER_RPC_PAYLOAD_BYTES,
                 "min_frame_size": MIN_SESSION_CONSENSUS_FRAME_SIZE,
                 "max_frame_size": MAX_NEGOTIATED_FRAME_SIZE,
             }),
-            "the bootstrap golden binds required scheduling metadata, v2 outcome-digest, protected-roster established-transition, and the Postcard tag-27 recovery incompatibility separately from consumer wire"
+            "the bootstrap golden binds explicit replay policy, required scheduling metadata, v2 outcome-digest, protected-roster established-transition, and recovery incompatibilities separately from consumer wire"
         );
         let mut previous_error_set = CURRENT_SESSION_CONSENSUS_CONTRACT_PROFILE;
         previous_error_set.error_set_revision =
@@ -5553,7 +5571,7 @@ mod tests {
     fn contract_profile_and_bootstrap_frames_are_exact_and_version_tolerant() {
         assert_eq!(SESSION_NET_ALPN, b"opc-session-net/5");
         assert!(CURRENT_CONTRACT_PROFILE.is_current());
-        assert_eq!(CURRENT_CONTRACT_PROFILE.wire_schema_revision, 8);
+        assert_eq!(CURRENT_CONTRACT_PROFILE.wire_schema_revision, 9);
         assert_eq!(CURRENT_CONTRACT_PROFILE.error_set_revision, 9);
         assert_eq!(CURRENT_CONTRACT_PROFILE.max_frame_size, 16_777_216);
         assert_eq!(CURRENT_CONTRACT_PROFILE.max_session_ttl_seconds, 31_536_000);
@@ -5562,7 +5580,7 @@ mod tests {
         assert_eq!(
             profile,
             serde_json::json!({
-                "wire_schema_revision": 8,
+                "wire_schema_revision": 9,
                 "error_set_revision": 9,
                 "max_restore_scan_page_records": 1024,
                 "max_restore_scan_page_payload_bytes": 2096128,
@@ -6046,6 +6064,7 @@ mod tests {
 
     fn replication_entry(op: ReplicationOp) -> ReplicationEntry {
         ReplicationEntry {
+            replay_policy: opc_session_store::ReplicationReplayPolicy::prune_expired(),
             sequence: 1,
             tx_id: "wire-tree".try_into().expect("valid transaction ID"),
             op,
@@ -6081,6 +6100,38 @@ mod tests {
             };
         }
         operation
+    }
+
+    #[test]
+    fn key_retention_batches_round_trip_with_bounded_flat_wire_nodes() {
+        let key = test_session_key();
+        let owner = OwnerId::new("retention-wire").unwrap();
+        for rotations in [0, 1, 2] {
+            let mut entry = replication_entry(ReplicationOp::Batch {
+                ops: vec![replication_leaf(&key, &owner); MAX_REPLICATION_OPERATIONS_PER_ENTRY - 1],
+            });
+            entry.replay_policy.capacity_rotations = rotations;
+            let json = serde_json::to_value(Request::ReplicateEntry {
+                entry: entry.clone(),
+            })
+            .unwrap();
+            assert_eq!(
+                json["ReplicateEntry"]["entry"]["operation_nodes"]
+                    .as_array()
+                    .unwrap()
+                    .len(),
+                MAX_REPLICATION_OPERATIONS_PER_ENTRY
+            );
+            assert!(
+                matches!(serde_json::from_value::<Request>(json.clone()).unwrap(), Request::ReplicateEntry { entry: actual } if actual == entry)
+            );
+            for invalid in [3, 255] {
+                let mut bad = json.clone();
+                bad["ReplicateEntry"]["entry"]["replay_policy"]["capacity_rotations"] =
+                    serde_json::json!(invalid);
+                assert!(serde_json::from_value::<Request>(bad).is_err());
+            }
+        }
     }
 
     #[test]
@@ -6231,12 +6282,14 @@ mod tests {
 
     #[test]
     fn revision_seven_replication_profile_is_rejected_before_create_dispatch() {
-        let mut revision_seven = CURRENT_CONTRACT_PROFILE;
-        revision_seven.wire_schema_revision = 7;
-        assert!(
-            !revision_seven.is_current(),
-            "revision-7 peers are rejected by the exact bootstrap profile before a create node can be decoded"
-        );
+        for wire_schema_revision in [7, 8] {
+            let mut previous = CURRENT_CONTRACT_PROFILE;
+            previous.wire_schema_revision = wire_schema_revision;
+            assert!(
+                !previous.is_current(),
+                "previous peers are rejected by the exact bootstrap profile before a create node can be decoded"
+            );
+        }
 
         // A current peer still has an unambiguous, independently bounded
         // create discriminant.  It is reachable only after the exact profile
@@ -6564,7 +6617,7 @@ mod tests {
         for len in [1, MAX_SESSION_NET_REPLICATION_TX_ID_BYTES] {
             let mut entry = base.clone();
             entry.tx_id = ReplicationTxId::new(&"t".repeat(len)).expect("valid transaction ID");
-            assert!(serde_json::to_vec(&Response::WatchEntry(Ok(entry.clone()))).is_ok());
+            assert!(serde_json::to_vec(&Response::watch_entry(Ok(entry.clone()))).is_ok());
             assert!(serde_json::to_vec(&Request::ReplicateEntry { entry }).is_ok());
         }
         assert!(ReplicationTxId::new("").is_err());
@@ -6575,7 +6628,7 @@ mod tests {
         let mut valid = base;
         valid.tx_id = ReplicationTxId::new(&"t".repeat(MAX_SESSION_NET_REPLICATION_TX_ID_BYTES))
             .expect("maximum transaction ID");
-        let valid = serde_json::to_value(Response::WatchEntry(Ok(valid)))
+        let valid = serde_json::to_value(Response::watch_entry(Ok(valid)))
             .expect("maximum transaction ID response");
         for (len, accepted) in [
             (0, false),
@@ -6655,7 +6708,7 @@ mod tests {
             Response::AcquireLease(Ok(valid_lease.clone())),
             Response::RenewLease(Ok(valid_lease.clone())),
             Response::GetReplicationLog(Ok(vec![valid_nested_entry.clone()])),
-            Response::WatchEntry(Ok(valid_nested_entry.clone())),
+            Response::watch_entry(Ok(valid_nested_entry.clone())),
         ];
         for response in valid_responses {
             let mut wire = serde_json::to_value(response).expect("valid response carrier");
@@ -7486,6 +7539,7 @@ mod tests {
         };
         let timestamp = Timestamp::now_utc();
         let entry = ReplicationEntry {
+            replay_policy: opc_session_store::ReplicationReplayPolicy::prune_expired(),
             sequence: 1,
             tx_id: "protocol-invariant-entry"
                 .try_into()
@@ -7597,7 +7651,7 @@ mod tests {
                 "replication log response",
                 json(Response::GetReplicationLog(Ok(vec![entry.clone()]))),
             ),
-            ("watch response", json(Response::WatchEntry(Ok(entry)))),
+            ("watch response", json(Response::watch_entry(Ok(entry)))),
         ];
 
         for (family, frame, has_owner) in request_frames {
@@ -7730,5 +7784,59 @@ mod tests {
         );
         ack.compatibility = Some([0x41; 32]);
         assert!(serde_json::from_slice::<LegacyAck>(&serde_json::to_vec(&ack).unwrap()).is_err());
+    }
+
+    #[test]
+    fn key_retention_boundaries_round_trip_with_bounded_flat_wire_nodes() {
+        use opc_session_store::{ReplicationCommandBoundary as Boundary, ReplicationReplayPolicy};
+        for following in [0, 1, 255] {
+            let mut entry = replication_entry(ReplicationOp::Batch { ops: vec![] });
+            entry.replay_policy = ReplicationReplayPolicy::preserve();
+            entry.replay_policy.async_fence_floor = 100;
+            entry.replay_policy.internal_key_count = 17;
+            entry.replay_policy.command = if following == 0 {
+                Boundary::Single
+            } else {
+                Boundary::Start {
+                    id: [0x51; 16],
+                    following_entries: following,
+                }
+            };
+            let json = serde_json::to_value(Request::ReplicateEntry {
+                entry: entry.clone(),
+            })
+            .unwrap();
+            assert!(
+                matches!(serde_json::from_value::<Request>(json.clone()).unwrap(), Request::ReplicateEntry { entry: actual } if actual == entry)
+            );
+            let mut invalid = json.clone();
+            invalid["ReplicateEntry"]["entry"]["replay_policy"]["command"] = serde_json::json!({"Start":{"id":[0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0],"following_entries":256}});
+            assert!(serde_json::from_value::<Request>(invalid).is_err());
+            let mut missing = json.clone();
+            missing["ReplicateEntry"]["entry"]
+                .as_object_mut()
+                .unwrap()
+                .remove("replay_policy");
+            assert!(serde_json::from_value::<Request>(missing).is_err());
+            for field in [
+                "prune_expired",
+                "retire_dead_keys",
+                "async_fence_floor",
+                "capacity_rotations",
+                "internal_key_count",
+                "command",
+                "recovery",
+            ] {
+                let mut missing = json.clone();
+                missing["ReplicateEntry"]["entry"]["replay_policy"]
+                    .as_object_mut()
+                    .unwrap()
+                    .remove(field);
+                assert!(
+                    serde_json::from_value::<Request>(missing).is_err(),
+                    "missing {field}"
+                );
+            }
+        }
     }
 }

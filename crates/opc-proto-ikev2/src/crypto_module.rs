@@ -72,6 +72,7 @@ impl Ikev2CryptoRequirements {
         let mut requirements = Self::new();
         for prf in [
             Ikev2PrfAlgorithm::HmacSha1,
+            Ikev2PrfAlgorithm::Aes128Xcbc,
             Ikev2PrfAlgorithm::HmacSha2_256,
             Ikev2PrfAlgorithm::HmacSha2_384,
             Ikev2PrfAlgorithm::HmacSha2_512,
@@ -93,6 +94,10 @@ impl Ikev2CryptoRequirements {
             Ikev2EncryptionAlgorithm::AesGcm16_128,
             Ikev2EncryptionAlgorithm::AesGcm16_192,
             Ikev2EncryptionAlgorithm::AesGcm16_256,
+            Ikev2EncryptionAlgorithm::AesCcm8_128,
+            Ikev2EncryptionAlgorithm::AesCcm8_192,
+            Ikev2EncryptionAlgorithm::AesCcm8_256,
+            Ikev2EncryptionAlgorithm::ChaCha20Poly1305,
         ] {
             requirements.add_encryption(encryption);
         }
@@ -100,6 +105,10 @@ impl Ikev2CryptoRequirements {
             Ikev2DhGroup::Modp768,
             Ikev2DhGroup::Modp1024,
             Ikev2DhGroup::Modp2048,
+            Ikev2DhGroup::Modp3072,
+            Ikev2DhGroup::Modp4096,
+            Ikev2DhGroup::Modp6144,
+            Ikev2DhGroup::Modp8192,
             Ikev2DhGroup::Ecp256,
             Ikev2DhGroup::Ecp384,
             Ikev2DhGroup::Ecp521,
@@ -109,6 +118,18 @@ impl Ikev2CryptoRequirements {
         requirements.require_signature(IkeSignatureAlgorithm::EcdsaP256Sha2_256);
         requirements.require_signature(IkeSignatureAlgorithm::EcdsaP384Sha2_256);
         requirements.require_signature(IkeSignatureAlgorithm::EcdsaP384Sha2_384);
+        requirements.require_signature(IkeSignatureAlgorithm::EcdsaP521Sha2_512);
+        requirements.require_signature(IkeSignatureAlgorithm::Ed25519);
+        requirements.require_signature(IkeSignatureAlgorithm::Ed448);
+        for algorithm in [
+            IkeSignatureAlgorithm::RsaPssSha2_256,
+            IkeSignatureAlgorithm::RsaPssSha2_384,
+            IkeSignatureAlgorithm::RsaPssSha2_512,
+        ] {
+            requirements.require_signature_verification(algorithm);
+            #[cfg(feature = "rsa-signing")]
+            requirements.require_signature_generation(algorithm);
+        }
         requirements.require_signature_verification(IkeSignatureAlgorithm::RsaPkcs1V15Sha2_256);
         #[cfg(feature = "rsa-signing")]
         requirements.require_signature_generation(IkeSignatureAlgorithm::RsaPkcs1V15Sha2_256);
@@ -1189,6 +1210,9 @@ enum SigningOutputShape {
     Rsa { modulus_len: usize },
     EcdsaP256,
     EcdsaP384,
+    EcdsaP521,
+    Ed25519,
+    Ed448,
 }
 
 fn signing_output_shape(
@@ -1200,7 +1224,10 @@ fn signing_output_shape(
     }
 
     match algorithm {
-        IkeSignatureAlgorithm::RsaPkcs1V15Sha2_256 => {
+        IkeSignatureAlgorithm::RsaPkcs1V15Sha2_256
+        | IkeSignatureAlgorithm::RsaPssSha2_256
+        | IkeSignatureAlgorithm::RsaPssSha2_384
+        | IkeSignatureAlgorithm::RsaPssSha2_512 => {
             let modulus_len = key
                 .rsa_modulus_len()
                 .filter(|modulus_len| *modulus_len > 0)
@@ -1218,6 +1245,24 @@ fn signing_output_shape(
                 return Err(Ikev2CryptoModuleError::invalid_output());
             }
             Ok(SigningOutputShape::EcdsaP384)
+        }
+        IkeSignatureAlgorithm::EcdsaP521Sha2_512 => {
+            if key.rsa_modulus_len().is_some() {
+                return Err(Ikev2CryptoModuleError::invalid_output());
+            }
+            Ok(SigningOutputShape::EcdsaP521)
+        }
+        IkeSignatureAlgorithm::Ed25519 => {
+            if key.rsa_modulus_len().is_some() {
+                return Err(Ikev2CryptoModuleError::invalid_output());
+            }
+            Ok(SigningOutputShape::Ed25519)
+        }
+        IkeSignatureAlgorithm::Ed448 => {
+            if key.rsa_modulus_len().is_some() {
+                return Err(Ikev2CryptoModuleError::invalid_output());
+            }
+            Ok(SigningOutputShape::Ed448)
         }
         _ => Err(algorithm_unsupported()),
     }
@@ -1237,11 +1282,31 @@ fn validate_signature_output(
         // and rejects either scalar unless it is in the range 1..n.
         SigningOutputShape::EcdsaP256 => p256::ecdsa::Signature::from_der(signature).is_ok(),
         SigningOutputShape::EcdsaP384 => p384::ecdsa::Signature::from_der(signature).is_ok(),
+        SigningOutputShape::EcdsaP521 => p521::ecdsa::Signature::from_der(signature).is_ok(),
+        SigningOutputShape::Ed25519 => valid_ed25519_signature_encoding(signature),
+        SigningOutputShape::Ed448 => ed448_goldilocks_plus::Signature::try_from(signature).is_ok(),
     };
     if !valid {
         return Err(Ikev2CryptoModuleError::invalid_output());
     }
     Ok(())
+}
+
+fn valid_ed25519_signature_encoding(signature: &[u8]) -> bool {
+    let Ok(signature) = ed25519_dalek::Signature::from_slice(signature) else {
+        return false;
+    };
+    let Ok(r) = ed25519_dalek::VerifyingKey::from_bytes(signature.r_bytes()) else {
+        return false;
+    };
+    // RFC 8032 section 5.1.7 requires S < L. Signature::from_slice only
+    // checks the octet count, so enforce the scalar encoding at this boundary.
+    const ORDER: [u8; 32] = [
+        0xed, 0xd3, 0xf5, 0x5c, 0x1a, 0x63, 0x12, 0x58, 0xd6, 0x9c, 0xf7, 0xa2, 0xde, 0xf9, 0xde,
+        0x14, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x10,
+    ];
+    !r.is_weak()
+        && signature.s_bytes().iter().rev().cmp(ORDER.iter().rev()) == std::cmp::Ordering::Less
 }
 
 const fn algorithm_unsupported() -> Ikev2CryptoModuleError {
@@ -1261,6 +1326,7 @@ enum MappedEncryption {
 const fn map_prf(algorithm: Ikev2PrfAlgorithm) -> IkePrfAlgorithm {
     match algorithm {
         Ikev2PrfAlgorithm::HmacSha1 => IkePrfAlgorithm::HmacSha1,
+        Ikev2PrfAlgorithm::Aes128Xcbc => IkePrfAlgorithm::Aes128Xcbc,
         Ikev2PrfAlgorithm::HmacSha2_256 => IkePrfAlgorithm::HmacSha2_256,
         Ikev2PrfAlgorithm::HmacSha2_384 => IkePrfAlgorithm::HmacSha2_384,
         Ikev2PrfAlgorithm::HmacSha2_512 => IkePrfAlgorithm::HmacSha2_512,
@@ -1296,6 +1362,18 @@ const fn map_encryption(algorithm: Ikev2EncryptionAlgorithm) -> Option<MappedEnc
         Ikev2EncryptionAlgorithm::AesGcm16_256 => {
             Some(MappedEncryption::Aead(IkeAeadAlgorithm::AesGcm16_256))
         }
+        Ikev2EncryptionAlgorithm::AesCcm8_128 => {
+            Some(MappedEncryption::Aead(IkeAeadAlgorithm::AesCcm8_128))
+        }
+        Ikev2EncryptionAlgorithm::AesCcm8_192 => {
+            Some(MappedEncryption::Aead(IkeAeadAlgorithm::AesCcm8_192))
+        }
+        Ikev2EncryptionAlgorithm::AesCcm8_256 => {
+            Some(MappedEncryption::Aead(IkeAeadAlgorithm::AesCcm8_256))
+        }
+        Ikev2EncryptionAlgorithm::ChaCha20Poly1305 => {
+            Some(MappedEncryption::Aead(IkeAeadAlgorithm::ChaCha20Poly1305))
+        }
         Ikev2EncryptionAlgorithm::Null => None,
     }
 }
@@ -1305,8 +1383,54 @@ const fn map_dh_group(group: Ikev2DhGroup) -> IkeDhGroup {
         Ikev2DhGroup::Modp768 => IkeDhGroup::Modp768,
         Ikev2DhGroup::Modp1024 => IkeDhGroup::Modp1024,
         Ikev2DhGroup::Modp2048 => IkeDhGroup::Modp2048,
+        Ikev2DhGroup::Modp3072 => IkeDhGroup::Modp3072,
+        Ikev2DhGroup::Modp4096 => IkeDhGroup::Modp4096,
+        Ikev2DhGroup::Modp6144 => IkeDhGroup::Modp6144,
+        Ikev2DhGroup::Modp8192 => IkeDhGroup::Modp8192,
         Ikev2DhGroup::Ecp256 => IkeDhGroup::Ecp256,
         Ikev2DhGroup::Ecp384 => IkeDhGroup::Ecp384,
         Ikev2DhGroup::Ecp521 => IkeDhGroup::Ecp521,
+    }
+}
+
+#[cfg(test)]
+mod extended_signature_output_tests {
+    use super::{validate_signature_output, SigningOutputShape};
+    use crate::Ikev2SoftwareCryptoOperations;
+    use opc_crypto_provider::{
+        CryptoOperationError, IkeSignatureAlgorithm, IkeSignatureOperations,
+    };
+
+    #[test]
+    fn eddsa_provider_outputs_require_valid_scalar_and_point_encodings(
+    ) -> Result<(), CryptoOperationError> {
+        let provider = Ikev2SoftwareCryptoOperations::new();
+        for (algorithm, shape, private, component_len) in [
+            (
+                IkeSignatureAlgorithm::Ed25519,
+                SigningOutputShape::Ed25519,
+                include_bytes!("../tests/data/ed25519_pkcs8.der").as_slice(),
+                32,
+            ),
+            (
+                IkeSignatureAlgorithm::Ed448,
+                SigningOutputShape::Ed448,
+                include_bytes!("../tests/data/ed448_pkcs8.der").as_slice(),
+                57,
+            ),
+        ] {
+            let key = provider.load_signing_key(algorithm, private)?;
+            let signature = key.sign(b"provider output contract")?;
+            assert!(validate_signature_output(shape, &signature).is_ok());
+            assert!(validate_signature_output(shape, &signature[..signature.len() - 1]).is_err());
+            let mut invalid_scalar = signature.clone();
+            invalid_scalar[component_len..].fill(0xff);
+            assert!(validate_signature_output(shape, &invalid_scalar).is_err());
+            let mut identity_point = signature.clone();
+            identity_point[..component_len].fill(0);
+            identity_point[0] = 1;
+            assert!(validate_signature_output(shape, &identity_point).is_err());
+        }
+        Ok(())
     }
 }

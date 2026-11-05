@@ -264,12 +264,13 @@ fn native_v1_original_lifetime_capacity_and_signed_sequence_horizon_are_exact() 
 fn native_v1_full_image_four_preserves_tombstones_and_explicit_legacy_readers() {
     let (mut ordinary, _, _) = super::super::changes::tests::fixture();
     apply(&mut ordinary, &[clock(2, time(2))]);
-    for version in 1..=4 {
+    for version in [1, 2, 3, 4, 6] {
         let mut bytes = Vec::new();
         match version {
             1 => ordinary.write_legacy_image_for_test(&mut bytes, [0xD1; 32], 9),
             2 => ordinary.write_legacy_v2_image_for_test(&mut bytes, [0xD1; 32], 9),
             3 => ordinary.write_legacy_v3_image_for_test(&mut bytes, [0xD1; 32], 9),
+            4 => ordinary.write_legacy_v4_image_for_test(&mut bytes, [0xD1; 32], 9),
             _ => ordinary.write_image(&mut bytes, [0xD1; 32], 9),
         }
         .unwrap();
@@ -307,48 +308,63 @@ fn native_v1_full_image_four_preserves_tombstones_and_explicit_legacy_readers() 
             decoded.status_v1(&first).unwrap(),
             storage.business.status_v1(&first).unwrap()
         );
-        let mut bytes = Vec::new();
-        storage.write_image(&mut bytes, [0xD1; 32], 9).unwrap();
-        assert_eq!(&bytes[..8], b"OPCNAT04");
-        let actual = NativeStorage::read_image(
-            &mut bytes.as_slice(),
-            [0xD1; 32],
-            9,
-            storage.business.identity,
-        )
-        .unwrap();
-        assert_eq!(
-            actual.business.status_v1(&first).unwrap(),
-            storage.business.status_v1(&first).unwrap()
-        );
-        assert_eq!(
-            generation::Version::capture(&actual)
-                .unwrap()
-                .context_digest()
-                .unwrap(),
-            generation::Version::capture(&storage)
-                .unwrap()
-                .context_digest()
-                .unwrap()
-        );
-        for old in [b"OPCNAT01", b"OPCNAT02", b"OPCNAT03"] {
-            let mut mislabeled = bytes.clone();
-            mislabeled[..8].copy_from_slice(old);
+        for version in [4, 6] {
+            let mut bytes = Vec::new();
+            if version == 4 {
+                storage
+                    .write_legacy_v4_image_for_test(&mut bytes, [0xD1; 32], 9)
+                    .unwrap();
+            } else {
+                storage.write_image(&mut bytes, [0xD1; 32], 9).unwrap();
+            }
             assert_eq!(
-                NativeStorage::read_image(
-                    &mut mislabeled.as_slice(),
-                    [0xD1; 32],
-                    9,
-                    storage.business.identity
-                )
-                .err()
-                .unwrap()
-                .to_string(),
-                "native legacy image carries an unsupported V1 context"
+                &bytes[..8],
+                if version == 4 {
+                    b"OPCNAT04"
+                } else {
+                    b"OPCNAT06"
+                }
             );
+            let actual = NativeStorage::read_image(
+                &mut bytes.as_slice(),
+                [0xD1; 32],
+                9,
+                storage.business.identity,
+            )
+            .unwrap();
+            assert_eq!(
+                actual.business.status_v1(&first).unwrap(),
+                storage.business.status_v1(&first).unwrap()
+            );
+            assert_eq!(
+                generation::Version::capture(&actual)
+                    .unwrap()
+                    .context_digest()
+                    .unwrap(),
+                generation::Version::capture(&storage)
+                    .unwrap()
+                    .context_digest()
+                    .unwrap()
+            );
+            for old in [b"OPCNAT01", b"OPCNAT02", b"OPCNAT03"] {
+                let mut mislabeled = bytes.clone();
+                mislabeled[..8].copy_from_slice(old);
+                assert_eq!(
+                    NativeStorage::read_image(
+                        &mut mislabeled.as_slice(),
+                        [0xD1; 32],
+                        9,
+                        storage.business.identity
+                    )
+                    .err()
+                    .unwrap()
+                    .to_string(),
+                    "native legacy image carries an unsupported V1 context"
+                );
+            }
+            assert!(storage
+                .write_legacy_v3_image_for_test(&mut Vec::new(), [0xD1; 32], 9)
+                .is_err());
         }
-        assert!(storage
-            .write_legacy_v3_image_for_test(&mut Vec::new(), [0xD1; 32], 9)
-            .is_err());
     }
 }

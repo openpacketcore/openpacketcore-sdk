@@ -19,8 +19,8 @@ use opc_proto_gtpv2c::{
     S2bUpdateBearerRequest, S2bUpdateBearerRequestContext, S2bUpdateBearerResponse,
     S2bUpdateBearerResult, TypedIe, TypedIeValue, CREATE_BEARER_REQUEST, CREATE_BEARER_RESPONSE,
     DELETE_BEARER_REQUEST, DELETE_BEARER_RESPONSE, IE_TYPE_LOAD_CONTROL_INFORMATION,
-    IE_TYPE_OVERLOAD_CONTROL_INFORMATION, IE_TYPE_PGW_CHANGE_INFO, INTERFACE_TYPE_S2B_U_EPDG_GTP_U,
-    INTERFACE_TYPE_S2B_U_PGW_GTP_U, MAX_DEDICATED_BEARER_CONTEXTS,
+    IE_TYPE_OVERLOAD_CONTROL_INFORMATION, IE_TYPE_PCO, IE_TYPE_PGW_CHANGE_INFO,
+    INTERFACE_TYPE_S2B_U_EPDG_GTP_U, INTERFACE_TYPE_S2B_U_PGW_GTP_U, MAX_DEDICATED_BEARER_CONTEXTS,
     MAX_PGW_APN_LOAD_CONTROL_INFORMATION_IES, MAX_PGW_OVERLOAD_CONTROL_INFORMATION_IES,
     UPDATE_BEARER_REQUEST, UPDATE_BEARER_RESPONSE,
 };
@@ -28,7 +28,9 @@ use opc_proto_tft::{
     PacketFilter, PacketFilterComponent, PacketFilterDirection, PacketFilterIdentifier,
     TrafficFlowTemplate,
 };
-use opc_protocol::{DecodeContext, DuplicateIePolicy, Encode, EncodeContext, ValidationLevel};
+use opc_protocol::{
+    DecodeContext, DecodeErrorCode, DuplicateIePolicy, Encode, EncodeContext, ValidationLevel,
+};
 
 const REQUEST_TEID: u32 = 0x1020_3040;
 const RESPONSE_TEID: u32 = 0x5060_7080;
@@ -2428,3 +2430,749 @@ const DELETE_REQUEST_FIXTURE: &[u8] =
     include_bytes!("fixtures/spec/delete_bearer_request_dedicated.bin");
 const DELETE_RESPONSE_FIXTURE: &[u8] =
     include_bytes!("fixtures/spec/delete_bearer_response_partial.bin");
+
+/// Issue #1441 verified payload with an unexpected Bearer-Context PCO.
+const ISSUE_1441_WITH_PCO: &str = "4861003c112233440234560048000800000177000002ee005d002400490001000750001600110100000000600000000060000000003000000000304e00010080";
+/// The same issue payload with only the PCO removed and the lengths repaired.
+const ISSUE_1441_WITHOUT_PCO: &str = "48610037112233440234560048000800000177000002ee005d001f0049000100075000160011010000000060000000006000000000300000000030";
+
+fn decode_hex(value: &str) -> Vec<u8> {
+    assert_eq!(value.len() % 2, 0, "hex fixture must have whole octets");
+    (0..value.len())
+        .step_by(2)
+        .map(|offset| u8::from_str_radix(&value[offset..offset + 2], 16).expect("hex fixture"))
+        .collect()
+}
+
+/// Append one IE to a complete message and repair the clause 5.5 length field.
+fn with_trailing_ie(message: &[u8], ie: &[u8]) -> Vec<u8> {
+    let mut extended = message.to_vec();
+    extended.extend_from_slice(ie);
+    let declared = u16::from_be_bytes([extended[2], extended[3]]);
+    let widened = declared
+        .checked_add(u16::try_from(ie.len()).expect("appended IE fits u16"))
+        .expect("extended message length fits u16");
+    extended[2..4].copy_from_slice(&widened.to_be_bytes());
+    extended
+}
+
+fn update_bearer_request_with(
+    nested: Vec<TypedIe<'static>>,
+    top_level: Vec<TypedIe<'static>>,
+) -> Bytes {
+    let mut ies = vec![typed(
+        0,
+        TypedIeValue::AggregateMaximumBitRate(AggregateMaximumBitRate {
+            uplink: 96_000,
+            downlink: 192_000,
+        }),
+    )];
+    ies.push(typed(
+        0,
+        TypedIeValue::BearerContext(BearerContext { members: nested }),
+    ));
+    ies.extend(top_level);
+    encode(&owned_message(
+        UPDATE_BEARER_REQUEST,
+        Some(REQUEST_TEID),
+        ies,
+    ))
+}
+
+#[test]
+fn issue_1441_payloads_decode_and_preserve_bearer_policy() {
+    // Both payloads from the issue must decode under the procedure-aware
+    // receiver profile and project the same bearer policy; only the PCO
+    // presence differs.
+    for (label, payload) in [
+        ("with unexpected PCO", ISSUE_1441_WITH_PCO),
+        ("without PCO", ISSUE_1441_WITHOUT_PCO),
+    ] {
+        let bytes = decode_hex(payload);
+        let (tail, decoded) = S2bMessage::decode(&bytes, procedure_context())
+            .unwrap_or_else(|error| panic!("{label} must decode: {error}"));
+        assert!(tail.is_empty(), "{label}: no trailing bytes");
+        let projected = decoded
+            .as_view()
+            .expect("typed view")
+            .update_bearer_request()
+            .unwrap_or_else(|error| panic!("{label} must project: {error}"));
+
+        assert_eq!(projected.teid, 0x1122_3344, "{label}: header TEID");
+        assert_eq!(
+            projected.sequence_number, 0x0002_3456,
+            "{label}: sequence number"
+        );
+        assert_eq!(
+            projected.apn_ambr.uplink, 96_000,
+            "{label}: APN-AMBR uplink"
+        );
+        assert_eq!(
+            projected.apn_ambr.downlink, 192_000,
+            "{label}: APN-AMBR downlink"
+        );
+        assert_eq!(projected.bearer_contexts.len(), 1, "{label}: one context");
+        let context = &projected.bearer_contexts[0];
+        assert_eq!(context.ebi, ebi(7), "{label}: EBI");
+        let qos = context
+            .bearer_qos
+            .as_ref()
+            .unwrap_or_else(|| panic!("{label}: QoS must be projected"));
+        assert_eq!(qos.qci, 1, "{label}: QCI");
+        assert_eq!(qos.priority_flags, 0x11, "{label}: ARP octet");
+
+        // Clause 7.7.9 discards non-S2b PCO before projection. Canonical
+        // encoding carries the same bearer policy as the PCO-free payload;
+        // raw-preserving encoding retains the original received bytes.
+        assert!(context
+            .additional_ies
+            .iter()
+            .all(|ie| ie.ie_type() != IE_TYPE_PCO));
+        let mut canonical = BytesMut::new();
+        decoded
+            .encode(&mut canonical, EncodeContext::default())
+            .expect("canonical encode");
+        assert_eq!(canonical.as_ref(), decode_hex(ISSUE_1441_WITHOUT_PCO));
+        let mut preserved = BytesMut::new();
+        decoded
+            .encode(
+                &mut preserved,
+                EncodeContext {
+                    raw_preserving: true,
+                    ..EncodeContext::default()
+                },
+            )
+            .expect("raw-preserving encode");
+        assert_eq!(preserved.as_ref(), bytes);
+    }
+}
+
+#[test]
+fn update_bearer_discards_non_s2b_pco_at_both_scopes() {
+    // Tables 7.2.15/16 do not assign PCO to Update Bearer on S2b.
+    // Clause 7.7.9 discards it at both scopes before typed projection.
+    let request_bytes = update_bearer_request_with(
+        vec![
+            typed(0, TypedIeValue::EpsBearerId(ebi(7))),
+            typed(0, TypedIeValue::BearerTft(tft(1, 11, 4_501))),
+            typed(
+                0,
+                TypedIeValue::ProtocolConfigurationOptions(ProtocolConfigurationOptions {
+                    value: vec![0x80, 0x21, 0x01],
+                }),
+            ),
+        ],
+        vec![typed(
+            0,
+            TypedIeValue::ProtocolConfigurationOptions(ProtocolConfigurationOptions {
+                value: vec![0x80, 0x21, 0x02],
+            }),
+        )],
+    );
+    // `S2bMessage::decode` runs the procedure-aware projection, so the old
+    // rejection surfaced here (the reported failure mode).
+    let (tail, decoded) =
+        S2bMessage::decode(&request_bytes, procedure_context()).expect("Update request decode");
+    assert!(tail.is_empty());
+    let request = decoded
+        .as_view()
+        .expect("typed view")
+        .update_bearer_request()
+        .expect("unexpected request PCO must not reject the procedure");
+    assert_eq!(request.bearer_contexts.len(), 1);
+    assert_eq!(request.bearer_contexts[0].ebi, ebi(7));
+    assert!(
+        request.bearer_contexts[0].tft.is_some(),
+        "TFT must survive PCO tolerance"
+    );
+    assert_eq!(
+        request
+            .additional_ies
+            .iter()
+            .filter(|ie| ie.ie_type() == IE_TYPE_PCO && ie.instance == 0)
+            .count(),
+        0,
+        "top-level PCO must be discarded in additional_ies"
+    );
+    assert_eq!(
+        request.bearer_contexts[0]
+            .additional_ies
+            .iter()
+            .filter(|ie| ie.ie_type() == IE_TYPE_PCO && ie.instance == 0)
+            .count(),
+        0,
+        "nested PCO must be discarded in the context's additional_ies"
+    );
+
+    // Response: top-level and context PCO instance 0 follow the same rule.
+    let response_ies = vec![
+        typed(
+            0,
+            TypedIeValue::Cause(opc_proto_gtpv2c::Cause {
+                value: CauseValue::RequestAccepted,
+                flags_octet: 0,
+                offending_ie: Vec::new(),
+            }),
+        ),
+        typed(
+            0,
+            TypedIeValue::BearerContext(BearerContext {
+                members: vec![
+                    typed(0, TypedIeValue::EpsBearerId(ebi(7))),
+                    typed(
+                        0,
+                        TypedIeValue::Cause(opc_proto_gtpv2c::Cause {
+                            value: CauseValue::RequestAccepted,
+                            flags_octet: 0,
+                            offending_ie: Vec::new(),
+                        }),
+                    ),
+                    typed(
+                        0,
+                        TypedIeValue::ProtocolConfigurationOptions(ProtocolConfigurationOptions {
+                            value: vec![0x80],
+                        }),
+                    ),
+                ],
+            }),
+        ),
+        typed(
+            0,
+            TypedIeValue::ProtocolConfigurationOptions(ProtocolConfigurationOptions {
+                value: vec![0x80, 0x21, 0x03],
+            }),
+        ),
+    ];
+    let response_bytes = encode(&owned_message(
+        UPDATE_BEARER_RESPONSE,
+        Some(RESPONSE_TEID),
+        response_ies,
+    ));
+    let (tail, decoded) =
+        S2bMessage::decode(&response_bytes, procedure_context()).expect("Update response decode");
+    assert!(tail.is_empty());
+    let response = decoded
+        .as_view()
+        .expect("typed view")
+        .update_bearer_response()
+        .expect("unexpected response PCO must not reject the procedure");
+    assert_eq!(
+        response
+            .additional_ies
+            .iter()
+            .filter(|ie| ie.ie_type() == IE_TYPE_PCO && ie.instance == 0)
+            .count(),
+        0,
+        "top-level response PCO must be discarded"
+    );
+    assert_eq!(
+        response.bearer_contexts[0]
+            .additional_ies
+            .iter()
+            .filter(|ie| ie.ie_type() == IE_TYPE_PCO && ie.instance == 0)
+            .count(),
+        0,
+        "nested response PCO must be discarded"
+    );
+}
+
+#[test]
+fn update_bearer_ignores_nonzero_pco_instances_and_keeps_strict_framing() {
+    // A nonzero PCO instance is not a declared S2b slot. Clause 7.7.9 discards
+    // it before the projection, so the procedure is not rejected and the typed
+    // view carries no PCO (ignored, not retained).
+    let nonzero_request = update_bearer_request_with(
+        vec![
+            typed(0, TypedIeValue::EpsBearerId(ebi(7))),
+            typed(0, TypedIeValue::BearerTft(tft(1, 11, 4_501))),
+            typed(
+                2,
+                TypedIeValue::ProtocolConfigurationOptions(ProtocolConfigurationOptions {
+                    value: vec![0x80],
+                }),
+            ),
+        ],
+        vec![typed(
+            1,
+            TypedIeValue::ProtocolConfigurationOptions(ProtocolConfigurationOptions {
+                value: vec![0x80],
+            }),
+        )],
+    );
+    let (tail, decoded) = S2bMessage::decode(&nonzero_request, procedure_context())
+        .expect("nonzero PCO instances must be ignored, not rejected");
+    assert!(tail.is_empty());
+    let request = decoded
+        .as_view()
+        .expect("typed view")
+        .update_bearer_request()
+        .expect("nonzero PCO instances must not reject the procedure");
+    assert!(
+        request
+            .additional_ies
+            .iter()
+            .all(|ie| ie.ie_type() != IE_TYPE_PCO),
+        "unexpected top-level instance is discarded, not retained"
+    );
+    assert!(request.bearer_contexts[0]
+        .additional_ies
+        .iter()
+        .all(|ie| ie.ie_type() != IE_TYPE_PCO));
+    assert_eq!(request.bearer_contexts[0].ebi, ebi(7));
+
+    // Framing validation is unchanged: a malformed PCO is not admitted by this
+    // tolerance (it is not a declared Optional slot in this procedure).
+    let valid_request = update_bearer_request_with(
+        vec![
+            typed(0, TypedIeValue::EpsBearerId(ebi(7))),
+            typed(0, TypedIeValue::BearerTft(tft(1, 11, 4_501))),
+        ],
+        Vec::new(),
+    );
+    // Clause 5.5 TLIV header declares four value octets, none follow.
+    let truncated_pco = [IE_TYPE_PCO, 0x00, 0x04, 0x00];
+    let with_truncated_pco = with_trailing_ie(&valid_request, &truncated_pco);
+    let error = S2bMessage::decode(&with_truncated_pco, procedure_context())
+        .expect_err("truncated PCO framing must stay rejected");
+    assert_eq!(
+        error.code(),
+        &DecodeErrorCode::Truncated,
+        "the failure is framing, not a value/mandatory check"
+    );
+
+    // Mandatory-field validation is unchanged: PCO presence never substitutes
+    // for the mandatory APN-AMBR.
+    let mut missing_ambr_ies = vec![typed(
+        0,
+        TypedIeValue::BearerContext(BearerContext {
+            members: vec![
+                typed(0, TypedIeValue::EpsBearerId(ebi(7))),
+                typed(
+                    0,
+                    TypedIeValue::ProtocolConfigurationOptions(ProtocolConfigurationOptions {
+                        value: vec![0x80],
+                    }),
+                ),
+            ],
+        }),
+    )];
+    missing_ambr_ies.push(typed(
+        0,
+        TypedIeValue::ProtocolConfigurationOptions(ProtocolConfigurationOptions {
+            value: vec![0x80],
+        }),
+    ));
+    let missing_ambr = encode(&owned_message(
+        UPDATE_BEARER_REQUEST,
+        Some(REQUEST_TEID),
+        missing_ambr_ies,
+    ));
+    assert!(
+        S2bMessage::decode(&missing_ambr, procedure_context()).is_err(),
+        "PCO tolerance must not relax the mandatory APN-AMBR"
+    );
+
+    // A malformed mandatory IE still fails structurally. (Appending it to a
+    // message that already carries a valid AMBR would be dropped as a duplicate
+    // by clause 7.7.10 before its value is read, so build the message without
+    // the mandatory AMBR and splice the malformed one in.)
+    let context_only = encode(&owned_message(
+        UPDATE_BEARER_REQUEST,
+        Some(REQUEST_TEID),
+        vec![typed(
+            0,
+            TypedIeValue::BearerContext(BearerContext {
+                members: vec![
+                    typed(0, TypedIeValue::EpsBearerId(ebi(7))),
+                    typed(0, TypedIeValue::BearerTft(tft(1, 11, 4_501))),
+                ],
+            }),
+        )],
+    ));
+    let truncated_ambr = [0x48, 0x00, 0x04, 0x00];
+    let with_truncated_ambr = with_trailing_ie(&context_only, &truncated_ambr);
+    let error = S2bMessage::decode(&with_truncated_ambr, procedure_context())
+        .expect_err("PCO tolerance must not relax malformed mandatory framing");
+    assert_eq!(
+        error.code(),
+        &DecodeErrorCode::Truncated,
+        "the malformed AMBR fails framing, not merely for being absent"
+    );
+}
+
+#[test]
+fn create_bearer_retains_a_well_formed_nested_pco() {
+    // Preserve the existing Create Bearer compatibility view independently
+    // of Update Bearer's receive grammar.
+    let mut create = create_request(1, SEQUENCE);
+    create.bearer_contexts[0].additional_ies.push(typed(
+        0,
+        TypedIeValue::ProtocolConfigurationOptions(ProtocolConfigurationOptions {
+            value: vec![0x80, 0x21, 0x04],
+        }),
+    ));
+    let bytes = encode(&s2b_create_bearer_request(create).expect("valid Create Bearer Request"));
+    let (tail, decoded) =
+        S2bMessage::decode(&bytes, procedure_context()).expect("Create request decode");
+    assert!(tail.is_empty());
+    let projected = decoded
+        .as_view()
+        .expect("typed view")
+        .create_bearer_request()
+        .expect("Create projection");
+    assert_eq!(
+        projected.bearer_contexts[0]
+            .additional_ies
+            .iter()
+            .filter(|ie| ie.ie_type() == IE_TYPE_PCO && ie.instance == 0)
+            .count(),
+        1,
+        "Create Bearer retains the nested PCO"
+    );
+}
+
+/// Encode one raw TS 29.274 clause 5.5 TLIV information element.
+fn tlvi(ie_type: u8, instance: u8, value: &[u8]) -> Vec<u8> {
+    let length = u16::try_from(value.len()).expect("test IE value fits u16");
+    let mut encoded = vec![ie_type];
+    encoded.extend_from_slice(&length.to_be_bytes());
+    encoded.push(instance & 0x0f);
+    encoded.extend_from_slice(value);
+    encoded
+}
+
+/// Encode a complete GTPv2-C message from raw IE bytes.
+fn raw_procedure_message(message_type: u8, teid: u32, sequence: u32, ies: &[u8]) -> Vec<u8> {
+    let mut encoded = vec![0x48, message_type];
+    let declared = 8u16
+        .checked_add(u16::try_from(ies.len()).expect("IE bytes fit u16"))
+        .expect("message length fits u16");
+    encoded.extend_from_slice(&declared.to_be_bytes());
+    encoded.extend_from_slice(&teid.to_be_bytes());
+    encoded.push((sequence >> 16) as u8);
+    encoded.push((sequence >> 8) as u8);
+    encoded.push(sequence as u8);
+    encoded.push(0);
+    encoded.extend_from_slice(ies);
+    encoded
+}
+
+#[test]
+fn update_bearer_builders_reject_non_s2b_pco() {
+    let pco = || {
+        typed(
+            0,
+            TypedIeValue::ProtocolConfigurationOptions(ProtocolConfigurationOptions {
+                value: vec![0x80, 0x21, 0x01],
+            }),
+        )
+    };
+    let request = S2bUpdateBearerRequest {
+        sequence_number: SEQUENCE,
+        teid: REQUEST_TEID,
+        message_priority: None,
+        apn_ambr: AggregateMaximumBitRate {
+            uplink: 96_000,
+            downlink: 192_000,
+        },
+        bearer_contexts: vec![S2bUpdateBearerRequestContext {
+            ebi: ebi(7),
+            tft: Some(tft(1, 11, 4_501)),
+            bearer_qos: None,
+            additional_ies: Vec::new(),
+        }],
+        additional_ies: Vec::new(),
+    };
+    let response = S2bUpdateBearerResponse {
+        sequence_number: SEQUENCE,
+        teid: RESPONSE_TEID,
+        message_priority: None,
+        cause: CauseValue::RequestAccepted,
+        bearer_contexts: vec![S2bUpdateBearerResult {
+            ebi: ebi(7),
+            cause: CauseValue::RequestAccepted,
+            additional_ies: Vec::new(),
+        }],
+        additional_ies: Vec::new(),
+    };
+    for nested in [false, true] {
+        let mut malformed_request = request.clone();
+        if nested {
+            malformed_request.bearer_contexts[0]
+                .additional_ies
+                .push(pco());
+        } else {
+            malformed_request.additional_ies.push(pco());
+        }
+        assert!(s2b_update_bearer_request(malformed_request).is_err());
+        let mut malformed_response = response.clone();
+        if nested {
+            malformed_response.bearer_contexts[0]
+                .additional_ies
+                .push(pco());
+        } else {
+            malformed_response.additional_ies.push(pco());
+        }
+        assert!(s2b_update_bearer_response(malformed_response).is_err());
+    }
+    let bytes = encode(&s2b_update_bearer_request(request).expect("valid canonical request"));
+    let (_, decoded) = S2bMessage::decode(&bytes, procedure_context()).expect("canonical decode");
+    let projected = decoded
+        .as_view()
+        .expect("typed view")
+        .update_bearer_request()
+        .expect("canonical projection");
+    assert_eq!(projected.bearer_contexts[0].ebi, ebi(7));
+    assert!(projected.bearer_contexts[0].additional_ies.is_empty());
+    assert!(projected.additional_ies.is_empty());
+}
+
+/// Inject a complete unexpected member without passing it through a sender builder.
+fn with_first_bearer_member(message: &[u8], member: &[u8]) -> Vec<u8> {
+    let mut extended = message.to_vec();
+    let mut offset = 12;
+    while offset < message.len() {
+        let length = u16::from_be_bytes([message[offset + 1], message[offset + 2]]);
+        let end = offset + 4 + usize::from(length);
+        if message[offset] == opc_proto_gtpv2c::IE_TYPE_BEARER_CONTEXT {
+            extended.splice(end..end, member.iter().copied());
+            let added = u16::try_from(member.len()).expect("member fits u16");
+            let context_length = length.checked_add(added).expect("context fits u16");
+            extended[offset + 1..offset + 3].copy_from_slice(&context_length.to_be_bytes());
+            let message_length = u16::from_be_bytes([message[2], message[3]])
+                .checked_add(added)
+                .expect("message fits u16");
+            extended[2..4].copy_from_slice(&message_length.to_be_bytes());
+            return extended;
+        }
+        offset = end;
+    }
+    panic!("fixture has a bearer context");
+}
+
+#[test]
+fn update_bearer_multi_context_pco_keeps_correlation() {
+    let mut request = S2bUpdateBearerRequest {
+        sequence_number: SEQUENCE,
+        teid: REQUEST_TEID,
+        message_priority: None,
+        apn_ambr: AggregateMaximumBitRate {
+            uplink: 96_000,
+            downlink: 192_000,
+        },
+        bearer_contexts: vec![
+            S2bUpdateBearerRequestContext {
+                ebi: ebi(6),
+                tft: Some(tft(1, 11, 4_501)),
+                bearer_qos: None,
+                additional_ies: vec![typed(
+                    0,
+                    TypedIeValue::ProtocolConfigurationOptions(ProtocolConfigurationOptions {
+                        value: vec![0x80, 0x21, 0x01],
+                    }),
+                )],
+            },
+            S2bUpdateBearerRequestContext {
+                ebi: ebi(7),
+                tft: None,
+                bearer_qos: Some(qos(1)),
+                additional_ies: Vec::new(),
+            },
+        ],
+        additional_ies: Vec::new(),
+    };
+    let unexpected = request.bearer_contexts[0].additional_ies.remove(0);
+    let canonical =
+        encode(&s2b_update_bearer_request(request).expect("multi-context request builds"));
+    let mut member = BytesMut::new();
+    encode_typed_ie_sequence(&[unexpected], &mut member, EncodeContext::default())
+        .expect("unexpected PCO encoding");
+    let request_bytes = with_first_bearer_member(&canonical, &member);
+    let (_, decoded) = S2bMessage::decode(&request_bytes, procedure_context())
+        .expect("multi-context request with PCO decodes");
+    let projected_request = decoded
+        .as_view()
+        .expect("typed view")
+        .update_bearer_request()
+        .expect("multi-context request with PCO projects");
+    assert_eq!(projected_request.bearer_contexts.len(), 2);
+    assert_eq!(
+        projected_request.bearer_contexts[0]
+            .additional_ies
+            .iter()
+            .filter(|ie| ie.ie_type() == IE_TYPE_PCO)
+            .count(),
+        0
+    );
+
+    let response = S2bUpdateBearerResponse {
+        sequence_number: SEQUENCE,
+        teid: RESPONSE_TEID,
+        message_priority: None,
+        cause: CauseValue::RequestAccepted,
+        bearer_contexts: vec![
+            S2bUpdateBearerResult {
+                ebi: ebi(6),
+                cause: CauseValue::RequestAccepted,
+                additional_ies: Vec::new(),
+            },
+            S2bUpdateBearerResult {
+                ebi: ebi(7),
+                cause: CauseValue::RequestAccepted,
+                additional_ies: Vec::new(),
+            },
+        ],
+        additional_ies: Vec::new(),
+    };
+    let response_bytes =
+        encode(&s2b_update_bearer_response(response).expect("correlated response builds"));
+    let (_, decoded) = S2bMessage::decode(&response_bytes, procedure_context())
+        .expect("correlated response decodes");
+    let projected_response = decoded
+        .as_view()
+        .expect("typed view")
+        .update_bearer_response()
+        .expect("correlated response projects");
+    correlate_update_bearer_response(&projected_request, &projected_response)
+        .expect("PCO tolerance must not break EBI correlation");
+}
+
+#[test]
+fn update_bearer_response_ignores_nonzero_pco_instances() {
+    let ies = vec![
+        typed(
+            0,
+            TypedIeValue::Cause(opc_proto_gtpv2c::Cause {
+                value: CauseValue::RequestAccepted,
+                flags_octet: 0,
+                offending_ie: Vec::new(),
+            }),
+        ),
+        typed(
+            0,
+            TypedIeValue::BearerContext(BearerContext {
+                members: vec![
+                    typed(0, TypedIeValue::EpsBearerId(ebi(7))),
+                    typed(
+                        0,
+                        TypedIeValue::Cause(opc_proto_gtpv2c::Cause {
+                            value: CauseValue::RequestAccepted,
+                            flags_octet: 0,
+                            offending_ie: Vec::new(),
+                        }),
+                    ),
+                    typed(
+                        2,
+                        TypedIeValue::ProtocolConfigurationOptions(ProtocolConfigurationOptions {
+                            value: vec![0x80],
+                        }),
+                    ),
+                ],
+            }),
+        ),
+        typed(
+            1,
+            TypedIeValue::ProtocolConfigurationOptions(ProtocolConfigurationOptions {
+                value: vec![0x80],
+            }),
+        ),
+    ];
+    let bytes = encode(&owned_message(
+        UPDATE_BEARER_RESPONSE,
+        Some(RESPONSE_TEID),
+        ies,
+    ));
+    let (_, decoded) = S2bMessage::decode(&bytes, procedure_context())
+        .expect("nonzero response PCO instances are ignored, not rejected");
+    let projected = decoded
+        .as_view()
+        .expect("typed view")
+        .update_bearer_response()
+        .expect("nonzero response PCO instances must not reject the procedure");
+    assert!(projected
+        .additional_ies
+        .iter()
+        .all(|ie| ie.ie_type() != IE_TYPE_PCO));
+    assert!(projected.bearer_contexts[0]
+        .additional_ies
+        .iter()
+        .all(|ie| ie.ie_type() != IE_TYPE_PCO));
+}
+
+#[test]
+fn update_bearer_nested_truncated_pco_still_fails_framing() {
+    // Bearer Context value = EBI instance 0 (valid) + PCO declaring four value
+    // octets with none following.
+    let mut context_value = tlvi(0x49, 0, &[7]);
+    context_value.extend_from_slice(&[0x4e, 0x00, 0x04, 0x00]);
+    let context = tlvi(0x5d, 0, &context_value);
+    let mut ies = tlvi(0x48, 0, &[0x00, 0x01, 0x77, 0x00, 0x00, 0x02, 0xee, 0x00]);
+    ies.extend_from_slice(&context);
+    let bytes = raw_procedure_message(97, REQUEST_TEID, SEQUENCE, &ies);
+    let error = S2bMessage::decode(&bytes, procedure_context())
+        .expect_err("truncated nested PCO framing must stay rejected");
+    assert_eq!(error.code(), &DecodeErrorCode::Truncated);
+}
+
+#[test]
+fn update_bearer_duplicate_nested_pco_discards_all_occurrences() {
+    // Clause 7.7.9 discards unexpected IEs before singleton bookkeeping.
+    let bytes = encode(&owned_message(
+        UPDATE_BEARER_REQUEST,
+        Some(REQUEST_TEID),
+        vec![
+            typed(
+                0,
+                TypedIeValue::AggregateMaximumBitRate(AggregateMaximumBitRate {
+                    uplink: 96_000,
+                    downlink: 192_000,
+                }),
+            ),
+            typed(
+                0,
+                TypedIeValue::BearerContext(BearerContext {
+                    members: vec![
+                        typed(0, TypedIeValue::EpsBearerId(ebi(7))),
+                        typed(0, TypedIeValue::BearerTft(tft(1, 11, 4_501))),
+                        typed(
+                            0,
+                            TypedIeValue::ProtocolConfigurationOptions(
+                                ProtocolConfigurationOptions {
+                                    value: vec![0x80, 0x21, 0x01],
+                                },
+                            ),
+                        ),
+                        typed(
+                            0,
+                            TypedIeValue::ProtocolConfigurationOptions(
+                                ProtocolConfigurationOptions {
+                                    value: vec![0x80, 0x21, 0x02],
+                                },
+                            ),
+                        ),
+                    ],
+                }),
+            ),
+        ],
+    ));
+    let (_, decoded) = S2bMessage::decode_with_diagnostics(&bytes, procedure_context())
+        .expect("duplicate unexpected PCO is discarded");
+    let projected = decoded
+        .message()
+        .as_view()
+        .expect("typed view")
+        .update_bearer_request()
+        .expect("duplicate nested PCO must not reject");
+    let retained: Vec<_> = projected.bearer_contexts[0]
+        .additional_ies
+        .iter()
+        .filter(|ie| ie.ie_type() == IE_TYPE_PCO)
+        .collect();
+    assert!(
+        retained.is_empty(),
+        "every unexpected occurrence is discarded"
+    );
+    assert!(decoded.diagnostics().duplicate_ies().is_empty());
+    assert_eq!(projected.bearer_contexts[0].ebi, ebi(7));
+    assert!(projected.bearer_contexts[0].tft.is_some());
+}

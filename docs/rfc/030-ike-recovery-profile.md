@@ -26,7 +26,7 @@ execution ownership or effect fencing:
 | --- | --- |
 | `Ikev2CommittedWindow::replay_request` | Return only a committed request with no committed response. A settled exchange yields `None`. Record the behavior change in the CHANGELOG and reverse the settled-replay regression. |
 | Empty and cached-response admission | Permit the narrow outbound-only uncertain-write case for `reply_empty`, the cached branch of `request_disposition` and `replay_response`; retain receive, authority, revocation and sync checks. Only empty replies require current canonical-provider admission; committed ordinary replay needs no cryptography. Do not relax `ready()` for new work or other operations. |
-| `recovery/packet.rs::open` | Authenticate an otherwise applicable `SKF` before returning a typed `UnsupportedShape` reason. Unauthenticated input remains an ordinary drop and cannot trigger teardown. |
+| `receive_peer_packet` | Authenticate each negotiated SKF, enforce bounded reassembly and complete-message admission, and replay only on fragment 1. The legacy complete-SK `open_peer` retains typed `UnsupportedShape`. |
 | Profile record construction | Add a checked `from_profile_persisted` entry point with a mandatory, explicit base/negotiated synchronization-state argument, including explicit recovery-event presence or absence. Reuse existing records. The low-level optional `with_sync_state` sequence alone does not qualify a profile restore. |
 | `notify.rs` | Add the `INITIAL_CONTACT` constant and strict typed decoding; authentication, identity matching and cleanup remain composition responsibilities. |
 | Pending KE custody | Opt in through `require_dh_checkpoint(group)` and the optional `IkeDhCheckpoint` capability. Export an initiator's private value once into `Zeroizing` bytes; import recomputes and checks its public value. Persist the checkpoint inside the existing row envelope in the request's child CAS. A fixture-held handle surviving a simulated crash is insufficient. |
@@ -40,37 +40,65 @@ composition guarantees merely by remaining callable.
 
 | Dimension | Contract |
 | --- | --- |
-| Packet/profile | Complete, unfragmented `SK`; existing AES-GCM-16 with 128/192/256-bit keys, or the existing 48 CBC encryption/integrity/PRF combinations. Qualify every configured provider/profile and KE custody capability. |
+| Packet/profile | Complete `SK` or bilaterally negotiated `SKF`; existing AES-GCM-16 with 128/192/256-bit keys, or the existing 48 CBC encryption/integrity/PRF combinations. Qualify every configured provider/profile and KE custody capability. |
 | Exchange classes | Final IKE_AUTH seeding/replay, CREATE_CHILD_SA and INFORMATIONAL. Handshake authentication precedes established-SA effects. |
 | Request windows | One outstanding ordinary request in each independent direction, for both original roles. Never send `SET_WINDOW_SIZE`. Zero is a valid ID where that direction's history permits it; `None` means exhaustion. |
 | Empty receive | Canonical policy and preflight, checked restore, then `enable_empty_replies`. CBC uses `preflight_cbc`; sync readiness does not qualify canonical replies. |
-| Base recovery | Restore committed history and reconstruct the lost empty prefix. No synthetic local liveness probe. |
+| Liveness probe (opt-in) | Durable positive unwritten-ID bound, then a volatile empty `INFORMATIONAL` request: no per-probe store command, exact-byte exponential retransmission, fixed deadline and a matching authenticated INFORMATIONAL response, with or without payloads. Restart requires RFC 6311 synchronization beyond the bound or scoped SA retirement. Caller idleness covers authenticated IKE and Child-SA ESP traffic; NAT keepalives never count. |
+| Base recovery | Restore committed history and reconstruct the lost empty prefix. No synthetic local liveness probe is sent by recovery itself; an opt-in volatile probe is a separate caller-driven primitive (below). |
 | Negotiated sync | Persist authenticated bilateral agreement; require `sync_readiness`, initiation and response handlers. Never assert `IPSEC_REPLAY_COUNTER_SYNC_SUPPORTED` (16421); ESP counter restoration is outside this profile. |
 | Persistence | Exact prior birth/generation CAS under the current RFC 022 execution stamp, with the SA, window, IV state and operation outcome committed atomically. |
 | Execution | One live window and allocator owner per immutable SA key epoch, including within one process. Positive authority is required to recover that cohort. |
 | Excluded histories | Unknown or rolled-back key/IV state, omitted negotiated metadata, partial records, unconfirmed predecessor takeover and restored old ESP sequence state. |
 
-This profile does not negotiate IKE fragmentation. A bilateral fragmentation
-agreement permits later SKF use, including a large rekey, so qualifying only the
-initial packet sizes is insufficient. The configuration check must cover all
-admitted handshake and later exchange shapes. See
-[RFC 7383 §§2.3–2.4](https://www.rfc-editor.org/rfc/rfc7383.html#section-2.3).
-An authenticated SKF received nevertheless has a typed refusal and enters the
-committed, scoped Delete path below; it must not disappear as unexplained noise.
+RFC 7383 support is an explicit, durable opt-in before IKE_AUTH. Commit
+`prepare_fragmentation` from both exact SA_INIT transcripts and retain that
+agreement across IKE rekey. Use `receive_peer_packet` for ordinary traffic;
+`open_peer` is intentionally limited to complete SK. Missing bilateral support
+produces `FragmentationNotNegotiated` only after authentication. Authentication
+failure remains `Drop`. See [RFC 7383 §§2.3–2.6](https://www.rfc-editor.org/rfc/rfc7383.html#section-2.3)
+and the [API contract](../../crates/opc-proto-ikev2/README.md#negotiated-rfc-7383-fragmentation).
 
-The scoped implementation adds refusal diagnostics and tests, not fragment
-recovery. A consumer that requires SKF needs a separately sized extension for
-authenticated reassembly, persisted exact fragment responses, IV accounting and
-crash/retransmission coverage before enabling this profile. That decision is a
-consumer integration gate, not permission to silently narrow an already
-negotiated SA. This revision covers typed refusal and its REDs; full fragment
-recovery is a separate dependency if the consumer's declared
-handshake/rekey shapes require it. Before consumer integration implementation,
-the consumer must declare whether its IKE_AUTH or rekey exchanges require
-fragmentation; a required extension must then be sized and the integration
-reforecast before proceeding. No full-SKF estimate or support claim is made
-without that shape decision. Third-party interoperability remains separate for
-either cipher.
+Reassembly has separate request/response queues, each bounded to 256 fragments,
+64 KiB cleartext and 96 KiB wire bytes. Every fragment authenticates before
+storage; no partial payload or effect is released. Higher fragment totals
+replace the old incomplete set without refreshing its deadline. The caller
+schedules expiry even while idle. An authenticated bound violation closes the
+runtime and requires durable IKE/Child teardown. Timeout discards only the
+incomplete set, leaving ordinary exchange retry/expiry policy to the caller.
+
+Prepare and persist every outgoing packet atomically with the exchange outcome.
+Retain packet boundaries and order; restoring authenticates the whole collection
+and covers every locally sent GCM IV. A failed partial preparation burns IVs
+without releasing packets or advancing the ordinary Message ID. Retransmission
+uses the stored bytes without fresh encryption. Only authenticated fragment 1
+of a processed request triggers response replay, including canonical empty
+responses. Sync cutover discards incomplete queues. RFC 6311 synchronization
+messages must remain unfragmented ([RFC 7383 §3](https://www.rfc-editor.org/rfc/rfc7383.html#section-3)).
+Known PMTU and the RFC IPv4/IPv6 defaults include transport/cipher overhead;
+optional active PMTU probing is outside this profile.
+
+`tests/fragmented_recovery.rs` covers missing, reordered, duplicate, corrupt,
+replaced and oversized sets, exact errors, complete-SK replacement, canonical
+empty-prefix interaction, IV exhaustion and packet/cleartext boundaries.
+`tests/recovery_profile/fragmentation_tests.rs` composes complete encrypted rows,
+fenced CAS, 51 cipher profiles × two original roles × two sync modes, exact
+request/response replay and idempotent outcomes. Real child exits between request
+and response datagrams are followed by replacement processes that read only
+encrypted rows under successor ownership; replay consumes no new entropy or
+provider sealing call. IKE_AUTH certificate-shaped payload tests qualify
+fragment transport, not certificate verification or handshake authentication.
+
+The independent [Python reference](../../crates/opc-proto-ikev2/tests/vectors/ikev2_fragment_reference.py)
+uses OpenSSL through cryptography, with no SDK imports. Twelve known-answer
+sets cover GCM/CBC, three AES key sizes and both original roles. It verifies
+SDK-exported random-IV CBC and deterministic GCM packets, and rejects 6,456
+single-byte packet mutations. Published NIST examples check its cipher backend.
+Reproduce the pinned environment and run `--check`; set
+`OPC_FRAGMENT_VECTOR_EXPORT` while running the `fragment_vectors` Rust target,
+then pass that file to `--verify-export`. Provenance is retained beside the
+vectors. This is independent synthetic wire qualification, not a third-party
+VPN deployment or consumer integration claim.
 
 ## Durability, writer fencing and ownership
 
@@ -100,12 +128,12 @@ repeating an effect. Only after successfully obtaining and unsealing the fenced
 current records can their contents establish an irrecoverably uncertain outcome
 and select the typed uncertain-operation resolution and scoped terminal path.
 Do not leave an SA waiting forever for a pruned receipt. Store or key-provider
-`Unavailable`, timeout or throttling during this read/unseal is retryable
-backpressure, never evidence of missing/corrupt history or a terminal outcome.
-Preserve that distinction through the consumer wrapper until
-[#1197](https://github.com/openpacketcore/openpacketcore-sdk/issues/1197) supplies
-it through the full envelope path. Retry budgets bound attempts; their exhaustion
-does not turn provider unavailability into proof of permanent key loss.
+`Unavailable`, timeout or throttling during this read/unseal is bounded outage
+backpressure. `ProviderUnusable` and custody-state failures require a redacted
+report and backoff until repair. Neither class is missing/corrupt history or a
+terminal outcome. The envelope path carries these nonterminal outcomes; the
+coarser storage/network errors preserve nonterminal handling. Exhausted retry
+budgets never establish key loss.
 
 That last resolution is a consumer operation-state CAS plus idempotent cleanup,
 not a fabricated SDK completion token or a claim that an unrecorded operation
@@ -243,14 +271,46 @@ old encrypted WAL or snapshot bytes.
 
 Apply [#1197](https://github.com/openpacketcore/openpacketcore-sdk/issues/1197) to
 every row seal/unseal, including checkpoint creation, restore and fenced readback.
-Key-provider `Unavailable`, timeout and throttling are retryable backpressure;
-they release no uncommitted request and never select SA teardown. Until that
-classification reaches the full SDK envelope path, the consumer key-provider
-wrapper must preserve `KeyError::Unavailable` and equivalent transient outcomes
-before any generic crypto-error collapse. Do not treat retry-budget exhaustion
-as corruption. Authenticated-decryption failure, binding/public-value mismatch,
-unknown checkpoint format, provider `InvalidOutput`, or a positively missing (`NotFound`) or revoked key
-are terminal. Never infer any of those from an unavailable provider.
+Key-provider `Unavailable`, timeout and throttling are bounded retry backpressure.
+`ProviderUnusable` is also backpressure for the request and stored data, but
+requires a redacted operator configuration report and backoff until provider
+repair rather than immediate outage retries. It includes malformed endpoints,
+Unix permissions, TLS certificate/peer authentication, protocol/authentication
+alerts and invalid provider protocol responses. TLS `internal_error` (80) is an
+outage, not configuration evidence. Short-lived SVID expiry and certificate rotation
+MUST NOT turn retained ciphertext into a terminal recovery outcome.
+
+Both classes release nothing, delete nothing and never select SA teardown or a
+final cached mutation result. Preserve the exact row, ciphertext, version and
+pending replay while access is blocked. Key custody and generic envelopes
+preserve the outage/repair distinction. Storage and network boundaries may
+collapse both to a coarse unavailable error after a fixed operator diagnostic;
+they MUST preserve nonterminal handling, not claim that the full subtype survives.
+Retry-budget exhaustion is not corruption.
+
+Only positive evidence about a key or ciphertext permits terminal rejection.
+Use `KeyError::is_definitive_rejection()`: it is true only for a positively
+missing key (`NotFound`) or actual key revocation/ciphertext rejection
+(`OperationFailed`). Its exhaustive matches cover every key and custody variant;
+a new variant requires an explicit decision in the defining crate. All other
+errors retain data, including `RotationFailed`, invalid identifiers/metadata,
+and every `KeyCustodyOperationError`. Installation, identity, validation,
+capability, generic operation and provider-output failures prove no key/data
+verdict. Unknown downstream variants MUST default to nonterminal backpressure.
+
+Locally established authenticated-decryption failure, stored binding/public-value
+mismatch, unknown checkpoint format and the DH checkpoint `InvalidOutput`
+contract remain terminal. A malformed key-provider response or
+`KeyCustodyOperationError::InvalidProviderOutput` is provider failure, not that
+checkpoint verdict. Generic envelopes preserve a positive key verdict as
+`CryptoError::KeyRejected`; a local encryption failure does not reject stored
+bytes. Repair alone must permit recovery of the unchanged retained row.
+
+The JSON KMS `error` status is not a verdict by itself. Only exact structured
+`reason` values `key_not_found`, `key_revoked`, or `ciphertext_rejected` (the last
+only on `decrypt`) authorize a provider verdict. Missing/unknown reasons and
+free-form `error_message` text retain data as specified in RFC 003 §9.3.
+
 
 Peer KE validation is a separate protocol boundary. `InvalidPeerPublicKey`,
 `MalformedKeyExchange` and `KeyAgreementFailed` terminate the exchange and are
@@ -274,7 +334,7 @@ missing/corrupt recovery inputs use the scoped terminal rule and checkpoint
 removal above. An IKE rekey is never "cancelled" by deleting its new IKE SPI as a
 Child of the old SA.
 
-## Empty receive, replay and liveness
+## Empty receive, probe, replay and liveness
 
 An admitted empty request advances only the volatile next receive ID. Exact
 retransmissions reuse the cached response; changed bytes, retired IDs and gaps in
@@ -294,18 +354,33 @@ have forgotten its response, and even an answer to old bytes is not fresh
 liveness. [RFC 7296 §§2.1 and 2.4](https://www.rfc-editor.org/rfc/rfc7296.html#section-2.1)
 distinguish retransmission from a new liveness exchange.
 
-This profile has **no local empty-INFORMATIONAL liveness-check API**. Such a
-check requires a fresh request; it cannot be implemented by settled replay.
-Empty local requests remain `NoDurableWork`, and no DPD write stream is added.
-Fresh authenticated IKE/ESP traffic, including genuinely new peer DPD, supplies
-inbound evidence; reconstructed uncertain DPD does not. With only outgoing
-traffic, the consumer must schedule genuine committed new work, such as rekey,
-within its declared liveness bound. Failure follows unanswered new requests and
-their bounded retransmission policy, or the legitimate SA lifetime policy, not
-silence after a settled replay. Detection is consequently bounded by that rekey/
-lifetime interval plus protocol retries; this is not a fast local DPD facility.
-With no prior request, `replay_request` yields `None`; real new work can still
-progress at the retained send ID after reconciliation.
+The separate `start_empty_probe` path originates a fresh empty INFORMATIONAL
+without a per-probe window write. Durable `prepare_liveness(max_unwritten)`
+activation bounds the live send-ID lead; ordinary commits or an explicit
+checkpoint fold it into the next atomic record. The declared peer window is
+still one. A pending probe serializes other locally initiated requests but
+leaves the opposite direction available. Retries preserve every original byte
+and use bounded exponential backoff under a fixed monotone deadline. Only the
+authenticated INFORMATIONAL response carrying the outstanding probe Message ID
+completes the probe, once; it may carry payloads. `complete_empty_probe` returns
+those payloads for caller processing (RFC 7296 §1.4).
+
+GCM probes consume already reserved Ordinary IVs, never a new reservation or
+control headroom; CBC probes use fresh admitted random IVs. Caller idle policy
+uses authenticated IKE and Child-SA ESP traffic, excluding NAT keepalives
+(RFC 3948 section 4). Durable empty requests remain `NoDurableWork`.
+
+A restart may have lost either answered or outstanding probes. An enabled row
+therefore requires RFC 6311 synchronization with a next-send lower bound at the
+stored floor plus the full unwritten lead, capped without wrapping. A pending
+durable request remains safe to replay because it prevented later probes.
+Without negotiated synchronization, the consumer automatically retires the
+scoped SA and creates a fresh one. It must retain known timeout/clock failure
+through automatic cleanup; restart or readback cannot refund IDs or budgets.
+No operator or node action is part of recovery. Persist explicit liveness
+metadata and the last folded probe evidence with the versioned atomic row;
+unknown or missing format fields must be refused. Crossing the stored-record
+change requires a fresh install.
 
 ### Store outage must not silence empty replies
 
@@ -408,7 +483,7 @@ alone never selects terminal closure of healthy forwarding.
 | Failure class | Automatic action |
 | --- | --- |
 | Store unavailable/acknowledgement lost | Keep the exact pending CAS and installed healthy forwarding. Apply the outbound-witness empty/cached-response rule; resolve by exact retry/fenced readback. No guessed success, new mutation effect or voluntary SA reset. |
-| Key-provider unavailable, timeout or throttling | [#1197](https://github.com/openpacketcore/openpacketcore-sdk/issues/1197): retryable backpressure during any row seal/unseal, checkpoint creation/restore or fenced read. Preserve transient classification through the consumer wrapper until the full envelope path carries it. No uncommitted release, missing/corrupt classification or SA teardown; exhausted retry attempts do not prove key loss. |
+| Key-provider outage, unusable configuration or custody state | Outages use bounded backoff; configuration/custody failures emit a redacted report and wait for repair. All preserve the exact row and pending replay through seal/unseal, checkpoint restore and fenced read. Coarse storage/network errors remain nonterminal. No uncommitted release, corruption classification, final cached mutation result or SA teardown; exhausted attempts do not prove key loss. |
 | DH custody module or capability state | `CapabilityWithdrawn`, `NotInstalled`, `KeyGenerationFailed`, `Unavailable`, entropy failure, unsupported/unadmitted algorithms, timeouts and throttling are backpressure: retain the SA and pending checkpoint; a rekey that cannot be checkpointed waits. `IdentityChanged` and `ValidationChanged` also stop process admission and raise an alarm, without tearing down individual SAs. Only `InvalidCheckpoint`, `CheckpointPublicValueMismatch` or provider `InvalidOutput` are terminal at this boundary; revoked or positively missing keys follow the envelope rule. |
 | Invalid peer KE | `InvalidPeerPublicKey`, `MalformedKeyExchange` and `KeyAgreementFailed` fail the exchange, never backpressure. An authenticated request commits `INVALID_SYNTAX` before reply release and IKE closure. A bad response commits checkpoint removal and Child SA Delete intent, or IKE SA closure for an IKE rekey. Resume cleanup after restart; never install derived keys or a successor epoch. |
 | Retryable canonical refusal | `Unavailable`, `LifecycleBlocked`, `CapabilityActive` and `NotCommitted`: retain attempts/cache/identity; retry only after the known cause clears. Join an existing owner rather than constructing duplicates. A terminal lifecycle routes to cleanup, not endless retry. |
@@ -420,7 +495,7 @@ alone never selects terminal closure of healthy forwarding.
 | In-process runtime loss | Stop/join its executor, retain epoch ownership fencing and take exact readback before replacement. Cache bytes may be lost while release history survives; `AlreadyReleased` must reach the bounded remedy, not lifetime waiting. |
 | Reconcile failure | Classify row/key-provider failures before calling SDK reconcile. `ReconcileUnavailable` retains the quiescent runtime/cache/witness for provider retry. Other existing reconcile failures revoke the epoch; they do not subsume a transient row-unseal failure. Readback never manufactures effects from an unrecognized record. |
 | Authenticated unsupported shape | Report `UnsupportedShape`, retain exact cause, and commit an IKE Delete through the independent send window once pending local work resolves. Unauthenticated packets cannot select this path. |
-| Terminal envelope/checkpoint failure | Authenticated-decryption failure, binding/public-value mismatch, unknown checkpoint format, provider `InvalidOutput` or a positively `NotFound`/revoked key: refuse the epoch and perform scoped terminal cleanup. Remove any checkpoint in the terminal CAS. Under [#1197](https://github.com/openpacketcore/openpacketcore-sdk/issues/1197), unavailable/timeout/throttled reads are never these outcomes. |
+| Terminal envelope/checkpoint failure | Authenticated-decryption failure, binding/public-value mismatch, unknown checkpoint format, provider `InvalidOutput` or a positively `NotFound`/revoked key: refuse the epoch and perform scoped terminal cleanup. Remove any checkpoint in the terminal CAS. Unavailable, unusable, unclassified and custody-state provider failures are never these outcomes; use the shared positive-verdict predicate. |
 | Confirmed incomplete recovery history | A successfully unsealed but incomplete record cannot authorize recovery. Resolve its operation through the scoped terminal CAS, removing its checkpoint. Distinguish that evidence from an unavailable store or key provider; a newer-looking partial record alone is not recovery evidence. |
 
 No attach ceiling, per-empty receipt row, whole-worker reset or manual recovery
@@ -560,6 +635,7 @@ production SDK code.
 | `outage_keeps_peer_dpd_alive`: `lifecycle::outage_keeps_peer_dpd_alive_and_replays_a_cached_nonempty_response`, plus admission refusals | An outage beyond the peer timeout still permits empty and applicable cached nonempty replies with zero writes/ordinary IV/entropy; revocation stops them. | SDK `src/recovery.rs::request_disposition`: replace `ready_for_cached_response` with `ready` in the cached branch. Separate focused mutations cover the shared witness guard. |
 | `lost_prefix_then_nonempty`: `lifecycle::lost_prefix_then_nonempty_commits_the_repaired_floor` | Lost/reordered empty prefix, cached replay, a fresh nonempty result and MAX exhaustion preserve the peer's independent windows. | `driver::Runtime::restore`: omit enabling empty reconstruction. |
 | `cache_loss_refusal_and_shape_exit`: `remedy_tests::canonical_cache_loss_and_attempt_exhaustion_reach_sync_or_committed_delete` and SKF/cleanup tests | Actual cache loss and three invalid-output charges reach the bounded sync/Delete remedy; authenticated SKF is distinct from noise, and positive trust failure permits only scoped cleanup. | `remedy::canonical_failure`: make `AlreadyReleased`/`AttemptsExhausted` wait forever. |
+| `provider_error_verdicts`: `provider_configuration_tests` | Every key/custody variant and live KMS channel/reply failure crosses actual recovery/cleanup with unchanged ciphertext/version, no new crypto effect or packet release, and recovery after repair. Outage retry and repair-wait policies are distinct. Positive missing/revoked-key controls still clean up. | `envelope::classify_key_error`: treat a false shared verdict predicate as integrity failure; classify KMS diagnostic text as key loss. |
 | `nat_mapping_and_initial_contact`: `endpoint_tests`, `contact_tests` | Only committed fresh evidence changes routes; genuine challenge responses bind source and request; authenticated cleanup survives later traffic, excludes other identities/namespaces/new SA and refuses reincarnated victims. | `endpoint::Runtime::endpoint_empty`: accept replay as fresh; `contact::Authenticated::plan`: ignore identity; `contact::cleanup`: ignore birth or require final AUTH to remain in the ordinary cache. |
 | `mode_and_effect_authority`: `effect_tests::mode_and_effect_authority_requires_current_committed_outcome_once`, `codec_tests` | Current committed outcomes apply once; candidate/stale/closed outcomes and incomplete records refuse. | `effects::Effects::apply_fenced`: bypass the idempotency entry; `codec::ProfileCodec::decode`: default an omitted mode. |
 

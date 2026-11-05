@@ -74,7 +74,7 @@ fn strict_inbound_ppid_rejects_protected_and_non_ngap_data() {
 #[test]
 fn accepted_record_keeps_payload_stream_and_association_exactly() {
     let original = data(60);
-    let N2Inbound::Payload(admitted) = profile().admit(original.clone()).unwrap() else {
+    let N2Inbound::Payload(admitted) = profile().admit(data(60)).unwrap() else {
         panic!("DATA became a notification");
     };
     assert!(admitted.payload() == &original.payload, "payload changed");
@@ -148,19 +148,22 @@ fn truncated_and_unordered_data_cannot_become_payload() {
 #[test]
 fn notification_bytes_never_become_ngap_and_do_not_use_the_data_cap_or_ppid() {
     let event = SctpEvent::Shutdown { assoc_id: 41 };
-    let mut notification = data(66);
-    notification.notification = true;
-    notification.event = Some(event);
-    notification.payload = Bytes::from_static(b"synthetic notification beyond DATA cap");
-    let admitted = profile().admit(notification.clone()).unwrap();
+    let make_notification = || InboundMessage {
+        notification: true,
+        event: Some(event),
+        payload: Bytes::from_static(b"synthetic notification beyond DATA cap"),
+        ..data(66)
+    };
+    let admitted = profile().admit(make_notification()).unwrap();
     assert!(matches!(admitted, N2Inbound::Notification(actual) if actual == event));
     assert!(format!("{admitted:?}") == "N2Inbound::Notification { .. }");
+    let mut notification = make_notification();
     notification.truncated = true;
     assert!(matches!(
-        profile().admit(notification.clone()),
+        profile().admit(notification),
         Err(N2Error::TruncatedPayload)
     ));
-    notification.truncated = false;
+    let mut notification = make_notification();
     notification.control_truncated = true;
     assert!(matches!(
         profile().admit(notification),

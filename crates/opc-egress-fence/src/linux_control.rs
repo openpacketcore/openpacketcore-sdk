@@ -1,5 +1,6 @@
 //! Linux `BPF_PROG_RUN` adapter for the frozen egress-fence control ABI.
 
+use std::os::fd::AsFd;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -47,10 +48,15 @@ impl BootClock for LinuxBootClock {
     async fn wait_poll(&self, duration: Duration) -> Result<(), KernelFailure> {
         let timer =
             opc_linux_gtpu_sys::BootTimeTimer::new(duration).map_err(|_| KernelFailure::Clock)?;
-        let timer = tokio::io::unix::AsyncFd::new(timer).map_err(|_| KernelFailure::Clock)?;
+        let timer = timer.into_owned_fd().map_err(|_| KernelFailure::Clock)?;
+        let timer =
+            opc_tokio_fd_sys::AsyncOwnedFd::with_interest(timer, tokio::io::Interest::READABLE)
+                .map_err(|_| KernelFailure::Clock)?;
         loop {
             let mut readiness = timer.readable().await.map_err(|_| KernelFailure::Clock)?;
-            match readiness.try_io(|inner| inner.get_ref().consume_expirations()) {
+            match readiness.try_io(|inner| {
+                opc_linux_gtpu_sys::consume_timer_expirations(inner.get_ref().as_fd())
+            }) {
                 Ok(Ok(expirations)) if expirations != 0 => return Ok(()),
                 Ok(_) => return Err(KernelFailure::Clock),
                 Err(_would_block) => {}
@@ -466,4 +472,27 @@ fn decode_entry(
         deadline_boot_ns: entry.deadline_boot_ns(),
         control_epoch: entry.control_epoch(),
     })
+}
+
+#[cfg(test)]
+mod clock_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn boot_timer_reactor_waits_for_the_actual_expiration() {
+        let clock = LinuxBootClock;
+        let before = clock.now_boot_ns().expect("boot clock");
+        tokio::time::timeout(
+            Duration::from_secs(1),
+            clock.wait_poll(Duration::from_millis(2)),
+        )
+        .await
+        .expect("bounded timer readiness")
+        .expect("boot timer expiration");
+        assert!(clock.now_boot_ns().expect("boot clock") - before >= 2_000_000);
+        assert!(matches!(
+            clock.wait_poll(Duration::ZERO).await,
+            Err(KernelFailure::Clock)
+        ));
+    }
 }

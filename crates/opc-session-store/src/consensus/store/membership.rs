@@ -2204,6 +2204,8 @@ impl ConsensusSessionStore {
             restore_scan_unavailable_for_test: AtomicBool::new(false),
             #[cfg(feature = "test-control")]
             restore_scan_rejections_for_test: AtomicU64::new(0),
+            #[cfg(feature = "test-control")]
+            restore_scan_fence_delay_for_test: Mutex::new(None),
             proactive_checkpoint_lane,
             consensus_log_prune_lane,
             storage_identity,
@@ -2233,6 +2235,7 @@ impl ConsensusSessionStore {
             diagnostics,
             shutdown: ConsensusShutdownCoordinator::new(),
             retirement: ConsensusRetirementCoordinator::new(),
+            roster_maintenance: OnceLock::new(),
             #[cfg(test)]
             accepted_receiver_test_outcomes: Mutex::new(VecDeque::new()),
         });
@@ -2253,6 +2256,10 @@ impl ConsensusSessionStore {
         store
             .stage_topology_transition_peers(&request, desired_peers)
             .map_err(|_| ConsensusSessionStoreOpenError::PeerSetMismatch)?;
+        let _ = store
+            .inner
+            .roster_maintenance
+            .set(roster_maintenance::start(Arc::downgrade(&store.inner)));
         Ok(store)
     }
 

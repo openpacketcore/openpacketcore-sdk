@@ -100,13 +100,104 @@ QUIESCENT_VOID_LIB_TESTS = (
     "consumer_void_unavailable_row_advances_past_status_resolvable_rows_and_wraps",
     "consumer_void_available_rows_drain_in_one_sweep_after_cursor_wrap",
 )
+# These controlled-turn signed progress proofs make no arrival-rate or
+# physical latency claim. Keep their backlog assertions and operation budgets
+# in the checked O1 timing profile.
+# The completion-congestion proofs also retain their literal operation budgets
+# while draining a deliberately held wave of signed requests.
+QUIESCENT_ROSTER_LIB_MODULE = "consensus::store::sequential_wal_sdk_tests"
+QUIESCENT_ROSTER_LIB_TESTS = (
+    "roster_maintenance_native_keeps_up_with_ten_due_rows_per_second",
+    "roster_maintenance_sqlite_keeps_up_with_ten_due_rows_per_second",
+    "roster_completion::roster_completion_native_ordinary_wave_does_not_delay_emergency_admission",
+    "roster_completion::roster_completion_native_ordinary_wave_does_not_delay_emergency_completion",
+    "roster_completion::roster_completion_native_ordinary_wave_consumes_normal_quota",
+    "roster_completion::roster_completion_sqlite_ordinary_wave_does_not_delay_emergency_admission",
+    "roster_completion::roster_completion_sqlite_ordinary_wave_does_not_delay_emergency_completion",
+    "roster_completion::roster_completion_sqlite_ordinary_wave_consumes_normal_quota",
+)
+# These proofs own a large fraction of the process verification allowance.
+# Keep their literal payloads and cap, and give each a fresh ordinary-profile
+# process rather than admitting concurrent library fixtures against that cap.
+QUIESCENT_VERIFICATION_LIB_TESTS = (
+    "consensus::native::generation::tests::rollover_capacity_tests::"
+    "native_checkpoint_delta_payload_can_exceed_the_verification_allowance",
+    "consensus::native::epoch_floor_tests::"
+    "native_epoch_floor_matches_fake_through_two_real_threshold_rotations",
+    "consensus::native::changes::tests::"
+    "native_scratch_worker_accepts_exact_original_log_limit_with_large_conflict_body",
+    "consensus::native::changes::tests::reclaim_memory::"
+    "native_reclaim_memory_candidate_counts_effects_and_tops_up_shortfall",
+    "consensus::native::changes::tests::reclaim_memory::"
+    "native_reclaim_memory_mixed_delivery_retains_full_reservation",
+    "consensus::native::changes::tests::reclaim_memory::"
+    "native_reclaim_memory_refund_probe_covers_early_shrink",
+    "consensus::native::changes::tests::reclaim_memory::"
+    "native_reclaim_memory_refund_probe_follows_split_owner",
+    "consensus::native::changes::tests::reclaim_memory::"
+    "native_reclaim_memory_void_mixed_delivery_retains_full_reservation",
+    "consensus::native::generation::catalog::tests::"
+    "native_journal_page_admission_preserves_selected_ranges_cancellation_and_integrity",
+    "consensus::native::generation::decode::tests::"
+    "native_generation_cold_log_preflight_accepts_original_256_profile_and_exact_16mib_conflict",
+    "consensus::native::generation::decode::tests::"
+    "native_owned_key_notification_and_log_copies_release_decoder_backing_with_large_valid_aad",
+    "consensus::native::generation::decode::tests::roster::"
+    "native_roster_log_maximum_admission_body_keeps_original_bounds_and_detached_storage",
+    "consensus::native::generation::decode::tests::roster::"
+    "native_roster_notification_codecs_charge_both_records_and_release_decoder_payloads",
+    "consensus::native::prefix::tests::"
+    "native_prefix_reservations_use_existing_process_limit_and_shared_view_ownership",
+    "consensus::native::scratch::tests::"
+    "native_scratch_production_path_uses_existing_global_budget",
+    "consensus::storage::tests::native_log_retained_bound::"
+    "native_log_three_cycles_reclaim_and_reopen_async",
+    "consensus::storage::tests::native_reopen_formats::responsiveness::"
+    "native_format_preflight_cancels_queued_scans",
+    "consensus::storage::tests::native_reopen_formats::responsiveness::"
+    "native_format_preflight_cancels_running_scans",
+    "consensus::storage::tests::native_reopen_formats::responsiveness::"
+    "native_format_preflight_keeps_runtime_responsive_before_scope_lookup",
+    "consensus::storage::tests::native_reopen_formats::responsiveness::"
+    "native_format_preflight_keeps_runtime_responsive_for_matching_scope",
+    "consensus::storage::tests::native_reopen_formats::responsiveness::"
+    "native_full_open_cancels_running_admission_and_releases_owners",
+    "consensus::storage::tests::native_reopen_formats::responsiveness::"
+    "native_full_open_keeps_runtime_responsive_for_installed_generation",
+    "consensus::storage::tests::native_reopen_formats::responsiveness::"
+    "native_full_open_keeps_runtime_responsive_for_selected_generation",
+    "consensus::storage::tests::native_reopen_formats::responsiveness::"
+    "native_full_open_worker_failures_keep_typed_refusals",
+    "consensus::store::async_persistence::tests::writer::"
+    "async_persistence_public_v2_and_snapshot_work_continue_during_writer_stall",
+    "consensus::store::sequential_wal_sdk_tests::native_log_bound::"
+    "native_leader_three_cycles_reproposes_one_idempotent_request_and_reopens",
+    "consensus::store::sequential_wal_sdk_tests::scope_batch::"
+    "scope_batch_requires_every_voter_then_commits_one_command_and_recovers_exact_rows",
+    "sqlite::consensus::tests::native::basis::cold_reads::"
+    "native_selected_log_read_returns_eight_full_256_request_rows_with_shared_memory_bound",
+    "sqlite::consensus::tests::native::basis::public_reads::"
+    "native_consensus_restore_late_delivery_preserves_terminal_cursor_error",
+    "sqlite::consensus::tests::native::basis::public_reads::"
+    "native_public_dispatch_ignores_sql_lanes_and_rejects_retained_closed_owner",
+    "sqlite::consensus::tests::native::public_reads::"
+    "native_public_record_journal_and_restore_pages_preserve_sql_cursors_across_cold_reopen",
+    "sqlite::consensus::tests::native::public_reads::"
+    "native_public_restore_filtered_progress_and_stale_revision_match_original_page_limits",
+    "sqlite::consensus::tests::native::public_reads::"
+    "native_public_selected_journal_ranges_preserve_sql_bytes_and_cancellation",
+    "sqlite::consensus::tests::native::retained_snapshot::"
+    "canonical_native_notification_history_round_trips_through_cold_native_catalog",
+)
 QUIESCENT_LIB_TESTS = (
+    *QUIESCENT_VERIFICATION_LIB_TESTS,
     "persistent_three_voter_consumer_write_does_not_spend_budget_on_a_read_quorum",
     "persistent_three_voter_fenced_status_converges_after_response_loss_and_compaction",
     "persistent_three_voter_first_transition_has_one_leader_activation_proof",
     "persistent_three_voter_protected_roster_survives_real_os_process_loss",
     QUIESCENT_SELECTOR_LIB_TEST,
     *QUIESCENT_VOID_LIB_TESTS,
+    *QUIESCENT_ROSTER_LIB_TESTS,
     "protected_consumer_chain_after_activation_elides_outer_capability_wire_calls",
     "persistent_three_voter_protected_roster_creates_absent_record_then_established_terminal",
     "persistent_three_voter_protected_roster_aborted_exact_bytes_survive_snapshot_and_full_restart",
@@ -139,6 +230,7 @@ QUIESCENT_CONSENSUS_OPENRAFT_TESTS = (
 )
 OPTIMIZED_QUIESCENT_LIB_TESTS = frozenset(
     {
+        *QUIESCENT_ROSTER_LIB_TESTS,
         "protected_consumer_chain_after_activation_elides_outer_capability_wire_calls",
         "persistent_three_voter_protected_roster_creates_absent_record_then_established_terminal",
         "persistent_three_voter_protected_roster_aborted_exact_bytes_survive_snapshot_and_full_restart",
@@ -149,13 +241,23 @@ OPTIMIZED_QUIESCENT_LIB_TESTS = frozenset(
 )
 if not OPTIMIZED_QUIESCENT_LIB_TESTS.issubset(QUIESCENT_LIB_TESTS):
     raise RuntimeError("optimized timing tests must also be isolated timing tests")
-# Keep O1 confined to the protected-transition and snapshot/restart proofs.
+# Keep O1 confined to protected-transition, roster-rate and snapshot/restart proofs.
 # Its functional counterpart uses the same optimized execution, debug
 # assertions, and overflow checks as the separate 100 ms performance gate.
 # Match the IPsec/i686 lanes.
 # Applying it to unrelated expiry/fault tests changes their lifecycle timing
 # and would no longer qualify the repository's ordinary test profile.
 OPTIMIZED_QUIESCENT_SHARD = "quiescent-o1"
+
+# These two signed backend work proofs exceed ordinary-shard headroom. Only
+# their exact names may join this existing O1 runner; its original full-bound
+# proof and every other library test retain their prior owner and profile.
+WORK_PROOF_SHARD = "native-log-6"
+WORK_PROOF_LIB_TESTS = tuple(
+    "sqlite::consensus::tests::native::roster::roster_work_bound::"
+    f"roster_maintenance_{backend}_work_is_independent_of_retained_history"
+    for backend in ("native", "sqlite")
+)
 
 # A partition that collapses to a handful of targets would still be "total and
 # disjoint" if metadata were misread, so hold a floor on the real inventory
@@ -344,20 +446,27 @@ def shard_ids(plan: dict) -> list[str]:
 
 
 def qualified_quiescent_lib_test(name: str) -> str:
+    if name in QUIESCENT_VERIFICATION_LIB_TESTS:
+        return name
     if name == QUIESCENT_SELECTOR_LIB_TEST:
         return f"{QUIESCENT_SELECTOR_LIB_MODULE}::{name}"
     if name in QUIESCENT_VOID_LIB_TESTS:
         return f"{QUIESCENT_VOID_LIB_MODULE}::{name}"
+    if name in QUIESCENT_ROSTER_LIB_TESTS:
+        return f"{QUIESCENT_ROSTER_LIB_MODULE}::{name}"
     return f"{QUIESCENT_LIB_MODULE}::{name}"
 
 
 def quiescent_lib_command(name: str) -> list[str]:
-    """Run one private-lib timing contract in its exact isolated profile."""
+    """Run one timing or verification contract in its exact isolated profile."""
     profile = (
         ["env", "CARGO_PROFILE_TEST_OPT_LEVEL=1"]
         if name in OPTIMIZED_QUIESCENT_LIB_TESTS
         else []
     )
+    if name in QUIESCENT_ROSTER_LIB_TESTS:
+        profile += ["CARGO_PROFILE_TEST_DEBUG_ASSERTIONS=true",
+                    "CARGO_PROFILE_TEST_OVERFLOW_CHECKS=true"]
     return profile + SELECTION + [
         "--lib",
         "--",
@@ -394,8 +503,13 @@ def lib_group_names(group: dict) -> list[str]:
     return [f"{group['module']}::{name}" for name in group["tests"]]
 
 
+def serial_lib_names(plan: dict) -> tuple[str, ...]:
+    """Keep process-wide scheduling gates out of the parallel harness."""
+    return (*SERIAL_LIB_TESTS, *sorted(plan.get("serial_lib_shards", {})))
+
+
 def moved_lib_names(plan: dict) -> list[str]:
-    return [*SERIAL_LIB_TESTS, *(
+    return [*serial_lib_names(plan), *(
         qualified_quiescent_lib_test(name) for name in QUIESCENT_LIB_TESTS
     )] + [
         name for group in plan.get("lib_groups", []) for name in lib_group_names(group)
@@ -415,10 +529,18 @@ def serial_lib_command(name: str) -> list[str]:
 
 
 def lib_group_command(group: dict) -> list[str]:
-    if any(name in native_log_bound.TESTS for name in lib_group_names(group)):
-        return ["env", "CARGO_PROFILE_TEST_OPT_LEVEL=1", *SELECTION,
+    names = lib_group_names(group)
+    if any(name in WORK_PROOF_LIB_TESTS for name in names):
+        return ["env", "CARGO_PROFILE_TEST_OPT_LEVEL=1",
+                "CARGO_PROFILE_TEST_DEBUG_ASSERTIONS=true",
+                "CARGO_PROFILE_TEST_OVERFLOW_CHECKS=true", *SELECTION,
+                "--lib", "--", "--test-threads=1", "--nocapture", "--exact", *names]
+    native = next((name for name in names if name in native_log_bound.CORE_TESTS), None)
+    if native is not None:
+        profile = native_log_bound.profile_env(native)
+        return ["env", *(f"{key}={value}" for key, value in profile.items()), *SELECTION,
                 "--lib", "--", "--test-threads=1", "--nocapture", "--exact",
-                *lib_group_names(group)]
+                *names]
     return SELECTION + ["--lib", "--", *HARNESS, "--exact", *lib_group_names(group)]
 
 
@@ -445,6 +567,22 @@ def quiescent_consensus_openraft_command(name: str) -> list[str]:
     ]
 
 
+QUIESCENT_RETAINED_SNAPSHOT_TARGET = "fenced_transition_v2_qualification"
+QUIESCENT_RETAINED_SNAPSHOT_TESTS = (
+    "retained_snapshot::durable_retained_notification_snapshot_boundary_round_trip",
+    "retained_snapshot::async_retained_notification_snapshot_boundary_round_trip",
+)
+
+
+def quiescent_retained_snapshot_command(name: str) -> list[str]:
+    """Keep the literal full-window proof in its checked optimized profile."""
+    return ["env", "CARGO_PROFILE_TEST_OPT_LEVEL=1",
+            "CARGO_PROFILE_TEST_DEBUG_ASSERTIONS=true",
+            "CARGO_PROFILE_TEST_OVERFLOW_CHECKS=true", *SELECTION,
+            "--test", QUIESCENT_RETAINED_SNAPSHOT_TARGET,
+            "--", "--test-threads=1", "--exact", name]
+
+
 def quiescent_contracts() -> tuple:
     """Integration-target contracts that require a fresh test process."""
     return (
@@ -452,6 +590,11 @@ def quiescent_contracts() -> tuple:
             QUIESCENT_CONSENSUS_OPENRAFT_TARGET,
             QUIESCENT_CONSENSUS_OPENRAFT_TESTS,
             quiescent_consensus_openraft_command,
+        ),
+        (
+            QUIESCENT_RETAINED_SNAPSHOT_TARGET,
+            QUIESCENT_RETAINED_SNAPSHOT_TESTS,
+            quiescent_retained_snapshot_command,
         ),
     )
 
@@ -589,7 +732,7 @@ def commands(plan: dict, shard: str, targets: list[str]) -> list[list[str]]:
             for arg in ("--skip", name)
         ]
         return [
-            *(serial_lib_command(name) for name in SERIAL_LIB_TESTS),
+            *(serial_lib_command(name) for name in serial_lib_names(plan)),
             SELECTION + ["--lib", "--", *HARNESS, "--exact", *lib_skips],
             *extra,
             # Library names must never filter a binary's unrelated tests.
@@ -640,9 +783,11 @@ def run_libraries(plan: dict, shard: int, output: Path) -> None:
     phase = [command for command in commands(plan, "misc", targets) if "--lib" in command]
     print("Compile and inventory the complete workspace library selection", flush=True)
     rows, metadata = library_partition.inventory(SELECTION, ROOT)
-    planned = {index: library_partition.commands(phase, len(SERIAL_LIB_TESTS), rows, index)
+    ordinary_index = len(serial_lib_names(plan))
+    serial_owners = plan.get("serial_lib_shards", {})
+    planned = {index: library_partition.commands(phase, ordinary_index, rows, index, serial_owners)
                for index in library_partition.SHARDS}
-    library_partition.verify(phase, len(SERIAL_LIB_TESTS), rows, planned, metadata)
+    library_partition.verify(phase, ordinary_index, rows, planned, metadata, serial_owners)
     all_libraries = {f"library-{index}": invocations for index, invocations in planned.items()}
     all_libraries.update({owner: [command for command in commands(plan, owner, targets) if "--lib" in command]
                           for owner in shard_ids(plan) if owner != "misc"})
@@ -653,9 +798,11 @@ def run_libraries(plan: dict, shard: int, output: Path) -> None:
     output.write_text(json.dumps({
         "head": subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=ROOT, text=True).strip(),
         "tests": rows, "logical_library_phase": phase, "plans": planned,
+        "library_partition_count": len(library_partition.SHARDS),
         "child_parents": child_parents, "named_test_owners": named_owners,
     }, indent=2) + "\n")
-    print(f"Exact library partition verified: {len(rows)} test identities; mapping: {output}", flush=True)
+    print(f"Exact library partition {shard}/{len(library_partition.SHARDS)} verified: "
+          f"{len(rows)} test identities; mapping: {output}", flush=True)
     for index, command in enumerate(planned[shard]):
         print(f"library shard {shard}: invocation {index + 1}/{len(planned[shard])}", flush=True)
         result = subprocess.run(command, cwd=ROOT)
@@ -745,7 +892,7 @@ def verify_commands(plan: dict, targets: list[str]) -> None:
     if len(set(qualification)) != len(qualification) or set(qualification) & set(named):
         sys.exit("qualification names are duplicated or also assigned to a required shard")
     misc_commands = commands(plan, "misc", targets)
-    serial = [serial_lib_command(name) for name in SERIAL_LIB_TESTS]
+    serial = [serial_lib_command(name) for name in serial_lib_names(plan)]
     if misc_commands[:len(serial)] != serial:
         sys.exit("misc must run its exact serial library phase before parallel tests")
     ordinary_index = len(serial)
@@ -919,6 +1066,15 @@ def verify_lib_plan(plan: dict) -> None:
         sys.exit("serial library test also belongs to an isolated timing contract")
     claimed.update(SERIAL_LIB_TESTS)
     rust_path = re.compile(r"[A-Za-z_][A-Za-z_0-9]*(?:::[A-Za-z_][A-Za-z_0-9]*)*")
+    serial_owners = plan.get("serial_lib_shards", {})
+    if not isinstance(serial_owners, dict) or any(
+        not rust_path.fullmatch(name) or type(owner) is not int or owner not in library_partition.SHARDS
+        for name, owner in serial_owners.items()
+    ):
+        sys.exit("invalid isolated library process owner")
+    if claimed.intersection(serial_owners):
+        sys.exit("isolated library process overlaps another serial contract")
+    claimed.update(serial_owners)
     for group in plan.get("lib_groups", []):
         if group["shard"] not in group_shards:
             sys.exit(f"invalid library-group shard: {group['shard']!r}")
@@ -935,17 +1091,22 @@ def verify_lib_plan(plan: dict) -> None:
             for child, parent in children.items()
         ):
             sys.exit("subprocess children require enabled parents in the same library group")
-        if any(name in native_log_bound.TESTS for name in names):
-            if len(names) != 1 or group["shard"] != native_log_bound.CORE_SHARDS[native_log_bound.TESTS.index(names[0])]:
+        if any(name in native_log_bound.CORE_TESTS for name in names):
+            if len(names) != 1 or group["shard"] != native_log_bound.CORE_SHARDS[native_log_bound.CORE_TESTS.index(names[0])]:
                 sys.exit("full native log proofs must each own one dedicated parallel shard")
+        elif any(name in WORK_PROOF_LIB_TESTS for name in names):
+            if len(names) != 1 or group["shard"] != WORK_PROOF_SHARD:
+                sys.exit("only exact backend work proofs may join their O1 headroom lane")
         elif group["shard"] in native_log_bound.CORE_SHARDS:
             sys.exit("dedicated native log proof shards cannot carry ordinary tests")
         for name in lib_group_names(group):
             if name in claimed:
                 sys.exit(f"library test is claimed more than once: {name!r}")
             claimed.add(name)
-    if not set(native_log_bound.TESTS).issubset(claimed):
+    if not set(native_log_bound.CORE_TESTS).issubset(claimed):
         sys.exit("full native log proofs are missing from the heavy library groups")
+    if not set(WORK_PROOF_LIB_TESTS).issubset(claimed):
+        sys.exit("backend work proofs are missing from their O1 headroom lane")
 
 
 def verify(plan: dict, targets: list[str]) -> None:
@@ -1011,23 +1172,15 @@ def list_heavy_tests(plan: dict, extra: list[str]) -> list[str]:
 
 
 def list_quiescent_test(target: str, name: str) -> list[str]:
-    """Resolve the isolated timing contract using its exact CI invocation."""
-    command = SELECTION + [
-        "--test",
-        target,
-        "--",
-        "--list",
-        "--exact",
-        name,
-    ]
-    out = subprocess.run(
-        command, cwd=ROOT, text=True, stdout=subprocess.PIPE, check=True
-    ).stdout
-    return [
-        line.rsplit(":", 1)[0]
-        for line in out.splitlines()
-        if line.endswith(": test")
-    ]
+    factory = next(factory for declared, _, factory in quiescent_contracts()
+                   if declared == target)
+    command = factory(name)
+    cut = command.index("--")
+    command = command[:cut + 1] + ["--list"] + command[cut + 1:]
+    output = subprocess.run(command, cwd=ROOT, text=True,
+                            stdout=subprocess.PIPE, check=True).stdout
+    return [line.removesuffix(": test") for line in output.splitlines()
+            if line.endswith(": test")]
 
 
 def list_quiescent_lib_test(name: str) -> list[str]:
@@ -1095,7 +1248,9 @@ def precheck(plan: dict, shard: str, *, split_libraries: bool = False) -> None:
             by_profile.setdefault(prefix, []).extend(lib_group_names(group))
         for prefix, names in by_profile.items():
             command = [*prefix, "--", "--list", "--exact", *names]
-            print(f"{shard}: compile/list {len(names)} library test(s) with {'O1' if 'CARGO_PROFILE_TEST_OPT_LEVEL=1' in prefix else 'ordinary'} profile", flush=True)
+            profile = next((f"O{arg.split('=', 1)[1]}" for arg in prefix
+                            if arg.startswith("CARGO_PROFILE_TEST_OPT_LEVEL=")), "ordinary")
+            print(f"{shard}: compile/list {len(names)} library test(s) with {profile} profile", flush=True)
             output = subprocess.run(
                 command, cwd=ROOT, text=True, stdout=subprocess.PIPE, check=True
             ).stdout
@@ -1110,7 +1265,7 @@ def precheck(plan: dict, shard: str, *, split_libraries: bool = False) -> None:
                     f"missing {dict(Counter(names) - selected)}, "
                     f"unexpected {dict(selected - Counter(names))}"
                 )
-            if any(name in native_log_bound.TESTS for name in names):
+            if any(name in (*native_log_bound.CORE_TESTS, *WORK_PROOF_LIB_TESTS) for name in names):
                 output = subprocess.run(
                     [*command, "--ignored"], cwd=ROOT, text=True,
                     stdout=subprocess.PIPE, check=True

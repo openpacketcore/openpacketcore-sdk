@@ -12,7 +12,7 @@ use std::time::Duration;
 /// Own the admitted lock, rather than relying on the last OS descriptor close.
 /// A concurrent preflight child can inherit this file description until exec.
 /// Only the final SDK owner releases it; failed acquisition owns no unlock.
-pub(crate) struct AdmissionFileLock(File);
+pub(crate) struct AdmissionFileLock(File, #[cfg(test)] Option<Box<dyn Fn() + Send + Sync>>);
 
 impl AdmissionFileLock {
     #[cfg(unix)]
@@ -26,7 +26,16 @@ impl AdmissionFileLock {
                 }
             },
         )?;
-        Ok(Self(file))
+        Ok(Self(
+            file,
+            #[cfg(test)]
+            None,
+        ))
+    }
+
+    #[cfg(all(test, target_os = "linux"))]
+    pub(crate) fn before_unlock(&mut self, hook: impl Fn() + Send + Sync + 'static) {
+        self.1 = Some(Box::new(hook));
     }
 }
 
@@ -40,6 +49,10 @@ impl std::ops::Deref for AdmissionFileLock {
 
 impl Drop for AdmissionFileLock {
     fn drop(&mut self) {
+        #[cfg(test)]
+        if let Some(hook) = &self.1 {
+            hook();
+        }
         #[cfg(unix)]
         let _ = rustix::fs::flock(&self.0, rustix::fs::FlockOperation::Unlock);
     }
@@ -50,8 +63,11 @@ impl Drop for AdmissionFileLock {
 pub(crate) struct FileAdmission {
     pub(crate) path: PathBuf,
     pub(crate) parent: File,
-    pub(crate) lock: AdmissionFileLock,
+    // Fields drop in declaration order. Every main-file descriptor must close
+    // before admission unlock, or its close could erase a successor's POSIX locks.
     pub(crate) database: File,
+    pub(crate) completion: Option<(PathBuf, File)>,
+    pub(crate) lock: AdmissionFileLock,
     pub(crate) identity: [u64; 6],
 }
 
@@ -68,6 +84,14 @@ impl FileAdmission {
         {
             return Err(RetainedConfigError::Rejected);
         }
+        if let Some((path, file)) = &self.completion {
+            let metadata = file
+                .metadata()
+                .map_err(|_| RetainedConfigError::Unavailable)?;
+            if identity_for_path(path, false)? != [metadata.dev(), metadata.ino()] {
+                return Err(RetainedConfigError::Rejected);
+            }
+        }
         Ok(())
     }
 }
@@ -75,6 +99,12 @@ impl FileAdmission {
 pub(crate) fn lock_path(path: &Path) -> PathBuf {
     let mut name = path.as_os_str().to_os_string();
     name.push(".opc-retained");
+    PathBuf::from(name)
+}
+
+pub(crate) fn completion_path(path: &Path) -> PathBuf {
+    let mut name = path.as_os_str().to_os_string();
+    name.push(".opc-retained-complete");
     PathBuf::from(name)
 }
 

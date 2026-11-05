@@ -5,7 +5,135 @@ use crate::{
 };
 use std::collections::{BTreeMap, BTreeSet};
 
-fn options(path: &Path) -> RetainedConfigOptions {
+// Retained schema admission is implemented only for the Linux runtime.
+#[cfg(target_os = "linux")]
+#[test]
+fn retained_heap_outage_is_unavailable_without_changing_bytes() {
+    const CHILD: &str = "OPC_RETAINED_HEAP_CHILD";
+    if let Some(directory) = std::env::var_os(CHILD) {
+        let path = Path::new(&directory).join("retained.sqlite");
+        let backend = open_authority_sync(
+            options(&path),
+            key(),
+            OpenIntent::NewAuthority,
+            &Arc::new(work()),
+        )
+        .unwrap();
+        let conn = backend.conn().try_lock_owned().unwrap();
+        let record: Vec<u8> = conn
+            .query_row(
+                "SELECT record FROM consensus_retained_binding WHERE singleton=1",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let record = record.try_into().unwrap();
+        validate_connection(&conn, &options(&path), &record, &key(), &Arc::new(work())).unwrap();
+        let before = std::fs::read(&path).unwrap();
+        let wal = path.with_extension("sqlite-wal");
+        let wal_before = std::fs::read(&wal).unwrap_or_default();
+        let _pressure = crate::error::exhaust_sqlite_heap(&conn);
+        let probe = conn
+            .query_row(
+                "SELECT COUNT(*) FROM consensus_retained_binding",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap_err();
+        assert_eq!(
+            probe.sqlite_error_code(),
+            Some(rusqlite::ErrorCode::OutOfMemory)
+        );
+        let failure =
+            validate_connection(&conn, &options(&path), &record, &key(), &Arc::new(work()))
+                .unwrap_err();
+        let schema_failure = crate::consensus::validate_retained_schema(
+            &conn,
+            options(&path).binding.topology(),
+            &key(),
+            work().deadline,
+        )
+        .unwrap_err();
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+        assert_eq!(std::fs::read(&wal).unwrap_or_default(), wal_before);
+        assert_eq!(
+            (
+                failure,
+                matches!(
+                    &schema_failure,
+                    crate::consensus::ConfigConsensusStorageError::BackendUnavailable
+                )
+            ),
+            (RetainedConfigError::Unavailable, true),
+            "{schema_failure:?}"
+        );
+        return;
+    }
+    let directory = tempfile::tempdir().unwrap();
+    let child = std::process::Command::new(std::env::current_exe().unwrap())
+        .args([
+            "--exact",
+            "retained::tests::retained_heap_outage_is_unavailable_without_changing_bytes",
+            "--test-threads=1",
+            "--nocapture",
+        ])
+        .env(CHILD, directory.path())
+        .output()
+        .unwrap();
+    assert!(
+        child.status.success(),
+        "{}\n{}",
+        String::from_utf8_lossy(&child.stdout),
+        String::from_utf8_lossy(&child.stderr)
+    );
+    assert!(String::from_utf8_lossy(&child.stdout)
+        .contains("test result: ok. 1 passed; 0 failed; 0 ignored;"));
+    open_authority_sync(
+        options(&directory.path().join("retained.sqlite")),
+        key(),
+        OpenIntent::Reopen,
+        &Arc::new(work()),
+    )
+    .expect("unchanged retained storage reopens after outage repair");
+}
+
+// Retained schema admission is implemented only for the Linux runtime.
+#[cfg(target_os = "linux")]
+#[test]
+fn retained_missing_binding_schema_is_rejected() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("retained.sqlite");
+    let backend = open_authority_sync(
+        options(&path),
+        key(),
+        OpenIntent::NewAuthority,
+        &Arc::new(work()),
+    )
+    .unwrap();
+    let conn = backend.conn().try_lock_owned().unwrap();
+    let record: Vec<u8> = conn
+        .query_row(
+            "SELECT record FROM consensus_retained_binding WHERE singleton=1",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    let record = record.try_into().unwrap();
+    conn.execute_batch("DROP TABLE consensus_retained_binding")
+        .unwrap();
+    let before = std::fs::read(&path).unwrap();
+    let wal = path.with_extension("sqlite-wal");
+    let wal_before = std::fs::read(&wal).unwrap_or_default();
+    assert_eq!(
+        validate_connection(&conn, &options(&path), &record, &key(), &Arc::new(work()))
+            .unwrap_err(),
+        RetainedConfigError::Rejected,
+    );
+    assert_eq!(before, std::fs::read(&path).unwrap());
+    assert_eq!(wal_before, std::fs::read(&wal).unwrap_or_default());
+}
+
+pub(super) fn options(path: &Path) -> RetainedConfigOptions {
     let node = ConfigConsensusNodeId::new(1).expect("node");
     let topology = ConfigConsensusTopology::try_new(
         ConfigConsensusIdentity::new(
@@ -27,10 +155,10 @@ fn options(path: &Path) -> RetainedConfigOptions {
     .expect("options")
 }
 
-fn key() -> AuditKey {
+pub(super) fn key() -> AuditKey {
     AuditKey::new([0x71; 32]).expect("key")
 }
-fn work() -> AdmissionWork {
+pub(super) fn work() -> AdmissionWork {
     AdmissionWork {
         cancelled: AtomicBool::new(false),
         mutated: AtomicBool::new(false),
@@ -38,8 +166,25 @@ fn work() -> AdmissionWork {
         hook: None,
         lock_hook: None,
         completion_hook: None,
+        provision_fault: None,
     }
 }
+/// The crash child is gone, so its exclusive admission lock must be free.
+fn lock_is_free(path: &Path) -> bool {
+    match open_file(&lock_path(path), true, false) {
+        Ok(file) => match AdmissionFileLock::acquire(file) {
+            Ok(lock) => {
+                drop(lock);
+                true
+            }
+            Err(RetainedConfigError::InUse) => false,
+            Err(_) => false,
+        },
+        Err(RetainedConfigError::RecoveryRequired) => true,
+        Err(_) => false,
+    }
+}
+
 fn files(path: &Path) -> BTreeMap<std::ffi::OsString, Vec<u8>> {
     std::fs::read_dir(path)
         .expect("files")
@@ -237,6 +382,61 @@ fn rewritten_schema_digest_cannot_authorize_extra_base_schema() {
     }
 }
 
+const PROVISION_STEPS: &[&str] = &[
+    "intent_created",
+    "intent_written",
+    "intent_synced",
+    "intent_published",
+    "intent_directory_synced",
+    "lock_created",
+    "database_created",
+    "base_initialized",
+    "consensus_initialized",
+    "binding_stored",
+    "database_written",
+    "database_synced",
+    "database_published",
+    "database_directory_synced",
+    "completion_created",
+    "completion_written",
+    "completion_synced",
+    "record_written",
+    "record_synced",
+];
+
+const CRASH_STAGES: [&str; 9] = [
+    "intent_published",
+    "lock_created",
+    "database_created",
+    "base_initialized",
+    "consensus_initialized",
+    "binding_stored",
+    "database_synced",
+    "record_written",
+    "record_synced",
+];
+
+fn crash_provision(path: &Path, stage: &str) {
+    crash_provision_with(path, stage, false);
+}
+
+fn crash_provision_with(path: &Path, stage: &str, repair: bool) {
+    let mut command = std::process::Command::new(std::env::current_exe().expect("test binary"));
+    command
+        .args([
+            "--exact",
+            "retained::tests::provisioning_crash_child",
+            "--nocapture",
+        ])
+        .env("OPC_RETAINED_TEST_DATABASE", path)
+        .env("OPC_RETAINED_TEST_CRASH_STAGE", stage);
+    if repair {
+        command.env("OPC_RETAINED_TEST_DISPOSITION", "repair");
+    }
+    let output = command.output().expect("crash child");
+    assert_eq!(output.status.code(), Some(91), "{stage}");
+}
+
 // Only this private unit-test executable can select a provisioning crash.
 #[test]
 fn provisioning_crash_child() {
@@ -244,18 +444,17 @@ fn provisioning_crash_child() {
         return;
     };
     let stage = std::env::var("OPC_RETAINED_TEST_CRASH_STAGE").expect("stage");
+    let intent = match std::env::var("OPC_RETAINED_TEST_DISPOSITION").as_deref() {
+        Ok("repair") => OpenIntent::RepairMember,
+        _ => OpenIntent::NewAuthority,
+    };
     let mut work = work();
     work.hook = Some(Arc::new(move |_, observed| {
         if observed == stage {
             std::process::exit(91);
         }
     }));
-    let _ = open_authority_sync(
-        options(Path::new(&path)),
-        key(),
-        OpenIntent::NewAuthority,
-        &Arc::new(work),
-    );
+    let _ = open_authority_sync(options(Path::new(&path)), key(), intent, &Arc::new(work));
     panic!("crash boundary not reached");
 }
 
@@ -295,6 +494,7 @@ fn process_loss_at_every_provisioning_boundary_never_authorizes_initialization()
             assert!(reopened.is_err(), "partial {stage}");
             assert_eq!(before, files(dir.path()), "rejected {stage}");
         }
+        let before_fresh = files(dir.path());
         assert!(open_authority_sync(
             options(&path),
             key(),
@@ -302,7 +502,309 @@ fn process_loss_at_every_provisioning_boundary_never_authorizes_initialization()
             &Arc::new(work())
         )
         .is_err());
+        assert_eq!(
+            before_fresh,
+            files(dir.path()),
+            "fresh request preserves {stage}"
+        );
     }
+}
+
+#[test]
+fn process_loss_at_every_provisioning_boundary_resumes_the_same_request() {
+    for stage in CRASH_STAGES {
+        let dir = tempfile::tempdir().expect("storage");
+        let path = dir.path().join("retained.sqlite");
+        crash_provision(&path, stage);
+        let before = files(dir.path());
+        assert!(lock_is_free(&path), "no admission lock leaked at {stage}");
+        let reopened =
+            open_authority_sync(options(&path), key(), OpenIntent::Reopen, &Arc::new(work()));
+        if matches!(stage, "record_written" | "record_synced") {
+            drop(reopened.expect("completed authority reconciles"));
+        } else {
+            assert!(reopened.is_err(), "partial {stage}");
+            assert_eq!(before, files(dir.path()), "reopen must not mutate {stage}");
+        }
+        drop(
+            open_authority_sync(
+                options(&path),
+                key(),
+                OpenIntent::ResumeAuthority,
+                &Arc::new(work()),
+            )
+            .unwrap_or_else(|error| panic!("same request resumes at {stage}: {error:?}")),
+        );
+        assert!(
+            lock_path(&path).exists(),
+            "authenticated intent remains after {stage}"
+        );
+        assert!(
+            completion_path(&path).exists(),
+            "completion survives after {stage}"
+        );
+        drop(
+            open_authority_sync(options(&path), key(), OpenIntent::Reopen, &Arc::new(work()))
+                .expect("resumed authority reopens"),
+        );
+        assert!(
+            !files(dir.path()).contains_key(&std::ffi::OsString::from(
+                "retained.sqlite.opc-retained.intent"
+            )),
+            "no obsolete transient intent residue after {stage}"
+        );
+    }
+}
+
+#[test]
+fn committed_authority_for_another_binding_is_never_deleted_by_a_resume() {
+    let dir = tempfile::tempdir().expect("storage");
+    let path = dir.path().join("retained.sqlite");
+    crash_provision(&path, "record_synced");
+    let before = files(dir.path());
+    // Replace the admission record with a valid authenticated record for a
+    // different backing identity, keeping the same database identity.
+    let original = before
+        .get(&std::ffi::OsString::from(
+            "retained.sqlite.opc-retained-complete",
+        ))
+        .expect("admission record")
+        .clone();
+    let mut original_bytes = [0u8; RECORD_BYTES];
+    original_bytes.copy_from_slice(&original);
+    let identity = record_identity(&original_bytes).expect("identity");
+    let other_binding = RetainedConfigBinding::new(
+        options(&path).binding.topology().clone(),
+        [0x43; 32],
+        [0x42; 32],
+    )
+    .expect("other binding");
+    let other_record =
+        make_record(&other_binding, &key(), identity, [0x55; 32], false).expect("other record");
+    std::fs::write(completion_path(&path), other_record).expect("replace record");
+    let before_resume = files(dir.path());
+    let resumed = open_authority_sync(
+        options(&path),
+        key(),
+        OpenIntent::ResumeAuthority,
+        &Arc::new(work()),
+    );
+    assert!(
+        matches!(resumed, Err(RetainedConfigError::Rejected)),
+        "foreign committed record: {resumed:?}"
+    );
+    assert_eq!(
+        before_resume,
+        files(dir.path()),
+        "another binding's committed record must not be adopted or deleted"
+    );
+    // The original committed operation is still recoverable once its record is
+    // restored (the database binding row was never touched).
+    std::fs::write(completion_path(&path), original).expect("restore record");
+    drop(
+        open_authority_sync(
+            options(&path),
+            key(),
+            OpenIntent::ResumeAuthority,
+            &Arc::new(work()),
+        )
+        .expect("original request reconciles"),
+    );
+}
+
+#[test]
+fn process_loss_after_completion_leaves_an_established_reopenable_store() {
+    let dir = tempfile::tempdir().expect("storage");
+    let path = dir.path().join("retained.sqlite");
+    crash_provision(&path, "record_synced");
+    assert!(lock_path(&path).exists());
+    assert!(completion_path(&path).exists());
+    drop(
+        open_authority_sync(options(&path), key(), OpenIntent::Reopen, &Arc::new(work()))
+            .expect("completed provisioning reopens"),
+    );
+    assert!(
+        matches!(
+            open_authority_sync(
+                options(&path),
+                key(),
+                OpenIntent::NewAuthority,
+                &Arc::new(work())
+            ),
+            Err(RetainedConfigError::AlreadyExists)
+        ),
+        "an established store is not adopted by a new provisioning request"
+    );
+    drop(
+        open_authority_sync(options(&path), key(), OpenIntent::Reopen, &Arc::new(work()))
+            .expect("established store unchanged"),
+    );
+}
+
+#[test]
+fn a_conflicting_provisioning_request_never_adopts_or_overwrites_authenticated_state() {
+    for stage in CRASH_STAGES {
+        let dir = tempfile::tempdir().expect("storage");
+        let path = dir.path().join("retained.sqlite");
+        crash_provision(&path, stage);
+        let before = files(dir.path());
+        // Compare the rejected operation against its immediate input. A later
+        // authorized reopen can legitimately switch the complete database to WAL.
+        let established_before = matches!(stage, "record_written" | "record_synced");
+        let conflicting = RetainedConfigOptions::new(
+            &path,
+            RetainedConfigBinding::new(
+                options(&path).binding.topology().clone(),
+                [0x43; 32],
+                [0x42; 32],
+            )
+            .expect("conflicting binding"),
+            RetainedConfigDurability::Ephemeral,
+            16 * 1024 * 1024,
+            Duration::from_secs(30),
+        )
+        .expect("conflicting options");
+        assert!(
+            matches!(
+                open_authority_sync(
+                    conflicting,
+                    key(),
+                    OpenIntent::ResumeAuthority,
+                    &Arc::new(work())
+                ),
+                Err(RetainedConfigError::Rejected)
+                    | Err(RetainedConfigError::RecoveryRequired)
+                    | Err(RetainedConfigError::AlreadyExists)
+            ),
+            "a conflicting request must be refused at {stage}"
+        );
+        assert_eq!(
+            before,
+            files(dir.path()),
+            "conflict must not mutate {stage}"
+        );
+        if established_before {
+            // A conflicting request never loses the established store.
+            drop(
+                open_authority_sync(options(&path), key(), OpenIntent::Reopen, &Arc::new(work()))
+                    .expect("established store survives the conflicting request"),
+            );
+        }
+        // The authenticated original request still resumes afterwards.
+        drop(
+            open_authority_sync(
+                options(&path),
+                key(),
+                OpenIntent::ResumeAuthority,
+                &Arc::new(work()),
+            )
+            .expect("original request still resumes"),
+        );
+        drop(
+            open_authority_sync(options(&path), key(), OpenIntent::Reopen, &Arc::new(work()))
+                .expect("original authority intact"),
+        );
+    }
+}
+
+#[test]
+fn injected_faults_at_every_persistent_step_leave_retryable_state() {
+    for &step in PROVISION_STEPS {
+        let dir = tempfile::tempdir().expect("storage");
+        let path = dir.path().join("retained.sqlite");
+        let mut failing = work();
+        failing.provision_fault = Some(Arc::new(move |observed| observed == step));
+        assert!(
+            open_authority_sync(
+                options(&path),
+                key(),
+                OpenIntent::NewAuthority,
+                &Arc::new(failing)
+            )
+            .is_err(),
+            "fault {step} must fail"
+        );
+        drop(
+            open_authority_sync(
+                options(&path),
+                key(),
+                OpenIntent::ResumeAuthority,
+                &Arc::new(work()),
+            )
+            .unwrap_or_else(|error| panic!("retry after {step}: {error:?}")),
+        );
+        drop(
+            open_authority_sync(options(&path), key(), OpenIntent::Reopen, &Arc::new(work()))
+                .expect("retried authority reopens"),
+        );
+        assert!(
+            lock_path(&path).exists(),
+            "authenticated intent retained after {step}"
+        );
+        assert!(
+            completion_path(&path).exists(),
+            "completion published after {step}"
+        );
+    }
+}
+
+#[test]
+fn provisioning_cancellation_is_retryable_and_distinct_from_completed_retirement() {
+    let dir = tempfile::tempdir().expect("storage");
+    let path = dir.path().join("retained.sqlite");
+    let mut cancelled = work();
+    cancelled.hook = Some(Arc::new(move |work, stage| {
+        if stage == "binding_stored" {
+            work.cancelled.store(true, Ordering::Release);
+        }
+    }));
+    assert!(
+        matches!(
+            open_authority_sync(
+                options(&path),
+                key(),
+                OpenIntent::NewAuthority,
+                &Arc::new(cancelled)
+            ),
+            Err(RetainedConfigError::Indeterminate) | Err(RetainedConfigError::AdmissionBound)
+        ),
+        "cancellation after a mutation is bounded, never success"
+    );
+    // Retry after cancellation finishes the same request and is not a
+    // completed-retirement claim.
+    drop(
+        open_authority_sync(
+            options(&path),
+            key(),
+            OpenIntent::ResumeAuthority,
+            &Arc::new(work()),
+        )
+        .expect("cancelled provisioning resumes"),
+    );
+    // A deadline before the first effect creates nothing and stays retryable.
+    let other = tempfile::tempdir().expect("storage");
+    let other_path = other.path().join("retained.sqlite");
+    let mut expired = work();
+    expired.deadline = Instant::now() - Duration::from_secs(1);
+    assert!(matches!(
+        open_authority_sync(
+            options(&other_path),
+            key(),
+            OpenIntent::NewAuthority,
+            &Arc::new(expired)
+        ),
+        Err(RetainedConfigError::AdmissionBound)
+    ));
+    assert!(!lock_path(&other_path).exists());
+    drop(
+        open_authority_sync(
+            options(&other_path),
+            key(),
+            OpenIntent::NewAuthority,
+            &Arc::new(work()),
+        )
+        .expect("deadline rejection leaves a retryable request"),
+    );
 }
 
 #[test]
@@ -411,4 +913,440 @@ fn an_independent_process_cannot_open_live_retained_authority() {
     assert!(
         open_authority_sync(options(&path), key(), OpenIntent::Reopen, &Arc::new(work())).is_ok()
     );
+}
+
+#[test]
+fn durable_intent_publication_is_classified_as_a_mutation() {
+    for &step in PROVISION_STEPS {
+        let dir = tempfile::tempdir().expect("storage");
+        let path = dir.path().join("retained.sqlite");
+        let mut failing = work();
+        failing.provision_fault = Some(Arc::new(move |observed| observed == step));
+        let admission = Arc::new(failing);
+        assert!(
+            open_authority_sync(options(&path), key(), OpenIntent::NewAuthority, &admission)
+                .is_err(),
+            "{step}"
+        );
+        let published = !matches!(step, "intent_created" | "intent_written" | "intent_synced");
+        assert_eq!(
+            admission.mutated.load(Ordering::Acquire),
+            published,
+            "named persistent effect must classify mutation at {step}"
+        );
+        assert_eq!(lock_path(&path).exists(), published, "{step}");
+        if !published {
+            assert!(
+                files(dir.path()).is_empty(),
+                "no named artifact before publication"
+            );
+        }
+    }
+}
+
+#[test]
+fn resume_rejects_writable_authenticated_intent_without_mutation() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let dir = tempfile::tempdir().expect("storage");
+    let path = dir.path().join("retained.sqlite");
+    crash_provision(&path, "intent_published");
+    let intent = lock_path(&path);
+    std::fs::set_permissions(&intent, std::fs::Permissions::from_mode(0o666))
+        .expect("writable intent permissions");
+    let before = files(dir.path());
+    let lock_acquired = Arc::new(AtomicBool::new(false));
+    let observed = Arc::clone(&lock_acquired);
+    let mut admission = work();
+    admission.lock_hook = Some(Arc::new(move |_| observed.store(true, Ordering::Release)));
+    let admission = Arc::new(admission);
+    let resumed = open_authority_sync(
+        options(&path),
+        key(),
+        OpenIntent::ResumeAuthority,
+        &admission,
+    );
+    assert!(
+        matches!(resumed, Err(RetainedConfigError::Rejected)),
+        "a valid authenticated intent still requires private write permissions: {resumed:?}"
+    );
+    assert_eq!(
+        before,
+        files(dir.path()),
+        "refused resume preserves every file"
+    );
+    assert!(
+        !lock_acquired.load(Ordering::Acquire),
+        "writable intent must be rejected before admission lock acquisition"
+    );
+
+    std::fs::set_permissions(&intent, std::fs::Permissions::from_mode(0o600))
+        .expect("private intent permissions");
+    drop(
+        open_authority_sync(
+            options(&path),
+            key(),
+            OpenIntent::ResumeAuthority,
+            &admission,
+        )
+        .expect("the same authenticated intent resumes with private write permissions"),
+    );
+    assert!(
+        lock_acquired.load(Ordering::Acquire),
+        "the positive control observes admission lock acquisition"
+    );
+}
+
+#[test]
+fn resume_preserves_foreign_intent_file_types() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let dir = tempfile::tempdir().expect("storage");
+    let path = dir.path().join("retained.sqlite");
+    let intent = lock_path(&path);
+
+    // Group/other-writable regular file: never unlinked by SDK cleanup.
+    std::fs::write(&intent, [0u8; 137]).expect("write");
+    std::fs::set_permissions(&intent, std::fs::Permissions::from_mode(0o666)).expect("permissions");
+    assert!(matches!(
+        open_authority_sync(
+            options(&path),
+            key(),
+            OpenIntent::ResumeAuthority,
+            &Arc::new(work())
+        ),
+        Err(RetainedConfigError::Rejected)
+    ));
+    assert!(intent.exists(), "foreign regular file preserved");
+    std::fs::remove_file(&intent).expect("test cleanup");
+
+    // Symlink at the intent path: never followed or unlinked.
+    let foreign = dir.path().join("foreign");
+    std::fs::write(&foreign, b"foreign").expect("foreign");
+    std::os::unix::fs::symlink(&foreign, &intent).expect("symlink");
+    assert!(matches!(
+        open_authority_sync(
+            options(&path),
+            key(),
+            OpenIntent::ResumeAuthority,
+            &Arc::new(work())
+        ),
+        Err(RetainedConfigError::Rejected)
+    ));
+    assert!(intent.symlink_metadata().is_ok(), "symlink preserved");
+    assert!(foreign.exists());
+}
+
+#[test]
+fn torn_first_intent_without_artifacts_is_preserved_and_refused() {
+    let dir = tempfile::tempdir().expect("storage");
+    let path = dir.path().join("retained.sqlite");
+    std::fs::write(lock_path(&path), [0u8; 137]).expect("torn intent");
+    let before = files(dir.path());
+    assert!(open_authority_sync(
+        options(&path),
+        key(),
+        OpenIntent::ResumeAuthority,
+        &Arc::new(work())
+    )
+    .is_err());
+    assert_eq!(before, files(dir.path()));
+    assert!(!path.exists());
+    assert!(
+        open_authority_sync(options(&path), key(), OpenIntent::Reopen, &Arc::new(work())).is_err()
+    );
+    assert_eq!(before, files(dir.path()));
+}
+
+#[test]
+fn resume_does_not_remove_a_concurrent_owners_admission_lock() {
+    let dir = tempfile::tempdir().expect("storage");
+    let path = dir.path().join("retained.sqlite");
+    crash_provision(&path, "intent_published");
+    let owner = open_file(&lock_path(&path), true, false).expect("concurrent owner opens intent");
+    let held = AdmissionFileLock::acquire(owner).expect("owner lock");
+    let before = files(dir.path());
+    let resumed = open_authority_sync(
+        options(&path),
+        key(),
+        OpenIntent::ResumeAuthority,
+        &Arc::new(work()),
+    );
+    assert!(
+        matches!(resumed, Err(RetainedConfigError::InUse)),
+        "live owner must remain excluded: {resumed:?}"
+    );
+    assert_eq!(
+        before,
+        files(dir.path()),
+        "a live owner's lock and partial state are preserved"
+    );
+    drop(held);
+    drop(
+        open_authority_sync(
+            options(&path),
+            key(),
+            OpenIntent::ResumeAuthority,
+            &Arc::new(work()),
+        )
+        .expect("retry after the concurrent owner retires"),
+    );
+}
+
+#[tokio::test]
+async fn repair_member_provisioning_resumes_and_disposition_conflicts_fail_closed() {
+    for stage in ["intent_published", "binding_stored", "record_synced"] {
+        let dir = tempfile::tempdir().expect("storage");
+        let path = dir.path().join("retained.sqlite");
+        crash_provision_with(&path, stage, true);
+        let before = files(dir.path());
+
+        // Same binding, different operation class: never adopt/abort/overwrite.
+        let conflict = SqliteBackend::begin_resume_config_authority(options(&path), key())
+            .expect("begin conflicting resume")
+            .wait()
+            .await;
+        assert!(
+            matches!(
+                conflict,
+                Err(RetainedConfigError::RecoveryRequired) | Err(RetainedConfigError::Rejected)
+            ),
+            "disposition conflict at {stage}: {conflict:?}"
+        );
+        assert_eq!(
+            before,
+            files(dir.path()),
+            "disposition conflict must not mutate {stage}"
+        );
+
+        // The authenticated repair request itself resumes.
+        drop(
+            SqliteBackend::begin_resume_config_member_repair(options(&path), key())
+                .expect("begin repair resume")
+                .wait()
+                .await
+                .unwrap_or_else(|error| panic!("repair resumes at {stage}: {error:?}")),
+        );
+        assert!(lock_path(&path).exists());
+        assert!(completion_path(&path).exists());
+        // The established repair store refuses fresh authority provisioning and
+        // reopens through the ordinary path.
+        assert!(matches!(
+            open_authority_sync(
+                options(&path),
+                key(),
+                OpenIntent::NewAuthority,
+                &Arc::new(work())
+            ),
+            Err(RetainedConfigError::AlreadyExists)
+        ));
+        drop(
+            open_authority_sync(options(&path), key(), OpenIntent::Reopen, &Arc::new(work()))
+                .expect("established repair store reopens"),
+        );
+    }
+}
+
+#[tokio::test]
+async fn public_authority_resume_completes_every_interrupted_prefix() {
+    for stage in CRASH_STAGES {
+        let dir = tempfile::tempdir().expect("storage");
+        let path = dir.path().join("retained.sqlite");
+        crash_provision(&path, stage);
+        let mut resumed = SqliteBackend::begin_resume_config_authority(options(&path), key())
+            .expect("begin authority resume");
+        let backend = resumed
+            .wait()
+            .await
+            .expect("same authorized request resumes");
+        assert!(!backend.retained_repair_only);
+        assert!(matches!(
+            resumed.cancel_and_join().await,
+            RetainedConfigOpenRetirement::BackendReturned
+        ));
+        let mut competing = SqliteBackend::begin_resume_config_authority(options(&path), key())
+            .expect("begin competing resume");
+        assert!(matches!(
+            competing.wait().await,
+            Err(RetainedConfigError::InUse)
+        ));
+        assert!(matches!(
+            competing.cancel_and_join().await,
+            RetainedConfigOpenRetirement::Released { .. }
+        ));
+        drop(backend);
+        drop(
+            SqliteBackend::reopen_config_authority(options(&path), key())
+                .await
+                .expect("ordinary reopen"),
+        );
+        assert!(completion_path(&path).exists());
+    }
+}
+
+mod provisioning_regressions {
+    use super::*;
+
+    #[tokio::test]
+    async fn obsolete_intent_still_denies_initialization() {
+        for bytes in [vec![], vec![0; 13], vec![0; 105]] {
+            let dir = tempfile::tempdir().expect("storage");
+            let path = dir.path().join("retained.sqlite");
+            let obsolete = dir.path().join("retained.sqlite.opc-retained.intent");
+            std::fs::write(&obsolete, bytes).expect("unverifiable earlier-format intent");
+            let before = files(dir.path());
+            for intent in [
+                OpenIntent::NewAuthority,
+                OpenIntent::ResumeAuthority,
+                OpenIntent::Reopen,
+            ] {
+                let result = open_authority_sync(options(&path), key(), intent, &Arc::new(work()));
+                assert!(
+                    matches!(result, Err(RetainedConfigError::RecoveryRequired)),
+                    "an earlier-format intent cannot authorize initialization: {result:?}"
+                );
+                assert_eq!(before, files(dir.path()));
+            }
+            let legacy = SqliteBackend::open_with_audit_key(&path, true, 0, key()).await;
+            assert!(
+                legacy.is_err(),
+                "legacy open must preserve the earlier-format boundary"
+            );
+            assert_eq!(before, files(dir.path()));
+        }
+    }
+
+    fn resume_intent() -> OpenIntent {
+        OpenIntent::ResumeAuthority
+    }
+
+    fn intent_path(path: &Path) -> PathBuf {
+        lock_path(path)
+    }
+
+    #[test]
+    fn different_audit_key_cannot_replace_interrupted_provisioning() {
+        let dir = tempfile::tempdir().expect("storage");
+        let path = dir.path().join("retained.sqlite");
+        crash_provision(&path, "intent_published");
+        let before = files(dir.path());
+        let foreign_key = AuditKey::new([0x72; 32]).expect("foreign key");
+        let result = open_authority_sync(
+            options(&path),
+            foreign_key,
+            resume_intent(),
+            &Arc::new(work()),
+        );
+        assert!(
+            result.is_err(),
+            "another key must not take over: {result:?}"
+        );
+        assert_eq!(before, files(dir.path()), "conflicting state is preserved");
+        drop(
+            open_authority_sync(options(&path), key(), resume_intent(), &Arc::new(work()))
+                .expect("the authorized original request still resumes"),
+        );
+    }
+
+    #[test]
+    fn unverifiable_interrupted_intent_is_preserved() {
+        for bytes in [vec![], vec![0; 13], vec![0; 105]] {
+            let dir = tempfile::tempdir().expect("storage");
+            let path = dir.path().join("retained.sqlite");
+            std::fs::write(intent_path(&path), bytes).expect("unverifiable intent");
+            let before = files(dir.path());
+            let result =
+                open_authority_sync(options(&path), key(), resume_intent(), &Arc::new(work()));
+            assert!(
+                result.is_err(),
+                "unverifiable state cannot authorize a retry"
+            );
+            assert_eq!(
+                before,
+                files(dir.path()),
+                "partial bytes must not be replaced"
+            );
+            assert!(!path.exists(), "no database may be initialized");
+        }
+    }
+
+    #[test]
+    fn reopen_then_fresh_provision_does_not_adopt_established_store() {
+        let dir = tempfile::tempdir().expect("storage");
+        let path = dir.path().join("retained.sqlite");
+        crash_provision(&path, "record_synced");
+        drop(
+            open_authority_sync(options(&path), key(), OpenIntent::Reopen, &Arc::new(work()))
+                .expect("established authority reopens"),
+        );
+        let before = files(dir.path());
+        let result = open_authority_sync(
+            options(&path),
+            key(),
+            OpenIntent::NewAuthority,
+            &Arc::new(work()),
+        );
+        assert!(
+            matches!(result, Err(RetainedConfigError::AlreadyExists)),
+            "fresh provision cannot adopt an established store: {result:?}"
+        );
+        assert_eq!(before, files(dir.path()));
+    }
+
+    #[test]
+    fn damaged_record_after_reopen_never_reinitializes_established_database() {
+        let dir = tempfile::tempdir().expect("storage");
+        let path = dir.path().join("retained.sqlite");
+        crash_provision(&path, "record_synced");
+        drop(
+            open_authority_sync(options(&path), key(), OpenIntent::Reopen, &Arc::new(work()))
+                .expect("established authority reopens"),
+        );
+        std::fs::write(lock_path(&path), b"damaged admission").expect("damage record");
+        let before = files(dir.path());
+        let result = open_authority_sync(options(&path), key(), resume_intent(), &Arc::new(work()));
+        assert!(
+            result.is_err(),
+            "damage cannot authorize new genesis: {result:?}"
+        );
+        assert_eq!(
+            before,
+            files(dir.path()),
+            "established database must survive"
+        );
+    }
+
+    #[test]
+    fn established_database_loss_never_authorizes_a_fresh_resume() {
+        let dir = tempfile::tempdir().expect("storage");
+        let path = dir.path().join("retained.sqlite");
+        crash_provision(&path, "record_synced");
+        drop(
+            open_authority_sync(options(&path), key(), OpenIntent::Reopen, &Arc::new(work()))
+                .expect("established authority reopens"),
+        );
+        std::fs::remove_file(&path).expect("database loss");
+        let before = files(dir.path());
+        let result = open_authority_sync(options(&path), key(), resume_intent(), &Arc::new(work()));
+        assert!(
+            matches!(result, Err(RetainedConfigError::RecoveryRequired)),
+            "resume must refuse established storage loss: {result:?}"
+        );
+        assert!(!path.exists());
+        assert_eq!(before, files(dir.path()));
+    }
+
+    #[tokio::test]
+    async fn legacy_open_during_interrupted_provision_is_rejected() {
+        let dir = tempfile::tempdir().expect("storage");
+        let path = dir.path().join("retained.sqlite");
+        crash_provision(&path, "intent_published");
+        let before = files(dir.path());
+        let legacy = SqliteBackend::open_with_audit_key(&path, true, 0, key()).await;
+        assert!(
+            legacy.is_err(),
+            "retained intent denies legacy initialization: {legacy:?}"
+        );
+        assert_eq!(before, files(dir.path()));
+    }
 }

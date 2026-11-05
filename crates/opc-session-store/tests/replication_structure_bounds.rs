@@ -84,6 +84,7 @@ fn mixed_tree_with_nodes(node_count: usize) -> ReplicationOp {
 
 fn entry(sequence: u64, tx_id: &str, op: ReplicationOp) -> ReplicationEntry {
     ReplicationEntry {
+        replay_policy: opc_session_store::ReplicationReplayPolicy::prune_expired(),
         sequence,
         tx_id: tx_id.try_into().expect("valid transaction ID"),
         op,
@@ -328,6 +329,7 @@ fn seed_prefix(now: Timestamp, key: &SessionKey) -> Vec<ReplicationEntry> {
     let expires_at = checked_session_deadline(now, ttl).expect("seed deadline");
     vec![
         ReplicationEntry {
+            replay_policy: opc_session_store::ReplicationReplayPolicy::prune_expired(),
             sequence: 1,
             tx_id: "seed-lease".try_into().expect("valid transaction ID"),
             op: ReplicationOp::AcquireLease {
@@ -341,6 +343,7 @@ fn seed_prefix(now: Timestamp, key: &SessionKey) -> Vec<ReplicationEntry> {
             timestamp: now,
         },
         ReplicationEntry {
+            replay_policy: opc_session_store::ReplicationReplayPolicy::prune_expired(),
             sequence: 2,
             tx_id: "seed-record".try_into().expect("valid transaction ID"),
             op: ReplicationOp::CompareAndSet {
@@ -447,4 +450,125 @@ async fn fake_rejects_over_limit_replicate_and_rebuild_atomically() {
 #[tokio::test]
 async fn sqlite_rejects_over_limit_replicate_and_rebuild_atomically() {
     assert_backend_rejects_structure_before_state_change(BackendKind::Sqlite).await;
+}
+
+#[test]
+fn key_retention_batch_preserves_replication_shape_bounds_and_encoding() {
+    let leaf = leaf_for(key(b"retention-shape"));
+    for rotations in [0, 1, 2] {
+        let mut exact = entry(
+            1,
+            "policy",
+            ReplicationOp::Batch {
+                ops: vec![leaf.clone(); MAX_REPLICATION_OPERATIONS_PER_ENTRY - 1],
+            },
+        );
+        exact.replay_policy.capacity_rotations = rotations;
+        exact.validate().unwrap();
+        assert_eq!(
+            postcard::from_bytes::<ReplicationEntry>(&postcard::to_allocvec(&exact).unwrap())
+                .unwrap(),
+            exact
+        );
+        let mut wide = exact.clone();
+        wide.op = ReplicationOp::Batch {
+            ops: vec![leaf.clone(); MAX_REPLICATION_OPERATIONS_PER_ENTRY],
+        };
+        assert_eq!(
+            wide.validate(),
+            Err(StoreError::ReplicationOperationLimitExceeded)
+        );
+        let mut depth = exact.clone();
+        depth.op = ReplicationOp::Batch {
+            ops: vec![nested_at_depth(
+                MAX_REPLICATION_OPERATION_DEPTH - 1,
+                leaf.clone(),
+            )],
+        };
+        depth.validate().unwrap();
+        depth.op = ReplicationOp::Batch {
+            ops: vec![nested_at_depth(
+                MAX_REPLICATION_OPERATION_DEPTH,
+                leaf.clone(),
+            )],
+        };
+        assert_eq!(
+            depth.validate(),
+            Err(StoreError::ReplicationOperationLimitExceeded)
+        );
+    }
+    for rotations in [3, u8::MAX] {
+        let mut invalid = entry(1, "policy", leaf.clone());
+        invalid.replay_policy.capacity_rotations = rotations;
+        assert!(invalid.validate().is_err());
+    }
+}
+
+#[test]
+fn key_retention_boundary_keeps_original_tree_bounds_and_bounded_continuations() {
+    use opc_session_store::{ReplicationCommandBoundary as Boundary, ReplicationReplayPolicy};
+    let leaf = leaf_for(key(b"boundary-shape"));
+    for following in [0, 1, 255, 256] {
+        let mut row = entry(
+            1,
+            "policy",
+            ReplicationOp::Batch {
+                ops: vec![leaf.clone()],
+            },
+        );
+        row.replay_policy = ReplicationReplayPolicy::preserve();
+        row.replay_policy.command = if following == 0 {
+            Boundary::Single
+        } else {
+            Boundary::Start {
+                id: [0x51; 16],
+                following_entries: following,
+            }
+        };
+        assert_eq!(row.validate().is_ok(), following <= 255);
+        if following <= 255 {
+            assert_eq!(
+                postcard::from_bytes::<ReplicationEntry>(&postcard::to_allocvec(&row).unwrap())
+                    .unwrap(),
+                row
+            );
+        }
+    }
+    for remaining in [0, 254, 255] {
+        let mut row = entry(1, "policy", leaf.clone());
+        row.replay_policy.command = Boundary::Continue {
+            id: [0x51; 16],
+            remaining_entries: remaining,
+        };
+        assert_eq!(row.validate().is_ok(), remaining <= 254);
+        row.replay_policy.capacity_rotations = 1;
+        assert!(
+            row.validate().is_err(),
+            "continuations never repeat command capacity decisions"
+        );
+    }
+    let row = entry(1, "policy", ReplicationOp::Batch { ops: vec![] });
+    row.validate().unwrap();
+    let mut json = serde_json::to_value(row).unwrap();
+    json.as_object_mut().unwrap().remove("replay_policy");
+    assert!(serde_json::from_value::<ReplicationEntry>(json).is_err());
+}
+
+#[test]
+fn policy_entry_encoding_is_required_and_old_readers_refuse_it() {
+    #[derive(serde::Deserialize)]
+    struct ImplicitPolicyEntry {
+        op: ReplicationOp,
+    }
+    let row = entry(1, "explicit-policy", leaf_for(key(b"explicit-policy")));
+    let json = serde_json::to_value(&row).unwrap();
+    assert!(json.get("op").is_none());
+    assert!(serde_json::from_value::<ImplicitPolicyEntry>(json.clone()).is_err());
+    let mut old = json;
+    old.as_object_mut().unwrap().remove("replay_policy");
+    let effects = old.as_object_mut().unwrap().remove("effects").unwrap();
+    old["op"] = effects;
+    let legacy = serde_json::from_value::<ImplicitPolicyEntry>(old.clone()).unwrap();
+    assert_eq!(legacy.op, row.op);
+    assert!(serde_json::from_value::<ReplicationEntry>(old).is_err());
 }

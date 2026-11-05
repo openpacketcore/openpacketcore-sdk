@@ -74,6 +74,12 @@ impl Dtls12CipherSuite {
     pub const ECDHE_ECDSA_AES128_GCM_SHA256: Self = Self(0xC02B);
     /// ECDHE with ECDSA authentication, ChaCha20-Poly1305, SHA-256.
     pub const ECDHE_ECDSA_CHACHA20_POLY1305_SHA256: Self = Self(0xCCA9);
+    /// ECDHE with RSA authentication, AES-128-GCM, SHA-256.
+    pub const ECDHE_RSA_AES128_GCM_SHA256: Self = Self(0xC02F);
+    /// ECDHE with RSA authentication, AES-256-GCM, SHA-384.
+    pub const ECDHE_RSA_AES256_GCM_SHA384: Self = Self(0xC030);
+    /// DHE with RSA authentication, AES-128-GCM, SHA-256.
+    pub const DHE_RSA_AES128_GCM_SHA256: Self = Self(0x009E);
     /// PSK with AES-128-CCM-8 (8-byte tag), SHA-256.
     pub const PSK_AES128_CCM_8: Self = Self(0xC0A8);
 
@@ -89,7 +95,10 @@ impl Dtls12CipherSuite {
 
     /// Returns true if this is not a known DTLS 1.2 cipher suite wire value.
     pub const fn is_unknown(&self) -> bool {
-        !matches!(*self, Self(0xC02B..=0xC02C | 0xC0A8 | 0xCCA9))
+        !matches!(
+            *self,
+            Self(0x009E | 0xC02B..=0xC02C | 0xC02F..=0xC030 | 0xC0A8 | 0xCCA9)
+        )
     }
 
     /// Parse a `Dtls12CipherSuite` from network byte order.
@@ -104,6 +113,8 @@ impl Dtls12CipherSuite {
             // AES-GCM suites
             Dtls12CipherSuite::ECDHE_ECDSA_AES256_GCM_SHA384
             | Dtls12CipherSuite::ECDHE_ECDSA_AES128_GCM_SHA256
+            | Dtls12CipherSuite::ECDHE_RSA_AES128_GCM_SHA256
+            | Dtls12CipherSuite::ECDHE_RSA_AES256_GCM_SHA384
             | Dtls12CipherSuite::ECDHE_ECDSA_CHACHA20_POLY1305_SHA256
             | Dtls12CipherSuite::PSK_AES128_CCM_8 => 12,
 
@@ -117,10 +128,13 @@ impl Dtls12CipherSuite {
             // All ECDHE ciphers
             Dtls12CipherSuite::ECDHE_ECDSA_AES256_GCM_SHA384
             | Dtls12CipherSuite::ECDHE_ECDSA_AES128_GCM_SHA256
+            | Dtls12CipherSuite::ECDHE_RSA_AES128_GCM_SHA256
+            | Dtls12CipherSuite::ECDHE_RSA_AES256_GCM_SHA384
             | Dtls12CipherSuite::ECDHE_ECDSA_CHACHA20_POLY1305_SHA256 => {
                 KeyExchangeAlgorithm::EECDH
             }
 
+            Dtls12CipherSuite::DHE_RSA_AES128_GCM_SHA256 => KeyExchangeAlgorithm::DHE,
             Dtls12CipherSuite::PSK_AES128_CCM_8 => KeyExchangeAlgorithm::PSK,
 
             _ => KeyExchangeAlgorithm::Unknown,
@@ -133,8 +147,15 @@ impl Dtls12CipherSuite {
             *self,
             Dtls12CipherSuite::ECDHE_ECDSA_AES256_GCM_SHA384
                 | Dtls12CipherSuite::ECDHE_ECDSA_AES128_GCM_SHA256
+                | Dtls12CipherSuite::ECDHE_RSA_AES128_GCM_SHA256
+                | Dtls12CipherSuite::ECDHE_RSA_AES256_GCM_SHA384
                 | Dtls12CipherSuite::ECDHE_ECDSA_CHACHA20_POLY1305_SHA256
         )
+    }
+
+    /// Whether this cipher suite uses finite-field ephemeral DH.
+    pub fn has_dhe(&self) -> bool {
+        *self == Self::DHE_RSA_AES128_GCM_SHA256
     }
 
     /// Whether this cipher suite uses PSK (Pre-Shared Key) key exchange.
@@ -143,11 +164,14 @@ impl Dtls12CipherSuite {
     }
 
     /// All supported cipher suites in server preference order.
-    pub const fn all() -> &'static [Dtls12CipherSuite; 4] {
+    pub const fn all() -> &'static [Dtls12CipherSuite; 7] {
         &[
             Dtls12CipherSuite::ECDHE_ECDSA_AES256_GCM_SHA384,
             Dtls12CipherSuite::ECDHE_ECDSA_AES128_GCM_SHA256,
             Dtls12CipherSuite::ECDHE_ECDSA_CHACHA20_POLY1305_SHA256,
+            Dtls12CipherSuite::ECDHE_RSA_AES128_GCM_SHA256,
+            Dtls12CipherSuite::ECDHE_RSA_AES256_GCM_SHA384,
+            Dtls12CipherSuite::DHE_RSA_AES128_GCM_SHA256,
             Dtls12CipherSuite::PSK_AES128_CCM_8,
         ]
     }
@@ -161,6 +185,11 @@ impl Dtls12CipherSuite {
                 Dtls12CipherSuite::ECDHE_ECDSA_AES256_GCM_SHA384,
                 Dtls12CipherSuite::ECDHE_ECDSA_AES128_GCM_SHA256,
                 Dtls12CipherSuite::ECDHE_ECDSA_CHACHA20_POLY1305_SHA256,
+            ],
+            SignatureAlgorithm::RSA => &[
+                Dtls12CipherSuite::ECDHE_RSA_AES128_GCM_SHA256,
+                Dtls12CipherSuite::ECDHE_RSA_AES256_GCM_SHA384,
+                Dtls12CipherSuite::DHE_RSA_AES128_GCM_SHA256,
             ],
             _ => &[],
         }
@@ -177,9 +206,12 @@ impl Dtls12CipherSuite {
     /// The hash algorithm used by this cipher suite.
     pub fn hash_algorithm(&self) -> HashAlgorithm {
         match *self {
-            Dtls12CipherSuite::ECDHE_ECDSA_AES256_GCM_SHA384 => HashAlgorithm::SHA384,
+            Dtls12CipherSuite::ECDHE_ECDSA_AES256_GCM_SHA384
+            | Dtls12CipherSuite::ECDHE_RSA_AES256_GCM_SHA384 => HashAlgorithm::SHA384,
             Dtls12CipherSuite::ECDHE_ECDSA_AES128_GCM_SHA256
+            | Dtls12CipherSuite::ECDHE_RSA_AES128_GCM_SHA256
             | Dtls12CipherSuite::ECDHE_ECDSA_CHACHA20_POLY1305_SHA256
+            | Dtls12CipherSuite::DHE_RSA_AES128_GCM_SHA256
             | Dtls12CipherSuite::PSK_AES128_CCM_8 => HashAlgorithm::SHA256,
             _ => HashAlgorithm::UNKNOWN_DERIVED,
         }
@@ -195,6 +227,9 @@ impl Dtls12CipherSuite {
             | Dtls12CipherSuite::ECDHE_ECDSA_CHACHA20_POLY1305_SHA256 => {
                 Some(SignatureAlgorithm::ECDSA)
             }
+            Dtls12CipherSuite::ECDHE_RSA_AES128_GCM_SHA256
+            | Dtls12CipherSuite::ECDHE_RSA_AES256_GCM_SHA384
+            | Dtls12CipherSuite::DHE_RSA_AES128_GCM_SHA256 => Some(SignatureAlgorithm::RSA),
             Dtls12CipherSuite::PSK_AES128_CCM_8 => None,
             _ => Some(SignatureAlgorithm::UNKNOWN_DERIVED),
         }
@@ -206,7 +241,7 @@ impl Dtls12CipherSuite {
     }
 
     /// Supported DTLS 1.2 cipher suites in server preference order.
-    pub const fn supported() -> &'static [Dtls12CipherSuite; 4] {
+    pub const fn supported() -> &'static [Dtls12CipherSuite; 7] {
         Self::all()
     }
 }
@@ -223,6 +258,15 @@ impl fmt::Debug for Dtls12CipherSuite {
             Dtls12CipherSuite::ECDHE_ECDSA_CHACHA20_POLY1305_SHA256 => {
                 f.write_str("ECDHE_ECDSA_CHACHA20_POLY1305_SHA256")
             }
+            Dtls12CipherSuite::ECDHE_RSA_AES128_GCM_SHA256 => {
+                f.write_str("ECDHE_RSA_AES128_GCM_SHA256")
+            }
+            Dtls12CipherSuite::ECDHE_RSA_AES256_GCM_SHA384 => {
+                f.write_str("ECDHE_RSA_AES256_GCM_SHA384")
+            }
+            Dtls12CipherSuite::DHE_RSA_AES128_GCM_SHA256 => {
+                f.write_str("DHE_RSA_AES128_GCM_SHA256")
+            }
             Dtls12CipherSuite::PSK_AES128_CCM_8 => f.write_str("PSK_AES128_CCM_8"),
             _ => f.debug_tuple("Unknown").field(&self.0).finish(),
         }
@@ -237,6 +281,7 @@ pub type CompressionMethodVec =
 #[allow(clippy::upper_case_acronyms)]
 pub enum KeyExchangeAlgorithm {
     EECDH,
+    DHE,
     PSK,
     Unknown,
 }
@@ -263,14 +308,17 @@ impl ClientCertificateType {
     }
 
     /// Returns true if this certificate type is supported by this implementation.
-    /// Currently only ECDSA_SIGN is supported.
+    /// RSA and ECDSA signing certificates are supported.
     pub fn is_supported(&self) -> bool {
         Self::supported().contains(self)
     }
 
     /// Supported client certificate types.
-    pub const fn supported() -> &'static [ClientCertificateType; 1] {
-        &[ClientCertificateType::ECDSA_SIGN]
+    pub const fn supported() -> &'static [ClientCertificateType; 2] {
+        &[
+            ClientCertificateType::ECDSA_SIGN,
+            ClientCertificateType::RSA_SIGN,
+        ]
     }
 
     pub const fn as_u8(&self) -> u8 {
@@ -325,6 +373,28 @@ impl SignatureAndHashAlgorithm {
         SignatureAndHashAlgorithm { hash, signature }
     }
 
+    /// RSA-PSS schemes reuse the TLS 1.2 two-byte signature field (RFC 8446 section 4.2.3).
+    pub const RSA_PSS_SHA256: Self =
+        Self::new(HashAlgorithm::from_u8(8), SignatureAlgorithm::from_u8(4));
+    pub const RSA_PSS_SHA384: Self =
+        Self::new(HashAlgorithm::from_u8(8), SignatureAlgorithm::from_u8(5));
+
+    pub fn signature_algorithm(self) -> SignatureAlgorithm {
+        if matches!(self, Self::RSA_PSS_SHA256 | Self::RSA_PSS_SHA384) {
+            SignatureAlgorithm::RSA
+        } else {
+            self.signature
+        }
+    }
+
+    pub fn hash_algorithm(self) -> HashAlgorithm {
+        match self {
+            Self::RSA_PSS_SHA256 => HashAlgorithm::SHA256,
+            Self::RSA_PSS_SHA384 => HashAlgorithm::SHA384,
+            _ => self.hash,
+        }
+    }
+
     pub fn from_u16(value: u16) -> Self {
         let hash = HashAlgorithm::from_u8((value >> 8) as u8);
         let signature = SignatureAlgorithm::from_u8(value as u8);
@@ -340,26 +410,21 @@ impl SignatureAndHashAlgorithm {
         Ok((input, SignatureAndHashAlgorithm::from_u16(value)))
     }
 
-    /// All recognized signature+hash combinations.
-    #[allow(dead_code)]
-    pub const fn all() -> &'static [SignatureAndHashAlgorithm; 4] {
-        const ALL: &[SignatureAndHashAlgorithm; 4] = &[
+    /// Supported TLS 1.2 signature schemes, preferring RSA-PSS over PKCS#1.
+    #[cfg(test)]
+    pub const fn all() -> &'static [SignatureAndHashAlgorithm; 6] {
+        Self::supported()
+    }
+
+    pub const fn supported() -> &'static [SignatureAndHashAlgorithm; 6] {
+        const SUPPORTED: &[SignatureAndHashAlgorithm; 6] = &[
             SignatureAndHashAlgorithm::new(HashAlgorithm::SHA256, SignatureAlgorithm::ECDSA),
             SignatureAndHashAlgorithm::new(HashAlgorithm::SHA384, SignatureAlgorithm::ECDSA),
+            SignatureAndHashAlgorithm::RSA_PSS_SHA256,
+            SignatureAndHashAlgorithm::RSA_PSS_SHA384,
             SignatureAndHashAlgorithm::new(HashAlgorithm::SHA256, SignatureAlgorithm::RSA),
             SignatureAndHashAlgorithm::new(HashAlgorithm::SHA384, SignatureAlgorithm::RSA),
         ];
-
-        ALL
-    }
-
-    /// Supported signature+hash combinations.
-    pub const fn supported() -> &'static [SignatureAndHashAlgorithm; 2] {
-        const SUPPORTED: &[SignatureAndHashAlgorithm; 2] = &[
-            SignatureAndHashAlgorithm::new(HashAlgorithm::SHA256, SignatureAlgorithm::ECDSA),
-            SignatureAndHashAlgorithm::new(HashAlgorithm::SHA384, SignatureAlgorithm::ECDSA),
-        ];
-
         SUPPORTED
     }
 
@@ -374,13 +439,21 @@ mod tests {
     use super::*;
 
     #[test]
-    fn rsa_signature_algorithms_are_recognized_but_not_supported() {
+    fn modern_rsa_signatures_are_supported_but_legacy_hashes_are_not() {
         let rsa_sha256 =
             SignatureAndHashAlgorithm::new(HashAlgorithm::SHA256, SignatureAlgorithm::RSA);
 
         assert!(SignatureAndHashAlgorithm::all().contains(&rsa_sha256));
-        assert!(!rsa_sha256.is_supported());
-        assert_eq!(SignatureAndHashAlgorithm::supported().len(), 2);
+        assert!(rsa_sha256.is_supported());
+        assert!(
+            !SignatureAndHashAlgorithm::new(HashAlgorithm::SHA1, SignatureAlgorithm::RSA)
+                .is_supported()
+        );
+        assert!(
+            !SignatureAndHashAlgorithm::new(HashAlgorithm::MD5, SignatureAlgorithm::RSA)
+                .is_supported()
+        );
+        assert_eq!(SignatureAndHashAlgorithm::supported().len(), 6);
     }
 
     #[test]

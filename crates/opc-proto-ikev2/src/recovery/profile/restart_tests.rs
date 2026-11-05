@@ -48,8 +48,8 @@ fn store(epoch: &Epoch, record: &Record<Cbc>) -> String {
         || ("-".into(), "-".into(), "-".into()),
         |entry| {
             (
-                hex(entry.request()),
-                hex(entry.response().unwrap()),
+                hex(entry.request().single_packet().unwrap()),
+                hex(entry.response().unwrap().single_packet().unwrap()),
                 hex(entry.outcome().unwrap()),
             )
         },
@@ -106,6 +106,8 @@ fn restore(f: &mut Fixture, serialized: &str) -> Record<Cbc> {
         Some(fields[3].parse().unwrap()),
         None,
         inbound,
+        None,
+        None,
     )
     .unwrap();
     assert_eq!(store(&f.epoch, &record), serialized);
@@ -262,19 +264,21 @@ fn cbc_restart_child() {
                 }
                 if stage == "ordinary-restored" {
                     let entry = durable.inbound().unwrap();
-                    let request = window.open_peer(profile, &f.keys, entry.request()).unwrap();
+                    let request = window
+                        .open_peer(profile, &f.keys, entry.request().single_packet().unwrap())
+                        .unwrap();
                     assert_eq!(
                         window.request_disposition(&request),
                         Ok(Disposition::CachedResponse)
                     );
                     assert_eq!(
-                        window.replay_response(&request).unwrap().bytes(),
-                        entry.response().unwrap()
+                        window.replay_response(&request).unwrap().bytes().unwrap(),
+                        entry.response().unwrap().single_packet().unwrap()
                     );
                     assert_eq!(entry.outcome(), Some(&b"ordinary result"[..]));
                     println!(
                         "REPLAY:{row}:{}",
-                        hex(window.replay_response(&request).unwrap().bytes())
+                        hex(window.replay_response(&request).unwrap().bytes().unwrap())
                     );
                 }
                 window

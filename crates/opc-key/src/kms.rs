@@ -5,7 +5,7 @@ use zeroize::Zeroizing;
 
 use crate::{
     errors::KeyError,
-    provider::{EncryptedPayload, KeyHandle, KeyProvider},
+    provider::{EncryptedPayload, KeyHandle, KeyProvider, AEAD_TAG_LEN},
     remote::{RemoteSealMaterialController, RemoteSealMaterialEpoch, RemoteSealProvider},
     scope::{serialize_bound_aad, EnvelopeAad, KeyId, KeyPurpose},
 };
@@ -63,13 +63,28 @@ struct KmsResponse {
     purpose: Option<String>,
     tenant: Option<String>,
     error_message: Option<String>,
+    reason: Option<String>,
     ciphertext_and_tag_hex: Option<String>,
     plaintext_hex: Option<String>,
 }
 
+fn classify_response(resp: KmsResponse, request_type: &str) -> Result<KmsResponse, KeyError> {
+    match resp.status.as_str() {
+        "success" => Ok(resp),
+        "unavailable" => Err(KeyError::Unavailable),
+        "error" => Err(match resp.reason.as_deref() {
+            Some("key_not_found") => KeyError::NotFound,
+            Some("key_revoked") => KeyError::OperationFailed,
+            Some("ciphertext_rejected") if request_type == "decrypt" => KeyError::OperationFailed,
+            _ => KeyError::ProviderUnusable,
+        }),
+        _ => Err(KeyError::ProviderUnusable),
+    }
+}
+
 fn decode_hex_32(hex: &str) -> Result<Zeroizing<[u8; 32]>, KeyError> {
     if hex.len() != 64 || !hex.is_ascii() {
-        return Err(KeyError::Unavailable);
+        return Err(KeyError::ProviderUnusable);
     }
     let mut bytes = Zeroizing::new([0u8; 32]);
     for (i, chunk) in hex.as_bytes().as_chunks::<2>().0.iter().enumerate() {
@@ -85,7 +100,7 @@ fn decode_hex_nibble(byte: u8) -> Result<u8, KeyError> {
         b'0'..=b'9' => Ok(byte - b'0'),
         b'a'..=b'f' => Ok(byte - b'a' + 10),
         b'A'..=b'F' => Ok(byte - b'A' + 10),
-        _ => Err(KeyError::Unavailable),
+        _ => Err(KeyError::ProviderUnusable),
     }
 }
 
@@ -101,7 +116,7 @@ fn encode_hex(bytes: &[u8]) -> String {
 fn decode_hex_vec(hex: &str) -> Result<Vec<u8>, KeyError> {
     let (chunks, remainder) = hex.as_bytes().as_chunks::<2>();
     if !remainder.is_empty() || !hex.is_ascii() {
-        return Err(KeyError::Unavailable);
+        return Err(KeyError::ProviderUnusable);
     }
     let mut bytes = Vec::with_capacity(hex.len() / 2);
     for chunk in chunks {
@@ -110,6 +125,114 @@ fn decode_hex_vec(hex: &str) -> Result<Vec<u8>, KeyError> {
         bytes.push((high << 4) | low);
     }
     Ok(bytes)
+}
+
+fn unix_endpoint_path(endpoint: &str) -> Result<&str, KeyError> {
+    let path = endpoint.strip_prefix("unix://").unwrap_or(endpoint);
+    if !std::path::Path::new(path).is_absolute() {
+        return Err(KeyError::ProviderUnusable);
+    }
+    // Validate the platform's actual sun_path limit and reject interior NULs
+    // before attempting I/O. An endpoint has at most one scheme prefix.
+    std::os::unix::net::SocketAddr::from_pathname(path).map_err(|_| KeyError::ProviderUnusable)?;
+    Ok(path)
+}
+
+fn unix_connect_error(error: std::io::Error) -> KeyError {
+    match error.raw_os_error() {
+        // The service socket is absent or has no listener.
+        Some(libc::ENOENT | libc::ECONNREFUSED)
+        // A connection raced service shutdown or exceeded its transport wait.
+        | Some(libc::ECONNRESET | libc::ECONNABORTED | libc::ETIMEDOUT)
+        // Interrupted syscall or a full local socket backlog.
+        | Some(libc::EINTR | libc::EAGAIN)
+        // Temporary memory, buffer or process/system descriptor exhaustion.
+        | Some(libc::ENOMEM | libc::ENOBUFS | libc::EMFILE | libc::ENFILE) => {
+            KeyError::Unavailable
+        }
+        // Permissions, invalid path components, protocol mismatch and other
+        // local configuration failures must not consume a retry budget.
+        _ => KeyError::ProviderUnusable,
+    }
+}
+
+async fn connect_tcp(addr: &str) -> std::io::Result<tokio::net::TcpStream> {
+    #[cfg(test)]
+    if tests::TCP_CONNECT_DENIALS.lock().unwrap().contains(addr) {
+        return Err(std::io::ErrorKind::PermissionDenied.into());
+    }
+    tokio::net::TcpStream::connect(addr).await
+}
+
+fn kms_transport_error(error: std::io::Error) -> KeyError {
+    // Rustls wraps certificate verification and fatal peer alerts in io::Error.
+    // TLS 1.3 can deliver a peer authentication refusal on application I/O after
+    // the client's connect future completes, so use this at every TLS I/O site.
+    // RFC 8446 §6.2: internal_error is a peer-internal failure, not evidence
+    // of incorrect client configuration, authentication or protocol use.
+    if matches!(
+        error
+            .get_ref()
+            .and_then(|cause| cause.downcast_ref::<tokio_rustls::rustls::Error>()),
+        Some(tokio_rustls::rustls::Error::AlertReceived(
+            tokio_rustls::rustls::AlertDescription::InternalError
+        ))
+    ) {
+        return KeyError::Unavailable;
+    }
+    if error
+        .get_ref()
+        .is_some_and(|cause| cause.is::<tokio_rustls::rustls::Error>())
+        || matches!(
+            error.kind(),
+            std::io::ErrorKind::InvalidData
+                | std::io::ErrorKind::InvalidInput
+                | std::io::ErrorKind::PermissionDenied
+        )
+    {
+        KeyError::ProviderUnusable
+    } else {
+        KeyError::Unavailable
+    }
+}
+
+fn tcp_endpoint_addr(endpoint: &str) -> Result<&str, KeyError> {
+    // Keep the address spelling accepted by the released adapters. In
+    // particular, converting scoped IPv6 to an (Ipv6Addr, port) tuple would
+    // discard its scope. Tokio parses a complete SocketAddr before resolving.
+    let addr = endpoint.strip_prefix("tcp://").unwrap_or(endpoint);
+    if addr.contains("://") {
+        return Err(KeyError::ProviderUnusable);
+    }
+    if addr.parse::<std::net::SocketAddr>().is_ok() {
+        return Ok(addr);
+    }
+    let (host, port) = addr.rsplit_once(':').ok_or(KeyError::ProviderUnusable)?;
+    if host.is_empty()
+        || host
+            .chars()
+            .any(|character| character.is_whitespace() || character.is_control())
+        || port.parse::<u16>().is_err()
+        || host.contains(['[', ']', '/', '?', '#', '@'])
+    {
+        return Err(KeyError::ProviderUnusable);
+    }
+    if host.contains(':') {
+        // The resolver also accepts unbracketed numeric IPv6 host:port forms.
+        // A zone is resolved with the address rather than treated as a name.
+        let literal = if let Some((literal, zone)) = host.split_once('%') {
+            if zone.is_empty() {
+                return Err(KeyError::ProviderUnusable);
+            }
+            literal
+        } else {
+            host
+        };
+        literal
+            .parse::<std::net::Ipv6Addr>()
+            .map_err(|_| KeyError::ProviderUnusable)?;
+    }
+    Ok(addr)
 }
 
 pub struct KmsKeyProvider {
@@ -168,72 +291,69 @@ impl KmsKeyProvider {
     async fn call_kms_inner(&self, req: KmsRequest) -> Result<KmsResponse, KeyError> {
         let connect_fut = async {
             if self.endpoint.starts_with('/') || self.endpoint.starts_with("unix://") {
-                let path = self.endpoint.trim_start_matches("unix://");
+                let path = unix_endpoint_path(&self.endpoint)?;
+                // A regular file can produce ECONNREFUSED just like a stale
+                // socket. Distinguish configuration from an absent listener.
+                // Connect still classifies races after this observation.
+                use std::os::unix::fs::FileTypeExt;
+                let metadata = tokio::fs::metadata(path)
+                    .await
+                    .map_err(unix_connect_error)?;
+                if !metadata.file_type().is_socket() {
+                    return Err(KeyError::ProviderUnusable);
+                }
                 let stream = tokio::net::UnixStream::connect(path)
                     .await
-                    .map_err(|_| KeyError::Unavailable)?;
+                    .map_err(unix_connect_error)?;
                 Ok::<KmsStream, KeyError>(KmsStream::Unix(stream))
             } else {
-                let addr = self.endpoint.trim_start_matches("tcp://");
-                let connector = self.connector.as_ref().ok_or(KeyError::Unavailable)?;
-                let stream = tokio::net::TcpStream::connect(addr)
-                    .await
-                    .map_err(|_| KeyError::Unavailable)?;
+                let addr = tcp_endpoint_addr(&self.endpoint)?;
+                let connector = self.connector.as_ref().ok_or(KeyError::ProviderUnusable)?;
                 let domain = rustls_pki_types::ServerName::try_from(self.server_name.clone())
-                    .map_err(|_| KeyError::Unavailable)?;
+                    .map_err(|_| KeyError::ProviderUnusable)?;
+                let stream = connect_tcp(addr).await.map_err(kms_transport_error)?;
                 let tls_stream = connector
                     .connect(domain, stream)
                     .await
-                    .map_err(|_| KeyError::Unavailable)?;
+                    .map_err(kms_transport_error)?;
                 Ok(KmsStream::Tls(Box::new(tls_stream)))
             }
         };
 
         let mut stream = connect_fut.await?;
 
-        let req_bytes = serde_json::to_vec(&req).map_err(|_| KeyError::Unavailable)?;
+        let req_bytes = serde_json::to_vec(&req).map_err(|_| KeyError::ProviderUnusable)?;
         let req_len = req_bytes.len() as u32;
 
         stream
             .write_all(&req_len.to_be_bytes())
             .await
-            .map_err(|_| KeyError::Unavailable)?;
+            .map_err(kms_transport_error)?;
         stream
             .write_all(&req_bytes)
             .await
-            .map_err(|_| KeyError::Unavailable)?;
-        stream.flush().await.map_err(|_| KeyError::Unavailable)?;
+            .map_err(kms_transport_error)?;
+        stream.flush().await.map_err(kms_transport_error)?;
 
         let mut len_buf = [0u8; 4];
         stream
             .read_exact(&mut len_buf)
             .await
-            .map_err(|_| KeyError::Unavailable)?;
+            .map_err(kms_transport_error)?;
         let len = u32::from_be_bytes(len_buf) as usize;
         if len > Self::MAX_RESPONSE_BYTES {
-            return Err(KeyError::Unavailable);
+            return Err(KeyError::ProviderUnusable);
         }
 
         let mut resp_buf = Zeroizing::new(vec![0u8; len]);
         stream
             .read_exact(&mut resp_buf)
             .await
-            .map_err(|_| KeyError::Unavailable)?;
+            .map_err(kms_transport_error)?;
         let resp: KmsResponse =
-            serde_json::from_slice(&resp_buf).map_err(|_| KeyError::Unavailable)?;
+            serde_json::from_slice(&resp_buf).map_err(|_| KeyError::ProviderUnusable)?;
 
-        if resp.status == "success" {
-            Ok(resp)
-        } else {
-            let msg = resp
-                .error_message
-                .unwrap_or_else(|| "KMS failed".to_string());
-            if msg.contains("not found") {
-                Err(KeyError::NotFound)
-            } else {
-                Err(KeyError::Unavailable)
-            }
-        }
+        classify_response(resp, &req.request_type)
     }
 }
 
@@ -254,10 +374,10 @@ impl KeyProvider for KmsKeyProvider {
             ciphertext_and_tag_hex: None,
         };
         let resp = self.call_kms(req).await?;
-        let key_id_str = resp.key_id.ok_or(KeyError::NotFound)?;
-        let key_bytes_hex = Zeroizing::new(resp.key_bytes_hex.ok_or(KeyError::NotFound)?);
+        let key_id_str = resp.key_id.ok_or(KeyError::ProviderUnusable)?;
+        let key_bytes_hex = Zeroizing::new(resp.key_bytes_hex.ok_or(KeyError::ProviderUnusable)?);
 
-        let key_id = KeyId::new(key_id_str)?;
+        let key_id = KeyId::new(key_id_str).map_err(|_| KeyError::ProviderUnusable)?;
         let key_bytes = decode_hex_32(&key_bytes_hex)?;
 
         let handle = KeyHandle::new(key_id, purpose, tenant.clone(), key_bytes);
@@ -275,9 +395,9 @@ impl KeyProvider for KmsKeyProvider {
             ciphertext_and_tag_hex: None,
         };
         let resp = self.call_kms(req).await?;
-        let key_bytes_hex = Zeroizing::new(resp.key_bytes_hex.ok_or(KeyError::NotFound)?);
-        let purpose_str = resp.purpose.ok_or(KeyError::NotFound)?;
-        let tenant_str = resp.tenant.ok_or(KeyError::NotFound)?;
+        let key_bytes_hex = Zeroizing::new(resp.key_bytes_hex.ok_or(KeyError::ProviderUnusable)?);
+        let purpose_str = resp.purpose.ok_or(KeyError::ProviderUnusable)?;
+        let tenant_str = resp.tenant.ok_or(KeyError::ProviderUnusable)?;
 
         let purpose = match purpose_str.as_str() {
             "config" => KeyPurpose::Config,
@@ -287,10 +407,9 @@ impl KeyProvider for KmsKeyProvider {
             "ipsec-sa" => KeyPurpose::IpsecSa,
             "audit" => KeyPurpose::Audit,
             "backup" => KeyPurpose::Backup,
-            _ => return Err(KeyError::Unavailable),
+            _ => return Err(KeyError::ProviderUnusable),
         };
-        let tenant = TenantId::new(tenant_str)
-            .map_err(|e| KeyError::invalid_metadata("tenant", e.to_string()))?;
+        let tenant = TenantId::new(tenant_str).map_err(|_| KeyError::ProviderUnusable)?;
         let key_bytes = decode_hex_32(&key_bytes_hex)?;
 
         let handle = KeyHandle::new(key_id.clone(), purpose, tenant, key_bytes);
@@ -308,8 +427,8 @@ impl KeyProvider for KmsKeyProvider {
             ciphertext_and_tag_hex: None,
         };
         let resp = self.call_kms(req).await?;
-        let key_id_str = resp.key_id.ok_or(KeyError::NotFound)?;
-        KeyId::new(key_id_str)
+        let key_id_str = resp.key_id.ok_or(KeyError::ProviderUnusable)?;
+        KeyId::new(key_id_str).map_err(|_| KeyError::ProviderUnusable)
     }
 }
 
@@ -372,72 +491,69 @@ impl KmsRemoteSealProvider {
     async fn call_kms_inner(&self, req: KmsRequest) -> Result<KmsResponse, KeyError> {
         let connect_fut = async {
             if self.endpoint.starts_with('/') || self.endpoint.starts_with("unix://") {
-                let path = self.endpoint.trim_start_matches("unix://");
+                let path = unix_endpoint_path(&self.endpoint)?;
+                // A regular file can produce ECONNREFUSED just like a stale
+                // socket. Distinguish configuration from an absent listener.
+                // Connect still classifies races after this observation.
+                use std::os::unix::fs::FileTypeExt;
+                let metadata = tokio::fs::metadata(path)
+                    .await
+                    .map_err(unix_connect_error)?;
+                if !metadata.file_type().is_socket() {
+                    return Err(KeyError::ProviderUnusable);
+                }
                 let stream = tokio::net::UnixStream::connect(path)
                     .await
-                    .map_err(|_| KeyError::Unavailable)?;
+                    .map_err(unix_connect_error)?;
                 Ok::<KmsStream, KeyError>(KmsStream::Unix(stream))
             } else {
-                let addr = self.endpoint.trim_start_matches("tcp://");
-                let connector = self.connector.as_ref().ok_or(KeyError::Unavailable)?;
-                let stream = tokio::net::TcpStream::connect(addr)
-                    .await
-                    .map_err(|_| KeyError::Unavailable)?;
+                let addr = tcp_endpoint_addr(&self.endpoint)?;
+                let connector = self.connector.as_ref().ok_or(KeyError::ProviderUnusable)?;
                 let domain = rustls_pki_types::ServerName::try_from(self.server_name.clone())
-                    .map_err(|_| KeyError::Unavailable)?;
+                    .map_err(|_| KeyError::ProviderUnusable)?;
+                let stream = connect_tcp(addr).await.map_err(kms_transport_error)?;
                 let tls_stream = connector
                     .connect(domain, stream)
                     .await
-                    .map_err(|_| KeyError::Unavailable)?;
+                    .map_err(kms_transport_error)?;
                 Ok(KmsStream::Tls(Box::new(tls_stream)))
             }
         };
 
         let mut stream = connect_fut.await?;
 
-        let req_bytes = serde_json::to_vec(&req).map_err(|_| KeyError::Unavailable)?;
+        let req_bytes = serde_json::to_vec(&req).map_err(|_| KeyError::ProviderUnusable)?;
         let req_len = req_bytes.len() as u32;
 
         stream
             .write_all(&req_len.to_be_bytes())
             .await
-            .map_err(|_| KeyError::Unavailable)?;
+            .map_err(kms_transport_error)?;
         stream
             .write_all(&req_bytes)
             .await
-            .map_err(|_| KeyError::Unavailable)?;
-        stream.flush().await.map_err(|_| KeyError::Unavailable)?;
+            .map_err(kms_transport_error)?;
+        stream.flush().await.map_err(kms_transport_error)?;
 
         let mut len_buf = [0u8; 4];
         stream
             .read_exact(&mut len_buf)
             .await
-            .map_err(|_| KeyError::Unavailable)?;
+            .map_err(kms_transport_error)?;
         let len = u32::from_be_bytes(len_buf) as usize;
         if len > KmsKeyProvider::MAX_RESPONSE_BYTES {
-            return Err(KeyError::Unavailable);
+            return Err(KeyError::ProviderUnusable);
         }
 
         let mut resp_buf = Zeroizing::new(vec![0u8; len]);
         stream
             .read_exact(&mut resp_buf)
             .await
-            .map_err(|_| KeyError::Unavailable)?;
+            .map_err(kms_transport_error)?;
         let resp: KmsResponse =
-            serde_json::from_slice(&resp_buf).map_err(|_| KeyError::Unavailable)?;
+            serde_json::from_slice(&resp_buf).map_err(|_| KeyError::ProviderUnusable)?;
 
-        if resp.status == "success" {
-            Ok(resp)
-        } else {
-            let msg = resp
-                .error_message
-                .unwrap_or_else(|| "KMS failed".to_string());
-            if msg.contains("not found") {
-                Err(KeyError::NotFound)
-            } else {
-                Err(KeyError::Unavailable)
-            }
-        }
+        classify_response(resp, &req.request_type)
     }
 }
 
@@ -460,8 +576,15 @@ impl RemoteSealProvider for KmsRemoteSealProvider {
             ciphertext_and_tag_hex: None,
         };
         let resp = self.call_kms(req).await?;
-        let ciphertext_hex = resp.ciphertext_and_tag_hex.ok_or(KeyError::Unavailable)?;
+        let ciphertext_hex = resp
+            .ciphertext_and_tag_hex
+            .ok_or(KeyError::ProviderUnusable)?;
         let ciphertext_and_tag = decode_hex_vec(&ciphertext_hex)?;
+        // RemoteSeal output is opaque and may include provider framing, but
+        // even an empty plaintext requires an authentication tag.
+        if ciphertext_and_tag.len() < AEAD_TAG_LEN {
+            return Err(KeyError::ProviderUnusable);
+        }
 
         Ok(EncryptedPayload {
             aad: bound_aad,
@@ -486,7 +609,7 @@ impl RemoteSealProvider for KmsRemoteSealProvider {
             ciphertext_and_tag_hex: Some(encode_hex(ciphertext_and_tag)),
         };
         let resp = self.call_kms(req).await?;
-        let plaintext_hex = Zeroizing::new(resp.plaintext_hex.ok_or(KeyError::Unavailable)?);
+        let plaintext_hex = Zeroizing::new(resp.plaintext_hex.ok_or(KeyError::ProviderUnusable)?);
         Ok(Zeroizing::new(decode_hex_vec(&plaintext_hex)?))
     }
 }
@@ -494,13 +617,535 @@ impl RemoteSealProvider for KmsRemoteSealProvider {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::provider::AES_256_GCM_SIV_KEY_LEN;
+    use crate::provider::{AES_256_GCM_SIV_KEY_LEN, AES_256_GCM_SIV_NONCE_LEN};
     use std::path::PathBuf;
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::time::Duration;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
+    // A missing client, frame or release must fail the fixture, not retain a
+    // server task until the CI job deadline. Provider operation limits stay fixed.
+    fn spawn_fixture<T: Send + 'static>(
+        step: &'static str,
+        work: impl std::future::Future<Output = T> + Send + 'static,
+    ) -> tokio::task::JoinHandle<T> {
+        tokio::spawn(async move {
+            tokio::time::timeout(Duration::from_secs(180), work)
+                .await
+                .unwrap_or_else(|_| panic!("key-provider fixture stalled at {step}"))
+        })
+    }
+
+    #[tokio::test]
+    async fn kms_error_verdict_requires_a_recognized_machine_reason() {
+        let mut failures = Vec::new();
+        for reason in [
+            None,
+            Some(""),
+            Some("unknown"),
+            Some("KEY_NOT_FOUND"),
+            Some("key_not_found"),
+            Some("key_revoked"),
+            Some("ciphertext_rejected"),
+        ] {
+            for message in [
+                "access denied",
+                "authentication failed",
+                "internal server error",
+                "route not found",
+                "",
+            ] {
+                let mut reply = serde_json::json!({"status":"error", "error_message":message});
+                if let Some(reason) = reason {
+                    reply["reason"] = reason.into();
+                }
+                for operation in 0..5 {
+                    let mock = mock_kms(MockResponse::Bytes(reply.to_string().into_bytes())).await;
+                    let key_id = KeyId::new("machine-reason-key").unwrap();
+                    let local =
+                        KmsKeyProvider::new(mock.endpoint.clone(), None, Duration::from_secs(1));
+                    let remote = KmsRemoteSealProvider::new(
+                        mock.endpoint.clone(),
+                        None,
+                        Duration::from_secs(1),
+                        key_id.clone(),
+                    );
+                    let error = match operation {
+                        0 => local
+                            .get_active_key(KeyPurpose::Session, &tenant())
+                            .await
+                            .unwrap_err(),
+                        1 => local.get_key_by_id(&key_id).await.unwrap_err(),
+                        2 => local
+                            .rotate_key(KeyPurpose::Session, &tenant())
+                            .await
+                            .unwrap_err(),
+                        3 => remote.seal(&session_aad(), b"plaintext").await.unwrap_err(),
+                        4 => remote
+                            .unseal(&key_id, &session_aad(), b"ciphertext")
+                            .await
+                            .unwrap_err(),
+                        _ => unreachable!(),
+                    };
+                    let expected = match reason {
+                        Some("key_not_found") => KeyError::NotFound,
+                        Some("key_revoked") => KeyError::OperationFailed,
+                        Some("ciphertext_rejected") if operation == 4 => KeyError::OperationFailed,
+                        _ => KeyError::ProviderUnusable,
+                    };
+                    if error != expected {
+                        failures.push((reason, message, operation, error, expected));
+                    }
+                }
+            }
+        }
+        assert!(
+            failures.is_empty(),
+            "free text or unrecognized reasons became verdicts: {failures:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn kms_tls_internal_error_is_an_outage_for_all_operations() {
+        let errors = kms_peer_alert_errors(Some(80)).await;
+        assert!(
+            errors.iter().all(|error| *error == KeyError::Unavailable),
+            "peer internal fault is not provider configuration: {errors:?}"
+        );
+    }
+
+    #[test]
+    fn kms_transport_permission_denial_requires_operator_repair() {
+        assert_eq!(
+            kms_transport_error(std::io::Error::from(std::io::ErrorKind::PermissionDenied)),
+            KeyError::ProviderUnusable
+        );
+    }
+
+    pub(super) static TCP_CONNECT_DENIALS: std::sync::Mutex<std::collections::BTreeSet<String>> =
+        std::sync::Mutex::new(std::collections::BTreeSet::new());
+    #[tokio::test]
+    async fn kms_tcp_permission_denial_is_reported_by_both_adapters() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        TCP_CONNECT_DENIALS.lock().unwrap().insert(addr.clone());
+        let errors = kms_request_errors(
+            format!("tcp://{addr}"),
+            Some(kms_test_tls_connector()),
+            "kms.example",
+        )
+        .await;
+        TCP_CONNECT_DENIALS.lock().unwrap().remove(&addr);
+        assert!(
+            errors
+                .iter()
+                .all(|error| *error == KeyError::ProviderUnusable),
+            "TCP permission error lost its class: {errors:?}"
+        );
+        assert_eq!(
+            listener.accept().unwrap_err().kind(),
+            std::io::ErrorKind::WouldBlock
+        );
+    }
+
     static NEXT_SOCKET_ID: AtomicU64 = AtomicU64::new(0);
+
+    fn assert_provider_configuration(errors: &[KeyError]) {
+        for error in errors {
+            assert_eq!(error.to_string(), "key provider unusable as configured");
+            assert_eq!(format!("{error:?}"), "ProviderUnusable");
+        }
+    }
+
+    #[tokio::test]
+    async fn kms_endpoint_configuration_is_not_a_key_verdict() {
+        assert_provider_configuration(
+            &kms_request_errors("unix://".into(), None, "kms.example").await,
+        );
+    }
+
+    #[tokio::test]
+    async fn kms_certificate_configuration_is_not_a_key_verdict() {
+        assert_provider_configuration(&kms_certificate_failure_errors(false).await);
+    }
+
+    #[tokio::test]
+    async fn kms_permission_configuration_is_not_a_key_verdict() {
+        use std::os::unix::fs::PermissionsExt;
+        let path = next_mock_socket_path();
+        let listener = std::os::unix::net::UnixListener::bind(&path).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o000)).unwrap();
+        assert_eq!(
+            std::os::unix::net::UnixStream::connect(&path)
+                .unwrap_err()
+                .kind(),
+            std::io::ErrorKind::PermissionDenied
+        );
+        let errors = kms_request_errors(path.display().to_string(), None, "kms.example").await;
+        drop(listener);
+        std::fs::remove_file(path).unwrap();
+        assert_provider_configuration(&errors);
+    }
+
+    #[tokio::test]
+    async fn kms_regular_file_endpoint_is_configuration_not_an_outage() {
+        let path = next_mock_socket_path();
+        std::fs::write(&path, b"not a socket").unwrap();
+        let errors = kms_request_errors(path.display().to_string(), None, "kms.example").await;
+        std::fs::remove_file(path).unwrap();
+        assert_provider_configuration(&errors);
+    }
+
+    #[test]
+    fn kms_unix_connect_classification_preserves_outages_and_rejects_configuration() {
+        for errno in [
+            libc::ENOENT,
+            libc::ECONNREFUSED,
+            libc::ECONNRESET,
+            libc::ECONNABORTED,
+            libc::ETIMEDOUT,
+            libc::EINTR,
+            libc::EAGAIN,
+            libc::ENOMEM,
+            libc::ENOBUFS,
+            libc::EMFILE,
+            libc::ENFILE,
+        ] {
+            assert_eq!(
+                unix_connect_error(std::io::Error::from_raw_os_error(errno)),
+                KeyError::Unavailable,
+                "temporary service or resource failure: {errno}"
+            );
+        }
+        for errno in [
+            libc::EACCES,
+            libc::EPERM,
+            libc::EINVAL,
+            libc::ENOTDIR,
+            libc::ENAMETOOLONG,
+            libc::ELOOP,
+            libc::ENOTSOCK,
+            libc::EPROTOTYPE,
+        ] {
+            assert_eq!(
+                unix_connect_error(std::io::Error::from_raw_os_error(errno)),
+                KeyError::ProviderUnusable,
+                "invalid local configuration: {errno}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn kms_invalid_unix_paths_require_repair_for_all_operations() {
+        let mut results = Vec::new();
+        for endpoint in [
+            "unix://".to_string(),
+            "unix://relative.sock".to_string(),
+            "unix://unix:///tmp/kms.sock".to_string(),
+            "/tmp/kms\0.sock".to_string(),
+            "unix:///tmp/kms\0.sock".to_string(),
+            format!("unix:///{}", "x".repeat(256)),
+        ] {
+            results.push(kms_request_errors(endpoint, None, "kms.example").await);
+        }
+        assert!(
+            results
+                .iter()
+                .flatten()
+                .all(|error| *error == KeyError::ProviderUnusable),
+            "invalid paths must require provider repair: {results:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn kms_repeated_tcp_scheme_requires_repair_before_connect() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let errors = kms_request_errors(
+            format!("tcp://tcp://{}", listener.local_addr().unwrap()),
+            Some(kms_test_tls_connector()),
+            "kms.example",
+        )
+        .await;
+        assert!(
+            errors
+                .iter()
+                .all(|error| *error == KeyError::ProviderUnusable),
+            "repeated scheme must require provider repair: {errors:?}"
+        );
+        // A rejected configuration must not send even a TLS ClientHello.
+        assert!(
+            tokio::time::timeout(Duration::from_millis(20), listener.accept())
+                .await
+                .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn kms_absent_and_refused_unix_services_remain_unavailable() {
+        let path = next_mock_socket_path();
+        for prefix in ["", "unix://"] {
+            let errors =
+                kms_request_errors(format!("{prefix}{}", path.display()), None, "kms.example")
+                    .await;
+            assert!(errors.iter().all(|error| *error == KeyError::Unavailable));
+        }
+        // Dropping the listener leaves a valid socket pathname with no service.
+        let listener = std::os::unix::net::UnixListener::bind(&path).unwrap();
+        drop(listener);
+        let errors = kms_request_errors(path.display().to_string(), None, "kms.example").await;
+        std::fs::remove_file(path).unwrap();
+        assert!(errors.iter().all(|error| *error == KeyError::Unavailable));
+    }
+
+    #[tokio::test]
+    async fn kms_non_socket_unix_path_requires_repair_for_all_operations() {
+        let directory = next_mock_socket_path();
+        std::fs::create_dir(&directory).unwrap();
+        let file = directory.join("regular-file");
+        std::fs::write(&file, b"not a socket").unwrap();
+        // Both the file itself and ENOTDIR require configuration repair;
+        // neither is an absent listener on an otherwise valid socket.
+        for path in [&file, &file.join("socket")] {
+            let errors = kms_request_errors(path.display().to_string(), None, "kms.example").await;
+            assert_provider_configuration(&errors);
+        }
+        std::fs::remove_file(file).unwrap();
+        std::fs::remove_dir(directory).unwrap();
+    }
+
+    async fn kms_certificate_failure_errors(trust_certificate: bool) -> [KeyError; 5] {
+        use tokio_rustls::rustls;
+        let generated = rcgen::generate_simple_self_signed(vec!["kms.example".into()]).unwrap();
+        let certificate = generated.cert.der().clone();
+        let key = rustls_pki_types::PrivatePkcs8KeyDer::from(generated.signing_key.serialize_der());
+        let crypto = std::sync::Arc::new(rustls::crypto::ring::default_provider());
+        let server = rustls::ServerConfig::builder_with_provider(crypto.clone())
+            .with_safe_default_protocol_versions()
+            .unwrap()
+            .with_no_client_auth()
+            .with_single_cert(vec![certificate.clone()], key.into())
+            .unwrap();
+        let mut roots = rustls::RootCertStore::empty();
+        if trust_certificate {
+            roots.add(certificate).unwrap();
+        }
+        let client = rustls::ClientConfig::builder_with_provider(crypto)
+            .with_safe_default_protocol_versions()
+            .unwrap()
+            .with_root_certificates(roots)
+            .with_no_client_auth();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = format!("tcp://{}", listener.local_addr().unwrap());
+        let acceptor = tokio_rustls::TlsAcceptor::from(std::sync::Arc::new(server));
+        let task = spawn_fixture("mock key-provider worker", async move {
+            for _ in 0..5 {
+                let (stream, _) = listener.accept().await.unwrap();
+                assert!(
+                    acceptor.accept(stream).await.is_err(),
+                    "client must reject the certificate"
+                );
+            }
+        });
+        let name = if trust_certificate {
+            "wrong.example"
+        } else {
+            "kms.example"
+        };
+        let errors = kms_request_errors(
+            endpoint,
+            Some(tokio_rustls::TlsConnector::from(std::sync::Arc::new(
+                client,
+            ))),
+            name,
+        )
+        .await;
+        task.await.unwrap();
+        errors
+    }
+
+    #[tokio::test]
+    async fn kms_untrusted_certificate_requires_repair_for_all_operations() {
+        let errors = kms_certificate_failure_errors(false).await;
+        assert!(
+            errors
+                .iter()
+                .all(|error| *error == KeyError::ProviderUnusable),
+            "untrusted certificate must require provider repair: {errors:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn kms_certificate_name_mismatch_requires_repair_for_all_operations() {
+        let errors = kms_certificate_failure_errors(true).await;
+        assert!(
+            errors
+                .iter()
+                .all(|error| *error == KeyError::ProviderUnusable),
+            "certificate name mismatch must require provider repair: {errors:?}"
+        );
+    }
+
+    async fn kms_peer_alert_errors(alert: Option<u8>) -> [KeyError; 5] {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = format!("tcp://{}", listener.local_addr().unwrap());
+        let task = spawn_fixture("mock key-provider worker", async move {
+            for _ in 0..5 {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let mut header = [0u8; 5];
+                stream.read_exact(&mut header).await.unwrap();
+                assert_eq!(header[0], 22, "client must send a handshake record");
+                let mut body = vec![0; usize::from(u16::from_be_bytes([header[3], header[4]]))];
+                stream.read_exact(&mut body).await.unwrap();
+                if let Some(alert) = alert {
+                    // TLS fatal alert record: bad_certificate, unknown_ca or access_denied.
+                    stream.write_all(&[21, 3, 3, 0, 2, 2, alert]).await.unwrap();
+                }
+            }
+        });
+        let errors =
+            kms_request_errors(endpoint, Some(kms_test_tls_connector()), "kms.example").await;
+        task.await.unwrap();
+        errors
+    }
+
+    #[tokio::test]
+    async fn kms_peer_authentication_alerts_require_repair_for_all_operations() {
+        let mut results = Vec::new();
+        for alert in [42, 48, 49] {
+            results.push(kms_peer_alert_errors(Some(alert)).await);
+        }
+        assert!(
+            results
+                .iter()
+                .flatten()
+                .all(|error| *error == KeyError::ProviderUnusable),
+            "peer authentication rejection must require provider repair: {results:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn kms_tls13_client_authentication_rejection_requires_repair_for_all_operations() {
+        use tokio_rustls::rustls;
+        let generated = rcgen::generate_simple_self_signed(vec!["kms.example".into()]).unwrap();
+        let certificate = generated.cert.der().clone();
+        let key = rustls_pki_types::PrivatePkcs8KeyDer::from(generated.signing_key.serialize_der());
+        let crypto = std::sync::Arc::new(rustls::crypto::ring::default_provider());
+        let mut roots = rustls::RootCertStore::empty();
+        roots.add(certificate.clone()).unwrap();
+        let verifier = rustls::server::WebPkiClientVerifier::builder_with_provider(
+            std::sync::Arc::new(roots.clone()),
+            crypto.clone(),
+        )
+        .build()
+        .unwrap();
+        let server = rustls::ServerConfig::builder_with_provider(crypto.clone())
+            .with_protocol_versions(&[&rustls::version::TLS13])
+            .unwrap()
+            .with_client_cert_verifier(verifier)
+            .with_single_cert(vec![certificate], key.into())
+            .unwrap();
+        let client = rustls::ClientConfig::builder_with_provider(crypto)
+            .with_protocol_versions(&[&rustls::version::TLS13])
+            .unwrap()
+            .with_root_certificates(roots)
+            .with_no_client_auth();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = format!("tcp://{}", listener.local_addr().unwrap());
+        let acceptor = tokio_rustls::TlsAcceptor::from(std::sync::Arc::new(server));
+        let task = spawn_fixture("mock key-provider worker", async move {
+            for _ in 0..5 {
+                let (stream, _) = listener.accept().await.unwrap();
+                let error = acceptor.accept(stream).await.unwrap_err();
+                assert!(matches!(
+                    error
+                        .get_ref()
+                        .and_then(|cause| cause.downcast_ref::<rustls::Error>()),
+                    Some(rustls::Error::NoCertificatesPresented)
+                ));
+            }
+        });
+        let errors = kms_request_errors(
+            endpoint,
+            Some(tokio_rustls::TlsConnector::from(std::sync::Arc::new(
+                client,
+            ))),
+            "kms.example",
+        )
+        .await;
+        task.await.unwrap();
+        assert!(
+            errors
+                .iter()
+                .all(|error| *error == KeyError::ProviderUnusable),
+            "TLS 1.3 client authentication rejection must require provider repair: {errors:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn kms_handshake_transport_loss_remains_unavailable() {
+        let errors = kms_peer_alert_errors(None).await;
+        assert!(errors.iter().all(|error| *error == KeyError::Unavailable));
+    }
+
+    #[tokio::test]
+    async fn kms_explicit_unavailable_status_is_retryable_for_all_operations() {
+        let mut results = Vec::new();
+        for operation in [
+            "get_active_key",
+            "get_key_by_id",
+            "rotate_key",
+            "seal",
+            "unseal",
+        ] {
+            for message in [
+                "busy",
+                "throttled",
+                "key not found in temporarily unavailable replica",
+            ] {
+                let response =
+                    serde_json::json!({"status": "unavailable", "error_message": message});
+                results.push(
+                    malformed_response_error(
+                        operation,
+                        MockResponse::Bytes(response.to_string().into_bytes()),
+                    )
+                    .await,
+                );
+            }
+        }
+        assert!(
+            results.iter().all(|error| *error == KeyError::Unavailable),
+            "explicit availability status must remain retryable: {results:?}"
+        );
+        for error in results {
+            assert_eq!(format!("{error:?}"), "Unavailable");
+        }
+    }
+
+    #[tokio::test]
+    async fn kms_error_text_cannot_make_a_rejection_retryable() {
+        for operation in [
+            "get_active_key",
+            "get_key_by_id",
+            "rotate_key",
+            "seal",
+            "unseal",
+        ] {
+            for status in ["error", "busy", "throttled", "UNAVAILABLE"] {
+                let response = serde_json::json!({"status": status,
+                    "error_message": "busy throttled service unavailable sensitive-canary", "retryable": true});
+                let error = malformed_response_error(
+                    operation,
+                    MockResponse::Bytes(response.to_string().into_bytes()),
+                )
+                .await;
+                assert_ne!(error, KeyError::Unavailable, "text cannot select an outage");
+                // Neither a generic error status nor diagnostic text is a verdict.
+                assert_provider_configuration(&[error]);
+            }
+        }
+    }
 
     fn next_mock_socket_path() -> PathBuf {
         let unique = NEXT_SOCKET_ID.fetch_add(1, Ordering::Relaxed);
@@ -541,7 +1186,7 @@ mod tests {
         let listener = tokio::net::UnixListener::bind(&path).expect("bind mock KMS socket");
         let task_path = path.clone();
         let (request_tx, request_rx) = tokio::sync::oneshot::channel();
-        let handle = tokio::spawn(async move {
+        let handle = spawn_fixture("mock key-provider worker", async move {
             let (mut stream, _) = listener.accept().await.expect("accept mock KMS client");
             let mut len_buf = [0u8; 4];
             stream
@@ -603,7 +1248,7 @@ mod tests {
         let task_path = path.clone();
         let (request_tx, request_rx) = tokio::sync::mpsc::channel(2);
         let (release_tx, release_rx) = tokio::sync::oneshot::channel();
-        let handle = tokio::spawn(async move {
+        let handle = spawn_fixture("mock key-provider worker", async move {
             let mut release_rx = Some(release_rx);
             for request_index in 0..2 {
                 let (mut stream, _) = listener.accept().await.expect("accept KMS client");
@@ -709,14 +1354,14 @@ mod tests {
     fn decode_hex_32_rejects_non_ascii_without_panic() {
         let malformed = "ä".repeat(32);
 
-        assert_eq!(decode_hex_32(&malformed), Err(KeyError::Unavailable));
+        assert_eq!(decode_hex_32(&malformed), Err(KeyError::ProviderUnusable));
     }
 
     #[test]
     fn decode_hex_32_rejects_non_hex_ascii() {
         assert_eq!(
             decode_hex_32("zz0102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e"),
-            Err(KeyError::Unavailable)
+            Err(KeyError::ProviderUnusable)
         );
     }
 
@@ -752,7 +1397,7 @@ mod tests {
             .await
             .expect_err("oversized KMS response must fail");
 
-        assert_eq!(err, KeyError::Unavailable);
+        assert_eq!(err, KeyError::ProviderUnusable);
     }
 
     #[tokio::test]
@@ -765,7 +1410,7 @@ mod tests {
             .await
             .expect_err("malformed KMS JSON must fail");
 
-        assert_eq!(err, KeyError::Unavailable);
+        assert_eq!(err, KeyError::ProviderUnusable);
     }
 
     #[tokio::test]
@@ -789,7 +1434,7 @@ mod tests {
                 .await
                 .expect_err("malformed KMS key hex must fail");
 
-            assert_eq!(err, KeyError::Unavailable);
+            assert_eq!(err, KeyError::ProviderUnusable);
         }
     }
 
@@ -810,7 +1455,545 @@ mod tests {
             .await
             .expect_err("unknown KMS purpose must fail");
 
-        assert_eq!(err, KeyError::Unavailable);
+        assert_eq!(err, KeyError::ProviderUnusable);
+    }
+
+    #[tokio::test]
+    async fn kms_malformed_success_fields_require_repair_and_redacted() {
+        let mut errors = Vec::new();
+        for (operation, fields) in [
+            ("get_active_key", &["key_id", "key_bytes_hex"][..]),
+            ("get_key_by_id", &["key_bytes_hex", "purpose", "tenant"][..]),
+            ("rotate_key", &["key_id"][..]),
+            ("seal", &["ciphertext_and_tag_hex"][..]),
+            ("unseal", &["plaintext_hex"][..]),
+        ] {
+            for field in fields {
+                let invalid = match *field {
+                    "key_id" | "tenant" => vec![None, Some(String::new())],
+                    "purpose" => vec![None, Some("unknown-sensitive-purpose".to_string())],
+                    "key_bytes_hex" => vec![
+                        None,
+                        Some("00".repeat(31)),
+                        Some("gg".repeat(32)),
+                        Some("ä".repeat(32)),
+                    ],
+                    "ciphertext_and_tag_hex" => vec![
+                        None,
+                        Some(String::new()),
+                        Some("00".into()),
+                        Some("00".repeat(AEAD_TAG_LEN - 1)),
+                        Some("0".into()),
+                        Some("gg".into()),
+                        Some("ä".into()),
+                    ],
+                    _ => vec![None, Some("0".into()), Some("gg".into()), Some("ä".into())],
+                };
+                for value in invalid {
+                    let mut response = serde_json::json!({
+                        "status": "success",
+                        "key_id": "kms-sensitive-key",
+                        "key_bytes_hex": key_hex(0x42),
+                        "purpose": "session",
+                        "tenant": "tenant-a",
+                        "ciphertext_and_tag_hex": encode_hex(b"ciphertext-canary"),
+                        "plaintext_hex": encode_hex(b"plaintext-canary"),
+                    });
+                    if let Some(value) = value {
+                        response[field] = serde_json::Value::String(value);
+                    } else {
+                        response.as_object_mut().unwrap().remove(*field);
+                    }
+                    let error = malformed_response_error(
+                        operation,
+                        MockResponse::Bytes(response.to_string().into_bytes()),
+                    )
+                    .await;
+                    errors.push((operation, *field, error));
+                }
+            }
+        }
+        assert!(
+            errors
+                .iter()
+                .all(|(_, _, error)| *error == KeyError::ProviderUnusable),
+            "malformed success responses must require provider repair: {errors:?}"
+        );
+        for (_, _, error) in errors {
+            assert_eq!(error.to_string(), "key provider unusable as configured");
+            assert_eq!(format!("{error:?}"), "ProviderUnusable");
+        }
+    }
+
+    #[tokio::test]
+    async fn provider_configuration_invalid_protocol_is_not_a_key_verdict() {
+        for operation in [
+            "get_active_key",
+            "get_key_by_id",
+            "rotate_key",
+            "seal",
+            "unseal",
+        ] {
+            for response in [
+                MockResponse::Bytes(br#"{"status":"success""#.to_vec()),
+                MockResponse::OversizedLength,
+                MockResponse::Bytes(br#"{"status":"success"}"#.to_vec()),
+            ] {
+                assert_provider_configuration(&[
+                    malformed_response_error(operation, response).await
+                ]);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn provider_configuration_unknown_status_cannot_reject_or_lose_a_key() {
+        for operation in [
+            "get_active_key",
+            "get_key_by_id",
+            "rotate_key",
+            "seal",
+            "unseal",
+        ] {
+            for status in ["UNAVAILABLE", "busy", "throttled", "unknown"] {
+                let response = serde_json::json!({"status": status, "error_message": "not found"});
+                assert_provider_configuration(&[malformed_response_error(
+                    operation,
+                    MockResponse::Bytes(response.to_string().into_bytes()),
+                )
+                .await]);
+            }
+        }
+    }
+
+    async fn malformed_response_error(operation: &str, response: MockResponse) -> KeyError {
+        let key_id = KeyId::new("kms-sensitive-key").expect("key ID");
+        let mock = mock_kms(response).await;
+        let local = KmsKeyProvider::new(mock.endpoint.clone(), None, Duration::from_secs(1));
+        let remote = KmsRemoteSealProvider::new(
+            mock.endpoint.clone(),
+            None,
+            Duration::from_secs(1),
+            key_id.clone(),
+        );
+        match operation {
+            "get_active_key" => local
+                .get_active_key(KeyPurpose::Session, &tenant())
+                .await
+                .expect_err("invalid active key response"),
+            "get_key_by_id" => local
+                .get_key_by_id(&key_id)
+                .await
+                .expect_err("invalid historical key response"),
+            "rotate_key" => local
+                .rotate_key(KeyPurpose::Session, &tenant())
+                .await
+                .expect_err("invalid rotation response"),
+            "seal" => remote
+                .seal(&session_aad(), b"plaintext-canary")
+                .await
+                .expect_err("invalid encrypt response"),
+            "unseal" => remote
+                .unseal(&key_id, &session_aad(), b"ciphertext-canary")
+                .await
+                .expect_err("invalid decrypt response"),
+            _ => unreachable!("fixed operation fixture"),
+        }
+    }
+
+    #[tokio::test]
+    async fn kms_malformed_response_frames_require_repair_for_all_operations() {
+        let mut errors = Vec::new();
+        for operation in [
+            "get_active_key",
+            "get_key_by_id",
+            "rotate_key",
+            "seal",
+            "unseal",
+        ] {
+            for response in [
+                MockResponse::Bytes(br#"{"status":"success""#.to_vec()),
+                MockResponse::OversizedLength,
+            ] {
+                errors.push((
+                    operation,
+                    malformed_response_error(operation, response).await,
+                ));
+            }
+        }
+        assert!(
+            errors
+                .iter()
+                .all(|(_, error)| *error == KeyError::ProviderUnusable),
+            "malformed complete response frames must require provider repair: {errors:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn kms_remote_seal_rejects_short_success_outputs() {
+        let mut results = Vec::new();
+        for plaintext in [b"".as_slice(), b"x".as_slice()] {
+            for length in 0..AEAD_TAG_LEN {
+                let mock = mock_kms(MockResponse::Bytes(
+                    serde_json::json!({
+                        "status": "success",
+                        "ciphertext_and_tag_hex": "00".repeat(length),
+                    })
+                    .to_string()
+                    .into_bytes(),
+                ))
+                .await;
+                let provider = KmsRemoteSealProvider::new(
+                    mock.endpoint.clone(),
+                    None,
+                    Duration::from_secs(1),
+                    KeyId::new("short-response-key").expect("key ID"),
+                );
+                let result = provider.seal(&session_aad(), plaintext).await;
+                results.push((plaintext.len(), length, result.err()));
+            }
+        }
+        assert!(
+            results
+                .iter()
+                .all(|(_, _, error)| *error == Some(KeyError::ProviderUnusable)),
+            "every short success output must require provider repair: {results:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn kms_remote_seal_accepts_empty_plaintext_with_valid_tag() {
+        let key_id = KeyId::new("empty-plaintext-key").expect("key ID");
+        let handle = KeyHandle::new(
+            key_id.clone(),
+            KeyPurpose::Session,
+            tenant(),
+            Zeroizing::new([0x42; AES_256_GCM_SIV_KEY_LEN]),
+        );
+        let aad = session_aad();
+        let nonce = [0x24; AES_256_GCM_SIV_NONCE_LEN];
+        let expected = handle
+            .encrypt_payload(&aad, b"", nonce)
+            .expect("seal empty payload");
+        assert_eq!(expected.ciphertext_and_tag.len(), AEAD_TAG_LEN);
+        let (mock, request_rx) = mock_kms_recording(MockResponse::Bytes(
+            serde_json::json!({
+                "status": "success",
+                "ciphertext_and_tag_hex": encode_hex(&expected.ciphertext_and_tag),
+            })
+            .to_string()
+            .into_bytes(),
+        ))
+        .await;
+        let provider =
+            KmsRemoteSealProvider::new(mock.endpoint.clone(), None, Duration::from_secs(1), key_id);
+        let sealed = provider
+            .seal(&aad, b"")
+            .await
+            .expect("valid empty-plaintext seal");
+        assert_eq!(sealed, expected);
+        assert!(handle
+            .decrypt_payload(&aad, &sealed.aad, &sealed.ciphertext_and_tag, nonce)
+            .expect("authenticate empty plaintext")
+            .is_empty());
+        assert_eq!(
+            request_rx
+                .await
+                .expect("request captured")
+                .plaintext_hex
+                .as_deref(),
+            Some("")
+        );
+    }
+
+    async fn kms_request_errors(
+        endpoint: String,
+        connector: Option<tokio_rustls::TlsConnector>,
+        server_name: &str,
+    ) -> [KeyError; 5] {
+        let key_id = KeyId::new("configuration-key").expect("key ID");
+        let local =
+            KmsKeyProvider::new(endpoint.clone(), connector.clone(), Duration::from_secs(1))
+                .with_server_name(server_name);
+        let remote =
+            KmsRemoteSealProvider::new(endpoint, connector, Duration::from_secs(1), key_id.clone())
+                .with_server_name(server_name);
+        [
+            local
+                .get_active_key(KeyPurpose::Session, &tenant())
+                .await
+                .expect_err("request must fail"),
+            local
+                .get_key_by_id(&key_id)
+                .await
+                .expect_err("request must fail"),
+            local
+                .rotate_key(KeyPurpose::Session, &tenant())
+                .await
+                .expect_err("request must fail"),
+            remote
+                .seal(&session_aad(), b"plaintext-canary")
+                .await
+                .expect_err("request must fail"),
+            remote
+                .unseal(&key_id, &session_aad(), b"ciphertext-canary")
+                .await
+                .expect_err("request must fail"),
+        ]
+    }
+
+    #[tokio::test]
+    async fn kms_missing_tls_connector_requires_repair_before_connect() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind fixture");
+        listener.set_nonblocking(true).expect("nonblocking fixture");
+        let errors = kms_request_errors(
+            format!("tcp://{}", listener.local_addr().expect("fixture address")),
+            None,
+            KmsRemoteSealProvider::DEFAULT_SERVER_NAME,
+        )
+        .await;
+        assert!(
+            errors
+                .iter()
+                .all(|error| *error == KeyError::ProviderUnusable),
+            "invalid configuration must require provider repair: {errors:?}"
+        );
+        assert_eq!(
+            listener
+                .accept()
+                .expect_err("no plaintext connection")
+                .kind(),
+            std::io::ErrorKind::WouldBlock
+        );
+    }
+
+    fn kms_test_tls_connector() -> tokio_rustls::TlsConnector {
+        use tokio_rustls::rustls;
+        let config = rustls::ClientConfig::builder_with_provider(std::sync::Arc::new(
+            rustls::crypto::ring::default_provider(),
+        ))
+        .with_safe_default_protocol_versions()
+        .expect("supported TLS versions")
+        .with_root_certificates(rustls::RootCertStore::empty())
+        .with_no_client_auth();
+        tokio_rustls::TlsConnector::from(std::sync::Arc::new(config))
+    }
+
+    #[test]
+    fn kms_tcp_endpoint_preserves_valid_authorities_and_rejects_uri_extras() {
+        for (endpoint, expected) in [
+            ("kms.example:443", "kms.example:443"),
+            ("tcp://kms.example:443", "kms.example:443"),
+            ("tcp://kms.example:+443", "kms.example:+443"),
+            ("tcp://127.0.0.1:0", "127.0.0.1:0"),
+            ("tcp://127.0.0.1:65535", "127.0.0.1:65535"),
+            ("tcp://[::1]:443", "[::1]:443"),
+            ("tcp://[2001:db8::1]:443", "[2001:db8::1]:443"),
+            ("tcp://::1:443", "::1:443"),
+            ("tcp://fe80::1%2:443", "fe80::1%2:443"),
+        ] {
+            assert_eq!(tcp_endpoint_addr(endpoint), Ok(expected), "{endpoint}");
+        }
+        for endpoint in [
+            // Only one scheme prefix is valid; repeated prefixes are configuration errors.
+            "tcp://tcp://kms.example:443",
+            "tcp://kms.example:443/path",
+            "tcp://kms.example/path:443",
+            "tcp://user@kms.example:443",
+            "tcp://kms.example?query:443",
+            "tcp://kms.example#fragment:443",
+            "tcp://kms example:443",
+            "tcp://[not-an-ip]:443",
+            "tcp://[::1:443",
+            "tcp://::1]:443",
+            "tcp://fe80::1%:443",
+        ] {
+            assert_eq!(
+                tcp_endpoint_addr(endpoint),
+                Err(KeyError::ProviderUnusable),
+                "{endpoint}"
+            );
+        }
+    }
+
+    #[test]
+    fn kms_tcp_endpoint_accepts_release_address_forms() {
+        for endpoint in [
+            "kms.example:7443",
+            "tcp://kms.example:7443",
+            "127.0.0.1:7443",
+            "tcp://127.0.0.1:7443",
+            "127.0.0.1:+7443",
+            "tcp://127.0.0.1:+7443",
+            "[::1]:7443",
+            "tcp://[::1]:7443",
+            "::1:7443",
+            "tcp://::1:7443",
+        ] {
+            assert!(tcp_endpoint_addr(endpoint).is_ok(), "{endpoint}");
+        }
+    }
+
+    #[test]
+    fn kms_tcp_endpoint_accepts_scoped_ipv6_without_connecting() {
+        let addr =
+            std::net::SocketAddrV6::new("fe80::1".parse().expect("IPv6 literal"), 7443, 0, 2);
+        for endpoint in [addr.to_string(), format!("tcp://{addr}")] {
+            assert_eq!(
+                tcp_endpoint_addr(&endpoint).expect("scoped IPv6 remains valid"),
+                addr.to_string(),
+                "scope must survive validation: {endpoint}"
+            );
+        }
+    }
+
+    #[test]
+    fn kms_tcp_endpoint_rejects_control_characters_in_hosts() {
+        for control in ['\0', '\u{1}', '\u{1f}', '\u{7f}', '\u{85}'] {
+            let endpoint = format!("tcp://kms{control}.example:7443");
+            assert_eq!(
+                tcp_endpoint_addr(&endpoint),
+                Err(KeyError::ProviderUnusable),
+                "{endpoint:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn kms_bare_endpoint_connection_failure_remains_unavailable() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind fixture");
+        let port = listener.local_addr().expect("fixture address").port();
+        drop(listener);
+        for endpoint in [format!("127.0.0.1:{port}"), format!("localhost:{port}")] {
+            let errors = kms_request_errors(
+                endpoint.clone(),
+                Some(kms_test_tls_connector()),
+                KmsRemoteSealProvider::DEFAULT_SERVER_NAME,
+            )
+            .await;
+            assert!(
+                errors.iter().all(|error| *error == KeyError::Unavailable),
+                "valid bare endpoint {endpoint} must reach connection: {errors:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn kms_nul_host_requires_repair_before_connect() {
+        let errors = kms_request_errors(
+            "tcp://kms\0.example:7443".into(),
+            Some(kms_test_tls_connector()),
+            KmsRemoteSealProvider::DEFAULT_SERVER_NAME,
+        )
+        .await;
+        assert!(
+            errors
+                .iter()
+                .all(|error| *error == KeyError::ProviderUnusable),
+            "a NUL host must require provider repair for every operation: {errors:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn kms_invalid_server_name_requires_repair_before_connect() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind fixture");
+        listener.set_nonblocking(true).expect("nonblocking fixture");
+        let errors = kms_request_errors(
+            format!("tcp://{}", listener.local_addr().expect("fixture address")),
+            Some(kms_test_tls_connector()),
+            "not a dns name",
+        )
+        .await;
+        assert!(
+            errors
+                .iter()
+                .all(|error| *error == KeyError::ProviderUnusable),
+            "invalid configuration must require provider repair: {errors:?}"
+        );
+        assert_eq!(
+            listener
+                .accept()
+                .expect_err("validate before connecting")
+                .kind(),
+            std::io::ErrorKind::WouldBlock
+        );
+    }
+
+    #[tokio::test]
+    async fn kms_invalid_tcp_endpoint_requires_repair_before_connect() {
+        let endpoints = [
+            "tcp://127.0.0.1",
+            "tcp://127.0.0.1:",
+            "tcp://:1234",
+            "tcp://127.0.0.1:not-a-port",
+            "tcp://127.0.0.1:65536",
+            "tcp://127.0.0.1:-1",
+            "tcp://[::1]",
+            "tcp://[]:1234",
+        ];
+        let mut observed = Vec::new();
+        for endpoint in endpoints {
+            let errors = kms_request_errors(
+                endpoint.to_string(),
+                Some(kms_test_tls_connector()),
+                KmsRemoteSealProvider::DEFAULT_SERVER_NAME,
+            )
+            .await;
+            observed.push((endpoint, errors));
+        }
+        assert!(
+            observed.iter().all(|(_, errors)| errors
+                .iter()
+                .all(|error| *error == KeyError::ProviderUnusable)),
+            "invalid endpoint configuration must require provider repair: {observed:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn kms_unsupported_endpoint_scheme_requires_repair_before_connect() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind fixture");
+        listener.set_nonblocking(true).expect("nonblocking fixture");
+        let addr = listener.local_addr().expect("fixture address");
+        let mut observed = Vec::new();
+        for endpoint in [format!("https://{addr}"), format!("http://{addr}")] {
+            let errors = kms_request_errors(
+                endpoint.clone(),
+                Some(kms_test_tls_connector()),
+                KmsRemoteSealProvider::DEFAULT_SERVER_NAME,
+            )
+            .await;
+            observed.push((endpoint, errors));
+        }
+        assert!(
+            observed.iter().all(|(_, errors)| errors
+                .iter()
+                .all(|error| *error == KeyError::ProviderUnusable)),
+            "unsupported endpoint schemes must require provider repair: {observed:?}"
+        );
+        assert_eq!(
+            listener
+                .accept()
+                .expect_err("validate before connecting")
+                .kind(),
+            std::io::ErrorKind::WouldBlock
+        );
+    }
+
+    #[tokio::test]
+    async fn kms_tcp_connection_failure_remains_unavailable() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind fixture");
+        let addr = listener.local_addr().expect("fixture address");
+        drop(listener);
+        let errors = kms_request_errors(
+            format!("tcp://{addr}"),
+            Some(kms_test_tls_connector()),
+            KmsRemoteSealProvider::DEFAULT_SERVER_NAME,
+        )
+        .await;
+        assert!(
+            errors.iter().all(|error| *error == KeyError::Unavailable),
+            "valid endpoints must preserve connection failures as retryable: {errors:?}"
+        );
     }
 
     #[tokio::test]
@@ -824,6 +2007,84 @@ mod tests {
             .expect_err("KMS timeout must fail");
 
         assert_eq!(err, KeyError::Unavailable);
+    }
+
+    #[tokio::test]
+    async fn kms_completed_failure_is_not_unavailability() {
+        let key_id = KeyId::new("kms-denial-sensitive-key").expect("key id");
+        for reason in ["authentication failed", "access denied", "key revoked"] {
+            for operation in ["get_active_key", "get_key_by_id", "seal", "unseal"] {
+                let response = serde_json::json!({
+                    "status": "error",
+                    "reason": (reason == "key revoked").then_some("key_revoked"),
+                    "error_message": format!("{reason}: key={} payload=secret-canary", key_id.as_str()),
+                })
+                .to_string()
+                .into_bytes();
+                let mock = mock_kms(MockResponse::Bytes(response)).await;
+                let local =
+                    KmsKeyProvider::new(mock.endpoint.clone(), None, Duration::from_secs(1));
+                let remote = KmsRemoteSealProvider::new(
+                    mock.endpoint.clone(),
+                    None,
+                    Duration::from_secs(1),
+                    key_id.clone(),
+                );
+                let error = match operation {
+                    "get_active_key" => local
+                        .get_active_key(KeyPurpose::Session, &tenant())
+                        .await
+                        .expect_err("explicit denial fails active lookup"),
+                    "get_key_by_id" => local
+                        .get_key_by_id(&key_id)
+                        .await
+                        .expect_err("explicit denial fails historical lookup"),
+                    "seal" => remote
+                        .seal(&session_aad(), b"plaintext-canary")
+                        .await
+                        .expect_err("explicit denial fails seal"),
+                    "unseal" => remote
+                        .unseal(&key_id, &session_aad(), b"ciphertext-canary")
+                        .await
+                        .expect_err("explicit denial fails unseal"),
+                    _ => unreachable!("fixed operation fixture"),
+                };
+                assert_ne!(error, KeyError::Unavailable, "{operation}: {reason}");
+                if reason == "key revoked" {
+                    assert_eq!(error, KeyError::OperationFailed);
+                    assert_eq!(error.to_string(), "key provider operation failed");
+                    assert_eq!(format!("{error:?}"), "OperationFailed");
+                } else {
+                    assert_provider_configuration(&[error]);
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn kms_remote_timeout_remains_unavailability() {
+        let key_id = KeyId::new("remote-timeout-key").expect("key id");
+        for unseal in [false, true] {
+            let mock = mock_kms(MockResponse::Hang(Duration::from_secs(5))).await;
+            let provider = KmsRemoteSealProvider::new(
+                mock.endpoint.clone(),
+                None,
+                Duration::from_millis(25),
+                key_id.clone(),
+            );
+            let error = if unseal {
+                provider
+                    .unseal(&key_id, &session_aad(), b"ciphertext-canary")
+                    .await
+                    .expect_err("unseal times out")
+            } else {
+                provider
+                    .seal(&session_aad(), b"plaintext-canary")
+                    .await
+                    .expect_err("seal times out")
+            };
+            assert_eq!(error, KeyError::Unavailable);
+        }
     }
 
     #[tokio::test]
@@ -924,6 +2185,7 @@ mod tests {
         let payload_canary = "subscriber-payload-canary";
         let response = serde_json::json!({
             "status": "error",
+            "reason": "key_not_found",
             "error_message": format!(
                 "not found: key={} tenant=tenant-a endpoint=provider.internal payload={payload_canary}",
                 key_id.as_str()
@@ -961,6 +2223,7 @@ mod tests {
         let key_id = KeyId::new("session-remote-revoked-sensitive").expect("key id");
         let response = serde_json::json!({
             "status": "error",
+            "reason": "key_revoked",
             "error_message": format!("revoked key {} for tenant-a", key_id.as_str()),
         })
         .to_string()
@@ -977,7 +2240,8 @@ mod tests {
             .unseal(&key_id, &session_aad(), b"ciphertext-canary")
             .await
             .expect_err("revoked historical key must fail closed");
-        assert_eq!(error, KeyError::Unavailable);
+        assert_eq!(error, KeyError::OperationFailed);
+        assert_eq!(error.to_string(), "key provider operation failed");
         let rendered = format!("{error} {error:?}");
         assert!(!rendered.contains(key_id.as_str()));
         assert!(!rendered.contains("tenant-a"));
@@ -1003,7 +2267,7 @@ mod tests {
         ));
         let aad = session_aad();
 
-        let first = tokio::spawn({
+        let first = spawn_fixture("mock key-provider worker", {
             let provider = std::sync::Arc::clone(&provider);
             let aad = aad.clone();
             async move { provider.seal(&aad, b"in flight").await }

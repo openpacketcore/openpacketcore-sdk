@@ -176,3 +176,149 @@ fn thread_local_teardown_after_runtime_shutdown_releases_admission() {
         "a stopped executor cannot retain pending reconnect admission"
     );
 }
+
+#[test]
+fn failover_cooldown_returns_the_exact_bounded_edge_without_taking_the_serial_probe() {
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .start_paused(true)
+        .build()
+        .expect("failover runtime");
+    let policy = ConnectionLifecyclePolicy::try_new(
+        Duration::from_secs(60),
+        Duration::from_secs(1),
+        Duration::from_millis(10),
+        Duration::from_millis(80),
+        Duration::ZERO,
+    )
+    .expect("bounded lifecycle");
+    let gate = ReconnectGate::new(policy);
+    runtime.block_on(async {
+        let now = tokio::time::Instant::now();
+        let attempt = gate
+            .acquire(now + Duration::from_secs(1), 0, None)
+            .await
+            .expect("first attempt");
+        attempt.failed();
+
+        // The explicit fail-over policy observes the published 10 ms cooldown
+        // and returns it immediately: no wait, no serial admission, no probe.
+        let admission = gate
+            .acquire_classified_with_jitter_and_cooldown(
+                now + Duration::from_secs(1),
+                0,
+                None,
+                Duration::ZERO,
+                ReconnectCooldownPolicy::FailOver,
+            )
+            .await;
+        assert!(
+            matches!(
+                admission,
+                ReconnectAdmission::Cooldown { remaining } if remaining == Duration::from_millis(10)
+            ),
+            "the exact remaining cooldown is reported"
+        );
+        assert_eq!(tokio::time::Instant::now(), now, "no clock advance");
+        assert_eq!(
+            gate.serial.available_permits(),
+            1,
+            "a fail-over caller neither takes nor waits for the serial probe"
+        );
+        assert_eq!(
+            gate.state.lock().expect("gate state").next_attempt_at,
+            Some(now + Duration::from_millis(10)),
+            "the shared cooldown edge is unchanged"
+        );
+
+        tokio::time::advance(Duration::from_millis(9)).await;
+        let admission = gate
+            .acquire_classified_with_jitter_and_cooldown(
+                now + Duration::from_secs(1),
+                0,
+                None,
+                Duration::ZERO,
+                ReconnectCooldownPolicy::FailOver,
+            )
+            .await;
+        assert!(
+            matches!(
+                admission,
+                ReconnectAdmission::Cooldown { remaining } if remaining == Duration::from_millis(1)
+            ),
+            "the remaining edge tracks the admitting clock exactly"
+        );
+
+        tokio::time::advance(Duration::from_millis(1)).await;
+        let admission = gate
+            .acquire_classified_with_jitter_and_cooldown(
+                now + Duration::from_secs(1),
+                0,
+                None,
+                Duration::ZERO,
+                ReconnectCooldownPolicy::FailOver,
+            )
+            .await;
+        let ReconnectAdmission::Admitted(attempt) = admission else {
+            panic!("one bounded probe is admitted at the exact cooldown expiry");
+        };
+        attempt.succeeded();
+        assert_eq!(
+            gate.serial.available_permits(),
+            1,
+            "the completed probe releases the single serial admission"
+        );
+    });
+}
+
+#[test]
+fn failover_cooldown_cannot_bypass_an_already_elapsed_caller_deadline() {
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .start_paused(true)
+        .build()
+        .expect("deadline runtime");
+    let policy = ConnectionLifecyclePolicy::try_new(
+        Duration::from_secs(60),
+        Duration::from_secs(1),
+        Duration::from_millis(10),
+        Duration::from_millis(80),
+        Duration::ZERO,
+    )
+    .expect("bounded lifecycle");
+    let gate = ReconnectGate::new(policy);
+    runtime.block_on(async {
+        let now = tokio::time::Instant::now();
+        gate.acquire(now + Duration::from_secs(1), 0, None)
+            .await
+            .expect("first attempt")
+            .failed();
+        // The caller budget elapsed before this admission attempt. Fail-over
+        // must preserve the terminal Deadline classification even though a
+        // cooldown is also active; it must not return a "try another peer"
+        // signal past the caller's own budget.
+        let admission = gate
+            .acquire_classified_with_jitter_and_cooldown(
+                now,
+                0,
+                None,
+                Duration::ZERO,
+                ReconnectCooldownPolicy::FailOver,
+            )
+            .await;
+        assert!(
+            matches!(admission, ReconnectAdmission::Deadline),
+            "an elapsed caller deadline stays terminal under fail-over"
+        );
+        assert_eq!(
+            tokio::time::Instant::now(),
+            now,
+            "the refusal itself does not advance the controlled clock"
+        );
+        assert_eq!(
+            gate.serial.available_permits(),
+            1,
+            "the deadline refusal never takes the serial probe admission"
+        );
+    });
+}

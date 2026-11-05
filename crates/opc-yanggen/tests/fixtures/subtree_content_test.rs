@@ -153,7 +153,7 @@ impl SchemaRegistry for Registry {
                 "/ex:system/ex:state-identity-ref" => Some(LeafType::LeafRef { target_path: "/ex:system/ex:identity-ref" }),
                 "/ex:system/ex:state-opaque-ref" => Some(LeafType::LeafRef { target_path: "/ex:system/ex:opaque-ref" }),
                 "/ex:system/ex:typed-peer/ex:identity" => Some(LeafType::IdentityRef { base: "identity-base" }),
-                "/ex:system/ex:typed-peer/ex:ratio" => Some(LeafType::Decimal64),
+                "/ex:system/ex:typed-peer/ex:ratio" => Some(LeafType::Decimal64 { fraction_digits: 2 }),
                 _ => node.leaf_type,
             };
             node
@@ -467,8 +467,8 @@ fn config() -> System {
     config.role = serde_json::from_str("\"active\"").unwrap();
     config.port_ref = LeafPresence::Explicit(7);
     config.chained_ref = LeafPresence::Explicit(7);
-    config.ratio = LeafPresence::Explicit(YangDecimal64(1.0));
-    config.ratio_ref = LeafPresence::Explicit(YangDecimal64(1.0));
+    config.ratio = LeafPresence::Explicit(YangDecimal64::from_scaled(100));
+    config.ratio_ref = LeafPresence::Explicit(YangDecimal64::from_scaled(100));
     config.identity = LeafPresence::Explicit("a:router".into());
     config.identity_ref = LeafPresence::Explicit("a:router".into());
     config.opaque = LeafPresence::Explicit("opaque-marker".into());

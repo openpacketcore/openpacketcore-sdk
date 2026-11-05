@@ -828,6 +828,28 @@ pub struct SaParameters {
     /// `None` emits exactly the pre-DSCP XFRM netlink bytes and does not
     /// require the companion.
     pub egress_dscp: Option<DscpCodepoint>,
+    /// Optional Traffic Flow Confidentiality (TFC) padding target length in
+    /// bytes (`XFRMA_TFCPAD`, Linux UAPI attribute 22).
+    ///
+    /// Linux ESP output pads the protected packet to at least this length when
+    /// it is shorter, capped at the SA's path MTU. The kernel accepts the
+    /// attribute only for ESP SAs in tunnel mode and stores a nonzero length;
+    /// validation therefore rejects a zero value, a non-ESP protocol, and a
+    /// non-tunnel mode before any netlink mutation.
+    ///
+    /// `None` emits no attribute and keeps the pre-TFC request bytes exactly
+    /// unchanged. Because the kernel omits the attribute for an unset length,
+    /// an absent attribute and a zero value are the same kernel state and must
+    /// not become two spellings of one identity; use `None` for no padding.
+    ///
+    /// The versioned durable install-request fingerprints
+    /// (`opc-xfrm-object-install-request-v1`,
+    /// `opc-xfrm-roster-install-request-v1`) and the outbound binding
+    /// fingerprint do not cover this field in this revision, so a recovery
+    /// request that differs only in `tfc_pad` is not distinguished. See the
+    /// crate README for the recommended auth-domain-v2 and migration
+    /// follow-up.
+    pub tfc_pad: Option<u32>,
 }
 
 /// Parameters needed to install or update a Security Policy.
@@ -1302,6 +1324,13 @@ pub struct SaState {
     /// window, so this is a decoded observation rather than durable proof of
     /// the original SA request. [`Self::output_mark`] remains exact.
     pub egress_dscp: Option<DscpCodepoint>,
+    /// TFC padding target length in bytes read from `XFRMA_TFCPAD`, when the
+    /// kernel reports one.
+    ///
+    /// `None` when the kernel omits the attribute, which it does for a zero
+    /// TFC padding length. A zero-valued attribute is therefore reported as
+    /// absent so the two wire spellings are not distinct identities.
+    pub tfc_pad: Option<u32>,
 }
 
 /// Exact Linux selector snapshot used by single-SA relocation.

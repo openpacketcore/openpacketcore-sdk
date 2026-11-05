@@ -8067,15 +8067,14 @@ impl NamespaceState {
         {
             return Err(GtpuSessionSelectorNamespaceError::Indeterminate);
         }
-        let mut codec = [0_u8; 145];
-        codec[0] = 1;
-        codec[1..33].copy_from_slice(&self.pin_commitment);
-        codec[33..49].copy_from_slice(&stable_device);
-        codec[49..65].copy_from_slice(&self.ledger_id);
-        codec[65..97].copy_from_slice(&self.key_commitment);
-        codec[97..129].copy_from_slice(&self.storage_scope_commitment);
-        codec[129..145].copy_from_slice(&self.backend_epoch);
-        Ok(codec)
+        Ok(crate::selector_adapter_codec::encode_binding_parts(
+            self.pin_commitment,
+            stable_device,
+            self.ledger_id,
+            self.key_commitment,
+            self.storage_scope_commitment,
+            self.backend_epoch,
+        ))
     }
 
     fn decommission_fence_is_exact(&self, fence: DecommissionFence) -> bool {
@@ -10760,6 +10759,8 @@ pub(crate) fn single_bearer_reattach_is_exact(
         && old_entry.outer_family() == new_entry.outer_family()
         && old_entry.context().bearer_mark == new_entry.context().bearer_mark
         && old_entry.n3_qfi() == new_entry.n3_qfi()
+        && old_entry.context().downlink_peer_source_policy
+            == new_entry.context().downlink_peer_source_policy
         && old_claim.atoms != new_claim.atoms
         && non_teid(&old_claim.atoms) == non_teid(&new_claim.atoms)
         && old_claim.atoms.difference(&new_claim.atoms).count() == 1
@@ -10911,7 +10912,15 @@ fn atom_codec(tag: u8, bytes: &[u8]) -> Vec<u8> {
 fn canonical_desired_bytes(group: &GtpuSessionGroup) -> Vec<u8> {
     let mut output = Vec::new();
     let n3 = group.entries().iter().any(|entry| entry.n3_qfi().is_some());
-    output.push(if n3 { 2 } else { 1 });
+    let multihoming = group.entries().iter().any(|entry| {
+        entry.context().downlink_peer_source_policy == crate::GtpuPeerSourcePolicy::TeidAndLocal
+    });
+    output.push(match (n3, multihoming) {
+        (false, false) => 1,
+        (true, false) => 2,
+        (false, true) => 3,
+        (true, true) => 4,
+    });
     output.extend_from_slice(&group.device_id().to_bytes());
     output.extend_from_slice(&group.id().to_bytes());
     let count = u8::try_from(group.entries().len()).unwrap_or(u8::MAX);
@@ -10933,6 +10942,9 @@ fn canonical_desired_bytes(group: &GtpuSessionGroup) -> Vec<u8> {
                 output.extend_from_slice(&mark.get().to_be_bytes());
             }
             None => output.push(0),
+        }
+        if multihoming {
+            output.push(context.downlink_peer_source_policy as u8);
         }
         append_downlink_source_port_policy(&mut output, context.downlink_source_port_policy);
         match context.uplink_source_port_policy {
@@ -11003,7 +11015,7 @@ fn decode_canonical_desired(bytes: &[u8]) -> Option<GtpuSessionGroup> {
 
     let mut cursor = 0_usize;
     let version = *take(bytes, &mut cursor, 1)?.first()?;
-    matches!(version, 1 | 2).then_some(())?;
+    matches!(version, 1..=4).then_some(())?;
     let device = crate::GtpuSessionDeviceId::new(take_array(take(bytes, &mut cursor, 16)?)?)?;
     let group_id = crate::GtpuSessionGroupId::new(take_array(take(bytes, &mut cursor, 16)?)?)?;
     let count = usize::from(*take(bytes, &mut cursor, 1)?.first()?);
@@ -11020,11 +11032,11 @@ fn decode_canonical_desired(bytes: &[u8]) -> Option<GtpuSessionGroup> {
             &mut cursor,
             4,
         )?)?))?;
-        let peer_teid = crate::Teid::new(u32::from_be_bytes(take_array(take(
+        let peer_teid = crate::PeerTeid::new(u32::from_be_bytes(take_array(take(
             bytes,
             &mut cursor,
             4,
-        )?)?))?;
+        )?)?));
         let link_ifindex = u32::from_be_bytes(take_array(take(bytes, &mut cursor, 4)?)?);
         let gtp_version = match *take(bytes, &mut cursor, 1)?.first()? {
             1 => crate::GtpVersion::V1,
@@ -11036,6 +11048,15 @@ fn decode_canonical_desired(bytes: &[u8]) -> Option<GtpuSessionGroup> {
                 take(bytes, &mut cursor, 4)?,
             )?))?),
             _ => return None,
+        };
+        let downlink_peer_source_policy = if version >= 3 {
+            match *take(bytes, &mut cursor, 1)?.first()? {
+                0 => crate::GtpuPeerSourcePolicy::BackendDefault,
+                1 => crate::GtpuPeerSourcePolicy::TeidAndLocal,
+                _ => return None,
+            }
+        } else {
+            crate::GtpuPeerSourcePolicy::BackendDefault
         };
         let downlink_source_port_policy = match *take(bytes, &mut cursor, 1)?.first()? {
             0 => crate::GtpuSourcePortPolicy::Any,
@@ -11069,6 +11090,7 @@ fn decode_canonical_desired(bytes: &[u8]) -> Option<GtpuSessionGroup> {
                 ms_address,
                 peer_address,
                 link_ifindex,
+                downlink_peer_source_policy,
                 downlink_source_port_policy,
                 gtp_version,
                 bearer_mark,
@@ -11079,7 +11101,7 @@ fn decode_canonical_desired(bytes: &[u8]) -> Option<GtpuSessionGroup> {
             local_outer_address,
         )
         .ok()?;
-        entries.push(if version == 2 {
+        entries.push(if matches!(version, 2 | 4) {
             match *take(bytes, &mut cursor, 1)?.first()? {
                 0xff => entry,
                 qfi => entry.restore_n3_qfi(qfi)?,
@@ -11187,10 +11209,11 @@ mod tests {
     ) -> GtpuSessionGroup {
         let context = GtpPdpContext {
             local_teid: Teid::new(teid).unwrap(),
-            peer_teid: Teid::new(teid + 1).unwrap(),
+            peer_teid: Teid::new(teid + 1).unwrap().into(),
             ms_address: paa,
             peer_address: IpAddr::V4(Ipv4Addr::new(192, 0, 2, 10)),
             link_ifindex: 7,
+            downlink_peer_source_policy: crate::GtpuPeerSourcePolicy::BackendDefault,
             downlink_source_port_policy: GtpuSourcePortPolicy::Any,
             gtp_version: GtpVersion::V1,
             bearer_mark: mark.and_then(crate::GtpBearerMark::new),
@@ -11204,6 +11227,24 @@ mod tests {
             vec![GtpuSessionEntry::new(context, IpAddr::V4(Ipv4Addr::new(192, 0, 2, 1))).unwrap()],
         )
         .unwrap()
+    }
+
+    #[test]
+    fn peer_teid_zero_survives_authenticated_descriptor_codec() {
+        for paa in ["10.23.0.2", "2001:db8:23::"] {
+            let original = group_with_paa(1, 1, 7, paa.parse().unwrap(), None);
+            let entry = &original.entries()[0];
+            let mut context = entry.context().clone();
+            context.peer_teid = crate::PeerTeid::new(0);
+            let desired = GtpuSessionGroup::new(
+                original.id(),
+                original.device_id(),
+                vec![GtpuSessionEntry::new(context, entry.local_outer_address()).unwrap()],
+            )
+            .unwrap();
+            let encoded = canonical_desired_bytes(&desired);
+            assert_eq!(decode_canonical_desired(&encoded), Some(desired));
+        }
     }
 
     fn test_backend_mutation_window() -> SelectorBackendMutationWindow {
@@ -12647,7 +12688,7 @@ mod tests {
         let mut changed_canonical = state.clone();
         let original = group(1, 1, 0x1000_0001, None);
         let mut context = original.entries()[0].context().clone();
-        context.peer_teid = Teid::new(0x2000_0001).unwrap();
+        context.peer_teid = Teid::new(0x2000_0001).unwrap().into();
         let changed_group = GtpuSessionGroup::new(
             original.id(),
             original.device_id(),
@@ -14115,7 +14156,7 @@ mod tests {
     fn stable_group_key_is_distinct_from_complete_forwarding_commitment() {
         let original = group(1, 1, 0x1000_0001, None);
         let mut changed_context = original.entries()[0].context().clone();
-        changed_context.peer_teid = Teid::new(0x2000_0001).unwrap();
+        changed_context.peer_teid = Teid::new(0x2000_0001).unwrap().into();
         let changed = GtpuSessionGroup::new(
             original.id(),
             original.device_id(),
@@ -15510,7 +15551,7 @@ mod tests {
         let mut entries = template.entries().to_vec();
         let mut second_context = template.entries()[0].context().clone();
         second_context.local_teid = Teid::new(0x1000_0002).unwrap();
-        second_context.peer_teid = Teid::new(0x1000_0003).unwrap();
+        second_context.peer_teid = Teid::new(0x1000_0003).unwrap().into();
         second_context.ms_address = IpAddr::V6(Ipv6Addr::new(0x2001, 0xdb8, 0, 2, 0, 0, 0, 1));
         entries.push(
             GtpuSessionEntry::new(second_context, template.entries()[0].local_outer_address())

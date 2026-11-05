@@ -154,6 +154,7 @@ async fn expired_mtls_rpc_broken_pipe_recovers_head_with_original_parent_budget(
     let manifest = Arc::new(
         SessionReplicationManifest::try_new_with_epoch(
             SessionClusterId::new("broken-pipe-recovery").unwrap(),
+            [0x5a; 32],
             SessionConfigurationGeneration::new("1").unwrap(),
             SessionConfigurationEpoch::new(1).unwrap(),
             descriptors,

@@ -24,8 +24,10 @@ use zeroize::{Zeroize, Zeroizing};
 pub const MAX_SPIFFE_ID_URI_LEN: usize = 2_048;
 
 pub mod file_svid;
+pub mod pki;
 pub mod projected_svid;
 pub use file_svid::{FileSvidShutdownError, FileSvidSource};
+pub use pki::{extract_spiffe_id_from_pki_cert_der, validate_local_pki_identity, LocalPkiUsage};
 pub use projected_svid::{
     ProjectedSvidAuthoritativeError, ProjectedSvidAvailability, ProjectedSvidConfigError,
     ProjectedSvidControllerClaimError, ProjectedSvidControllerInput, ProjectedSvidReloadReason,
@@ -244,6 +246,8 @@ pub enum SpiffeSanError {
     MissingSpiffeId,
     #[error("certificate contains multiple URI SANs")]
     MultipleUriSans,
+    #[error("certificate contains multiple SPIFFE URI SANs")]
+    MultipleSpiffeIds,
     #[error("certificate contains a malformed SPIFFE URI SAN")]
     MalformedSpiffeId,
 }
@@ -255,6 +259,10 @@ pub enum SpiffeSanError {
 /// A certificate with more than one URI SAN is rejected even when only one is a
 /// SPIFFE URI, so callers never select an identity from an ambiguous X.509-SVID.
 pub fn extract_spiffe_id_from_cert_der(cert_der: &[u8]) -> Result<SpiffeId, SpiffeSanError> {
+    extract_spiffe_id(cert_der, true)
+}
+
+fn extract_spiffe_id(cert_der: &[u8], strict_svid: bool) -> Result<SpiffeId, SpiffeSanError> {
     let (remaining, x509) =
         X509Certificate::from_der(cert_der).map_err(|_| SpiffeSanError::MalformedCertificate)?;
     if !remaining.is_empty() {
@@ -276,8 +284,19 @@ pub fn extract_spiffe_id_from_cert_der(cert_der: &[u8]) -> Result<SpiffeId, Spif
         let GeneralName::URI(uri) = name else {
             continue;
         };
+        if !strict_svid
+            && !uri
+                .split_once(':')
+                .is_some_and(|(scheme, _)| scheme.eq_ignore_ascii_case("spiffe"))
+        {
+            continue;
+        }
         if candidate.replace(*uri).is_some() {
-            return Err(SpiffeSanError::MultipleUriSans);
+            return Err(if strict_svid {
+                SpiffeSanError::MultipleUriSans
+            } else {
+                SpiffeSanError::MultipleSpiffeIds
+            });
         }
     }
 
@@ -404,7 +423,21 @@ pub fn build_identity_state(
         .ok_or(IdentityReloadError::MalformedSpiffeId)?;
     let identity = WorkloadIdentity::from_cert_der(leaf_der.as_ref(), &trust_bundles)?;
 
-    validate_leaf_chains_to_bundle(&identity, &cert_chain, &trust_bundles)?;
+    let (_, leaf) = X509Certificate::from_der(leaf_der.as_ref())
+        .map_err(|_| IdentityReloadError::InvalidCertificateChain)?;
+    if leaf
+        .extended_key_usage()
+        .map_err(|_| IdentityReloadError::InvalidCertificateChain)?
+        .is_some_and(|eku| !eku.value.client_auth || !eku.value.server_auth)
+    {
+        return Err(IdentityReloadError::InvalidCertificateChain);
+    }
+    validate_leaf_chains_to_bundle(
+        &identity.trust_domain,
+        &cert_chain,
+        &trust_bundles,
+        LocalPkiUsage::ClientAndServer,
+    )?;
     validate_private_key_matches_leaf(&cert_chain, &private_key)?;
 
     let svid = SvidDocument {
@@ -422,13 +455,17 @@ pub fn build_identity_state(
 }
 
 fn validate_leaf_chains_to_bundle(
-    identity: &WorkloadIdentity,
+    trust_domain: &TrustDomain,
     cert_chain: &[CertificateDer<'static>],
     trust_bundles: &TrustBundleSet,
+    usage: LocalPkiUsage,
 ) -> Result<(), IdentityReloadError> {
     let bundle = trust_bundles
-        .get(&identity.trust_domain)
+        .get(trust_domain)
         .ok_or(IdentityReloadError::UnknownTrustDomain)?;
+    if bundle.trust_domain != *trust_domain {
+        return Err(IdentityReloadError::InvalidTrustDomain);
+    }
     let mut root_store = rustls::RootCertStore::empty();
     let (valid_roots, _invalid_roots) =
         root_store.add_parsable_certificates(bundle.certificates.iter().cloned());
@@ -439,23 +476,42 @@ fn validate_leaf_chains_to_bundle(
     let leaf = cert_chain
         .first()
         .ok_or(IdentityReloadError::MalformedSpiffeId)?;
-    let parsed = rustls::server::ParsedCertificate::try_from(leaf)
-        .map_err(|_| IdentityReloadError::InvalidCertificateChain)?;
     let provider = rustls::crypto::ring::default_provider();
-
-    rustls::client::verify_server_cert_signed_by_trust_anchor(
-        &parsed,
-        &root_store,
-        &cert_chain[1..],
-        UnixTime::now(),
-        provider.signature_verification_algorithms.all,
-    )
-    .map_err(|_| IdentityReloadError::InvalidCertificateChain)
+    let now = UnixTime::now();
+    if matches!(
+        usage,
+        LocalPkiUsage::Server | LocalPkiUsage::ClientAndServer
+    ) {
+        let parsed = rustls::server::ParsedCertificate::try_from(leaf)
+            .map_err(|_| IdentityReloadError::InvalidCertificateChain)?;
+        rustls::client::verify_server_cert_signed_by_trust_anchor(
+            &parsed,
+            &root_store,
+            &cert_chain[1..],
+            now,
+            provider.signature_verification_algorithms.all,
+        )
+        .map_err(|_| IdentityReloadError::InvalidCertificateChain)?;
+    }
+    if matches!(
+        usage,
+        LocalPkiUsage::Client | LocalPkiUsage::ClientAndServer
+    ) {
+        rustls::server::WebPkiClientVerifier::builder_with_provider(
+            std::sync::Arc::new(root_store),
+            std::sync::Arc::new(provider),
+        )
+        .build()
+        .map_err(|_| IdentityReloadError::InvalidCertificateChain)?
+        .verify_client_cert(leaf, &cert_chain[1..], now)
+        .map_err(|_| IdentityReloadError::InvalidCertificateChain)?;
+    }
+    Ok(())
 }
 
 fn validate_private_key_matches_leaf(
     cert_chain: &[CertificateDer<'static>],
-    private_key: &PrivateKeyDer<'static>,
+    private_key: &PrivateKeyDer<'_>,
 ) -> Result<(), IdentityReloadError> {
     let provider = rustls::crypto::ring::default_provider();
     let signing_key = provider

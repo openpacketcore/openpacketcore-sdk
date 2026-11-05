@@ -33,16 +33,16 @@ Running `make generate-api` with the same pinned YAML produces byte-identical
 `types.rs`.  Fields are emitted in alphabetical order; enum variants follow YAML
 declaration order.
 
-## Gaps vs. Hand-Written `opc-sbi`
+## SBI integration
 
-The hand-written `opc-sbi::NfProfile` is a minimal subset (10 fields) used for
-discovery caching.  The generated `opc_api_nnrf::NfProfile` is the full schema
-(80+ fields).  The two are **not** API-compatible as drop-in replacements,
-because the generated struct uses `Option<T>` for most fields and `Vec<T>`
-rather than `Vec<String>` for `nfServices`.
+`opc_sbi::nrf::NfProfile` retains a bounded discovery profile. Its wire JSON
+now uses standard enum names and the generated PLMN/S-NSSAI wrappers and
+`NfService` objects. `tests/compat_sbi.rs` checks the shared fields directly,
+without normalizing the serialized payload. Absent optional generated fields
+are omitted; enum spellings are pinned explicitly, including `5G_EIR` and
+`5G_DDNMF`. The generated profile's `nfServices` is typed as `Vec<NfService>`.
 
-`tests/compat_sbi.rs` demonstrates that an `opc-sbi::NfProfile` can be
-serialized, normalized (snake_case → camelCase, lowercase/PascalCase enums →
-SCREAMING_SNAKE_CASE), and deserialized into `opc_api_nnrf::NfProfile` with
-value-level equivalence for the shared fields.  A future iteration will add a
-compact profile view or bridge trait if `opc-sbi` adopts the generated types.
+Rust source APIs still differ: the generated profile has many additional
+optional fields. Neither schema generation nor these tests implement every
+conditional/cardinality requirement of TS 29.510. NF-specific registration
+policy remains the caller's responsibility.

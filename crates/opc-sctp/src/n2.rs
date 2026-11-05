@@ -167,6 +167,13 @@ impl N2OutboundMessage {
 /// One admitted opaque NGAP record and its original SCTP metadata.
 ///
 /// The association identifier is backend metadata, not a generation token.
+///
+/// ```compile_fail
+/// fn requires_clone<T: Clone>(_: &T) {}
+/// fn probe(payload: &opc_sctp::n2::N2Payload) {
+///     requires_clone(payload);
+/// }
+/// ```
 pub struct N2Payload {
     payload: Bytes,
     stream_id: u16,
@@ -198,7 +205,9 @@ impl N2Payload {
         self.assoc_id
     }
 
-    /// Transfer the admitted payload to the caller.
+    /// Transfer the admitted payload to the caller. Payloads from the live SCTP
+    /// adapter retain wiping custody through this handoff and any Bytes clones;
+    /// their allocation is cleared when its final reference is dropped.
     #[must_use]
     pub fn into_payload(self) -> Bytes {
         self.payload

@@ -36,6 +36,14 @@ pub enum NasIntegrityAlgorithm {
     Nia2 = 2,
     /// 128-NIA3.
     Nia3 = 3,
+    /// 5G-IA4 codepoint; not implemented by the bundled providers.
+    Nia4 = 4,
+    /// 5G-IA5 codepoint; not implemented by the bundled providers.
+    Nia5 = 5,
+    /// 5G-IA6 codepoint; not implemented by the bundled providers.
+    Nia6 = 6,
+    /// 5G-IA7 codepoint; not implemented by the bundled providers.
+    Nia7 = 7,
 }
 
 impl NasIntegrityAlgorithm {
@@ -46,6 +54,10 @@ impl NasIntegrityAlgorithm {
             1 => Some(Self::Nia1),
             2 => Some(Self::Nia2),
             3 => Some(Self::Nia3),
+            4 => Some(Self::Nia4),
+            5 => Some(Self::Nia5),
+            6 => Some(Self::Nia6),
+            7 => Some(Self::Nia7),
             _ => None,
         }
     }
@@ -62,6 +74,14 @@ pub enum NasCipheringAlgorithm {
     Nea2 = 2,
     /// 128-NEA3.
     Nea3 = 3,
+    /// 5G-EA4 codepoint; not implemented by the bundled providers.
+    Nea4 = 4,
+    /// 5G-EA5 codepoint; not implemented by the bundled providers.
+    Nea5 = 5,
+    /// 5G-EA6 codepoint; not implemented by the bundled providers.
+    Nea6 = 6,
+    /// 5G-EA7 codepoint; not implemented by the bundled providers.
+    Nea7 = 7,
 }
 
 impl NasCipheringAlgorithm {
@@ -72,6 +92,10 @@ impl NasCipheringAlgorithm {
             1 => Some(Self::Nea1),
             2 => Some(Self::Nea2),
             3 => Some(Self::Nea3),
+            4 => Some(Self::Nea4),
+            5 => Some(Self::Nea5),
+            6 => Some(Self::Nea6),
+            7 => Some(Self::Nea7),
             _ => None,
         }
     }

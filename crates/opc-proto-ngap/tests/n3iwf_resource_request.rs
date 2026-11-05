@@ -62,8 +62,8 @@ fn independent_resource_fields_match_values_and_constructed_bytes() {
                     DownlinkTransport::decode(&wire, DecodeContext::default()).unwrap() == down
                 );
                 assert!(down.encode(EncodeContext::default()).unwrap().as_bytes() == wire);
-                assert!(up.address() == address && up.teid() == teid);
-                assert!(down.address() == address && down.teid() == teid);
+                assert!(up.address() == address.into() && up.teid() == teid);
+                assert!(down.address() == address.into() && down.teid() == teid);
                 up.encode(EncodeContext::default()).unwrap()
             }
             "PDUSessionAggregateMaximumBitRate" => {

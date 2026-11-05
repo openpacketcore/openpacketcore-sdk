@@ -11,14 +11,14 @@ type Field = (u16, u8, Vec<u8>);
 
 fn message_fields(message: &Message) -> (&'static str, Vec<Field>) {
     macro_rules! view {
-        ($name:literal, $message:expr $(, $inner:tt)?) => {
+        ($name:literal, $message:expr) => {
             (
                 $name,
                 $message
                     .protocol_ies
                     .0
                     .iter()
-                    .map(|ie| (ie.id$(.$inner)?, ie.criticality as u8, ie.value.as_bytes().to_vec()))
+                    .map(|ie| (ie.id, ie.criticality as u8, ie.value.as_bytes().to_vec()))
                     .collect(),
             )
         };
@@ -29,7 +29,7 @@ fn message_fields(message: &Message) -> (&'static str, Vec<Field>) {
         Message::NgSetupFailure(value) => view!("NGSetupFailure", value),
         Message::InitialUeMessage(value) => view!("InitialUEMessage", value),
         Message::DownlinkNasTransport(value) => view!("DownlinkNASTransport", value),
-        Message::UplinkNasTransport(value) => view!("UplinkNASTransport", value, 0),
+        Message::UplinkNasTransport(value) => view!("UplinkNASTransport", value),
         Message::PduSessionResourceModifyRequest(value) => {
             view!("PDUSessionResourceModifyRequest", value)
         }
@@ -41,7 +41,7 @@ fn message_fields(message: &Message) -> (&'static str, Vec<Field>) {
         Message::NgResetAcknowledge(value) => view!("NGResetAcknowledge", value),
         Message::ErrorIndication(value) => view!("ErrorIndication", value),
         Message::NasNonDeliveryIndication(value) => view!("NASNonDeliveryIndication", value),
-        Message::UeContextReleaseRequest(value) => view!("UEContextReleaseRequest", value, 0),
+        Message::UeContextReleaseRequest(value) => view!("UEContextReleaseRequest", value),
         Message::InitialContextSetupRequest(value) => view!("InitialContextSetupRequest", value),
         Message::InitialContextSetupResponse(value) => view!("InitialContextSetupResponse", value),
         Message::InitialContextSetupFailure(value) => view!("InitialContextSetupFailure", value),
@@ -57,8 +57,8 @@ fn message_fields(message: &Message) -> (&'static str, Vec<Field>) {
         Message::PduSessionResourceReleaseResponse(value) => {
             view!("PDUSessionResourceReleaseResponse", value)
         }
-        Message::UeContextReleaseCommand(value) => view!("UEContextReleaseCommand", value, 0),
-        Message::UeContextReleaseComplete(value) => view!("UEContextReleaseComplete", value, 0),
+        Message::UeContextReleaseCommand(value) => view!("UEContextReleaseCommand", value),
+        Message::UeContextReleaseComplete(value) => view!("UEContextReleaseComplete", value),
         Message::Paging(_) | Message::Unknown(_) => panic!("reference outcome not dispatched"),
     }
 }

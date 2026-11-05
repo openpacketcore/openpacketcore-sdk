@@ -737,6 +737,7 @@ async fn seed_replication_log(inner: &SqliteSessionBackend) {
         .unwrap();
     let ttl = Duration::from_secs(60);
     let entry = ReplicationEntry {
+        replay_policy: opc_session_store::ReplicationReplayPolicy::prune_expired(),
         sequence: 1,
         tx_id: "strict-read-replication-canary".try_into().unwrap(),
         timestamp: now,

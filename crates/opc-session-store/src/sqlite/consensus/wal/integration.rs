@@ -263,8 +263,52 @@ impl ApplicationCosts {
     }
 }
 
+#[cfg(any(test, feature = "test-control"))]
+#[derive(Clone, Copy, Debug, Default)]
+pub(super) struct GenerationSize {
+    pub(super) epoch: u64,
+    pub(super) file_epoch: u64,
+    pub(super) base_bytes: u64,
+    pub(super) appended_bytes: u64,
+    pub(super) total_bytes: u64,
+    pub(super) trigger_bytes: u64,
+    pub(super) block_bytes: u64,
+}
+
+/// Sizes come from the admitted views, never from an estimated body size.
+#[cfg(any(test, feature = "test-control"))]
+#[derive(Clone, Copy, Debug, Default, serde::Serialize)]
+pub(super) struct SwitchSize {
+    pub(super) old_cut_bytes: u64,
+    pub(super) old_cut_epoch: u64,
+    pub(super) old_head_bytes: u64,
+    pub(super) old_head_epoch: u64,
+    pub(super) raw_selected_suffix_bytes: u64,
+    pub(super) compact_base_bytes: u64,
+    pub(super) rebased_suffix_bytes: u64,
+    pub(super) switch_frame_bytes: u64,
+    pub(super) total_bytes: u64,
+    pub(super) frame_count: u64,
+    pub(super) pending_base_only: bool,
+}
+
 #[derive(Default)]
 pub(super) struct CheckpointCosts {
+    #[cfg(any(test, feature = "test-control"))]
+    pub(super) generation: GenerationSize,
+    #[cfg(any(test, feature = "test-control"))]
+    pub(super) last_switch: Option<SwitchSize>,
+    pub(super) pending_base_attempts: u64,
+    pub(super) pending_base_selections: u64,
+    pub(super) pending_capacity_waits: u64,
+    pub(super) compactor_attempts: u64,
+    pub(super) compactor_restarts: u64,
+    pub(super) compactor_switches: u64,
+    pub(super) last_rollover_attempts: u64,
+    pub(super) maximum_rollover_attempts: u64,
+    pub(super) live_capacity_events: u64,
+    pub(super) ordinary_journal_captured_bytes: u64,
+    pub(super) ordinary_journal_capture_maximum: u64,
     pub(super) automatic_requests: u64,
     pub(super) completed: u64,
     pub(super) failures: u64,
@@ -558,7 +602,24 @@ impl Wal {
     #[cfg(any(test, feature = "test-control"))]
     fn integration_cost_snapshot_locked(&self, state: &super::State) -> serde_json::Value {
         let totals = &state.observation_totals;
+        let generation = state.checkpoint_costs.generation;
         let checkpoint = serde_json::json!({
+            "generation": { "epoch": generation.epoch, "file_epoch": generation.file_epoch,
+                "base_bytes": generation.base_bytes, "appended_bytes": generation.appended_bytes,
+                "total_bytes": generation.total_bytes, "trigger_bytes": generation.trigger_bytes,
+                "block_bytes": generation.block_bytes },
+            "last_switch": state.checkpoint_costs.last_switch,
+            "pending_base_attempts": state.checkpoint_costs.pending_base_attempts,
+            "pending_base_selections": state.checkpoint_costs.pending_base_selections,
+            "pending_capacity_waits": state.checkpoint_costs.pending_capacity_waits,
+            "compactor_attempts": state.checkpoint_costs.compactor_attempts,
+            "compactor_restarts": state.checkpoint_costs.compactor_restarts,
+            "compactor_switches": state.checkpoint_costs.compactor_switches,
+            "last_rollover_attempts": state.checkpoint_costs.last_rollover_attempts,
+            "maximum_rollover_attempts": state.checkpoint_costs.maximum_rollover_attempts,
+            "live_capacity_events": state.checkpoint_costs.live_capacity_events,
+            "ordinary_journal_captured_bytes": state.checkpoint_costs.ordinary_journal_captured_bytes,
+            "ordinary_journal_capture_maximum": state.checkpoint_costs.ordinary_journal_capture_maximum,
             "selected_epoch": state.checkpoint_epoch,
             "automatic_requests": state.checkpoint_costs.automatic_requests,
             "completed": state.checkpoint_costs.completed,

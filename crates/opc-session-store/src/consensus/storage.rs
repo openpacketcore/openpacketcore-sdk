@@ -2444,6 +2444,18 @@ async fn wait_before_current_snapshot_admission(path: &Path) {
     }
 }
 
+#[cfg(test)]
+fn block_current_snapshot_open(path: &Path) {
+    let gate = current_snapshot_admission_gates()
+        .lock()
+        .expect("find current snapshot open gate")
+        .get(&path.with_extension("opening"))
+        .cloned();
+    if let Some(gate) = gate {
+        gate.block_if_armed_blocking();
+    }
+}
+
 /// Fail-closed errors emitted while binding an existing SQLite database to a
 /// durable consensus identity.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
@@ -2482,6 +2494,9 @@ pub enum SessionConsensusStorageError {
     /// A required row, constraint, or typed high-water mark is invalid.
     #[error("session consensus durable state is corrupt")]
     CorruptState,
+    /// A format-five namespace lost its mandatory initial roster witness.
+    #[error("session consensus durable state is corrupt: mandatory roster witness is missing; a store created by a pre-release build must be reinitialized")]
+    MissingMandatoryRosterWitness,
     /// The supplied identity could not be represented by the durable schema.
     #[error("invalid session consensus storage identity")]
     InvalidIdentity,
@@ -2508,6 +2523,7 @@ impl SessionConsensusStorageError {
             Some(Self::FreshInstallationRequired) => Self::FreshInstallationRequired,
             Some(Self::PersistenceFormatMismatch) => Self::PersistenceFormatMismatch,
             Some(Self::BackendUnavailable) => Self::BackendUnavailable,
+            Some(Self::MissingMandatoryRosterWitness) => Self::MissingMandatoryRosterWitness,
             _ => Self::CorruptState,
         }
     }
@@ -2668,26 +2684,37 @@ async fn verify_admitted_snapshot(
 ) -> io::Result<PinnedSqliteFile> {
     tokio::task::spawn_blocking(move || {
         let _retention = retention;
-        let path = lease.namespace.sqlite_child_path(&name)?;
-        let mut pinned = PinnedSqliteFile::from_file_and_verify_in_namespace(
-            file,
-            Arc::clone(&lease.namespace),
-            &name,
-            policy,
-        )?;
-        let verified = pinned.verify_snapshot_envelope_and_bind_immutable_generation(
-            &path,
-            SNAPSHOT_FOOTER_MAGIC,
-            SNAPSHOT_FOOTER_BYTES,
-            SNAPSHOT_MAX_BYTES,
-            checksum,
-            length,
-        )?;
-        pinned.verify_bound_immutable_snapshot_envelope(&path, verified.total_length)?;
-        Ok(pinned)
+        verify_admitted_snapshot_sync(file, &lease, &name, policy, checksum, length)
     })
     .await
     .map_err(|_| io::Error::other("snapshot integrity worker unavailable"))?
+}
+
+fn verify_admitted_snapshot_sync(
+    file: std::fs::File,
+    lease: &SnapshotDirectoryLease,
+    name: &std::ffi::OsStr,
+    policy: SnapshotIntegrityPolicy,
+    checksum: [u8; 32],
+    length: u64,
+) -> io::Result<PinnedSqliteFile> {
+    let path = lease.namespace.sqlite_child_path(name)?;
+    let mut pinned = PinnedSqliteFile::from_file_and_verify_in_namespace(
+        file,
+        Arc::clone(&lease.namespace),
+        name,
+        policy,
+    )?;
+    let verified = pinned.verify_snapshot_envelope_and_bind_immutable_generation(
+        &path,
+        SNAPSHOT_FOOTER_MAGIC,
+        SNAPSHOT_FOOTER_BYTES,
+        SNAPSHOT_MAX_BYTES,
+        checksum,
+        length,
+    )?;
+    pinned.verify_bound_immutable_snapshot_envelope(&path, verified.total_length)?;
+    Ok(pinned)
 }
 
 #[cfg(target_os = "linux")]
@@ -5770,97 +5797,68 @@ impl RaftStateMachine<SessionRaftTypeConfig> for SqliteConsensusStateMachine {
                     error,
                 )
             })?;
-        let (mut snapshot, checksum, length) =
-            if self.core.authority_profile == ConsensusAuthorityProfile::FixedImmutable {
-                // Validate and return the measured descriptor itself. A pathname
-                // reopen after measurement could substitute an unsealed inode.
-                let file = open_snapshot_child_in_namespace(
-                    Arc::clone(&self._snapshot_directory_lease.namespace),
-                    std::ffi::OsString::from(&file_name),
-                )
-                .await
-                .map_err(|error| {
-                    storage_error(
-                        ErrorSubject::Snapshot(Some(meta.signature())),
-                        ErrorVerb::Read,
-                        error,
-                    )
-                })?;
+        let lease = Arc::clone(&self._snapshot_directory_lease);
+        let integrity_work = SnapshotIntegrityWork {
+            _gate: SnapshotIntegrityGate::Serving {
+                _guard: Arc::clone(&serving_guard),
+            },
+            _lease: Arc::clone(&lease),
+        };
+        let shutdown = self.shutdown_guard.child();
+        let name = std::ffi::OsString::from(file_name);
+        // Opening can outlive its caller too. Hand the ownership through the
+        // open worker's result so every queued or active descriptor operation
+        // remains covered, including cancellation between the two workers.
+        let (file, lease, name, integrity_work, shutdown) =
+            tokio::task::spawn_blocking(move || {
                 #[cfg(test)]
-                wait_before_current_snapshot_admission(&path).await;
-                let pinned = verify_admitted_snapshot(
+                block_current_snapshot_open(&lease.namespace.sqlite_child_path(&name)?);
+                let file = lease.namespace.open_read(&name)?;
+                Ok::<_, io::Error>((file, lease, name, integrity_work, shutdown))
+            })
+            .await
+            .map_err(|_| io::Error::other("snapshot namespace open worker failed"))
+            .and_then(|result| result)
+            .map_err(|error| {
+                storage_error(
+                    ErrorSubject::Snapshot(Some(meta.signature())),
+                    ErrorVerb::Read,
+                    error,
+                )
+            })?;
+        #[cfg(test)]
+        wait_before_current_snapshot_admission(&path).await;
+        let profile = self.core.authority_profile;
+        let policy = self.core.snapshot_integrity;
+        let snapshot = tokio::task::spawn_blocking(move || {
+            let _retention = (integrity_work, shutdown);
+            if profile == ConsensusAuthorityProfile::FixedImmutable {
+                // Validate and return the measured descriptor itself. A
+                // pathname reopen could substitute an unsealed inode.
+                let pinned = verify_admitted_snapshot_sync(
                     file,
-                    Arc::clone(&self._snapshot_directory_lease),
-                    std::ffi::OsString::from(&file_name),
-                    self.core.snapshot_integrity,
+                    &lease,
+                    &name,
+                    policy,
                     expected_checksum,
                     expected_length,
-                    Some(SnapshotIntegrityWork {
-                        _gate: SnapshotIntegrityGate::Serving {
-                            _guard: Arc::clone(&serving_guard),
-                        },
-                        _lease: Arc::clone(&self._snapshot_directory_lease),
-                    }),
-                )
-                .await
-                .map_err(|error| {
-                    storage_error(
-                        ErrorSubject::Snapshot(Some(meta.signature())),
-                        ErrorVerb::Read,
-                        error,
-                    )
-                })?;
-                let snapshot = SessionSnapshotFile::from_pinned(pinned, path.clone())
-                    .await
-                    .map_err(|error| {
-                        storage_error(
-                            ErrorSubject::Snapshot(Some(meta.signature())),
-                            ErrorVerb::Read,
-                            error,
-                        )
-                    })?;
-                (snapshot, expected_checksum, expected_length)
+                )?;
+                SessionSnapshotFile::from_pinned_rewound(pinned, path)
             } else {
-                let file = open_snapshot_child_in_namespace(
-                    Arc::clone(&self._snapshot_directory_lease.namespace),
-                    std::ffi::OsString::from(&file_name),
-                )
-                .await
-                .map_err(|error| {
-                    storage_error(
-                        ErrorSubject::Snapshot(Some(meta.signature())),
-                        ErrorVerb::Read,
-                        error,
-                    )
-                })?;
-                let mut snapshot = SessionSnapshotFile::from_std(file, path.clone())
-                    .await
-                    .map_err(|error| {
-                        storage_error(
-                            ErrorSubject::Snapshot(Some(meta.signature())),
-                            ErrorVerb::Read,
-                            error,
-                        )
-                    })?;
-                let (_, checksum, length) = verify_snapshot_envelope_reader(&mut snapshot)
-                    .await
-                    .map_err(|error| {
-                        storage_error(
-                            ErrorSubject::Snapshot(Some(meta.signature())),
-                            ErrorVerb::Read,
-                            error,
-                        )
-                    })?;
-                (snapshot, checksum, length)
-            };
-        if checksum != expected_checksum || length != expected_length {
-            return Err(storage_error(
-                ErrorSubject::Snapshot(Some(meta.signature())),
-                ErrorVerb::Read,
-                consensus::invalid_data("session consensus snapshot metadata is inconsistent"),
-            ));
-        }
-        snapshot.rewind().await.map_err(|error| {
+                let mut file = file;
+                let (_, checksum, length) = verify_snapshot_envelope_sync(&mut file, &path)?;
+                if checksum != expected_checksum || length != expected_length {
+                    return Err(consensus::invalid_data(
+                        "session consensus snapshot metadata is inconsistent",
+                    ));
+                }
+                SessionSnapshotFile::from_std_rewound(file, path)
+            }
+        })
+        .await
+        .map_err(|_| io::Error::other("snapshot admission worker unavailable"))
+        .and_then(|result| result)
+        .map_err(|error| {
             storage_error(
                 ErrorSubject::Snapshot(Some(meta.signature())),
                 ErrorVerb::Read,
@@ -6795,8 +6793,12 @@ async fn build_file_backed_snapshot_database(
         let expected_members = core.expected_members.clone();
         let expected_bindings = core.expected_bindings.clone();
         let fixed_placement_policy = core.fixed_placement_policy;
+        #[cfg(feature = "test-control")]
+        let native_observation = Arc::clone(&core.snapshot_observation);
         let (result, snapshot_guard) = tokio::task::spawn_blocking(move || {
             let result = (|| {
+                #[cfg(feature = "test-control")]
+                native_observation.record_phase_for_test("native_export");
                 // Native export writes the portable projection directly into
                 // the eventual sealed inode. Reclaim the empty raw reservation
                 // before allocating pages; there is no full-size compaction copy.
@@ -6817,6 +6819,8 @@ async fn build_file_backed_snapshot_database(
                         "native snapshot export stopped after Raft shutdown",
                     ));
                 }
+                #[cfg(feature = "test-control")]
+                native_observation.record_phase_for_test("native_finalize");
                 consensus::finalize_native_snapshot_database_sync(
                     export,
                     vacuum_snapshot,
@@ -7136,6 +7140,22 @@ impl RaftSnapshotBuilder<SessionRaftTypeConfig> for SqliteConsensusSnapshotBuild
             .map_err(|error| {
                 storage_error(ErrorSubject::Snapshot(None), ErrorVerb::Write, error)
             })?;
+            // Fail after both real staging children have cleanup ownership.
+            #[cfg(feature = "test-control")]
+            if self
+                .core
+                .snapshot_observation
+                .take_injected_build_failure_for_test()
+            {
+                self.core
+                    .snapshot_observation
+                    .record_phase_for_test("staging_failed");
+                return Err(storage_error(
+                    ErrorSubject::Snapshot(None),
+                    ErrorVerb::Write,
+                    io::Error::other("injected snapshot staging failure"),
+                ));
+            }
             build_file_backed_snapshot_database(
                 &self.core,
                 Arc::clone(&self._snapshot_directory_lease),
@@ -7528,6 +7548,28 @@ impl RaftSnapshotBuilder<SessionRaftTypeConfig> for SqliteConsensusSnapshotBuild
         self.core
             .snapshot_observation
             .record_phase_for_test("publishing_metadata");
+        // Model an indeterminate publication at the actual sealed-candidate
+        // boundary. Preserve the candidate just as the native publisher does
+        // before its first fallible commit step; a fresh owner must audit it.
+        #[cfg(feature = "test-control")]
+        if self
+            .core
+            .snapshot_observation
+            .take_injected_indeterminate_publication_for_test()
+        {
+            published_cleanup.disarm();
+            self.core
+                .snapshot_publication_indeterminate
+                .store(true, Ordering::Release);
+            self.core
+                .snapshot_observation
+                .record_phase_for_test("publication_failed");
+            return Err(storage_error(
+                ErrorSubject::Snapshot(Some(meta.signature())),
+                ErrorVerb::Write,
+                io::Error::other("injected indeterminate snapshot publication"),
+            ));
+        }
         let publication = {
             let publish_legacy = |cleanup: &mut UnpublishedSnapshotArtifact| {
                 publish_snapshot_metadata_with_readback(
@@ -8066,6 +8108,75 @@ pub(crate) async fn inspect_voter_snapshot(
     }
 }
 
+// All seeks and reads stay on the admission worker. Per-operation Tokio file
+// jobs would otherwise outlive a cancelled future without its ownership.
+fn verify_snapshot_envelope_sync(
+    file: &mut std::fs::File,
+    _path: &Path,
+) -> io::Result<(u64, [u8; 32], u64)> {
+    use std::io::{Read as _, Seek as _};
+
+    let total_length = file.seek(io::SeekFrom::End(0))?;
+    if total_length <= SNAPSHOT_FOOTER_BYTES || total_length > SNAPSHOT_ENVELOPE_MAX_BYTES {
+        return Err(consensus::invalid_data(
+            "session consensus snapshot size is invalid",
+        ));
+    }
+    file.seek(io::SeekFrom::End(
+        -i64::try_from(SNAPSHOT_FOOTER_BYTES).map_err(|_| {
+            consensus::invalid_data("session consensus snapshot footer size is invalid")
+        })?,
+    ))?;
+    let mut magic = [0_u8; 8];
+    let mut encoded_length = [0_u8; 8];
+    let mut expected_checksum = [0_u8; 32];
+    file.read_exact(&mut magic)?;
+    file.read_exact(&mut encoded_length)?;
+    file.read_exact(&mut expected_checksum)?;
+    if &magic != SNAPSHOT_FOOTER_MAGIC {
+        return Err(consensus::invalid_data(
+            "session consensus snapshot magic is invalid",
+        ));
+    }
+    let payload_length = u64::from_be_bytes(encoded_length);
+    if payload_length == 0
+        || payload_length > SNAPSHOT_MAX_BYTES
+        || payload_length.checked_add(SNAPSHOT_FOOTER_BYTES) != Some(total_length)
+    {
+        return Err(consensus::invalid_data(
+            "session consensus snapshot length is invalid",
+        ));
+    }
+    file.seek(io::SeekFrom::Start(0))?;
+    #[cfg(test)]
+    super::snapshot::block_fixed_prepublication_scan(_path);
+    let mut limited = file.take(payload_length);
+    let mut hasher = Sha256::new();
+    let mut observed = 0_u64;
+    let mut buffer = vec![0_u8; 64 * 1024];
+    loop {
+        let read = limited.read(&mut buffer)?;
+        if read == 0 {
+            break;
+        }
+        observed = observed
+            .checked_add(u64::try_from(read).map_err(|_| {
+                consensus::invalid_data("session consensus snapshot length overflow")
+            })?)
+            .ok_or_else(|| consensus::invalid_data("session consensus snapshot length overflow"))?;
+        hasher.update(&buffer[..read]);
+    }
+    let actual_checksum: [u8; 32] = hasher.finalize().into();
+    #[cfg(test)]
+    super::snapshot::record_fixed_prepublication_scan(_path, observed);
+    if observed != payload_length || actual_checksum != expected_checksum {
+        return Err(consensus::invalid_data(
+            "session consensus snapshot checksum mismatch",
+        ));
+    }
+    Ok((payload_length, actual_checksum, total_length))
+}
+
 pub(crate) async fn verify_snapshot_envelope_reader(
     file: &mut SessionSnapshotFile,
 ) -> io::Result<(u64, [u8; 32], u64)> {
@@ -8437,9 +8548,13 @@ async fn open_snapshot_child_in_namespace(
     namespace: Arc<RetainedSnapshotDirectory>,
     name: std::ffi::OsString,
 ) -> io::Result<std::fs::File> {
-    tokio::task::spawn_blocking(move || namespace.open_read(&name))
-        .await
-        .map_err(|_| io::Error::other("snapshot namespace open worker failed"))?
+    tokio::task::spawn_blocking(move || {
+        #[cfg(test)]
+        block_current_snapshot_open(&namespace.sqlite_child_path(&name)?);
+        namespace.open_read(&name)
+    })
+    .await
+    .map_err(|_| io::Error::other("snapshot namespace open worker failed"))?
 }
 
 async fn remove_old_snapshot(
@@ -17425,6 +17540,283 @@ mod tests {
     }
 
     #[cfg(target_os = "linux")]
+    #[test]
+    fn cancelled_dynamic_snapshot_admission_retains_descriptor_work_ownership() {
+        exercise_cancelled_dynamic_snapshot_admission(false);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn cancelled_dynamic_snapshot_open_retains_admission_ownership() {
+        exercise_cancelled_snapshot_open(false).await;
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn cancelled_fixed_snapshot_open_retains_admission_ownership() {
+        exercise_cancelled_snapshot_open(true).await;
+    }
+
+    #[cfg(target_os = "linux")]
+    async fn exercise_cancelled_snapshot_open(fixed: bool) {
+        let directory = FixedRawReadStoreFixture::new();
+        let (log, mut machine, _backend) = if fixed {
+            let (log, machine, _) = open_fixed_raw_read_store_with_integrity(
+                &directory,
+                None,
+                SnapshotIntegrityPolicy::PortableVerified,
+            )
+            .await;
+            (log, machine, None)
+        } else {
+            let backend = SqliteSessionBackend::open(directory.path().join("dynamic.sqlite"))
+                .expect("dynamic backend");
+            let (log, machine) = open(
+                &backend,
+                directory.snapshot_path(),
+                identity(1),
+                expected_members(),
+            )
+            .await
+            .expect("dynamic store");
+            (log, machine, Some(backend))
+        };
+        machine.shutdown_guard = ConsensusStorageShutdownGuard::tracked();
+        machine
+            .apply([if fixed {
+                fixed_initial_membership_entry()
+            } else {
+                initial_membership_entry()
+            }])
+            .await
+            .expect("initial membership");
+        let original = machine
+            .get_snapshot_builder()
+            .await
+            .build_snapshot()
+            .await
+            .expect("publish initial snapshot");
+        let shutdown = machine.shutdown_observer().expect("tracked owner");
+        let core = machine.core.clone();
+        let lease = Arc::downgrade(&machine._snapshot_directory_lease);
+        let gate = Arc::new(SnapshotArtifactGate::new());
+        gate.arm();
+        let _gate_owner = CurrentSnapshotAdmissionGateGuard::install(
+            original.snapshot.path().with_extension("opening"),
+            Arc::clone(&gate),
+        );
+        let admission = tokio::spawn(async move { machine.get_current_snapshot().await });
+        tokio::time::timeout(Duration::from_secs(5), gate.wait_started())
+            .await
+            .expect("admission dispatches its descriptor open");
+        admission.abort();
+        assert!(admission.await.unwrap_err().is_cancelled());
+        drop(log);
+        drop(original);
+        let retains_publication = core.snapshot_serving_gate.try_lock().is_err();
+        let retains_shutdown = futures_util::poll!(Box::pin(shutdown.wait())).is_pending();
+        let retains_namespace = lease.upgrade().is_some();
+        gate.release();
+        tokio::time::timeout(Duration::from_secs(5), shutdown.wait())
+            .await
+            .expect("descriptor completion releases shutdown");
+        assert!(
+            retains_publication,
+            "cancelled open must exclude publication"
+        );
+        assert!(retains_shutdown, "shutdown must join the cancelled open");
+        assert!(
+            retains_namespace,
+            "cancelled open retains the namespace lease"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn cancelled_dynamic_snapshot_admission_retains_ownership_after_runtime_shutdown() {
+        exercise_cancelled_dynamic_snapshot_admission(true);
+    }
+
+    #[cfg(target_os = "linux")]
+    fn exercise_cancelled_dynamic_snapshot_admission(stop_runtime: bool) {
+        let (stopped_tx, stopped_rx) = std::sync::mpsc::channel();
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .max_blocking_threads(1)
+            .on_thread_stop(move || {
+                let _ = stopped_tx.send(());
+            })
+            .build()
+            .expect("bounded blocking-pool runtime");
+        let (
+            _fixture,
+            core,
+            shutdown,
+            _gate_owner,
+            _blocker_owner,
+            blocker_gate,
+            blocker,
+            retains_publication,
+            retains_shutdown,
+        ) = runtime.block_on(async {
+            let directory = tempfile::tempdir().expect("dynamic store directory");
+            let backend = SqliteSessionBackend::open(directory.path().join("sessions.sqlite"))
+                .expect("dynamic backend");
+            let (log, mut machine) = open(
+                &backend,
+                directory.path().join("snapshots"),
+                identity(1),
+                expected_members(),
+            )
+            .await
+            .expect("dynamic store");
+            let original = machine
+                .get_snapshot_builder()
+                .await
+                .build_snapshot()
+                .await
+                .expect("publish dynamic snapshot");
+            let path = original.snapshot.path().to_path_buf();
+            let core = machine.core.clone();
+            let shutdown = machine.shutdown_observer().expect("tracked owner");
+            let gate = Arc::new(SnapshotArtifactGate::new());
+            gate.arm();
+            let gate_owner = CurrentSnapshotAdmissionGateGuard::install(path, Arc::clone(&gate));
+            let mut admission = Box::pin(machine.get_current_snapshot());
+            tokio::time::timeout(Duration::from_secs(5), async {
+                tokio::select! {
+                    biased;
+                    _ = gate.wait_started() => {}
+                    result = &mut admission => panic!("admission skipped read gate: {result:?}"),
+                }
+            })
+            .await
+            .expect("admission reaches its descriptor read");
+
+            // Occupy the sole blocking worker, then poll the real admission
+            // through its read dispatch. Its descriptor work remains queued
+            // after the caller is dropped.
+            let blocker_gate = Arc::new(SnapshotArtifactGate::new());
+            blocker_gate.arm();
+            let blocker_owner = CurrentSnapshotAdmissionGateGuard::install(
+                directory.path().join("blocking-pool-sentinel"),
+                Arc::clone(&blocker_gate),
+            );
+            let worker_gate = Arc::clone(&blocker_gate);
+            let blocker =
+                tokio::task::spawn_blocking(move || worker_gate.block_if_armed_blocking());
+            blocker_gate.wait_started().await;
+            gate.release();
+            assert!(futures_util::poll!(&mut admission).is_pending());
+            drop(admission);
+            drop(machine);
+            drop(log);
+            let retains_publication = core.snapshot_serving_gate.try_lock().is_err();
+            let retains_shutdown = futures_util::poll!(Box::pin(shutdown.wait())).is_pending();
+
+            (
+                (directory, backend, original),
+                core,
+                shutdown,
+                gate_owner,
+                blocker_owner,
+                blocker_gate,
+                blocker,
+                retains_publication,
+                retains_shutdown,
+            )
+        });
+        if stop_runtime {
+            runtime.shutdown_timeout(Duration::ZERO);
+            assert!(core.snapshot_serving_gate.try_lock().is_err());
+            assert!(futures_util::FutureExt::now_or_never(shutdown.wait()).is_none());
+            blocker_gate.release();
+            stopped_rx
+                .recv_timeout(Duration::from_secs(5))
+                .expect("blocking worker drains admission after runtime shutdown");
+            futures_util::FutureExt::now_or_never(blocker)
+                .expect("blocking pool has retired")
+                .expect("join pool blocker");
+            assert!(futures_util::FutureExt::now_or_never(shutdown.wait()).is_some());
+        } else {
+            runtime.block_on(async {
+                blocker_gate.release();
+                blocker.await.expect("join pool blocker");
+                tokio::task::spawn_blocking(|| ())
+                    .await
+                    .expect("drain the queued descriptor read");
+                tokio::time::timeout(Duration::from_secs(5), shutdown.wait())
+                    .await
+                    .expect("descriptor completion releases shutdown");
+            });
+        }
+        assert!(core.snapshot_serving_gate.try_lock().is_ok());
+        assert!(
+            retains_publication,
+            "cancelled read must exclude publication"
+        );
+        assert!(
+            retains_shutdown,
+            "shutdown must join cancelled descriptor work"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn cancelled_portable_snapshot_admission_retains_shutdown_ownership() {
+        let directory = FixedRawReadStoreFixture::new();
+        let (log, mut machine, _) = open_fixed_raw_read_store_with_integrity(
+            &directory,
+            None,
+            SnapshotIntegrityPolicy::PortableVerified,
+        )
+        .await;
+        // Raw-store fixtures normally bypass the engine's shutdown barrier.
+        // Give this state-machine owner the same tracker as a live engine.
+        machine.shutdown_guard = ConsensusStorageShutdownGuard::tracked();
+        machine
+            .apply([fixed_initial_membership_entry()])
+            .await
+            .unwrap();
+        let original = machine
+            .get_snapshot_builder()
+            .await
+            .build_snapshot()
+            .await
+            .unwrap();
+        let shutdown = machine.shutdown_observer().expect("tracked owner");
+        let core = machine.core.clone();
+        let gate = Arc::new(SnapshotArtifactGate::new());
+        gate.arm();
+        let _gate_owner = FixedPrepublicationScanGateGuard::install(
+            snapshot_namespace_test_hook_directory(&machine._snapshot_directory_lease),
+            Arc::clone(&gate),
+        );
+        let admission = tokio::spawn(async move { machine.get_current_snapshot().await });
+        tokio::time::timeout(Duration::from_secs(5), gate.wait_started())
+            .await
+            .unwrap();
+        admission.abort();
+        assert!(admission.await.unwrap_err().is_cancelled());
+        drop(log);
+        drop(original);
+        let retains_shutdown = futures_util::poll!(Box::pin(shutdown.wait())).is_pending();
+        gate.release();
+        let released =
+            tokio::time::timeout(Duration::from_secs(5), core.snapshot_serving_gate.lock())
+                .await
+                .expect("scan retires");
+        drop(released);
+        tokio::time::timeout(Duration::from_secs(5), shutdown.wait())
+            .await
+            .unwrap();
+        assert!(
+            retains_shutdown,
+            "shutdown must join cancelled fixed admission"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn cancelled_fixed_current_snapshot_scan_retains_worker_ownership() {
         cancelled_current_snapshot_scan_retains_worker_ownership(SnapshotIntegrityPolicy::FsVerity)
@@ -17498,6 +17890,94 @@ mod tests {
                 .meta,
             original.meta
         );
+    }
+
+    /// Dynamic authority streams the selected portable envelope, so its
+    /// admission scan must keep serving/shutdown evidence inside the detached
+    /// blocking worker. Dropping the caller mid-read may not release the
+    /// publication exclusion, the namespace lease or the shutdown child while
+    /// that scan still reads the selected inode.
+    #[cfg(target_os = "linux")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn cancelled_dynamic_current_snapshot_scan_retains_worker_ownership() {
+        let directory = FixedRawReadStoreFixture::new();
+        let database = directory.path().join("dynamic-current-snapshot.sqlite");
+        let backend = SqliteSessionBackend::open(&database).expect("dynamic backend");
+        let (log, mut machine) = open(
+            &backend,
+            directory.snapshot_path(),
+            identity(1),
+            expected_members(),
+        )
+        .await
+        .expect("open dynamic authority store");
+        machine
+            .apply([initial_membership_entry()])
+            .await
+            .expect("apply membership before current snapshot");
+        let original = machine
+            .get_snapshot_builder()
+            .await
+            .build_snapshot()
+            .await
+            .expect("publish dynamic current snapshot before cancellation");
+        let original_meta = original.meta.clone();
+        drop(original);
+        let observer = machine
+            .shutdown_observer()
+            .expect("dynamic store has a tracked shutdown guard");
+        let gate = Arc::new(SnapshotArtifactGate::new());
+        gate.arm();
+        let hook_directory =
+            snapshot_namespace_test_hook_directory(&machine._snapshot_directory_lease);
+        let _gate_guard =
+            FixedPrepublicationScanGateGuard::install(hook_directory, Arc::clone(&gate));
+        let mut serving = Box::pin(machine.get_current_snapshot());
+        tokio::select! {
+            _ = gate.wait_started() => {}
+            result = &mut serving => {
+                let _ = result;
+                panic!("dynamic admission completed before its descriptor-scan gate");
+            }
+        }
+        drop(serving);
+        assert_eq!(
+            observer.0.active_owners.load(Ordering::Acquire),
+            3,
+            "the detached dynamic admission worker retains its shutdown child"
+        );
+        let worker_owns_publication = Arc::clone(&machine.core.snapshot_serving_gate)
+            .try_lock_owned()
+            .is_err();
+        gate.release();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while observer.0.active_owners.load(Ordering::Acquire) != 2 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("detached dynamic scan releases its shutdown child after completion");
+        let released = tokio::time::timeout(
+            Duration::from_secs(5),
+            Arc::clone(&machine.core.snapshot_serving_gate).lock_owned(),
+        )
+        .await
+        .expect("detached dynamic scan releases publication exclusion after completion");
+        drop(released);
+        assert!(
+            worker_owns_publication,
+            "cancelled dynamic admission must exclude publication until its worker stops"
+        );
+        assert_eq!(
+            machine
+                .get_current_snapshot()
+                .await
+                .expect("read original snapshot after cancelled dynamic scan")
+                .expect("original snapshot remains selected")
+                .meta,
+            original_meta
+        );
+        drop(log);
     }
 
     #[cfg(target_os = "linux")]

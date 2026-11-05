@@ -147,10 +147,10 @@ fn test_node_id_ipv4_wrong_length_rejected() {
 }
 
 // ---------------------------------------------------------------------------
-// F-SEID (§8.2.40)
+// F-SEID (§8.2.37)
 // ---------------------------------------------------------------------------
 
-/// F-SEID IE with V4=1, SEID=0x123456789ABCDEF0, IPv4=192.0.2.1 per §8.2.40.
+/// F-SEID IE with V4=1, SEID=0x123456789ABCDEF0, IPv4=192.0.2.1 per §8.2.37.
 /// Octet 5: flags = 0x02 (V4=1, V6=0).
 /// Octets 6-13: SEID (8 octets).
 /// Octets 14-17: IPv4 address.
@@ -159,7 +159,7 @@ fn test_fseid_v4_spec_bytes() {
     let bytes: &[u8] = &[
         0x00, 0x39, // IE type 57 (F-SEID)
         0x00, 0x0D, // length 13 (1 + 8 + 4)
-        0x02, // flags: V4=1, V6=0, spare bits 0 (§8.2.40)
+        0x02, // flags: V4=1, V6=0, spare bits 0 (§8.2.37)
         0x12, 0x34, 0x56, 0x78, 0x9A, 0xBC, 0xDE, 0xF0, // SEID
         0xC0, 0x00, 0x02, 0x01, // IPv4
     ];
@@ -177,7 +177,7 @@ fn test_fseid_v4_spec_bytes() {
     assert_typed_roundtrip(bytes);
 }
 
-/// F-SEID IE with V4=1, V6=1, SEID, IPv4, IPv6 per §8.2.40.
+/// F-SEID IE with V4=1, V6=1, SEID, IPv4, IPv6 per §8.2.37.
 /// IPv4 precedes IPv6 when both are present.
 #[test]
 fn test_fseid_v4v6_spec_bytes() {
@@ -219,10 +219,10 @@ fn test_fseid_truncated_rejected() {
 }
 
 // ---------------------------------------------------------------------------
-// F-TEID (§8.2.5)
+// F-TEID (§8.2.3)
 // ---------------------------------------------------------------------------
 
-/// F-TEID IE with V4=1, TEID=0x12345678, IPv4=192.0.2.1 per §8.2.5.
+/// F-TEID IE with V4=1, TEID=0x12345678, IPv4=192.0.2.1 per §8.2.3.
 /// Octet 5: flags = 0x01 (V4=1).
 /// Octets 6-9: TEID.
 /// Octets 10-13: IPv4.
@@ -231,7 +231,7 @@ fn test_fteid_v4_spec_bytes() {
     let bytes: &[u8] = &[
         0x00, 0x15, // IE type 21 (F-TEID)
         0x00, 0x09, // length 9 (1 + 4 + 4)
-        0x01, // flags: V4=1 (§8.2.5)
+        0x01, // flags: V4=1 (§8.2.3)
         0x12, 0x34, 0x56, 0x78, // TEID
         0xC0, 0x00, 0x02, 0x01, // IPv4
     ];
@@ -249,14 +249,14 @@ fn test_fteid_v4_spec_bytes() {
     assert_typed_roundtrip(bytes);
 }
 
-/// F-TEID IE with CH=1, CHID=1, Choose ID=5 per §8.2.5.
+/// F-TEID IE with CH=1, CHID=1, V4=1, Choose ID=5 per §8.2.3.
 /// When CH=1 and CHID=1, only flags and CHID are present.
 #[test]
 fn test_fteid_ch_chid_spec_bytes() {
     let bytes: &[u8] = &[
         0x00, 0x15, // IE type 21
         0x00, 0x02, // length 2
-        0x0C, // flags: CH=1, CHID=1 (bits 3 and 4)
+        0x0D, // flags: V4=1, CH=1, CHID=1 (bits 1, 3 and 4)
         0x05, // Choose ID
     ];
     let ie = decode_typed(bytes);
@@ -305,10 +305,10 @@ fn test_pdr_id_spec_bytes() {
 }
 
 // ---------------------------------------------------------------------------
-// FAR ID (§8.2.50)
+// FAR ID (§8.2.74)
 // ---------------------------------------------------------------------------
 
-/// FAR ID IE, value = 0x12345678 per §8.2.50 (4 octets).
+/// FAR ID IE, value = 0x12345678 per §8.2.74 (4 octets).
 #[test]
 fn test_far_id_spec_bytes() {
     let bytes: &[u8] = &[
@@ -325,10 +325,10 @@ fn test_far_id_spec_bytes() {
 }
 
 // ---------------------------------------------------------------------------
-// QER ID (§8.2.37)
+// QER ID (§8.2.75)
 // ---------------------------------------------------------------------------
 
-/// QER ID IE, value = 0x00000001 per §8.2.37 (4 octets).
+/// QER ID IE, value = 0x00000001 per §8.2.75 (4 octets).
 #[test]
 fn test_qer_id_spec_bytes() {
     let bytes: &[u8] = &[
@@ -345,10 +345,10 @@ fn test_qer_id_spec_bytes() {
 }
 
 // ---------------------------------------------------------------------------
-// URR ID (§8.2.71)
+// URR ID (§8.2.54)
 // ---------------------------------------------------------------------------
 
-/// URR ID IE, value = 0x00000002 per §8.2.71 (4 octets).
+/// URR ID IE, value = 0x00000002 per §8.2.54 (4 octets).
 #[test]
 fn test_urr_id_spec_bytes() {
     let bytes: &[u8] = &[
@@ -365,10 +365,10 @@ fn test_urr_id_spec_bytes() {
 }
 
 // ---------------------------------------------------------------------------
-// Precedence (§8.2.20)
+// Precedence (§8.2.11)
 // ---------------------------------------------------------------------------
 
-/// Precedence IE, value = 0x0000000A per §8.2.20 (4 octets).
+/// Precedence IE, value = 0x0000000A per §8.2.11 (4 octets).
 #[test]
 fn test_precedence_spec_bytes() {
     let bytes: &[u8] = &[
@@ -388,7 +388,9 @@ fn test_precedence_spec_bytes() {
 // Apply Action (§8.2.26)
 // ---------------------------------------------------------------------------
 
-/// Apply Action IE with DROP=1, FORW=1 per §8.2.26 (2 octets).
+/// Syntactic round-trip of DROP|FORW: the typed codec exposes both bits.
+/// This combination violates §8.2.26 and is rejected by the production profile;
+/// semantic action rules deliberately belong to that profile, not this codec.
 /// Octet 5: 0x03 (DROP | FORW).
 /// Octet 6: 0x00 (spare).
 #[test]
@@ -437,16 +439,16 @@ fn test_source_interface_access_spec_bytes() {
 }
 
 // ---------------------------------------------------------------------------
-// Destination Interface (§8.2.3)
+// Destination Interface (§8.2.24)
 // ---------------------------------------------------------------------------
 
-/// Destination Interface IE, value = Core (1) per §8.2.3.
+/// Destination Interface IE, value = Core (1) per §8.2.24.
 #[test]
 fn test_destination_interface_core_spec_bytes() {
     let bytes: &[u8] = &[
         0x00, 0x2A, // IE type 42 (Destination Interface)
         0x00, 0x01, // length 1
-        0x01, // Core (1), spare nibble 0 (§8.2.3)
+        0x01, // Core (1), spare nibble 0 (§8.2.24)
     ];
     let ie = decode_typed(bytes);
     match ie {
@@ -483,14 +485,14 @@ fn test_network_instance_spec_bytes() {
 // ---------------------------------------------------------------------------
 
 /// UE IP Address IE with V4=1, IPv4=192.0.2.1 per §8.2.62.
-/// Octet 5: flags = 0x01 (V4=1).
+/// Octet 5: flags = 0x02 (V4=1).
 /// Octets 6-9: IPv4 address.
 #[test]
 fn test_ue_ip_address_v4_spec_bytes() {
     let bytes: &[u8] = &[
         0x00, 0x5D, // IE type 93 (UE IP Address)
         0x00, 0x05, // length 5
-        0x01, // V4=1 (§8.2.62)
+        0x02, // V4=1 (§8.2.62)
         0xC0, 0x00, 0x02, 0x01, // IPv4
     ];
     let ie = decode_typed(bytes);
@@ -505,22 +507,22 @@ fn test_ue_ip_address_v4_spec_bytes() {
     assert_typed_roundtrip(bytes);
 }
 
-/// UE IP Address IE with V4=1, IPv4D=1, prefix length 24 per §8.2.62.
+/// UE IP Address IE with V6=1, IPv6D=1, delegation bits 4 per §8.2.62.
 #[test]
-fn test_ue_ip_address_v4_prefix_spec_bytes() {
+fn test_ue_ip_address_v6_delegation_spec_bytes() {
     let bytes: &[u8] = &[
         0x00, 0x5D, // IE type 93
-        0x00, 0x06, // length 6
-        0x09, // V4=1, IPv4D=1
-        0xC0, 0x00, 0x02, 0x00, // IPv4
-        0x18, // prefix length 24
+        0x00, 0x12, // length 18
+        0x09, // V6=1, IPv6D=1
+        0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,    // IPv6
+        0x04, // four delegation bits relative to /64: /60
     ];
     let ie = decode_typed(bytes);
     match ie {
         TypedIe::UeIpAddress(u) => {
-            assert!(u.v4);
-            assert!(u.ipv4d);
-            assert_eq!(u.ipv4_prefix_length, Some(24));
+            assert!(u.v6);
+            assert!(u.ipv6d);
+            assert_eq!(u.ipv6_prefix_delegation_bits, Some(4));
         }
         other => panic!("expected UeIpAddress, got {other:?}"),
     }
@@ -528,16 +530,16 @@ fn test_ue_ip_address_v4_prefix_spec_bytes() {
 }
 
 // ---------------------------------------------------------------------------
-// Outer Header Removal (§8.2.57)
+// Outer Header Removal (§8.2.64)
 // ---------------------------------------------------------------------------
 
-/// Outer Header Removal IE, description = GTP-U/UDP/IPv4 (0) per §8.2.57.
+/// Outer Header Removal IE, description = GTP-U/UDP/IPv4 (0) per §8.2.64.
 #[test]
 fn test_outer_header_removal_spec_bytes() {
     let bytes: &[u8] = &[
         0x00, 0x5F, // IE type 95 (Outer Header Removal)
         0x00, 0x01, // length 1
-        0x00, // description 0 (§8.2.57)
+        0x00, // description 0 (§8.2.64)
     ];
     let ie = decode_typed(bytes);
     match ie {
@@ -548,16 +550,16 @@ fn test_outer_header_removal_spec_bytes() {
 }
 
 // ---------------------------------------------------------------------------
-// Recovery Time Stamp (§8.2.69)
+// Recovery Time Stamp (§8.2.65)
 // ---------------------------------------------------------------------------
 
-/// Recovery Time Stamp IE, value = 0x66555A00 per §8.2.69 (4 octets).
+/// Recovery Time Stamp IE, value = 0x66555A00 per §8.2.65 (4 octets).
 #[test]
 fn test_recovery_time_stamp_spec_bytes() {
     let bytes: &[u8] = &[
         0x00, 0x60, // IE type 96 (Recovery Time Stamp)
         0x00, 0x04, // length 4
-        0x66, 0x55, 0x5A, 0x00, // seconds since epoch (§8.2.69)
+        0x66, 0x55, 0x5A, 0x00, // seconds since epoch (§8.2.65)
     ];
     let ie = decode_typed(bytes);
     match ie {
@@ -568,7 +570,7 @@ fn test_recovery_time_stamp_spec_bytes() {
 }
 
 // ---------------------------------------------------------------------------
-// Outer Header Creation (§8.2.12)
+// Outer Header Creation (§8.2.56)
 // ---------------------------------------------------------------------------
 
 /// Outer Header Creation IE, GTP-U/UDP/IPv4 per §8.2.56: octet 5 bit 1 set,
@@ -1765,6 +1767,7 @@ mod from_typed_tests {
 
     fn all_typed_ie_variants() -> Vec<TypedIe> {
         vec![
+            TypedIe::UserPlaneInactivityTimer(crate::ie::UserPlaneInactivityTimer { seconds: 60 }),
             TypedIe::CreatePdr(CreatePdr {
                 members: vec![
                     TypedIe::PdrId(PdrId { value: 1 }),
@@ -1794,6 +1797,8 @@ mod from_typed_tests {
                         edrt: false,
                         bdpn: false,
                         ddpn: false,
+                        fssm: false,
+                        mbsu: false,
                         spare: 0,
                     }),
                 ],
@@ -1930,6 +1935,8 @@ mod from_typed_tests {
                 edrt: false,
                 bdpn: false,
                 ddpn: false,
+                fssm: false,
+                mbsu: false,
                 spare: 0,
             }),
             TypedIe::DestinationInterface(DestinationInterface { value: 0, spare: 0 }),
@@ -1950,14 +1957,13 @@ mod from_typed_tests {
                 v4: true,
                 v6: false,
                 sd: false,
-                ipv4d: false,
                 ipv6d: false,
+                ip6pl: false,
                 chv4: false,
                 chv6: false,
-                ch: false,
                 ipv4: Some([1, 2, 3, 4]),
                 ipv6: None,
-                ipv4_prefix_length: None,
+                ipv6_prefix_delegation_bits: None,
                 ipv6_prefix_length: None,
             }),
             TypedIe::OuterHeaderRemoval(OuterHeaderRemoval { description: 0 }),

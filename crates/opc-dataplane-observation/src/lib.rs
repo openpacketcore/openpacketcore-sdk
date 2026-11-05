@@ -1651,15 +1651,20 @@ mod tests {
             4
         )
         .is_err());
-        assert!(TrafficContinuityPolicy::new(
-            2,
-            Duration::from_secs(1),
-            Duration::from_secs(1),
-            Duration::from_secs(1),
-            Duration::from_secs(1),
-            MAX_RETAINED_EVENTS + 1
-        )
-        .is_err());
+        assert_eq!(
+            TrafficContinuityPolicy::new(
+                2,
+                Duration::from_secs(1),
+                Duration::from_secs(1),
+                Duration::from_secs(1),
+                Duration::from_secs(1),
+                MAX_RETAINED_EVENTS + 1,
+            )
+            .unwrap_err(),
+            TrafficContinuityError::InvalidPolicy {
+                code: "maximum_retained_events_exceeds_bound"
+            }
+        );
         assert_eq!(
             TrafficContinuityPolicy::new(
                 3,
@@ -1674,7 +1679,7 @@ mod tests {
                 code: "minimum_samples_exceed_retention",
             }
         );
-        assert!(TrafficContinuityPolicy::new(
+        let at_capacity = TrafficContinuityPolicy::new(
             MAX_RETAINED_EVENTS / 2,
             Duration::from_secs(1),
             Duration::from_secs(1),
@@ -1682,7 +1687,8 @@ mod tests {
             Duration::from_secs(1),
             MAX_RETAINED_EVENTS,
         )
-        .is_ok());
+        .expect("the exact retained-event bound is a valid policy");
+        assert_eq!(at_capacity.maximum_retained_events(), MAX_RETAINED_EVENTS);
     }
 
     #[test]

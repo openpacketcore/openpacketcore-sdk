@@ -225,9 +225,24 @@ example, logical self `epdg-app-0` can identify a descriptor whose dial route is
 Openraft node ID is derived from cluster identity plus that logical
 `ReplicaId`, never from DNS ordering or endpoint spelling.
 
-Build one immutable `ConsensusIdentity` from the cluster ID, a positive
-monotonic configuration epoch, and the exact order-independent configuration
-digest over that cluster, epoch, and complete descriptor-fingerprint set.
+Cluster identity is installation-qualified: at first install, generate one
+non-zero 32-byte installation nonce from a cryptographically secure random
+source with at least 256 bits of entropy, persist it immutably with the
+manifest, and pass it to every `SessionReplicationManifest` constructor. The
+SDK can reject only the all-zero value; a constant, reused or low-entropy nonce
+is accepted and silently collapses installations that share the cluster name
+into one authority domain, so never derive it from configuration text, never
+share it between deployments, and never regenerate it on an existing
+installation. A
+retained volume from an earlier installation (same cluster name, different
+nonce) is refused with the store's typed identity mismatch instead of joining;
+reusing the persisted nonce is what continues the installation. Changing the
+nonce on existing storage is a fresh-install boundary with no migration.
+
+Build one immutable `ConsensusIdentity` from the installation-qualified
+cluster ID, a positive monotonic configuration epoch, and the exact
+order-independent configuration digest over that installation's cluster,
+epoch, and complete descriptor-fingerprint set.
 The topology contains only those member descriptors. Supply the node's one
 local SQLite backend separately to `ConsensusSessionStore::open`, and build
 the exact consensus-peer map plus `SessionReplicationManifest` bindings from
@@ -1245,7 +1260,7 @@ held by the Python wrapper as the exact nofollow inode via
 inheritance; Rust opens/locks that inode and revalidates procfd, parent, name,
 and path before mkdir, publication, and completion to close the A-to-B
 split-lock seam. The V9 schema digest is
-`sha256:65d456edc15359e9cbac25a6771822219797c53f03aa6ca5d8837e43a6dbc018`.
+`sha256:eb410e3be0c2260ebefc8567507941f9b08d06f5280a0ac43aebef9b7b60039e`.
 
 The protected `/3` pool is rebound to a readiness-proven live leader after each
 loss/restart. Its tenant-negative evidence is exactly three per-voter,

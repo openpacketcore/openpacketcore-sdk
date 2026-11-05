@@ -8,13 +8,12 @@ use std::time::Duration;
 
 use crate::subscription_auth::{authorization_failure, StreamAuthorization};
 use opc_config_bus::{ConfigEvent, SubscriberLagPolicy};
-use opc_config_model::{OpcConfig, RequestId, TrustedPrincipal, YangPath};
+use opc_config_model::{OpcConfig, RequestId, TrustedPrincipal};
 use opc_mgmt_audit::{AuditOperation, AuditOutcome, SchemaNodePath};
 use opc_mgmt_authz::{AuthorizationGate, ReadAction, ReadAuthorizer};
 use opc_mgmt_opstate::{
     OperationalEvent, OperationalEventReceiver, OperationalSubscriptionRequest,
 };
-use prost::Message;
 use tokio::sync::mpsc;
 use tonic::{Status, Streaming};
 
@@ -30,10 +29,12 @@ use crate::metrics::{
 use crate::proto::gnmi;
 use crate::proto_adapter::path_from_proto;
 use crate::service::{status_from_error, validate_extensions_for_operation, ExtensionOperation};
-use crate::{GnmiConfigBinding, GnmiError, GnmiJsonUpdate, GnmiServer, ResolvedGnmiPath};
+use crate::{GnmiConfigBinding, GnmiError, GnmiJsonUpdate, GnmiServer};
 
 const RESPONSE_QUEUE_BYTES_ESTIMATE: usize = 4096;
 const MAX_SUBSCRIBE_QUEUE_MESSAGES: usize = 1024;
+
+mod delta;
 
 /// Serves one authenticated gNMI Subscribe request stream.
 #[cfg(test)]
@@ -322,44 +323,57 @@ where
         }
         None => None,
     };
-    let config_rx = plan
+    let stream = plan
         .stream
         .as_ref()
-        .filter(|stream| stream.has_config_on_change)
-        .map(|_| {
+        .ok_or_else(|| GnmiError::schema("missing stream plan"))?;
+    let config_rx = stream
+        .snapshots
+        .iter()
+        .any(|snapshot| snapshot.config_on_change)
+        .then(|| {
             server
                 .binding()
                 .config_bus()
                 .subscribe(SubscriberLagPolicy::ForceResync, queue_capacity)
         });
-    let mut dedupe = SnapshotDedupe::default();
-    if !plan.updates_only
-        && !send_snapshot(&server, &principal, &plan, &outbound, &mut dedupe, true).await?
-    {
-        return Ok(());
+    // Seed every schedule from the same authorized observation, including overlapping paths.
+    let initial = render_snapshot_async(&server, &principal, &plan).await?;
+    let mut snapshots = Vec::with_capacity(stream.snapshots.len());
+    for snapshot in &stream.snapshots {
+        let snapshot_plan = SubscribePlan {
+            mode: plan.mode,
+            updates_only: plan.updates_only,
+            get_request: snapshot.get_request.clone(),
+            stream: None,
+            audit_paths: plan.audit_paths.clone(),
+            authorization: plan.authorization.clone(),
+        };
+        let selected_initial =
+            select_snapshot_responses(server.as_ref(), &snapshot_plan.get_request, &initial)?;
+        let dedupe = SnapshotDedupe {
+            previous: selected_initial,
+            changed: false,
+        };
+        snapshots.push(ActiveSnapshot {
+            plan: snapshot_plan,
+            dedupe,
+            sample: snapshot.sample_interval.map(stream_interval),
+            heartbeat: snapshot.heartbeat_interval.map(stream_interval),
+            config_on_change: snapshot.config_on_change,
+            suppress_redundant: snapshot.suppress_redundant,
+        });
     }
-    if plan.updates_only {
-        let responses = render_snapshot_async(&server, &principal, &plan).await?;
-        dedupe.last = Some(fingerprint_responses(&responses));
+    if !plan.updates_only {
+        for response in initial {
+            if outbound.send(Ok(response)).await.is_err() {
+                return Ok(());
+            }
+        }
     }
     send_sync(&outbound).await?;
 
-    let mut sample = plan
-        .stream
-        .as_ref()
-        .and_then(|stream| stream.sample_interval)
-        .map(tokio::time::interval);
-    if let Some(sample) = sample.as_mut() {
-        sample.tick().await;
-    }
-    let mut heartbeat = plan
-        .stream
-        .as_ref()
-        .and_then(|stream| stream.heartbeat_interval)
-        .map(tokio::time::interval);
-    if let Some(heartbeat) = heartbeat.as_mut() {
-        heartbeat.tick().await;
-    }
+    let mut next_snapshot = 0;
 
     loop {
         tokio::select! {
@@ -430,16 +444,16 @@ where
                 }
             }, if config_rx.is_some() => {
                 match event {
-                    Some(ConfigEvent::Change(_)) => {
-                        if !send_snapshot(&server, &principal, &plan, &outbound, &mut dedupe, false).await? {
-                            return Ok(());
+                    Some(event) => {
+                        let resync = matches!(event, ConfigEvent::ResyncRequired { .. });
+                        let mut changed = false;
+                        for snapshot in snapshots.iter_mut().filter(|snapshot| snapshot.config_on_change) {
+                            if !send_snapshot(&server, &principal, &snapshot.plan, &outbound, &mut snapshot.dedupe, false).await? {
+                                return Ok(());
+                            }
+                            changed |= snapshot.dedupe.changed;
                         }
-                    }
-                    Some(ConfigEvent::ResyncRequired { .. }) => {
-                        if !send_snapshot(&server, &principal, &plan, &outbound, &mut dedupe, false).await? {
-                            return Ok(());
-                        }
-                        if dedupe.changed { send_sync(&outbound).await?; }
+                        if resync && changed { send_sync(&outbound).await?; }
                     }
                     None => return Ok(()),
                 }
@@ -460,24 +474,22 @@ where
                     None => return Ok(()),
                 }
             }
-            _ = async {
-                match sample.as_mut() {
-                    Some(sample) => sample.tick().await,
-                    None => future::pending().await,
+            (index, heartbeat) = future::poll_fn(|cx| {
+                for offset in 0..snapshots.len() {
+                    let index = (next_snapshot + offset) % snapshots.len();
+                    let snapshot = &mut snapshots[index];
+                    let sample = snapshot.sample.as_mut().is_some_and(|timer| timer.poll_tick(cx).is_ready());
+                    let heartbeat = snapshot.heartbeat.as_mut().is_some_and(|timer| timer.poll_tick(cx).is_ready());
+                    if sample || heartbeat {
+                        return std::task::Poll::Ready((index, heartbeat));
+                    }
                 }
-            }, if sample.is_some() => {
-                let suppress = plan.stream.as_ref().is_some_and(|stream| stream.suppress_redundant);
-                if !send_snapshot(&server, &principal, &plan, &outbound, &mut dedupe, !suppress).await? {
-                    return Ok(());
-                }
-            }
-            _ = async {
-                match heartbeat.as_mut() {
-                    Some(heartbeat) => heartbeat.tick().await,
-                    None => future::pending().await,
-                }
-            }, if heartbeat.is_some() => {
-                if !send_snapshot(&server, &principal, &plan, &outbound, &mut dedupe, true).await? {
+                std::task::Poll::Pending
+            }) => {
+                next_snapshot = (index + 1) % snapshots.len();
+                let snapshot = &mut snapshots[index];
+                let force = heartbeat || !snapshot.suppress_redundant;
+                if !send_snapshot(&server, &principal, &snapshot.plan, &outbound, &mut snapshot.dedupe, force).await? {
                     return Ok(());
                 }
             }
@@ -513,6 +525,70 @@ where
     .map_err(|_| GnmiError::unavailable("gNMI snapshot work failed"))?
 }
 
+fn select_snapshot_responses<C, B>(
+    server: &GnmiServer<C, B>,
+    request: &gnmi::GetRequest,
+    responses: &[gnmi::SubscribeResponse],
+) -> Result<Vec<gnmi::SubscribeResponse>, GnmiError>
+where
+    C: OpcConfig,
+    B: GnmiConfigBinding<C>,
+{
+    let entries = select_read_request(server, request)?;
+    let paths = entries
+        .iter()
+        .map(|entry| entry.schema_path())
+        .collect::<Vec<_>>();
+    let selection = crate::ReadSelection::with_entries(&paths, &entries);
+    let mut selected = Vec::new();
+    for response in responses {
+        let Some(gnmi::subscribe_response::Response::Update(notification)) = &response.response
+        else {
+            continue;
+        };
+        let prefix = notification
+            .prefix
+            .as_ref()
+            .map(path_from_proto)
+            .transpose()?;
+        let matches = |path: Option<&gnmi::Path>| -> Result<bool, GnmiError> {
+            let path = path.map(path_from_proto).transpose()?.unwrap_or_default();
+            Ok(
+                crate::path::resolve_read_path(server.binding().schema(), prefix.as_ref(), &path)?
+                    .is_some_and(|resolved| {
+                        selection.contains_path(&resolved.schema_path, &resolved.canonical)
+                    }),
+            )
+        };
+        let mut notification = notification.clone();
+        notification.update = notification
+            .update
+            .into_iter()
+            .filter_map(|update| match matches(update.path.as_ref()) {
+                Ok(true) => Some(Ok(update)),
+                Ok(false) => None,
+                Err(err) => Some(Err(err)),
+            })
+            .collect::<Result<_, _>>()?;
+        notification.delete = notification
+            .delete
+            .into_iter()
+            .filter_map(|path| match matches(Some(&path)) {
+                Ok(true) => Some(Ok(path)),
+                Ok(false) => None,
+                Err(err) => Some(Err(err)),
+            })
+            .collect::<Result<_, _>>()?;
+        if !notification.update.is_empty() || !notification.delete.is_empty() {
+            selected.push(gnmi::SubscribeResponse {
+                response: Some(gnmi::subscribe_response::Response::Update(notification)),
+                extension: response.extension.clone(),
+            });
+        }
+    }
+    Ok(selected)
+}
+
 async fn send_snapshot<C, B>(
     server: &Arc<GnmiServer<C, B>>,
     principal: &TrustedPrincipal,
@@ -525,14 +601,29 @@ where
     C: OpcConfig + 'static,
     B: GnmiConfigBinding<C> + 'static,
 {
+    // Authorization reevaluation can deliberately return an empty selection.
+    // It is not evidence that the previously visible data was deleted.
+    let revision = plan
+        .authorization
+        .as_ref()
+        .map(|authorization| authorization.snapshot_revision())
+        .transpose()?;
     let responses = render_snapshot_async(server, principal, plan).await?;
-    let fingerprint = fingerprint_responses(&responses);
-    dedupe.changed = dedupe.last.as_ref() != Some(&fingerprint);
-    dedupe.last = Some(fingerprint);
-    if !force && !dedupe.changed {
+    let after = plan
+        .authorization
+        .as_ref()
+        .map(|authorization| authorization.snapshot_revision())
+        .transpose()?;
+    // Preserve the existing read-side authorization evaluation even while
+    // output is gated; only the data comparison is deferred.
+    if revision == Some(None) || after != revision {
+        dedupe.changed = false;
         return Ok(true);
     }
-    for response in responses {
+    let (updates, changed) = delta::snapshot_delta(&dedupe.previous, &responses, force);
+    dedupe.previous = responses;
+    dedupe.changed = changed;
+    for response in updates {
         if outbound.send(Ok(response)).await.is_err() {
             return Ok(false);
         }
@@ -565,9 +656,14 @@ where
     Ok(response
         .notification
         .into_iter()
-        .map(|notification| gnmi::SubscribeResponse {
-            response: Some(gnmi::subscribe_response::Response::Update(notification)),
-            extension: Vec::new(),
+        .map(|mut notification| {
+            // Each subscription selects individual paths; it does not assert
+            // completeness for the subtree rooted at the notification prefix.
+            notification.atomic = false;
+            gnmi::SubscribeResponse {
+                response: Some(gnmi::subscribe_response::Response::Update(notification)),
+                extension: Vec::new(),
+            }
         })
         .collect())
 }
@@ -799,61 +895,9 @@ async fn send_sync(
     Ok(())
 }
 
-#[expect(
-    clippy::expect_used,
-    reason = "prost encode_length_delimited into a Vec is infallible (buffer grows)"
-)]
-fn fingerprint_responses(responses: &[gnmi::SubscribeResponse]) -> Vec<u8> {
-    let mut out = Vec::new();
-    for response in responses {
-        let mut content = response.clone();
-        let mut keys = Vec::new();
-        if let Some(gnmi::subscribe_response::Response::Update(notification)) =
-            &mut content.response
-        {
-            notification.timestamp = 0;
-            if let Some(prefix) = &mut notification.prefix {
-                fingerprint_path_keys(prefix, &mut keys);
-            }
-            for update in &mut notification.update {
-                if let Some(path) = &mut update.path {
-                    fingerprint_path_keys(path, &mut keys);
-                }
-            }
-            for path in &mut notification.delete {
-                fingerprint_path_keys(path, &mut keys);
-            }
-        }
-        content
-            .encode_length_delimited(&mut out)
-            .expect("encoding SubscribeResponse to Vec cannot fail");
-        out.extend_from_slice(&(keys.len() as u64).to_le_bytes());
-        out.extend_from_slice(&keys);
-    }
-    out
-}
-
-// Protobuf map encoding follows HashMap iteration order. Extract the keys in a
-// stable order before encoding the remaining message, preserving every literal
-// value and boundary in the fingerprint.
-fn fingerprint_path_keys(path: &mut gnmi::Path, out: &mut Vec<u8>) {
-    for element in &mut path.elem {
-        let mut keys: Vec<_> = element.key.iter().collect();
-        keys.sort_unstable_by_key(|(name, _)| *name);
-        out.extend_from_slice(&(keys.len() as u64).to_le_bytes());
-        for (name, value) in keys {
-            for text in [name, value] {
-                out.extend_from_slice(&(text.len() as u64).to_le_bytes());
-                out.extend_from_slice(text.as_bytes());
-            }
-        }
-        element.key.clear();
-    }
-}
-
 #[derive(Default)]
 struct SnapshotDedupe {
-    last: Option<Vec<u8>>,
+    previous: Vec<gnmi::SubscribeResponse>,
     changed: bool,
 }
 
@@ -1032,11 +1076,32 @@ enum SubscribeListMode {
 
 #[derive(Debug, Clone)]
 struct StreamPlan {
-    has_config_on_change: bool,
+    snapshots: Vec<SnapshotPlan>,
     operational_request: Option<OperationalSubscriptionRequest>,
+}
+
+#[derive(Debug, Clone)]
+struct SnapshotPlan {
+    get_request: gnmi::GetRequest,
+    config_on_change: bool,
     sample_interval: Option<Duration>,
     heartbeat_interval: Option<Duration>,
     suppress_redundant: bool,
+}
+
+struct ActiveSnapshot {
+    plan: SubscribePlan,
+    dedupe: SnapshotDedupe,
+    sample: Option<tokio::time::Interval>,
+    heartbeat: Option<tokio::time::Interval>,
+    config_on_change: bool,
+    suppress_redundant: bool,
+}
+
+fn stream_interval(interval: Duration) -> tokio::time::Interval {
+    let mut timer = tokio::time::interval_at(tokio::time::Instant::now() + interval, interval);
+    timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    timer
 }
 
 fn enforce_min_interval(interval: Duration, floor: Duration) -> Result<Duration, GnmiError> {
@@ -1054,290 +1119,100 @@ where
     C: OpcConfig,
     B: GnmiConfigBinding<C>,
 {
-    let mut has_on_change = false;
-    let mut sample_interval = None;
-    let mut heartbeat_interval = None;
-    let mut suppress_redundant = false;
+    use gnmi::get_request::DataType;
+    use gnmi::SubscriptionMode;
 
+    let mut snapshots = Vec::new();
+    let mut operational_paths = Vec::new();
     for subscription in &list.subscription {
-        match gnmi::SubscriptionMode::try_from(subscription.mode) {
-            Ok(gnmi::SubscriptionMode::OnChange) => has_on_change = true,
-            Ok(gnmi::SubscriptionMode::Sample) => {
-                if subscription.sample_interval == 0 {
-                    return Err(GnmiError::invalid(
-                        "gNMI SAMPLE subscription requires sample_interval",
-                    ));
-                }
-                sample_interval = Some(min_duration(
-                    sample_interval,
-                    nanos(subscription.sample_interval).and_then(|duration| {
-                        enforce_min_interval(duration, server.limits().min_sample_interval)
-                    })?,
-                ));
-            }
-            Ok(gnmi::SubscriptionMode::TargetDefined) => {
-                return Err(GnmiError::unimplemented(
-                    "gNMI TARGET_DEFINED subscriptions are not supported by this profile",
-                ));
-            }
-            Err(_) => return Err(GnmiError::invalid("unknown gNMI subscription mode")),
-        }
-        if subscription.suppress_redundant {
-            suppress_redundant = true;
-        }
-        if subscription.heartbeat_interval > 0 {
-            if !subscription.suppress_redundant {
-                return Err(GnmiError::invalid(
-                    "gNMI heartbeat_interval requires suppress_redundant",
-                ));
-            }
-            heartbeat_interval = Some(min_duration(
-                heartbeat_interval,
-                nanos(subscription.heartbeat_interval).and_then(|duration| {
-                    enforce_min_interval(duration, server.limits().min_sample_interval)
-                })?,
+        let mode = SubscriptionMode::try_from(subscription.mode)
+            .map_err(|_| GnmiError::invalid("unknown gNMI subscription mode"))?;
+        if mode == SubscriptionMode::TargetDefined && subscription.sample_interval != 0 {
+            return Err(GnmiError::invalid(
+                "gNMI TARGET_DEFINED chooses its own sample_interval",
             ));
         }
+        let sample_interval =
+            if mode == SubscriptionMode::Sample && subscription.sample_interval != 0 {
+                enforce_min_interval(
+                    nanos(subscription.sample_interval)?,
+                    server.limits().min_sample_interval,
+                )?
+            } else {
+                server.limits().min_sample_interval
+            };
+        let heartbeat_interval = (subscription.heartbeat_interval > 0)
+            .then(|| {
+                enforce_min_interval(
+                    nanos(subscription.heartbeat_interval)?,
+                    server.limits().min_sample_interval,
+                )
+            })
+            .transpose()?;
+        // ConfigBus supplies config changes; operational providers can always be sampled.
+        let selections: &[(DataType, bool, Option<Duration>)] = match mode {
+            SubscriptionMode::TargetDefined => &[
+                (DataType::Config, true, None),
+                (DataType::State, false, Some(sample_interval)),
+            ],
+            SubscriptionMode::OnChange => &[
+                (DataType::Config, true, None),
+                (DataType::State, false, None),
+            ],
+            SubscriptionMode::Sample => &[(DataType::All, false, Some(sample_interval))],
+        };
+        for &(data_type, config_on_change, sample_interval) in selections {
+            let get_request = gnmi::GetRequest {
+                prefix: list.prefix.clone(),
+                path: vec![subscription.path.clone().unwrap_or_default()],
+                r#type: data_type as i32,
+                encoding: list.encoding,
+                use_models: list.use_models.clone(),
+                extension: Vec::new(),
+            };
+            let selected = select_read_request(server, &get_request)?;
+            if selected.is_empty() {
+                continue;
+            }
+            if mode == SubscriptionMode::OnChange && data_type == DataType::State {
+                operational_paths.extend(
+                    selected
+                        .into_iter()
+                        .map(|entry| entry.canonical_path().clone()),
+                );
+            }
+            snapshots.push(SnapshotPlan {
+                get_request,
+                config_on_change,
+                sample_interval,
+                heartbeat_interval,
+                suppress_redundant: subscription.suppress_redundant,
+            });
+        }
     }
-
-    let on_change_classes = has_on_change
-        .then(|| classify_on_change_paths(server, list))
-        .transpose()?
-        .unwrap_or_default();
-    if !on_change_classes.operational_paths.is_empty()
-        && server.binding().operational_events().is_none()
-    {
+    operational_paths.sort_by(|a, b| a.as_str().cmp(b.as_str()));
+    operational_paths.dedup();
+    server
+        .limits()
+        .check_paths(operational_paths.len())
+        .map_err(GnmiError::from_limits)?;
+    if !operational_paths.is_empty() && server.binding().operational_events().is_none() {
         return Err(GnmiError::unimplemented(
             "gNMI operational on-change subscriptions require an event source",
         ));
     }
-    let operational_request = if on_change_classes.operational_paths.is_empty() {
+    let operational_request = if operational_paths.is_empty() {
         None
     } else {
         Some(
-            OperationalSubscriptionRequest::new(on_change_classes.operational_paths)
+            OperationalSubscriptionRequest::new(operational_paths)
                 .with_max_queued_events(subscribe_queue_capacity(server.limits())?),
         )
     };
     Ok(StreamPlan {
-        has_config_on_change: on_change_classes.has_config,
+        snapshots,
         operational_request,
-        sample_interval,
-        heartbeat_interval,
-        suppress_redundant,
     })
-}
-
-#[derive(Debug, Default)]
-struct OnChangePathClasses {
-    has_config: bool,
-    operational_paths: Vec<YangPath>,
-}
-
-fn classify_on_change_paths<C, B>(
-    server: &GnmiServer<C, B>,
-    list: &gnmi::SubscriptionList,
-) -> Result<OnChangePathClasses, GnmiError>
-where
-    C: OpcConfig,
-    B: GnmiConfigBinding<C>,
-{
-    let registry = server.binding().schema();
-    let model_filter = SubscribeModelFilter::new(registry, &list.use_models)?;
-    let prefix = list.prefix.as_ref().map(path_from_proto).transpose()?;
-    if prefix.as_ref().is_some_and(path_has_target) {
-        return Err(GnmiError::unimplemented(
-            "non-empty gNMI target is not supported",
-        ));
-    }
-    let mut classes = OnChangePathClasses::default();
-    for subscription in &list.subscription {
-        if !matches!(
-            gnmi::SubscriptionMode::try_from(subscription.mode),
-            Ok(gnmi::SubscriptionMode::OnChange)
-        ) {
-            continue;
-        }
-        let path = subscription
-            .path
-            .as_ref()
-            .map(path_from_proto)
-            .transpose()?
-            .unwrap_or_default();
-        if path_has_target(&path) {
-            return Err(GnmiError::unimplemented(
-                "non-empty gNMI target is not supported",
-            ));
-        }
-        if path.elems.is_empty() {
-            let origin_modules = root_origin_modules(registry, prefix.as_ref(), Some(&path))?;
-            if let Some(prefix) = prefix.as_ref().filter(|prefix| !prefix.elems.is_empty()) {
-                if let Some(resolved) = crate::path::resolve_read_path(registry, None, prefix)? {
-                    classify_from_resolved(registry, &resolved, &model_filter, &mut classes)?;
-                }
-            } else {
-                classify_all_matching(
-                    registry,
-                    &model_filter,
-                    origin_modules.as_ref(),
-                    &mut classes,
-                )?;
-            }
-            continue;
-        }
-        if let Some(resolved) = crate::path::resolve_read_path(registry, prefix.as_ref(), &path)? {
-            classify_from_resolved(registry, &resolved, &model_filter, &mut classes)?;
-        }
-    }
-    classes
-        .operational_paths
-        .sort_by(|a, b| a.as_str().cmp(b.as_str()));
-    classes
-        .operational_paths
-        .dedup_by(|a, b| a.as_str() == b.as_str());
-    server
-        .limits()
-        .check_paths(classes.operational_paths.len())
-        .map_err(GnmiError::from_limits)?;
-    Ok(classes)
-}
-
-struct SubscribeModelFilter {
-    modules: Option<Vec<&'static str>>,
-}
-
-impl SubscribeModelFilter {
-    fn new(
-        registry: &'static dyn opc_mgmt_schema::SchemaRegistry,
-        requested: &[gnmi::ModelData],
-    ) -> Result<Self, GnmiError> {
-        if requested.is_empty() {
-            return Ok(Self { modules: None });
-        }
-
-        let mut modules = Vec::new();
-        for model in requested {
-            let Some(served) = registry.served_models().iter().find(|served| {
-                served.name == model.name
-                    && (model.version.is_empty() || served.revision == model.version)
-            }) else {
-                return Err(GnmiError::invalid(
-                    "gNMI Subscribe requested an unserved model",
-                ));
-            };
-            modules.push(served.name);
-        }
-        modules.sort();
-        modules.dedup();
-        Ok(Self {
-            modules: Some(modules),
-        })
-    }
-
-    fn allows(&self, module: &str) -> bool {
-        self.modules
-            .as_ref()
-            .is_none_or(|modules| modules.contains(&module))
-    }
-}
-
-fn classify_all_matching(
-    registry: &'static dyn opc_mgmt_schema::SchemaRegistry,
-    model_filter: &SubscribeModelFilter,
-    origin_modules: Option<&std::collections::HashSet<&'static str>>,
-    classes: &mut OnChangePathClasses,
-) -> Result<(), GnmiError> {
-    for node in registry.nodes() {
-        if !model_filter.allows(node.module)
-            || origin_modules.is_some_and(|modules| !modules.contains(node.module))
-        {
-            continue;
-        }
-        if node.config {
-            classes.has_config = true;
-        } else {
-            classes.operational_paths.push(
-                YangPath::new(node.path).map_err(|_| GnmiError::schema("invalid schema path"))?,
-            );
-        }
-    }
-    Ok(())
-}
-
-fn classify_from_resolved(
-    registry: &'static dyn opc_mgmt_schema::SchemaRegistry,
-    resolved: &ResolvedGnmiPath,
-    model_filter: &SubscribeModelFilter,
-    classes: &mut OnChangePathClasses,
-) -> Result<(), GnmiError> {
-    if !model_filter.allows(resolved.node.module) {
-        return Err(GnmiError::invalid(
-            "gNMI Subscribe path is outside the requested model set",
-        ));
-    }
-
-    let root = resolved.schema_path.as_str();
-    for node in registry.nodes() {
-        let under_root = node.path == root
-            || node
-                .path
-                .strip_prefix(root)
-                .is_some_and(|suffix| suffix.starts_with('/'));
-        if !under_root || !model_filter.allows(node.module) {
-            continue;
-        }
-        if node.config {
-            classes.has_config = true;
-        } else {
-            classes
-                .operational_paths
-                .push(canonical_descendant_path(resolved, node.path)?);
-        }
-    }
-    Ok(())
-}
-
-fn canonical_descendant_path(
-    resolved: &ResolvedGnmiPath,
-    schema_path: &'static str,
-) -> Result<YangPath, GnmiError> {
-    if schema_path == resolved.schema_path {
-        return Ok(resolved.canonical.clone());
-    }
-    let suffix = schema_path
-        .strip_prefix(resolved.schema_path.as_str())
-        .ok_or_else(|| GnmiError::schema("invalid selected schema descendant"))?;
-    YangPath::new(format!("{}{}", resolved.canonical.as_str(), suffix))
-        .map_err(|_| GnmiError::schema("invalid selected canonical path"))
-}
-
-fn root_origin_modules(
-    registry: &'static dyn opc_mgmt_schema::SchemaRegistry,
-    prefix: Option<&crate::GnmiPath>,
-    path: Option<&crate::GnmiPath>,
-) -> Result<Option<std::collections::HashSet<&'static str>>, GnmiError> {
-    let prefix_origin = prefix.and_then(|path| path.origin.as_deref());
-    let path_origin = path.and_then(|path| path.origin.as_deref());
-    let origin = match (prefix_origin, path_origin) {
-        (Some(prefix), Some(path)) if prefix != path => {
-            return Err(GnmiError::invalid(
-                "gNMI prefix origin and path origin differ",
-            ));
-        }
-        (Some(origin), _) | (_, Some(origin)) => Some(origin),
-        (None, None) => None,
-    };
-    let Some(origin) = origin else {
-        return Ok(None);
-    };
-    let modules = registry
-        .modules_for_origin(origin)
-        .ok_or_else(|| GnmiError::invalid("unknown gNMI origin"))?;
-    Ok(Some(modules.iter().copied().collect()))
-}
-
-fn path_has_target(path: &crate::GnmiPath) -> bool {
-    path.target.is_some()
 }
 
 fn subscribe_queue_capacity(limits: &opc_mgmt_limits::MgmtLimits) -> Result<usize, GnmiError> {
@@ -1350,10 +1225,6 @@ fn subscribe_queue_capacity(limits: &opc_mgmt_limits::MgmtLimits) -> Result<usiz
     )
 }
 
-fn min_duration(current: Option<Duration>, candidate: Duration) -> Duration {
-    current.map_or(candidate, |current| current.min(candidate))
-}
-
 fn nanos(value: u64) -> Result<Duration, GnmiError> {
     if value == 0 {
         return Err(GnmiError::invalid("zero duration is invalid"));
@@ -1364,6 +1235,7 @@ fn nanos(value: u64) -> Result<Duration, GnmiError> {
 #[cfg(test)]
 mod fingerprint_tests {
     use super::*;
+    use prost::Message;
 
     #[test]
     fn equal_key_maps_have_equal_fingerprints_despite_distinct_wire_order() {
@@ -1399,9 +1271,19 @@ mod fingerprint_tests {
                 .any(|response| response.encode_to_vec() != first_wire),
             "fixture must exercise distinct protobuf map orders"
         );
-        let first = fingerprint_responses(&responses[..1]);
+        let fingerprint = |response: &gnmi::SubscribeResponse| {
+            let Some(gnmi::subscribe_response::Response::Update(notification)) = &response.response
+            else {
+                panic!("fixture must contain an update")
+            };
+            delta::snapshot_key(
+                notification.prefix.as_ref(),
+                notification.update[0].path.as_ref(),
+            )
+        };
+        let first = fingerprint(&responses[0]);
         for response in responses {
-            assert_eq!(fingerprint_responses(&[response]), first);
+            assert_eq!(fingerprint(&response), first);
         }
     }
 }

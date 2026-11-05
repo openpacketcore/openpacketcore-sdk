@@ -66,7 +66,8 @@ fn settled_request_is_suppressed_live_and_after_restore() {
         let pending = prepared.record().clone();
         let commit = prepared.commit_after_durable(&pending).unwrap();
         assert_eq!(f.window.apply_committed(commit).unwrap(), None);
-        let request = Bytes::copy_from_slice(f.window.replay_request().unwrap().unwrap().bytes());
+        let request =
+            Bytes::copy_from_slice(f.window.replay_request().unwrap().unwrap().bytes().unwrap());
         assert_eq!(peer.receive(&request), Ok(Event::NewRequest(0)));
         let response = peer.respond(0, child_delete()).unwrap();
         let opened = f.window.open_peer(f.profile, &f.keys, &response).unwrap();
@@ -150,7 +151,7 @@ fn empty_outage(prewarm: bool, completion: bool, base: u64) {
             let token = prepared.commit_after_durable(&request).unwrap();
             assert_eq!(f.window.apply_committed(token).unwrap(), None);
             assert_eq!(
-                peer.receive(f.window.replay_request().unwrap().unwrap().bytes()),
+                peer.receive(f.window.replay_request().unwrap().unwrap().bytes().unwrap()),
                 Ok(Event::NewRequest(0))
             );
             let response = peer.respond(0, child_delete()).unwrap();
@@ -263,7 +264,8 @@ fn cached_work_outage(check_disposition: bool, unavailable: bool, base: u64) {
         let cached = prepared.record().clone();
         let commit = prepared.commit_after_durable(&cached).unwrap();
         assert!(f.window.apply_committed(commit).unwrap().is_some());
-        let original = Bytes::copy_from_slice(f.window.replay_response(&opened).unwrap().bytes());
+        let original =
+            Bytes::copy_from_slice(f.window.replay_response(&opened).unwrap().bytes().unwrap());
         assert_eq!(peer.receive(&original), Ok(Event::Completed(0)));
         let provider_outage = |window: &Window| {
             super::module::withdraw(opc_crypto_provider::CryptoCapability::IkeEncryption, || {
@@ -276,7 +278,7 @@ fn cached_work_outage(check_disposition: bool, unavailable: bool, base: u64) {
                     Ok(Disposition::CachedResponse)
                 );
                 assert_eq!(
-                    window.replay_response(&opened).unwrap().bytes(),
+                    window.replay_response(&opened).unwrap().bytes().unwrap(),
                     original.as_ref()
                 );
                 assert_eq!(window.record(), &cached);
@@ -311,8 +313,8 @@ fn cached_work_outage(check_disposition: bool, unavailable: bool, base: u64) {
             .window
             .replay_response(&opened)
             .expect("outbound-only uncertainty must permit the exact committed response");
-        assert_eq!(reply.bytes(), original.as_ref());
-        assert_eq!(peer.receive(reply.bytes()), Ok(Event::Ignored));
+        assert_eq!(reply.bytes().unwrap(), original.as_ref());
+        assert_eq!(peer.receive(reply.bytes().unwrap()), Ok(Event::Ignored));
         assert_eq!(f.window.record(), &cached);
         let next = peer.request(37, child_delete()).unwrap();
         let next = f.window.open_peer(f.profile, &f.keys, &next).unwrap();

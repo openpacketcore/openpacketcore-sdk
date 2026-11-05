@@ -2,7 +2,6 @@
 
 use std::fmt;
 
-use bytes::Bytes;
 use thiserror::Error;
 
 use crate::{DeliveryOrder, InboundMessage, PayloadProtocolIdentifier};
@@ -163,7 +162,7 @@ impl<'a> DataChunk<'a> {
 
     /// Copy one unfragmented chunk into an owned SCTP DATA record.
     ///
-    /// This conversion allocates and copies the user data into [`Bytes`]. U
+    /// This conversion allocates and copies the user data into wiping, owner-backed [`bytes::Bytes`]. U
     /// maps to [`DeliveryOrder::Unordered`]; stream and PPID are preserved.
     /// `assoc_id` is supplied by the caller because DATA chunks carry no
     /// association identifier. It grants no authentication or generation
@@ -182,7 +181,7 @@ impl<'a> DataChunk<'a> {
             return Err(DataChunkError::Fragmented);
         }
         Ok(InboundMessage {
-            payload: Bytes::copy_from_slice(self.user_data),
+            payload: crate::ReceivePayload::copy_from_slice(self.user_data).into_bytes(),
             stream_id: self.stream_id,
             ppid: self.ppid,
             order: if self.flags.unordered {

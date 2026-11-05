@@ -36,8 +36,16 @@ const CONTROL_SOCKET_MODE: u32 = 0o600;
 #[path = "qualification_control_socket/fenced_exit.rs"]
 mod fenced_exit;
 
+/// Test-only environment variable honoured by the node server: delay injected
+/// after the control listener is bound and the node is open, immediately before
+/// readiness is published.
+#[cfg(feature = "test-control")]
+const QUALIFICATION_STARTUP_DELAY_ENV: &str = "OPC_QUALIFICATION_CONTROL_STARTUP_DELAY_MILLIS";
+
 struct TestServer {
     child: Child,
+    expected_node_index: usize,
+    expected_bind_addr: SocketAddr,
 }
 
 impl TestServer {
@@ -56,20 +64,84 @@ impl TestServer {
             .stderr(Stdio::piped())
             .spawn()
             .expect("spawn control server");
-        Self { child }
+        Self::from_child(child, node_index, bind_addr)
     }
 
+    fn from_child(child: Child, node_index: usize, bind_addr: SocketAddr) -> Self {
+        Self {
+            child,
+            expected_node_index: node_index,
+            expected_bind_addr: bind_addr,
+        }
+    }
+
+    #[cfg(feature = "test-control")]
+    fn start_with_injected_startup_delay(
+        config_path: &Path,
+        node_index: usize,
+        bind_addr: SocketAddr,
+        socket: &Path,
+        delay: Duration,
+    ) -> Self {
+        let child = Command::new(env!("CARGO_BIN_EXE_opc-session-quorum-node"))
+            .arg("--config")
+            .arg(config_path)
+            .arg("--node-index")
+            .arg(node_index.to_string())
+            .arg("--bind-addr")
+            .arg(bind_addr.to_string())
+            .arg("--control-socket")
+            .arg(socket)
+            .env(
+                QUALIFICATION_STARTUP_DELAY_ENV,
+                delay.as_millis().to_string(),
+            )
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("spawn control server with injected startup delay");
+        Self::from_child(child, node_index, bind_addr)
+    }
+
+    /// Wait for the server's explicit readiness publication. The control socket
+    /// file appears when the listener is bound, before the node is open, so
+    /// polling for it is a startup race; the server instead publishes one
+    /// bounded readiness frame on stdout after it is ready to serve. The frame
+    /// is consumed with the unchanged PROCESS_TIMEOUT as the hang guard.
     fn wait_for_socket(&mut self, socket: &Path) {
-        let deadline = Instant::now() + PROCESS_TIMEOUT;
-        loop {
-            if fs::symlink_metadata(socket)
-                .ok()
-                .is_some_and(|metadata| metadata.file_type().is_socket())
-                && UnixStream::connect(socket).is_ok()
-            {
-                return;
+        let stdout = self.child.stdout.take().expect("control server stdout");
+        let (sender, receiver) = std::sync::mpsc::channel();
+        thread::spawn(move || {
+            let mut reader = BufReader::new(stdout);
+            let _ = sender.send(read_bounded_json_line::<_, QualificationNodeReply>(
+                &mut reader,
+            ));
+        });
+        match receiver.recv_timeout(PROCESS_TIMEOUT) {
+            Ok(Ok(Some(QualificationNodeReply::Bound {
+                node_index,
+                bind_addr,
+            }))) => {
+                assert_eq!(
+                    node_index, self.expected_node_index,
+                    "control server published readiness for a different node"
+                );
+                assert_eq!(
+                    bind_addr.ip(),
+                    self.expected_bind_addr.ip(),
+                    "control server published readiness for a different address"
+                );
+                assert!(
+                    self.expected_bind_addr.port() == 0
+                        || bind_addr.port() == self.expected_bind_addr.port(),
+                    "control server published readiness for a different port"
+                );
             }
-            if let Some(status) = self.child.try_wait().expect("poll control server") {
+            Ok(Ok(Some(other))) => {
+                panic!("control server published an unexpected startup frame: {other:?}")
+            }
+            Ok(Ok(None)) | Ok(Err(_)) => {
                 let mut stderr = Vec::new();
                 self.child
                     .stderr
@@ -77,17 +149,33 @@ impl TestServer {
                     .expect("control server stderr")
                     .read_to_end(&mut stderr)
                     .expect("read control server stderr");
+                let status = self.wait_for_exit();
                 panic!(
                     "control server exited before publishing its socket: {status}; stderr={}",
                     String::from_utf8_lossy(&stderr)
                 );
             }
-            assert!(
-                Instant::now() < deadline,
-                "control socket startup timed out"
-            );
-            thread::sleep(Duration::from_millis(20));
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                let _ = self.child.kill();
+                let _ = self.child.wait();
+                panic!("control socket startup timed out");
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                panic!("control server readiness reader stopped before publishing its socket");
+            }
         }
+        // The original readiness assertions stay exact; they are evaluated once
+        // after the publication event instead of in a polling loop.
+        assert!(
+            fs::symlink_metadata(socket)
+                .ok()
+                .is_some_and(|metadata| metadata.file_type().is_socket()),
+            "control server published readiness without a control socket"
+        );
+        assert!(
+            UnixStream::connect(socket).is_ok(),
+            "control server published readiness without a connectable control socket"
+        );
     }
 
     fn wait(mut self) -> ExitStatus {
@@ -1240,6 +1328,73 @@ fn private_control_server_survives_bad_clients_and_recovers_stale_socket() {
         !socket.exists(),
         "clean shutdown must remove its exact socket"
     );
+}
+
+#[cfg(feature = "test-control")]
+#[test]
+fn control_socket_readiness_is_published_after_injected_slow_start() {
+    let workspace = tempfile::tempdir().expect("slow start workspace");
+    let addresses = reserve_addresses(3);
+    let configs = write_configs(workspace.path(), &addresses);
+    let control_directory = workspace.path().join("control");
+    let socket = control_directory.join("node.sock");
+    let injected_startup_delay = Duration::from_millis(1_000);
+    let started = Instant::now();
+    let mut server = TestServer::start_with_injected_startup_delay(
+        &configs[0],
+        0,
+        addresses[0],
+        &socket,
+        injected_startup_delay,
+    );
+
+    // The socket file already appears while the injected slow start is still
+    // running: that legacy readiness signal is not a readiness publication.
+    let appearance_deadline = Instant::now() + PROCESS_TIMEOUT;
+    while !(fs::symlink_metadata(&socket)
+        .ok()
+        .is_some_and(|metadata| metadata.file_type().is_socket())
+        && UnixStream::connect(&socket).is_ok())
+    {
+        if let Some(status) = server.child.try_wait().expect("poll control server") {
+            let mut stderr = Vec::new();
+            server
+                .child
+                .stderr
+                .take()
+                .expect("control server stderr")
+                .read_to_end(&mut stderr)
+                .expect("read control server stderr");
+            panic!(
+                "control server exited during the injected slow start: {status}; stderr={}",
+                String::from_utf8_lossy(&stderr)
+            );
+        }
+        assert!(
+            Instant::now() < appearance_deadline,
+            "control socket never appeared during the injected slow start"
+        );
+        thread::sleep(Duration::from_millis(10));
+    }
+
+    // The waiter observes the server's publication event, bounded by the
+    // unchanged PROCESS_TIMEOUT. The publication cannot precede the injected
+    // slow start, and a server without the publication path never satisfies
+    // this wait.
+    server.wait_for_socket(&socket);
+    assert!(
+        started.elapsed() >= injected_startup_delay,
+        "readiness publication must not precede the injected slow start"
+    );
+    assert!(matches!(
+        invoke_client(&socket, &QualificationNodeCommand::Configure),
+        QualificationNodeReply::Started { node_index: 0 }
+    ));
+    assert!(matches!(
+        invoke_client(&socket, &QualificationNodeCommand::Shutdown),
+        QualificationNodeReply::ShuttingDown
+    ));
+    assert!(server.wait().success());
 }
 
 #[test]

@@ -65,6 +65,13 @@ pub(crate) trait ProtectedFrameSender: Send {
 /// payload details.
 pub(crate) trait ProtectedFrameTransportClose: Send + Sync {
     fn close(&self);
+
+    /// Terminate an unparseable stream. SCTP overrides this with the wire
+    /// ABORT required by RFC 6733 section 2.1. The TCP fallback uses graceful
+    /// shutdown and does not yet provide the required TCP RST.
+    fn abort(&self) {
+        self.close();
+    }
 }
 
 /// Independently owned receive, send, and full-close capabilities for one

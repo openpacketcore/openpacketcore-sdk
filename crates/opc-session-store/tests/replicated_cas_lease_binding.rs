@@ -79,6 +79,7 @@ where
 
     let err = backend
         .replicate_entry(ReplicationEntry {
+            replay_policy: opc_session_store::ReplicationReplayPolicy::prune_expired(),
             sequence,
             tx_id: format!("replicated-cas-{sequence}")
                 .try_into()

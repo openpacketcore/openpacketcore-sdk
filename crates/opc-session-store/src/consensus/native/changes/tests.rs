@@ -19,6 +19,12 @@ use std::time::Duration;
 #[path = "reclaim_memory.rs"]
 mod reclaim_memory;
 
+#[path = "retention_capture.rs"]
+mod retention_capture;
+
+#[path = "journal_admission.rs"]
+mod journal_admission;
+
 #[test]
 fn native_frontier_captures_preserve_nested_authority_without_allocating() {
     let (mut storage, _, _) = fixture();
@@ -253,7 +259,10 @@ fn log_id(index: u64) -> LogId<SessionConsensusNodeId> {
     )
 }
 pub(in crate::consensus::native) fn time(second: u8) -> Timestamp {
-    Timestamp::from_str(&format!("2026-07-12T00:00:{second:02}Z")).unwrap()
+    Timestamp::from_str("2026-07-12T00:00:00Z")
+        .unwrap()
+        .add_seconds(i64::from(second))
+        .unwrap()
 }
 fn formation() -> Entry<SessionRaftTypeConfig> {
     Entry {
@@ -386,24 +395,53 @@ pub(in crate::consensus::native) fn apply(
     storage: &mut NativeStorage,
     entries: &[Entry<SessionRaftTypeConfig>],
 ) -> NativeApplied {
-    let encoded = entries
+    apply_with_admission(storage, entries, false)
+}
+
+#[cfg(feature = "lab-memory")]
+pub(in crate::consensus::native) fn apply_after_journal_admission(
+    storage: &mut NativeStorage,
+    entries: &[Entry<SessionRaftTypeConfig>],
+) -> NativeApplied {
+    apply_with_admission(storage, entries, true)
+}
+
+fn apply_with_admission(
+    storage: &mut NativeStorage,
+    entries: &[Entry<SessionRaftTypeConfig>],
+    retry: bool,
+) -> NativeApplied {
+    fn ready<T>(retry: bool, mut operation: impl FnMut() -> std::io::Result<T>) -> T {
+        if retry {
+            journal_admission::admit(operation, || {
+                std::thread::sleep(Duration::from_millis(1));
+            })
+            .unwrap()
+        } else {
+            operation().unwrap()
+        }
+    }
+    let encoded: Vec<_> = entries
         .iter()
         .map(|entry| serde_json::to_vec(entry).unwrap().into())
         .collect();
-    storage
-        .log
-        .project(&Operation::Append(encoded), &storage.business, None)
-        .unwrap();
-    storage
-        .log
-        .project(
+    // OpenRaft can deliver several bounded append batches in one apply call.
+    for chunk in encoded.chunks(LOG_RPC_ENTRIES) {
+        ready(retry, || {
+            storage
+                .log
+                .project(&Operation::Append(chunk.to_vec()), &storage.business, None)
+        });
+    }
+    ready(retry, || {
+        storage.log.project(
             &Operation::Committed(entries.last().map(|entry| entry.log_id)),
             &storage.business,
             None,
         )
-        .unwrap();
-    let result = storage.business.apply(entries).unwrap();
-    storage.validate_image().unwrap();
+    });
+    let result = ready(retry, || storage.business.apply(entries));
+    ready(retry, || storage.validate_image());
     result
 }
 
@@ -1054,6 +1092,7 @@ fn native_changes_coalescing_keeps_remove_reinsert_and_equal_value_revisions() {
         key: 1,
         journal_key: Some(1),
         change: RowChange {
+            key_removal: None,
             before: Some(Box::new(original.clone())),
             after: None,
             before_hash: Some(first_hash),
@@ -1067,6 +1106,7 @@ fn native_changes_coalescing_keeps_remove_reinsert_and_equal_value_revisions() {
         key: 1,
         journal_key: Some(1),
         change: RowChange {
+            key_removal: None,
             before: None,
             after: Some(Box::new(replacement.clone())),
             before_hash: None,
@@ -1472,6 +1512,7 @@ pub(in crate::consensus::native) fn transient_history_capture(
         dirty.receipts.insert(
             id,
             RowChange {
+                key_removal: None,
                 before: None,
                 after: None,
                 before_hash: None,
@@ -1596,6 +1637,7 @@ fn native_deferral_capture_rejects_transient_removals_without_witnesses() {
         dirty.receipts.insert(
             id,
             RowChange {
+                key_removal: None,
                 before: None,
                 after: None,
                 before_hash: None,

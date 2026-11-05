@@ -17,32 +17,22 @@ pub(super) struct OrderedKey(pub(super) Arc<SessionKey>);
 
 impl Ord for OrderedKey {
     fn cmp(&self, other: &Self) -> Ordering {
-        fn kind(value: &crate::SessionKeyType) -> u8 {
-            match value {
-                crate::SessionKeyType::SubscriberContext => 0,
-                crate::SessionKeyType::PduSession => 1,
-                crate::SessionKeyType::TeidMapping => 2,
-                crate::SessionKeyType::PfcpSeid => 3,
-                crate::SessionKeyType::HandoverTransaction => 4,
-                crate::SessionKeyType::Other(_) => 5,
-            }
-        }
         let left = &self.0;
         let right = &other.0;
-        (
-            left.tenant.as_str(),
-            left.nf_kind.as_str(),
-            left.key_type.as_str(),
-            kind(&left.key_type),
-            left.stable_id.as_bytes(),
-        )
-            .cmp(&(
+        crate::key_retention::compare_key_parts(
+            (
+                left.tenant.as_str(),
+                left.nf_kind.as_str(),
+                &left.key_type,
+                left.stable_id.as_bytes(),
+            ),
+            (
                 right.tenant.as_str(),
                 right.nf_kind.as_str(),
-                right.key_type.as_str(),
-                kind(&right.key_type),
+                &right.key_type,
                 right.stable_id.as_bytes(),
-            ))
+            ),
+        )
     }
 }
 
@@ -59,11 +49,53 @@ pub(super) struct ExpiryIndex {
     scope_records: scope_records::ScopeRecordIndex,
     leases: imbl::OrdSet<(Timestamp, OrderedKey)>,
     released: imbl::OrdSet<OrderedKey>,
+    retired: imbl::OrdSet<(u64, u64, OrderedKey)>,
+    retired_counts: imbl::OrdMap<u64, usize>,
+    internal_keys: usize,
+    internal_keys_invalid: bool,
     v1_due: imbl::OrdSet<(Timestamp, [u8; 16])>,
     v1_count: usize,
 }
 
 impl ExpiryIndex {
+    pub(super) fn internal_key_count(&self) -> io::Result<u32> {
+        if self.internal_keys_invalid
+            || self.internal_keys > crate::MAX_REPLICATION_INTERNAL_KEYS as usize
+        {
+            return Err(invalid("native replay internal key count invalid"));
+        }
+        u32::try_from(self.internal_keys)
+            .map_err(|_| invalid("native replay internal key count invalid"))
+    }
+
+    pub(super) fn oldest_retired_through(&self, epoch: u64) -> Option<SessionKey> {
+        self.retired
+            .get_min()
+            .filter(|(tag, _, _)| *tag <= epoch)
+            .map(|(_, _, key)| (*key.0).clone())
+    }
+
+    pub(super) fn validate_key_retention(&self, frontiers: &NativeFrontiers) -> io::Result<()> {
+        self.internal_key_count()?;
+        let retention = frontiers.retention.keys;
+        let window = crate::key_retention::RETIRED_KEYS_PER_EPOCH as usize;
+        if self.retired.len() > 2 * window
+            || self.retired_counts.iter().any(|(epoch, count)| {
+                !retention.retains_epoch(*epoch)
+                    || *count > window
+                    || (*epoch == retention.epoch && *count as u64 > retention.retired_count)
+            })
+            || self.retired.get_max().is_some_and(|(epoch, fence, _)| {
+                *epoch == retention.epoch && *fence > retention.retired_max
+            })
+        {
+            return Err(invalid(
+                "native exact retirement index differs from epoch frontiers",
+            ));
+        }
+        Ok(())
+    }
+
     pub(super) fn replace_request(
         &mut self,
         id: SessionConsensusRequestId,
@@ -117,12 +149,36 @@ impl ExpiryIndex {
         before: Option<&NativeKeyState>,
         after: Option<&NativeKeyState>,
     ) {
+        let scope = crate::scope_storage::is_scope_record_key(key);
+        let before_internal = before.is_some_and(|row| {
+            scope || (row.record.is_none() && row.lease.is_none() && row.retired_epoch.is_none())
+        });
+        let after_internal = after.is_some_and(|row| {
+            scope || (row.record.is_none() && row.lease.is_none() && row.retired_epoch.is_none())
+        });
+        match self
+            .internal_keys
+            .checked_sub(usize::from(before_internal))
+            .and_then(|count| count.checked_add(usize::from(after_internal)))
+        {
+            Some(count) => self.internal_keys = count,
+            None => self.internal_keys_invalid = true,
+        }
         if crate::scope_storage::is_scope_record_key(key) {
             self.scope_records
                 .replace(key, after.and_then(|row| row.record.as_ref()));
         }
         let key = OrderedKey(Arc::new(key.clone()));
         if let Some(before) = before {
+            if let Some(epoch) = before.retired_epoch {
+                self.retired.remove(&(epoch, before.fence, key.clone()));
+                let count = self.retired_counts.get(&epoch).copied().unwrap_or_default();
+                if count <= 1 {
+                    self.retired_counts.remove(&epoch);
+                } else {
+                    self.retired_counts.insert(epoch, count - 1);
+                }
+            }
             if before.record.is_some() {
                 self.ordered_records.remove(&key);
             }
@@ -138,6 +194,11 @@ impl ExpiryIndex {
             }
         }
         if let Some(after) = after {
+            if let Some(epoch) = after.retired_epoch {
+                self.retired.insert((epoch, after.fence, key.clone()));
+                let count = self.retired_counts.get(&epoch).copied().unwrap_or_default();
+                self.retired_counts.insert(epoch, count + 1);
+            }
             if after.record.is_some() {
                 self.ordered_records.insert(key.clone());
             }

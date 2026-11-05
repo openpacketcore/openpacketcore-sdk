@@ -1488,6 +1488,7 @@ fn current_persistent_consumer_head_attestation_binds_the_compiled_revision() {
     for (path, replacement) in [
         ("transport_revision", serde_json::json!(7)),
         ("application_revision", serde_json::json!(2)),
+        ("application_revision", serde_json::json!(4)),
         ("sdk_protocol_revision", serde_json::json!(4)),
         ("consumer_alpn", serde_json::json!("opc-session-consumer/2")),
     ] {

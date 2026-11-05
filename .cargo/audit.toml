@@ -10,17 +10,11 @@
 # in deny.toml — keep the two in sync and drop both once `rsa` ships the
 # constant-time rewrite.
 #
-# Out-of-bounds reads when deserializing untrusted `rkyv` archives that
-# contain Rc/Arc. rkyv 0.7.46 appears in Cargo.lock only as the optional,
+# OOB reads deserializing untrusted rkyv archives containing Rc/Arc
+# (RUSTSEC-2026-0235). rkyv 0.7.46 is only a lockfile entry: it is the optional,
 # never-enabled rkyv integration of rust_decimal, reached through the pinned
-# openraft fork's byte-unit dependency; byte-unit consumes rust_decimal with
-# default features off and nothing enables rust_decimal's rkyv feature, so
-# rkyv is never compiled into or linked by any workspace artifact under any
-# feature set (`cargo tree -i rkyv --all-features` prints nothing). There is
-# no patched 0.7.x release (the advisory's fix is >= 0.8.17, which
-# rust_decimal 1.42.1's `^0.7.46` requirement cannot reach), and rust_decimal
-# and byte-unit are both already at their newest releases. Mirror of the
-# ignore entry in deny.toml — keep the two in sync and drop both once
-# rust_decimal migrates its rkyv integration to a patched rkyv (or byte-unit
-# or the pinned openraft no longer pulls rust_decimal).
+# openraft fork's byte-unit dependency and never compiled into a workspace
+# artifact. No patched 0.7.x release exists. Remove once rust_decimal's rkyv
+# integration moves to a patched rkyv or the pinned openraft drops it.
+# Mirror of deny.toml — keep in sync.
 ignore = ["RUSTSEC-2023-0071", "RUSTSEC-2026-0235"]

@@ -541,8 +541,16 @@ impl fmt::Debug for TftUplinkFragmentSnapshot {
 /// poisoned entries until their immutable two-second deadline. It admits at
 /// most four datagrams in each of 16,384 buckets, with at most 64 fragment ranges
 /// per datagram; a full bucket never evicts a live entry. The host allocation
-/// is approximately 24.5 MiB. The shared budget has no per-subscriber reservation:
-/// one subscriber can occupy every slot and deny admission to others.
+/// is approximately 24.5 MiB.
+///
+/// Bucket selection is owner-partitioned: one attachment plus one subscriber
+/// PAA owns 64 buckets, and the remaining 256 groups belong to other
+/// subscribers. One subscriber can therefore occupy at most
+/// [`opc_gtpu_ebpf_common::TFT_FRAGMENT_OWNER_MAX_DATAGRAMS`] (256) concurrent
+/// fragmented datagrams and cannot reset or deny another owner group's
+/// capacity. Two PAAs that hash into the same group share that group's bound;
+/// the refusal is then [`TftUplinkDropReason::CapacityExhausted`], distinct
+/// from invalid classifier state.
 ///
 /// This host model supplies classifier decisions, not forwarding authority.
 /// Every selected mark must still pass the ordinary exact bearer/F-TEID lookup.
@@ -672,7 +680,13 @@ impl TftUplinkFragmentTable {
             TftFragmentDisposition::Malformed => Some(TftUplinkClassification::Drop(
                 TftUplinkDropReason::MalformedOrUnsupportedPacket,
             )),
+            TftFragmentDisposition::Capacity => Some(TftUplinkClassification::Drop(
+                TftUplinkDropReason::CapacityExhausted,
+            )),
             TftFragmentDisposition::Drop => invalid,
+            // `TftFragmentDisposition` is non-exhaustive: an outcome this crate
+            // does not know must fail closed, never fall through to forwarding.
+            _ => invalid,
         }
     }
 }
@@ -695,9 +709,13 @@ pub enum TftUplinkDropReason {
     /// No filter matched and there is no unfiltered/default bearer.
     NoMatch,
     /// Classifier state was inconsistent, or bounded fragment affinity refused
-    /// the packet: orphan, stale or expired identity, full bucket, conflicting
-    /// or overlapping ranges, range exhaustion, or a backwards clock.
+    /// the packet: orphan, stale or expired identity, conflicting or overlapping
+    /// ranges, range exhaustion, or a backwards clock.
     InvalidState,
+    /// The subscriber's bounded fragment-affinity owner group was full, so a
+    /// new fragmented datagram could not be tracked. The packet is dropped fail
+    /// closed; another subscriber's entries are not evicted.
+    CapacityExhausted,
 }
 
 /// Result of selecting a bearer for one inner uplink packet.
@@ -1242,6 +1260,109 @@ mod tests {
             };
             assert_eq!(host.classify(paa, current, packet, now), expected_host);
         }
+    }
+
+    fn owner_group_for(paa: Ipv4Addr) -> u32 {
+        let classifier = TftClassifierKey::new(7, paa.octets()).expect("canonical classifier");
+        TftFragmentKey::new(classifier, paa.octets(), [198, 51, 100, 20], 50, 1).bucket()
+            / opc_gtpu_ebpf_common::TFT_FRAGMENT_OWNER_BUCKETS
+    }
+
+    fn fragment_zero(paa: Ipv4Addr, remote: [u8; 4], identification: u16) -> Vec<u8> {
+        let mut packet = vec![0_u8; 44];
+        packet[0] = 0x45;
+        packet[2..4].copy_from_slice(&44_u16.to_be_bytes());
+        packet[4..6].copy_from_slice(&identification.to_be_bytes());
+        packet[6..8].copy_from_slice(&0x2000_u16.to_be_bytes());
+        packet[8] = 64;
+        packet[9] = 50;
+        packet[12..16].copy_from_slice(&paa.octets());
+        packet[16..20].copy_from_slice(&remote);
+        packet[20..24].copy_from_slice(&0x1020_3040_u32.to_be_bytes());
+        packet
+    }
+
+    fn classifier_for(paa: Ipv4Addr) -> TftUplinkClassifier {
+        TftUplinkClassifier::new(
+            7,
+            IpAddr::V4(paa),
+            vec![
+                TftUplinkBearer::default_bearer(),
+                dedicated(
+                    11,
+                    10,
+                    vec![
+                        PacketFilterComponent::ProtocolIdentifierNextHeader(50),
+                        PacketFilterComponent::SecurityParameterIndex(0x1020_3040),
+                    ],
+                ),
+            ],
+        )
+        .unwrap()
+    }
+
+    /// The host model enforces the same owner-group bound as tc: one saturated
+    /// subscriber reports the distinct capacity reason, and another subscriber
+    /// (different owner group) keeps classifying.
+    #[test]
+    fn host_fragment_affinity_refuses_a_saturated_owner_and_isolates_another() {
+        let paa = Ipv4Addr::new(192, 0, 2, 10);
+        let remote = [198, 51, 100, 20];
+        let classifier = classifier_for(paa);
+        let snapshot = TftUplinkFragmentSnapshot::new(&classifier, [1; 16], 2, 3).unwrap();
+        let mut table = TftUplinkFragmentTable::new(7).unwrap();
+        let now = 100;
+        // Fill exactly four entries in every bucket of this owner group; an ID
+        // whose bucket is already full is skipped (that is a capacity refusal).
+        let owner = TftFragmentKey::new(snapshot.key, paa.octets(), remote, 50, 1).bucket()
+            / opc_gtpu_ebpf_common::TFT_FRAGMENT_OWNER_BUCKETS;
+        let mut counts = [0_u8; opc_gtpu_ebpf_common::TFT_FRAGMENT_OWNER_BUCKETS as usize];
+        let mut identification = 0_u16;
+        let mut live = 0_u32;
+        while live < opc_gtpu_ebpf_common::TFT_FRAGMENT_OWNER_MAX_DATAGRAMS {
+            identification = identification.wrapping_add(1);
+            let key = TftFragmentKey::new(snapshot.key, paa.octets(), remote, 50, identification);
+            let slot =
+                (key.bucket() - owner * opc_gtpu_ebpf_common::TFT_FRAGMENT_OWNER_BUCKETS) as usize;
+            if counts[slot] == 4 {
+                continue;
+            }
+            let packet = fragment_zero(paa, remote, identification);
+            assert_eq!(
+                table.classify(paa, Some(&snapshot), &packet, now),
+                Some(TftUplinkClassification::Selected(Some(
+                    GtpBearerMark::new(11).unwrap()
+                ))),
+                "owner datagram {identification} must be admitted"
+            );
+            counts[slot] += 1;
+            live += 1;
+        }
+        let refused = fragment_zero(paa, remote, identification.wrapping_add(1));
+        assert_eq!(
+            table.classify(paa, Some(&snapshot), &refused, now),
+            Some(TftUplinkClassification::Drop(
+                TftUplinkDropReason::CapacityExhausted
+            )),
+            "a saturated owner is refused with the distinct capacity reason"
+        );
+
+        // A subscriber in another owner group is unaffected.
+        let other_paa = (2_u8..=255)
+            .map(|last| Ipv4Addr::new(10, 0, 0, last))
+            .find(|candidate| owner_group_for(*candidate) != owner_group_for(paa))
+            .expect("a different owner group exists");
+        let other_classifier = classifier_for(other_paa);
+        let other_snapshot =
+            TftUplinkFragmentSnapshot::new(&other_classifier, [2; 16], 4, 5).unwrap();
+        let other_packet = fragment_zero(other_paa, remote, 1);
+        assert_eq!(
+            table.classify(other_paa, Some(&other_snapshot), &other_packet, now),
+            Some(TftUplinkClassification::Selected(Some(
+                GtpBearerMark::new(11).unwrap()
+            ))),
+            "one subscriber's saturation must not deny another owner group"
+        );
     }
 
     #[test]

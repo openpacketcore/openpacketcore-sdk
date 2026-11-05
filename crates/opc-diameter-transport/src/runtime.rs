@@ -1271,7 +1271,14 @@ impl RuntimeCore {
         // completing a public operation. This ordering makes the observable
         // terminal boundary synchronous rather than a promise that a
         // supervisor will close it later.
-        self.transport_close.close();
+        if matches!(
+            error,
+            DiameterPeerRuntimeError::Transport(DiameterTlsError::InvalidFrame)
+        ) {
+            self.transport_close.abort();
+        } else {
+            self.transport_close.close();
+        }
         state.terminal = Some(error);
         // Complete every live operation after the transport and state are
         // terminal but before watch/closing wakeups. On a multi-thread
@@ -2655,6 +2662,7 @@ mod tests {
     struct TestTransportClose {
         closed: AtomicBool,
         calls: AtomicUsize,
+        aborted: AtomicBool,
     }
 
     impl ProtectedFrameTransportClose for TestTransportClose {
@@ -2662,6 +2670,11 @@ mod tests {
             if !self.closed.swap(true, Ordering::AcqRel) {
                 self.calls.fetch_add(1, Ordering::AcqRel);
             }
+        }
+
+        fn abort(&self) {
+            self.aborted.store(true, Ordering::Release);
+            self.close();
         }
     }
 
@@ -2904,6 +2917,22 @@ mod tests {
 
     fn test_capacity() -> NonZeroUsize {
         NonZeroUsize::new(8).expect("nonzero test capacity")
+    }
+
+    #[tokio::test]
+    async fn invalid_frames_abort_before_terminal_publication_and_orderly_close_does_not() {
+        for failure in [DiameterTlsError::InvalidFrame, DiameterTlsError::PeerClosed] {
+            let (core, _source, close) = test_runtime_core();
+            let error = DiameterPeerRuntimeError::Transport(failure);
+            assert_eq!(core.terminate(error, true).await, error);
+            assert!(close.closed.load(Ordering::Acquire));
+            assert_eq!(
+                close.aborted.load(Ordering::Acquire),
+                failure == DiameterTlsError::InvalidFrame
+            );
+            assert_eq!(*core.terminal.borrow(), Some(error));
+            assert_eq!(close.calls.load(Ordering::Acquire), 1);
+        }
     }
 
     #[test]

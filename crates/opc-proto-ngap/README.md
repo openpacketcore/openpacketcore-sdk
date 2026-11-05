@@ -40,6 +40,15 @@ literals. Modify responses expose up to three `DownlinkQosTunnel` associations
 in `additional`; use `Vec::new()` for existing response literals. See the
 [additional tunnel contract](CONFORMANCE.md#additional-request-tunnels-and-modify-associations).
 
+GTP transport endpoints preserve IPv4, IPv6 and combined IPv4+IPv6 addresses.
+`UplinkTransport::address()` and `DownlinkTransport::address()` return
+`TransportLayerAddress`; match its `Ipv4`, `Ipv6` or `Ipv4v6` variant explicitly
+when selecting a destination. `new(IpAddr, teid)` still constructs a single
+address; `with_address(TransportLayerAddress, teid)` also accepts combined
+addresses. The 160-bit encoding places IPv4 first, then IPv6, in standalone
+fields and nested setup/modify tunnels. See the
+[transport address contract](CONFORMANCE.md#combined-transport-addresses).
+
 The [N3IWF subset acceptance record](N3IWF-ACCEPTANCE.md) maps the original
 codec task to implemented evidence, exact public field revisions and real fuzz
 campaigns. The 23 admitted subsets and 17 disabled handler outcomes retain
@@ -51,9 +60,9 @@ their distinct contracts and documented unsupported fields.
   needed for byte-exact re-encode.
 - `PduKind` distinguishes initiating, successful, and unsuccessful NGAP-PDU
   wrappers and exposes procedure code and criticality.
-- `Message` is the supported typed message-body subset with `Unknown(Bytes)`
+- `Message` is the supported typed message-body subset with `Unknown(SensitiveBytes)`
   fallback for unsupported procedure/outcome combinations.
-- `messages` re-exports the generated message body types used in `Message`.
+- `messages` exposes owned message body types with zeroizing opaque IE values.
 - `Criticality` and `ProcedureCode` are re-exported from generated ASN.1 types.
 - `decode` and `Pdu::decode` parse one APER PDU. `Pdu::decode_owned` rejects
   trailing bytes after a complete PDU.
@@ -94,7 +103,7 @@ available message bytes.
 The remaining `DecodeContext` policies apply as follows:
 
 - `UnknownIePolicy::Preserve` retains an unknown entry and its opaque raw value
-  in the typed generated container.
+  in the typed owned container.
 - `UnknownIePolicy::Drop` removes unknown entries from the typed container.
 - `UnknownIePolicy::Reject` rejects every unknown entry. A `reject`-criticality
   entry uses the stable `UnknownCriticalIe` code; `ignore` and `notify` use a
@@ -334,8 +343,21 @@ exercise the field-to-container composition.
 
 `SecurityKey` borrows exactly 32 octets. It is redacted, has no Clone/equality/
 hash/serialization implementation, and has no key-provider effects.
-`EncodedValue` clears its buffer on drop. The caller must protect the source
-key and all generic-PDU/wire copies: clearing one buffer does not clear copies.
+`EncodedValue`, raw PDUs, decoded IE values, and coalesced fragments clear their
+buffers on drop, including errors and values discarded by IE policy. The
+`messages` containers use `u16` identifiers and `Criticality`; they and `Pdu`
+have no cloning or equality implementations. `SensitiveBytes` exposes only its
+length in diagnostics. Use `SecurityKey::to_zeroizing()` for an explicit
+`Zeroizing<Vec<u8>>` provider handoff. The key's original borrow remains valid
+only while its source PDU lives.
+
+Live `opc-sctp` receive payloads retain a wiping owner through N2 admission and
+`Bytes` clones; the last reference clears the allocation. `Pdu::decode_zeroizing`
+accepts wiping input from other transports. Borrowed input, arbitrary caller-made
+`Bytes`, explicit byte copies and final encoded output remain caller custody.
+Reconstruct a fresh PDU explicitly instead of cloning one. Existing
+`protocol_ies.0` iteration and `value.as_bytes()` access remain available;
+identifiers previously accessed as `id.0` are now plain `id`.
 All field wrappers redact their contents in Debug; byte/identity getters are
 explicit disclosure boundaries.
 

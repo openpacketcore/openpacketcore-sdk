@@ -60,16 +60,20 @@ The distinction is decisive:
 ## Decision
 
 Amend ADR 0014 §8 to permit a **narrow, explicitly allowlisted** unsafe
-exception pattern for Linux kernel UAPI sys crates, and adopt **Option A** when
+exception pattern for Linux kernel UAPI sys crates, and adopt **kernel FFI** when
 an SCTP-terminating CNF is in scope:
 
 1. **`opc-libsctp-sys`** provides thin FFI over Linux SCTP socket UAPI and
    minimal `libsctp` helpers where required. It is the **only SCTP workspace
    crate** permitted to contain `unsafe`; follow-on Linux kernel UAPI exceptions
-   such as `opc-linux-xfrm-sys`, `opc-linux-gtpu-sys`, and
-   `opc-fs-verity-sys`, and narrow reviewed FFI boundaries such as
+   such as `opc-linux-clock-sys`, `opc-linux-xfrm-sys`, `opc-linux-gtpu-sys`,
+   and `opc-fs-verity-sys`, and narrow reviewed FFI boundaries such as
    `opc-sqlite-file-control-sys`, must be separately and explicitly allowlisted
-   by the same mechanical gate. The fs-verity boundary is limited to enabling
+   by the same mechanical gate. The clock boundary is limited to one read-only,
+   unprivileged `clock_adjtime(CLOCK_REALTIME)` query (`modes == 0`, the clock
+   is never changed) that returns the kernel synchronization state and the
+   kernel maximum and estimated error; it accepts no paths, credentials, or
+   configuration and has no mutation surface. The fs-verity boundary is limited to enabling
    and measuring the fixed version-1, SHA-256, 4096-byte-block profile through
    already-open file descriptors; it accepts no paths or file contents. The SQLite production
    boundary is limited to `SQLITE_FCNTL_HAS_MOVED`, `SQLITE_FCNTL_VFSNAME`,
@@ -97,8 +101,9 @@ an SCTP-terminating CNF is in scope:
    `scripts/check-management-plane-policy.py --check` token-scans OpenPacketCore
    workspace crate sources and asserts `unsafe` appears only in explicitly
    allowlisted sys crates (`opc-libsctp-sys` and later, reviewed kernel-UAPI
-   boundaries such as `opc-linux-xfrm-sys`, `opc-linux-gtpu-sys`, and the
-   fixed-profile descriptor-only `opc-fs-verity-sys`, plus the pinned
+   boundaries such as `opc-linux-clock-sys`, `opc-linux-xfrm-sys`,
+   `opc-linux-gtpu-sys`, and the fixed-profile descriptor-only
+   `opc-fs-verity-sys`, plus the pinned
    file-control, test-only VFS, and ADR 0020 read-only snapshot VFS boundary in
    `opc-sqlite-file-control-sys`); the same gate also rejects each allowed sys
    crate if it
@@ -122,9 +127,28 @@ an SCTP-terminating CNF is in scope:
    socket/XFRM netlink calls and minimal helper calls that wrap those UAPIs. FFI
    that links a foreign **C protocol codec** (parsing attacker-controlled bytes
    — NGAP/NAS/etc.) remains rejected; those stay pure-Rust per ADR 0013/0015.
-6. SCTP is implemented per Option A behind this boundary, never as scattered
-   `unsafe` and never as a userspace reimplementation without revisiting this
-   ADR.
+6. SCTP is implemented through kernel FFI behind this boundary, never as
+   scattered `unsafe` and never as a userspace reimplementation without
+   revisiting this ADR.
+7. **Owned Tokio registration amendment (compliance branch; review pending).**
+   RUSTSEC-2026-0386 replaces safe `AsyncFd` constructors with a caller-proven
+   lifetime contract. `opc-tokio-fd-sys` is the explicit Unix reactor exception:
+   it consumes only `OwnedFd`, registers it with Tokio, and exposes shared
+   readiness access. It cannot expose mutable or owning access to the inner
+   registration, accept raw descriptor integers, or substitute a borrowed
+   descriptor. Tokio deregisters before closing the owned descriptor. The same
+   mechanical allowlist and adjacent safety-comment requirements apply.
+   Compile-fail tests retain the ownership boundary; live socket and timer tests
+   exercise registration and drop on admitted platforms. This amendment adds
+   no protocol codec FFI and keeps unsafe code out of the three consumers
+   (`opc-sctp`, `opc-egress-fence`, and `opc-session-store`).
+   SCTP's abortive-close owner keeps this registration in a synchronous
+   `Mutex<Option<AsyncOwnedFd>>`. Descriptor borrows and readiness guards end
+   within one poll; pending futures retain no descriptor borrow. Abort sets
+   zero-time SO_LINGER, takes and drops the registration, then wakes waiters.
+   Per-direction gates serialize the single-waker polling API. No registered
+   descriptor integer is closed or replaced outside its owner. Native wire
+   capture and pending-read/write tests qualify this close path.
 
 ## Consequences
 

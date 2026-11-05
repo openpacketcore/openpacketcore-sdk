@@ -362,7 +362,7 @@ fn independent_missing_fields_duplicates_and_unknown_policies() {
                 continue;
             }
             let pdu = decode(&wire, context()).unwrap();
-            let raw = pdu.raw.clone();
+            let raw = pdu.raw.as_bytes().to_vec();
             let admitted = SetupMessage::from_pdu(&pdu, context()).unwrap();
             assert_eq!(
                 admitted.ignored_ie_count,
@@ -376,7 +376,7 @@ fn independent_missing_fields_duplicates_and_unknown_policies() {
                     vec![]
                 }
             );
-            assert!(pdu.raw == raw);
+            assert!(pdu.raw.as_bytes() == raw);
             assert!(decode(
                 &wire,
                 DecodeContext {

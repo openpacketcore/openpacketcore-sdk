@@ -7,22 +7,137 @@ use crate::consensus::types::{
 };
 use crate::fenced_mutation_roster::{
     provider_receipt_compact_digest, roster_executor_evidence_commitment,
-    stable_terminal_proof_commitment, Member, Phase, RequestId, RosterAttestationCertificateRoleV1,
-    RosterAttestationLeafCertificatePartsV1, RosterAttestationLeafCertificateV1,
-    RosterCompactTerminalEvidenceBindingV2, RosterCompactTerminalEvidenceV2,
-    RosterCompactTerminalMemberProjectionV2, RosterCompactTerminalMemberProofPartsV2,
-    RosterCompactTerminalMemberSigningInputV2, RosterExecutorMemberProofPartsV1,
-    RosterExecutorProofBundleV1, RosterIngressAttestationSigningInputV1,
-    RosterIngressAttestationV1, RosterProviderOperationV1, RosterProviderOutcomeV1,
-    RosterProviderReceiptSigningInputV1, RosterTerminalAttestationSigningInputV1, TerminalRecord,
+    stable_terminal_proof_commitment, Admission, AdmissionProposal, EstablishedMutation, Member,
+    Phase, RequestId, RosterAttestationCertificateRoleV1, RosterAttestationLeafCertificatePartsV1,
+    RosterAttestationLeafCertificateV1, RosterCompactAdmissionProvenanceSigningInputV2,
+    RosterCompactAdmissionProvenanceV2, RosterCompactTerminalEvidenceBindingV2,
+    RosterCompactTerminalEvidenceV2, RosterCompactTerminalMemberProjectionV2,
+    RosterCompactTerminalMemberProofPartsV2, RosterCompactTerminalMemberSigningInputV2,
+    RosterExecutorMemberProofPartsV1, RosterExecutorProofBundleV1, RosterId,
+    RosterIngressAttestationSigningInputV1, RosterIngressAttestationV1, RosterProviderOperationV1,
+    RosterProviderOutcomeV1, RosterProviderReceiptSigningInputV1,
+    RosterTerminalAttestationSigningInputV1, TerminalRecord,
 };
 use crate::fenced_mutation_roster_executor::BackendRegistration;
-use crate::fenced_mutation_roster_transport::roster_terminal_ingress_capsule_commitment;
+use crate::fenced_mutation_roster_transport::{
+    roster_poll_admit_ingress_capsule_commitment, roster_terminal_ingress_capsule_commitment,
+};
 use p256::ecdsa::{signature::hazmat::PrehashSigner, Signature, SigningKey};
 
 fn sign(key: &SigningKey, digest: [u8; 32]) -> [u8; 64] {
     let signature: Signature = key.sign_prehash(&digest).unwrap();
     signature.normalize_s().to_bytes().into()
+}
+
+/// This fixture signs the actual V1 capsule and provenance under the same
+/// configured root as the SQL-created predecessor. Wire-shape-only fixtures
+/// with placeholder capsule/proof digests cannot exercise native admission.
+pub(crate) fn signed_v1_command(
+    signed: &crate::consensus::types::RosterV2PersistenceFixture,
+) -> ConsensusRosterAdmissionCommand {
+    signed_v1_command_with_mutation(signed, EstablishedMutation::no_op())
+}
+
+pub(crate) fn signed_v1_command_with_mutation(
+    signed: &crate::consensus::types::RosterV2PersistenceFixture,
+    mutation: EstablishedMutation,
+) -> ConsensusRosterAdmissionCommand {
+    signed_v1_command_with_payloads(signed, mutation, [vec![0xB2], vec![0xB3], vec![0xB4]])
+}
+
+pub(crate) fn signed_v1_command_with_payloads(
+    signed: &crate::consensus::types::RosterV2PersistenceFixture,
+    mutation: EstablishedMutation,
+    [plan, checkpoint, result]: [Vec<u8>; 3],
+) -> ConsensusRosterAdmissionCommand {
+    let admission = Admission::authenticate(
+        AdmissionProposal::new(
+            crate::fenced_mutation_roster::Profile::v1(),
+            RosterId::from_bytes([0xB1; 16]).unwrap(),
+            signed.admission.members().to_vec(),
+            mutation,
+            plan,
+            checkpoint,
+            result,
+        )
+        .unwrap(),
+        signed.admission.key().clone(),
+        signed.admission.scope(),
+        signed.authority.owner().clone(),
+        signed.authority.fence(),
+        signed.authority.generation(),
+    )
+    .unwrap()
+    .with_admission_class(signed.admission.admission_class());
+    let root_key = SigningKey::from_bytes((&[0x96; 32]).into()).unwrap();
+    let ingress_key = SigningKey::from_bytes((&[0x97; 32]).into()).unwrap();
+    let input = RosterIngressAttestationSigningInputV1 {
+        peer_identity_commitment: [0xB5; 32],
+        consumer_scope: admission.scope().digest(),
+        request_id: [0xB6; 16],
+        operation_tag: 1,
+        canonical_capsule_digest: roster_poll_admit_ingress_capsule_commitment(
+            &admission,
+            &signed.authority,
+        )
+        .unwrap(),
+        authenticated_at: signed.authority.acquired_at().add_seconds(1).unwrap(),
+        peer_certificate_expires_at: signed.authority.expires_at(),
+        material_generation: 1,
+        handshake_epoch: 1,
+    };
+    let mut certificate = RosterAttestationLeafCertificatePartsV1 {
+        root_id: signed.root.root_id(),
+        role: RosterAttestationCertificateRoleV1::TransportIngress,
+        configuration_identity: signed.identity,
+        scope: admission.scope().digest(),
+        subject_identity_commitment: input.peer_identity_commitment,
+        leaf_epoch: 1,
+        key_id: [0xB7; 32],
+        not_before: signed.authority.acquired_at(),
+        not_after: signed.authority.expires_at(),
+        public_key: ingress_key
+            .verifying_key()
+            .to_sec1_point(true)
+            .as_bytes()
+            .try_into()
+            .unwrap(),
+        root_signature: [0; 64],
+    };
+    certificate.root_signature = sign(
+        &root_key,
+        RosterAttestationLeafCertificateV1::signing_digest(&certificate).unwrap(),
+    );
+    let ingress = RosterIngressAttestationV1::issue_from_signed_parts(
+        &signed.root,
+        certificate.clone(),
+        &input,
+        sign(&ingress_key, input.digest().unwrap()),
+    )
+    .unwrap();
+    let provenance_input = RosterCompactAdmissionProvenanceSigningInputV2::for_admission(
+        signed.identity,
+        &admission,
+        &signed.authority,
+        ingress.signing_input(),
+        input.peer_identity_commitment,
+    )
+    .unwrap();
+    let provenance = RosterCompactAdmissionProvenanceV2::issue_from_signed_parts(
+        &signed.root,
+        certificate,
+        &provenance_input,
+        sign(&ingress_key, provenance_input.digest().unwrap()),
+    )
+    .unwrap();
+    ConsensusRosterAdmissionCommand::new_with_provenance_and_ingress_request_id(
+        admission,
+        signed.authority.clone(),
+        input.request_id,
+        ingress,
+        provenance,
+    )
+    .unwrap()
 }
 
 pub(crate) fn terminal(

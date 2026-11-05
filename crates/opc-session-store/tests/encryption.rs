@@ -29,6 +29,9 @@ use tokio::sync::Barrier;
 #[path = "encryption/strict_reads.rs"]
 mod strict_reads;
 
+#[path = "encryption/provider_availability.rs"]
+mod provider_availability;
+
 fn hex_encode(bytes: &[u8]) -> String {
     bytes.iter().map(|byte| format!("{byte:02x}")).collect()
 }
@@ -110,6 +113,7 @@ fn far_future_record(mut record: StoredSessionRecord) -> StoredSessionRecord {
 fn test_replication_entry(sequence: u64, tx_id: &str) -> ReplicationEntry {
     let key = test_key();
     ReplicationEntry {
+        replay_policy: opc_session_store::ReplicationReplayPolicy::prune_expired(),
         sequence,
         tx_id: tx_id.try_into().expect("valid transaction ID"),
         op: ReplicationOp::CompareAndSet {
@@ -136,6 +140,7 @@ fn crypto_then_invalid_ttl_entry(sequence: u64, tx_id: &str) -> ReplicationEntry
     let crypto_op = test_replication_entry(sequence, "crypto-canary").op;
     let timestamp = Timestamp::now_utc();
     ReplicationEntry {
+        replay_policy: opc_session_store::ReplicationReplayPolicy::prune_expired(),
         sequence,
         tx_id: tx_id.try_into().expect("valid transaction ID"),
         timestamp,
@@ -178,7 +183,10 @@ fn nested_replication_entry(sequence: u64, tag: &str) -> ReplicationEntry {
         },
     };
 
+    let mut replay_policy = opc_session_store::ReplicationReplayPolicy::preserve();
+    replay_policy.internal_key_count = 17;
     ReplicationEntry {
+        replay_policy,
         sequence,
         tx_id: format!("{tag}-tx-{sequence}")
             .try_into()
@@ -233,6 +241,7 @@ fn wrap_operation_to_depth(mut op: ReplicationOp, depth: usize) -> ReplicationOp
 
 fn boundary_depth_entry(sequence: u64, depth: usize, tag: &str) -> ReplicationEntry {
     ReplicationEntry {
+        replay_policy: opc_session_store::ReplicationReplayPolicy::prune_expired(),
         sequence,
         tx_id: format!("{tag}-tx")
             .try_into()
@@ -248,6 +257,7 @@ fn boundary_count_entry(sequence: u64, node_count: usize, tag: &str) -> Replicat
     ops.push(boundary_cas_op(sequence, tag));
     ops.extend((1..(node_count - 1)).map(|_| ReplicationOp::Batch { ops: Vec::new() }));
     ReplicationEntry {
+        replay_policy: opc_session_store::ReplicationReplayPolicy::prune_expired(),
         sequence,
         tx_id: format!("{tag}-tx")
             .try_into()
@@ -514,6 +524,7 @@ fn assert_nested_entry_protected(
     assert_eq!(protected.sequence, original.sequence);
     assert_eq!(protected.tx_id, original.tx_id);
     assert_eq!(protected.timestamp, original.timestamp);
+    assert_eq!(protected.replay_policy, original.replay_policy);
 
     let original_records = replication_cas_records(&original.op);
     let protected_records = replication_cas_records(&protected.op);
@@ -1028,7 +1039,10 @@ async fn late_local_provider_failure_never_delegates_nested_replication() {
         .replicate_entry(nested_replication_entry(1, "local-late-secret-canary"))
         .await
         .expect_err("third nested CAS must fail");
-    assert!(matches!(error, StoreError::Crypto(_)));
+    assert_eq!(
+        error,
+        StoreError::BackendUnavailable("session key provider unavailable".into())
+    );
     assert_eq!(provider.calls(), 3);
     assert_eq!(inner.replicate_calls.load(Ordering::SeqCst), 0);
     assert!(inner.entries().is_empty());
@@ -1049,7 +1063,10 @@ async fn late_local_provider_failure_never_delegates_nested_replication() {
         ])
         .await
         .expect_err("final nested CAS must fail rebuild staging");
-    assert!(matches!(error, StoreError::Crypto(_)));
+    assert_eq!(
+        error,
+        StoreError::BackendUnavailable("session key provider unavailable".into())
+    );
     assert_eq!(provider.calls(), 4);
     assert_eq!(inner.rebuild_calls.load(Ordering::SeqCst), 0);
     assert!(inner.entries().is_empty());
@@ -1073,7 +1090,10 @@ async fn late_remote_provider_failure_never_delegates_nested_replication() {
         .replicate_entry(nested_replication_entry(1, "remote-late-secret-canary"))
         .await
         .expect_err("third nested CAS must fail");
-    assert!(matches!(error, StoreError::Crypto(_)));
+    assert_eq!(
+        error,
+        StoreError::BackendUnavailable("session key provider unavailable".into())
+    );
     assert_eq!(provider.calls(), 3);
     assert_eq!(inner.replicate_calls.load(Ordering::SeqCst), 0);
     assert!(inner.entries().is_empty());
@@ -1097,7 +1117,10 @@ async fn late_remote_provider_failure_never_delegates_nested_replication() {
         ])
         .await
         .expect_err("final nested CAS must fail rebuild staging");
-    assert!(matches!(error, StoreError::Crypto(_)));
+    assert_eq!(
+        error,
+        StoreError::BackendUnavailable("session key provider unavailable".into())
+    );
     assert_eq!(provider.calls(), 4);
     assert_eq!(inner.rebuild_calls.load(Ordering::SeqCst), 0);
     assert!(inner.entries().is_empty());
@@ -1917,6 +1940,7 @@ async fn remote_sealing_replication_log_seals_and_unseals_nested_batch_cas_recor
 
     backend
         .replicate_entry(ReplicationEntry {
+            replay_policy: opc_session_store::ReplicationReplayPolicy::prune_expired(),
             sequence: 2,
             tx_id: "remote-batch-cas".try_into().expect("valid transaction ID"),
             op: ReplicationOp::Batch {

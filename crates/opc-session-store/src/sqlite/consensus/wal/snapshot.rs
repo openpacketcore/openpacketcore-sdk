@@ -303,6 +303,9 @@ impl InstallSource {
         let incoming_memory = consensus::native_snapshot::reserve_input(&incoming_tx, check)?;
         let old_recovery = consensus::async_recovery::read(conn)?;
         let new_recovery = consensus::async_recovery::read(&incoming_tx)?;
+        let old_retention = consensus::native_retention::read(conn)?.unwrap_or_default();
+        let new_retention = consensus::native_retention::read(&incoming_tx)?.unwrap_or_default();
+        old_retention.transition(new_retention)?;
         if new_recovery.is_some() && !binding.async_recovery_format {
             return Err(invalid_data(
                 "native asynchronous snapshot requires a reserved authority root",
@@ -317,6 +320,8 @@ impl InstallSource {
             incarnation,
             |tx| {
                 check()?;
+                consensus::native_retention::write(tx, new_retention)?;
+                consensus::native_retired::replace(tx, &incoming_tx, check)?;
                 self.prepare_native_install_tail(tx, binding, &authority.members)?;
                 check()
             },
@@ -1224,7 +1229,7 @@ pub(crate) struct Opening {
     binding: Binding,
     limits: Limits,
     control: IoControl,
-    lock: File,
+    lock: RootLock,
     selected: Option<checkpoint::Anchor>,
     proof: Proof,
     snapshots: Vec<CurrentSnapshot>,
@@ -1233,6 +1238,10 @@ pub(crate) struct Opening {
 
 #[cfg(test)]
 impl Opening {
+    pub(in crate::sqlite::consensus) fn duplicate_root_lock_for_test(&self) -> io::Result<File> {
+        self.lock.file.try_clone()
+    }
+
     #[cfg(test)]
     pub(in crate::sqlite::consensus) fn new(
         directory: &Path,
@@ -1244,8 +1253,7 @@ impl Opening {
         if !fs::symlink_metadata(directory)?.is_dir() {
             return Err(invalid_data("private WAL opening directory is invalid"));
         }
-        let lock = file_read(&directory.join("LOCK"))?;
-        rustix::fs::flock(&lock, rustix::fs::FlockOperation::NonBlockingLockExclusive)?;
+        let lock = RootLock::acquire(file_read(&directory.join("LOCK"))?)?;
         let mut opening = Self {
             directory: directory.to_path_buf(),
             binding,

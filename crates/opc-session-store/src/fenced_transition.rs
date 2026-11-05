@@ -812,14 +812,18 @@ pub enum FencedTransitionLease {
     ///
     /// The committed fence is `expected_fence + 1`. This deterministic target
     /// lets a protected record bind that fence in its AEAD AAD before the
-    /// request crosses the consensus boundary. A different persisted fence is
-    /// a no-effect stale-fence rejection.
+    /// request crosses the consensus boundary. Retained keys require their exact
+    /// fence. Native and memory-only epoch retention accept the previous or current
+    /// absent-key floor for keys with no retained row, after Async recovery's floor
+    /// where applicable. Other values are a no-effect stale-fence rejection.
     Acquire {
         /// Exact record/lease key.
         key: SessionKey,
         /// Owner receiving the new credential.
         owner: OwnerId,
-        /// Exact current fence, or zero for a key with no fence history.
+        /// The observed fence for this key. With epoch retention, a key with no
+        /// retained row uses the published absent-key floor, initially zero.
+        /// Re-observe and prepare a new request after a create-time `StaleFence`.
         expected_fence: FenceToken,
         /// Bounded lease lifetime from committed admission time.
         ttl: Duration,
@@ -2611,9 +2615,11 @@ impl fmt::Debug for FencedTransitionOutcome {
 
 /// One fresh, exact-key observation used to prepare a deterministic acquire.
 ///
-/// The record and durable per-key fence floor are read in the same backend
-/// transaction after a consensus read barrier. A deleted key therefore still
-/// exposes its fence floor without granting fence-allocation authority.
+/// The record and fence are read in the same backend transaction after a
+/// consensus read barrier. Native and memory-only epoch retention keep exact
+/// fences for live and recently dead keys; keys with no retained row expose the
+/// current absent-key floor. Async recovery raises either answer when applicable.
+/// Observation does not retire keys, rotate an epoch or allocate a fence.
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct FencedTransitionObservation {
@@ -2645,7 +2651,8 @@ impl FencedTransitionObservation {
         self.record.as_ref()
     }
 
-    /// Durable fence floor for the exact key, including deleted history.
+    /// Exact retained fence, or the published current absent-key floor when no
+    /// row is retained, raised by the backend's recovery floor if applicable.
     pub const fn current_fence(&self) -> FenceToken {
         self.current_fence
     }

@@ -12,8 +12,10 @@ mod application;
 mod asynchronous;
 mod cold_reads;
 mod export;
+mod mixed_journals;
 mod public_reads;
 mod reclaim_memory;
+mod rollover;
 
 struct Gate {
     point: Point,

@@ -1087,13 +1087,40 @@ impl fmt::Display for Ikev2SaInitBuildError {
 
 impl Error for Ikev2SaInitBuildError {}
 
-/// Error returned while building an unauthenticated IKE_SA_INIT error
+/// Error returned while building an unauthenticated IKE_SA_INIT Notify
 /// response.
 ///
-/// @spec IETF RFC7296 2.5, 2.6, 2.7, 2.21.1, 3.10.1
+/// @spec IETF RFC7296 2.5, 2.6, 2.7, 2.21.1, 3.10.1; IETF RFC5685 3
 /// @req REQ-IETF-RFC7296-SA-INIT-ERROR-NOTIFY-BUILD-ERROR-001
 /// @conformance boundary-only
+///
+/// External matches must retain a wildcard for future outcomes:
+/// ```compile_fail
+/// use opc_proto_ikev2::Ikev2SaInitNotifyBuildError as Error;
+/// fn exhaustive(value: Error) {
+///     match value {
+///         Error::NotIkeSaInit => {},
+///         Error::ResponseHeader => {},
+///         Error::InitiatorFlagNotSet => {},
+///         Error::InitiatorSpiZero => {},
+///         Error::MessageIdNonZero => {},
+///         Error::ResponderSpiNonZero => {},
+///         Error::MissingNotify => {},
+///         Error::MultipleNotifies => {},
+///         Error::UnsupportedNotifyType => {},
+///         Error::ProtocolIdNotZero => {},
+///         Error::SpiNotEmpty => {},
+///         Error::UnexpectedNotificationData => {},
+///         Error::UnsupportedCriticalPayloadDataLength => {},
+///         Error::InvalidKePayloadDataLength => {},
+///         Error::InvalidDhGroup => {},
+///         Error::InvalidRedirect => {},
+///         Error::LengthOverflow => {},
+///     }
+/// }
+/// ```
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum Ikev2SaInitNotifyBuildError {
     /// Input header was not IKE_SA_INIT.
     NotIkeSaInit,
@@ -1107,9 +1134,9 @@ pub enum Ikev2SaInitNotifyBuildError {
     MessageIdNonZero,
     /// IKE_SA_INIT request carried a non-zero responder SPI.
     ResponderSpiNonZero,
-    /// No error Notify payload was supplied.
+    /// No Notify payload was supplied.
     MissingNotify,
-    /// More than one error Notify payload was supplied.
+    /// More than one Notify payload was supplied.
     MultipleNotifies,
     /// The Notify type is not safe for this unauthenticated response builder.
     UnsupportedNotifyType,
@@ -1125,6 +1152,8 @@ pub enum Ikev2SaInitNotifyBuildError {
     InvalidKePayloadDataLength,
     /// INVALID_KE_PAYLOAD selected the reserved zero Diffie-Hellman group.
     InvalidDhGroup,
+    /// REDIRECT does not have a valid identity and echoed Ni (RFC 5685 §9.2).
+    InvalidRedirect,
     /// Payload or message length overflowed an IKEv2 length field.
     LengthOverflow,
 }
@@ -1150,6 +1179,7 @@ impl Ikev2SaInitNotifyBuildError {
             }
             Self::InvalidKePayloadDataLength => "ike_sa_init_notify_invalid_ke_payload_data_length",
             Self::InvalidDhGroup => "ike_sa_init_notify_invalid_dh_group",
+            Self::InvalidRedirect => "ike_sa_init_notify_invalid_redirect",
             Self::LengthOverflow => "ike_sa_init_notify_length_overflow",
         }
     }
@@ -1352,15 +1382,17 @@ pub fn build_ike_sa_init_response(
     })
 }
 
-/// Build a bounded, notify-only IKE_SA_INIT error response.
+/// Build a bounded, notify-only IKE_SA_INIT error or REDIRECT response.
 ///
 /// This builder accepts exactly one unauthenticated error with an IKE-SA-level
 /// Notify shape: `UNSUPPORTED_CRITICAL_PAYLOAD` with the offending payload type
 /// as exactly one octet, `NO_PROPOSAL_CHOSEN` with empty notification data, or
 /// `INVALID_KE_PAYLOAD` with the accepted non-zero Diffie-Hellman group as an
-/// exact two-octet big-endian value. The response uses the request's initiator
+/// exact two-octet big-endian value. It also accepts a canonical RFC 5685 §3
+/// REDIRECT with a valid gateway identity and 16..=256-octet echoed Ni.
+/// The response uses the request's initiator
 /// SPI, a zero responder SPI, Message ID zero, and canonical responder flags.
-/// The supported failures are complete, mutually exclusive outcomes, so a
+/// The supported outcomes are complete and mutually exclusive, so a
 /// multi-Notify slice is rejected instead of emitting an ambiguous response.
 ///
 /// `INVALID_SYNTAX` is deliberately outside this API. RFC 7296 §3.10.1 only
@@ -1370,6 +1402,12 @@ pub fn build_ike_sa_init_response(
 /// response rate limiting, retransmission behavior, and all other
 /// anti-amplification controls.
 ///
+/// For REDIRECT the caller MUST verify that the peer indicated support in its
+/// initial request and echo that request's exact Ni (RFC 5685 §3). This API
+/// receives only a header and cannot check those preconditions. It establishes
+/// no SA and supplies no target authorization. A redirected client sends
+/// REDIRECTED_FROM in its next initial request.
+///
 /// # Errors
 ///
 /// Returns [`Ikev2SaInitNotifyBuildError`] when the header is not an initial
@@ -1377,7 +1415,7 @@ pub fn build_ike_sa_init_response(
 /// the IKE-SA Notify Protocol ID/SPI shape is invalid, the notification data
 /// does not have its exact RFC-defined form, or a wire length overflows.
 ///
-/// @spec IETF RFC7296 1.2, 2.5, 2.6, 2.7, 2.21.1, 3.10.1
+/// @spec IETF RFC7296 1.2, 2.5, 2.6, 2.7, 2.21.1, 3.10.1; IETF RFC5685 3, 9.2
 /// @req REQ-IETF-RFC7296-SA-INIT-ERROR-NOTIFY-BUILD-001
 /// @conformance boundary-only
 pub fn build_ike_sa_init_notify_response(
@@ -1390,7 +1428,7 @@ pub fn build_ike_sa_init_notify_response(
         [notify] => notify,
         _ => return Err(Ikev2SaInitNotifyBuildError::MultipleNotifies),
     };
-    validate_sa_init_error_notify(notify)?;
+    validate_sa_init_response_notify(notify)?;
 
     let body = encode_notify_payload_build(notify)
         .map_err(|_| Ikev2SaInitNotifyBuildError::LengthOverflow)?;
@@ -1816,7 +1854,7 @@ fn validate_notify_response_request_header(
     Ok(())
 }
 
-fn validate_sa_init_error_notify(
+fn validate_sa_init_response_notify(
     notify: &Ikev2NotifyPayloadBuild,
 ) -> Result<(), Ikev2SaInitNotifyBuildError> {
     if notify.protocol_id != IKEV2_NOTIFY_PROTOCOL_ID_NONE {
@@ -1846,6 +1884,20 @@ fn validate_sa_init_error_notify(
             if u16::from_be_bytes(group_bytes) == 0 {
                 return Err(Ikev2SaInitNotifyBuildError::InvalidDhGroup);
             }
+        }
+        crate::IKEV2_NOTIFY_REDIRECT => {
+            crate::decode_ikev2_redirect_notify_with_profile(
+                Ikev2NotifyPayload {
+                    protocol_id: notify.protocol_id,
+                    spi_size: 0,
+                    spi: &notify.spi,
+                    notify_message_type: notify.notify_message_type,
+                    notification_data: &notify.notification_data,
+                },
+                crate::Ikev2RedirectContext::SaInitResponse,
+                crate::Ikev2ValidationProfile::SenderCanonical,
+            )
+            .map_err(|_| Ikev2SaInitNotifyBuildError::InvalidRedirect)?;
         }
         _ => return Err(Ikev2SaInitNotifyBuildError::UnsupportedNotifyType),
     }

@@ -11,20 +11,74 @@ use crate::consensus::verified_snapshot::VerificationMemory;
 pub(in crate::sqlite::consensus::wal) struct Selected {
     pub(super) append: VerifiedAppendOwner,
     pub(super) version: Version,
+    pub(super) base_bytes: u64,
+    #[cfg(any(test, feature = "test-control"))]
+    pub(super) last_switch: Option<integration::SwitchSize>,
+    pub(super) initial_capture: Option<crate::consensus::native::SnapshotCapture>,
 }
 
 impl Selected {
     pub(in crate::sqlite::consensus::wal) fn admitted(
         append: VerifiedAppendOwner,
         native: &NativeStorage,
+        base_bytes: u64,
     ) -> io::Result<Self> {
         let version = Version::capture(native)?;
-        if version.context_digest()? != append.current().identity().frontiers {
+        let prefix = append.current().identity();
+        if version.context_digest()? != prefix.frontiers
+            || base_bytes == 0
+            || base_bytes > prefix.length
+            || !base_bytes.is_multiple_of(prefix.block_bytes as u64)
+        {
             return Err(invalid_data(
                 "native selected process version differs from admitted prefix",
             ));
         }
-        Ok(Self { append, version })
+        Ok(Self {
+            append,
+            version,
+            base_bytes,
+            #[cfg(any(test, feature = "test-control"))]
+            last_switch: None,
+            initial_capture: Some(native.capture_snapshot()?),
+        })
+    }
+
+    pub(super) fn record_switch_size(
+        &mut self,
+        cut: crate::consensus::native::prefix::PrefixIdentity,
+        old: crate::consensus::native::prefix::PrefixIdentity,
+        before_switch: u64,
+        frames: usize,
+        pending_base_only: bool,
+    ) -> io::Result<()> {
+        #[cfg(any(test, feature = "test-control"))]
+        {
+            let total = self.append.current().identity().length;
+            self.last_switch = Some(integration::SwitchSize {
+                old_cut_bytes: cut.length,
+                old_cut_epoch: cut.checkpoint_epoch,
+                old_head_bytes: old.length,
+                old_head_epoch: old.checkpoint_epoch,
+                raw_selected_suffix_bytes: old
+                    .length
+                    .checked_sub(cut.length)
+                    .ok_or_else(|| invalid_data("native switch old suffix regressed"))?,
+                compact_base_bytes: self.base_bytes,
+                rebased_suffix_bytes: before_switch
+                    .checked_sub(self.base_bytes)
+                    .ok_or_else(|| invalid_data("native switch candidate base regressed"))?,
+                switch_frame_bytes: total
+                    .checked_sub(before_switch)
+                    .ok_or_else(|| invalid_data("native switch candidate extent regressed"))?,
+                total_bytes: total,
+                frame_count: frames as u64,
+                pending_base_only,
+            });
+        }
+        #[cfg(not(any(test, feature = "test-control")))]
+        let _ = (cut, old, before_switch, frames, pending_base_only);
+        Ok(())
     }
 
     pub(in crate::sqlite::consensus::wal) fn repair(
@@ -90,7 +144,10 @@ pub(in crate::sqlite::consensus::wal) fn bootstrap(
             block_bytes: 64 * 1024,
             frontiers: [0; 32],
         }),
-        native_snapshots: None,
+        native_snapshots: disk
+            .anchor
+            .as_ref()
+            .and_then(|anchor| anchor.native_snapshots.clone()),
         async_cut: (binding.persistence == SessionPersistenceMode::Async).then_some(
             checkpoint::AsyncCut {
                 generation: 0,
@@ -160,10 +217,11 @@ pub(in crate::sqlite::consensus::wal) fn bootstrap(
     (control.hook)(Point::AfterBasisDirectorySync)?;
     let members = native.business.members().clone();
     let roster_root = native.business.roster_root().cloned();
+    let snapshot_origin = native.snapshot_origin();
     // The next reader reconstructs the sole prospective resident index. Keep
     // neither a decoded predecessor model nor its payload-bearing roots alive.
     drop(native);
-    let (append, catalog) = Catalog::open(
+    let (append, catalog) = Catalog::open_with_origin(
         &final_path,
         identity,
         MAX_BASIS,
@@ -172,6 +230,7 @@ pub(in crate::sqlite::consensus::wal) fn bootstrap(
             members: &members,
             roster_root,
         },
+        snapshot_origin,
         cut_binding,
         &|| Ok(()),
     )?;
@@ -179,8 +238,9 @@ pub(in crate::sqlite::consensus::wal) fn bootstrap(
         return Err(invalid_data("native bootstrap catalog binding differs"));
     }
     (control.hook)(Point::AfterNativeBasisAdmission)?;
+    let base_bytes = catalog.base_bytes();
     let mut native = catalog.into_storage(&|| Ok(()))?;
-    let mut selected = Selected::admitted(append, &native)?;
+    let mut selected = Selected::admitted(append, &native, base_bytes)?;
     // Recheck all selected bytes and named descriptor after conversion before
     // publication, including an exact-length repeated cold recovery attempt.
     selected.repair(&final_path, &|| Ok(()))?;

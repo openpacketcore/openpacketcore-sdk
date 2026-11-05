@@ -9,9 +9,9 @@ use std::pin::Pin;
 
 use opc_gtpu_ebpf_common::GtpuEndpointAddress;
 pub use opc_gtpu_ebpf_common::{
-    GtpuDownlinkFragmentContract, GtpuOuterFragmentPolicy, GtpuReassemblyBounds,
-    GtpuSessionDeviceId, GtpuSessionGroupId, GtpuSessionPaa, GtpuSourcePortPolicy,
-    GtpuSourcePortRange, GtpuUplinkMtuPolicy, GtpuUplinkSourcePortPolicy,
+    GtpuDownlinkFragmentContract, GtpuOuterFragmentPolicy, GtpuPeerSourcePolicy,
+    GtpuReassemblyBounds, GtpuSessionDeviceId, GtpuSessionGroupId, GtpuSessionPaa,
+    GtpuSourcePortPolicy, GtpuSourcePortRange, GtpuUplinkMtuPolicy, GtpuUplinkSourcePortPolicy,
 };
 use opc_types::DscpCodepoint;
 use sha2::{Digest, Sha256};
@@ -118,6 +118,74 @@ impl fmt::Debug for Teid {
 }
 
 impl fmt::Display for Teid {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("<redacted-teid>")
+    }
+}
+
+/// Outgoing/peer GTP-U TEID, where the reserved zero value is admitted.
+///
+/// TS 29.281 section 5.1 requires backward compatibility with peers that assign
+/// an all-zero TEID: a GTP-U entity must accept that value and send subsequent
+/// G-PDUs with the TEID field set to all zeros. Only the peer/outgoing TEID may
+/// be zero. Locally allocated, received and map-key TEIDs remain [`Teid`],
+/// whose zero value stays invalid; this type cannot be used in their place.
+///
+/// TEIDs are sensitive routing/session handles. `Debug` and `Display` never
+/// emit the raw value.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Ord, PartialOrd)]
+pub struct PeerTeid(u32);
+
+impl PeerTeid {
+    /// The TS 29.281 section 5.1 all-zero peer TEID.
+    pub const ZERO: Self = Self(0);
+
+    /// Create a peer TEID. Unlike [`Teid::new`], zero is valid here.
+    #[must_use]
+    pub const fn new(value: u32) -> Self {
+        Self(value)
+    }
+
+    /// Reuse an already validated TEID as a peer TEID.
+    #[must_use]
+    pub const fn from_teid(teid: Teid) -> Self {
+        Self(teid.get())
+    }
+
+    /// Return the raw TEID value for kernel encoding or wire construction.
+    ///
+    /// Callers must not expose this value through logs or diagnostics.
+    #[must_use]
+    pub const fn get(self) -> u32 {
+        self.0
+    }
+
+    /// Return whether this is the reserved all-zero peer TEID.
+    #[must_use]
+    pub const fn is_zero(self) -> bool {
+        self.0 == 0
+    }
+
+    /// Return the network-order wire representation.
+    #[must_use]
+    pub const fn to_be_bytes(self) -> [u8; 4] {
+        self.0.to_be_bytes()
+    }
+}
+
+impl From<Teid> for PeerTeid {
+    fn from(teid: Teid) -> Self {
+        Self::from_teid(teid)
+    }
+}
+
+impl fmt::Debug for PeerTeid {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_tuple("PeerTeid").field(&"<redacted>").finish()
+    }
+}
+
+impl fmt::Display for PeerTeid {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str("<redacted-teid>")
     }
@@ -4603,6 +4671,7 @@ pub struct GtpuDownlinkEndpoint {
     local_address: IpAddr,
     ingress_ifindex: u32,
     source_port_policy: GtpuSourcePortPolicy,
+    peer_source_policy: GtpuPeerSourcePolicy,
 }
 
 impl GtpuDownlinkEndpoint {
@@ -4629,10 +4698,24 @@ impl GtpuDownlinkEndpoint {
             local_address,
             ingress_ifindex,
             source_port_policy,
+            peer_source_policy: GtpuPeerSourcePolicy::BackendDefault,
         })
     }
 
-    /// Return the authorized outer peer address.
+    /// Select the explicit inbound peer-address policy.
+    #[must_use]
+    pub const fn with_peer_source_policy(mut self, policy: GtpuPeerSourcePolicy) -> Self {
+        self.peer_source_policy = policy;
+        self
+    }
+
+    /// Return the retained inbound peer-address policy.
+    #[must_use]
+    pub const fn peer_source_policy(&self) -> GtpuPeerSourcePolicy {
+        self.peer_source_policy
+    }
+
+    /// Return the configured outer peer address.
     #[must_use]
     pub const fn peer_address(&self) -> IpAddr {
         self.peer_address
@@ -4669,7 +4752,8 @@ impl fmt::Debug for GtpuDownlinkEndpoint {
 }
 
 /// What the eBPF backend does with a downlink inner IPv4 packet that has
-/// Don't Fragment set and exceeds its session's [`GtpuDownlinkInnerMtu`].
+/// Don't Fragment set and exceeds its session's [`GtpuDownlinkInnerMtu`], or
+/// any downlink inner IPv6 packet that exceeds it.
 ///
 /// Under both policies tc hands the packet, undecapsulated, to the
 /// backend-owned consumer
@@ -4715,16 +4799,24 @@ pub enum GtpuDownlinkOversizePolicy {
 /// [`GtpPdpContext::downlink_inner_mtu`] `None` to keep the existing
 /// behaviour.
 ///
-/// Under either policy the eBPF backend also hands every inner IPv4 fragment
-/// of the session (More Fragments set, or a non-zero fragment offset) to the
-/// backend-owned consumer instead of decapsulating it in tc, so that all
+/// Under either IPv4 policy the eBPF backend also hands every inner IPv4
+/// fragment of the session (More Fragments set, or a non-zero fragment offset)
+/// to the backend-owned consumer instead of decapsulating it in tc, so that all
 /// fragments of one datagram take one path; see
 /// [`GtpPdpContext::downlink_inner_mtu`].
 ///
+/// An ordinary inner-IPv6 context accepts only
+/// [`GtpuDownlinkOversizePolicy::InTunnelPacketTooBig`]: IPv6 has no in-network
+/// fragmentation (RFC 8200 section 4.5), so the fragment-inner policy is
+/// refused and the MTU must be at least the IPv6 minimum 1,280. Its
+/// family-tagged entry carries the opt-in MTU in a versioned profile and the
+/// consumer sends one RFC 4443 Packet Too Big per offending packet.
+///
 /// The MTU is from [`opc_gtpu_ebpf_common::DOWNLINK_INNER_MTU_MIN`] (576, the
 /// RFC 791 IPv4 floor) to [`opc_gtpu_ebpf_common::DOWNLINK_INNER_MTU_MAX`]
-/// (32,767, the commit record's 15-bit field). `Debug` exposes the value and
-/// policy; they are path properties, not subscriber identifiers.
+/// (32,767, the commit record's 15-bit field); an inner-IPv6 context requires
+/// at least 1,280. `Debug` exposes the value and policy; they are path
+/// properties, not subscriber identifiers.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct GtpuDownlinkInnerMtu {
     mtu: std::num::NonZeroU16,
@@ -4800,19 +4892,30 @@ impl GtpuDownlinkInnerMtu {
     }
 }
 
-/// GTP-U PDP context programmed into the Linux `gtp` kernel module.
+/// GTP-U PDP context installed by the selected dataplane backend.
 #[derive(Clone, PartialEq, Eq, Hash)]
 pub struct GtpPdpContext {
-    /// Incoming/local S2b-U/N3 TEID.
+    /// Incoming/local S2b-U/N3 TEID. Always nonzero.
     pub local_teid: Teid,
     /// Outgoing peer PGW/UPF TEID.
-    pub peer_teid: Teid,
+    ///
+    /// TS 29.281 section 5.1 backward compatibility admits the reserved
+    /// all-zero peer TEID; outgoing G-PDUs then carry TEID zero. This does not
+    /// relax the nonzero local TEID used for receive lookup and ownership.
+    pub peer_teid: PeerTeid,
     /// MS/UE packet-data-network address.
     pub ms_address: IpAddr,
     /// Peer PGW/UPF GTP-U address.
     pub peer_address: IpAddr,
     /// GTP netdevice ifindex.
     pub link_ifindex: u32,
+    /// Inbound outer-source policy, independent of the outgoing peer address.
+    ///
+    /// `BackendDefault` preserves eBPF's exact peer check and Linux GTP's native
+    /// behavior. `TeidAndLocal` explicitly enables eBPF multi-homing; it keeps
+    /// TEID, local endpoint, ingress attachment, source-port and inner-PAA
+    /// checks. Linux GTP rejects this opt-in instead of losing it on readback.
+    pub downlink_peer_source_policy: GtpuPeerSourcePolicy,
     /// Explicit UDP source-port authorization for inbound GTP-U G-PDUs.
     ///
     /// Use [`GtpuSourcePortPolicy::Any`] for peers that select dynamic source
@@ -4898,6 +5001,13 @@ pub struct GtpPdpContext {
     /// recovery rejects the non-canonical commit and refuses the whole attachment
     /// as indeterminate, not just that context. Before downgrading, drain every
     /// MTU-bearing context (reinstall it with `None`, or remove it).
+    ///
+    /// For an ordinary inner-IPv6 context only
+    /// [`GtpuDownlinkInnerMtu::in_tunnel_packet_too_big`] is installable, with
+    /// an MTU of at least 1,280; the opt-in is stored in a versioned profile of
+    /// the family-tagged entry and the in-tunnel error is RFC 4443 ICMPv6.
+    /// The grouped schema marker advances to `OPC-GROUP-IP-v7`, so a retained
+    /// version-6 graph needs a fresh attachment before it can carry this field.
     pub downlink_inner_mtu: Option<GtpuDownlinkInnerMtu>,
 }
 
@@ -4955,8 +5065,8 @@ impl GtpuSessionEntry {
             || context.peer_address.is_unspecified()
             || local_outer_address.is_unspecified()
             || context.link_ifindex == 0
-            // The grouped entry ABI carries no downlink inner MTU; refuse it
-            // rather than silently dropping enforcement.
+            // The MTU family-entry profile belongs to the ordinary IPv6 API;
+            // grouped policy is unsupported and must not be silently dropped.
             || context.downlink_inner_mtu.is_some()
         {
             return Err(GtpuSessionModelError::InvalidContext);
@@ -5011,6 +5121,7 @@ impl GtpuSessionEntry {
                 ms_address: inner_address,
                 peer_address: intent.received_uplink().destination(),
                 link_ifindex,
+                downlink_peer_source_policy: GtpuPeerSourcePolicy::BackendDefault,
                 downlink_source_port_policy,
                 gtp_version: GtpVersion::V1,
                 bearer_mark: intent.flow().mark(),
@@ -5022,6 +5133,13 @@ impl GtpuSessionEntry {
         )?;
         entry.n3_qfi = Some(intent.flow().qfi());
         Ok(entry)
+    }
+
+    /// Select an inbound peer-address policy without changing outgoing routing.
+    #[must_use]
+    pub const fn with_peer_source_policy(mut self, policy: GtpuPeerSourcePolicy) -> Self {
+        self.context.downlink_peer_source_policy = policy;
+        self
     }
 
     /// Exact fixed-flow N3 QFI; `None` means ordinary GTP-U without PSC enforcement.
@@ -5064,6 +5182,7 @@ impl GtpuSessionEntry {
             self.context.egress_dscp,
         )
         .ok()
+        .map(|entry| entry.with_peer_source_policy(self.context.downlink_peer_source_policy))
     }
 
     /// Complete existing PDP-context policy.
@@ -5836,6 +5955,8 @@ pub enum PdpContextMismatchField {
     BearerMark,
     /// Optional fixed outer DSCP.
     EgressDscp,
+    /// Inbound GTP-U peer-address policy.
+    DownlinkPeerSourcePolicy,
     /// Inbound GTP-U source-port policy.
     DownlinkSourcePortPolicy,
     /// Uplink GTP-U source-port selection policy.
@@ -6612,6 +6733,9 @@ pub(crate) fn pdp_context_mismatches(
     if existing.egress_dscp != desired.egress_dscp {
         fields.push(PdpContextMismatchField::EgressDscp);
     }
+    if existing.downlink_peer_source_policy != desired.downlink_peer_source_policy {
+        fields.push(PdpContextMismatchField::DownlinkPeerSourcePolicy);
+    }
     if existing.downlink_source_port_policy != desired.downlink_source_port_policy {
         fields.push(PdpContextMismatchField::DownlinkSourcePortPolicy);
     }
@@ -6965,10 +7089,11 @@ mod tests {
     fn reconciliation_context() -> GtpPdpContext {
         GtpPdpContext {
             local_teid: Teid::new(0x1234_5678).unwrap(),
-            peer_teid: Teid::new(0x8765_4321).unwrap(),
+            peer_teid: Teid::new(0x8765_4321).unwrap().into(),
             ms_address: IpAddr::V4(Ipv4Addr::new(10, 23, 0, 2)),
             peer_address: IpAddr::V4(Ipv4Addr::new(192, 0, 2, 10)),
             link_ifindex: 7,
+            downlink_peer_source_policy: crate::GtpuPeerSourcePolicy::BackendDefault,
             downlink_source_port_policy: GtpuSourcePortPolicy::Exact(21_152),
             gtp_version: GtpVersion::V1,
             bearer_mark: Some(GtpBearerMark::new(0x3456_789a).unwrap()),
@@ -6985,6 +7110,41 @@ mod tests {
         assert_eq!(teid.get(), 0x1234_5678);
         assert!(!format!("{teid:?}").contains("12345678"));
         assert!(!teid.to_string().contains("12345678"));
+    }
+
+    #[test]
+    fn peer_teid_admits_zero_and_redacts_debug_display() {
+        // TS 29.281 section 5.1 admits the all-zero peer TEID.
+        let zero = PeerTeid::new(0);
+        assert_eq!(zero, PeerTeid::ZERO);
+        assert!(zero.is_zero());
+        assert_eq!(zero.get(), 0);
+        assert_eq!(zero.to_be_bytes(), [0, 0, 0, 0]);
+
+        let nonzero = PeerTeid::new(0x1234_5678);
+        assert!(!nonzero.is_zero());
+        assert_eq!(nonzero.to_be_bytes(), [0x12, 0x34, 0x56, 0x78]);
+        assert_eq!(
+            PeerTeid::from_teid(Teid::new(0x1234_5678).unwrap()),
+            nonzero
+        );
+        assert_eq!(PeerTeid::from(Teid::new(7).unwrap()), PeerTeid::new(7));
+
+        // Redaction is unchanged for both the zero and nonzero values.
+        assert_eq!(format!("{zero:?}"), "PeerTeid(\"<redacted>\")");
+        assert_eq!(format!("{nonzero:?}"), "PeerTeid(\"<redacted>\")");
+        assert!(!format!("{nonzero:?}").contains("12345678"));
+        assert!(!nonzero.to_string().contains("12345678"));
+        assert_eq!(zero.to_string(), "<redacted-teid>");
+    }
+
+    #[test]
+    fn zero_peer_teid_does_not_relax_the_local_teid_domain() {
+        assert_eq!(PeerTeid::new(0), PeerTeid::ZERO);
+        assert_eq!(PeerTeid::new(u32::MAX).get(), u32::MAX);
+        assert!(Teid::new(0).is_none());
+        assert_eq!(Teid::new(1).unwrap().get(), 1);
+        assert_eq!(Teid::new(u32::MAX).unwrap().get(), u32::MAX);
     }
 
     #[test]
@@ -7014,10 +7174,11 @@ mod tests {
     fn pdp_context_debug_redacts_teids_and_addresses() {
         let ctx = GtpPdpContext {
             local_teid: Teid::new(0x1234_5678).unwrap(),
-            peer_teid: Teid::new(0x8765_4321).unwrap(),
+            peer_teid: Teid::new(0x8765_4321).unwrap().into(),
             ms_address: IpAddr::V4(Ipv4Addr::new(10, 23, 0, 2)),
             peer_address: IpAddr::V6(Ipv6Addr::LOCALHOST),
             link_ifindex: 7,
+            downlink_peer_source_policy: crate::GtpuPeerSourcePolicy::BackendDefault,
             downlink_source_port_policy: GtpuSourcePortPolicy::Exact(21_152),
             gtp_version: GtpVersion::V1,
             bearer_mark: Some(GtpBearerMark::new(0x3456_789a).unwrap()),
@@ -7079,12 +7240,13 @@ mod tests {
         let desired = reconciliation_context();
         let mut existing = desired.clone();
         existing.local_teid = Teid::new(1).unwrap();
-        existing.peer_teid = Teid::new(2).unwrap();
+        existing.peer_teid = Teid::new(2).unwrap().into();
         existing.ms_address = IpAddr::V4(Ipv4Addr::new(10, 23, 0, 3));
         existing.peer_address = IpAddr::V4(Ipv4Addr::new(192, 0, 2, 11));
         existing.link_ifindex = 8;
         existing.bearer_mark = None;
         existing.egress_dscp = None;
+        existing.downlink_peer_source_policy = GtpuPeerSourcePolicy::TeidAndLocal;
         existing.downlink_source_port_policy = GtpuSourcePortPolicy::Any;
         existing.uplink_source_port_policy = GtpuUplinkSourcePortPolicy::LegacyServicePort;
 
@@ -7103,6 +7265,7 @@ mod tests {
                 PdpContextMismatchField::LinkIfindex,
                 PdpContextMismatchField::BearerMark,
                 PdpContextMismatchField::EgressDscp,
+                PdpContextMismatchField::DownlinkPeerSourcePolicy,
                 PdpContextMismatchField::DownlinkSourcePortPolicy,
                 PdpContextMismatchField::UplinkSourcePortPolicy,
             ]
@@ -7150,7 +7313,7 @@ mod tests {
         );
 
         let mut conflict = desired.clone();
-        conflict.peer_teid = Teid::new(3).unwrap();
+        conflict.peer_teid = Teid::new(3).unwrap().into();
         let classified =
             classify_dual_selector_state(&PdpContextReadback::Present(conflict), &absent, &desired);
         assert!(matches!(
@@ -7208,10 +7371,11 @@ mod tests {
     fn remove_request_derives_family_from_context() {
         let ctx = GtpPdpContext {
             local_teid: Teid::new(1).unwrap(),
-            peer_teid: Teid::new(2).unwrap(),
+            peer_teid: Teid::new(2).unwrap().into(),
             ms_address: IpAddr::V6(Ipv6Addr::LOCALHOST),
             peer_address: IpAddr::V4(Ipv4Addr::new(192, 0, 2, 10)),
             link_ifindex: 9,
+            downlink_peer_source_policy: crate::GtpuPeerSourcePolicy::BackendDefault,
             downlink_source_port_policy: GtpuSourcePortPolicy::Any,
             gtp_version: GtpVersion::V1,
             bearer_mark: None,
@@ -7859,7 +8023,7 @@ mod tests {
         let ipv4_entry = GtpuSessionEntry::new(reconciliation_context(), ipv4_local).unwrap();
         let mut ipv6_context = reconciliation_context();
         ipv6_context.local_teid = Teid::new(0x1234_5679).unwrap();
-        ipv6_context.peer_teid = Teid::new(0x8765_4322).unwrap();
+        ipv6_context.peer_teid = Teid::new(0x8765_4322).unwrap().into();
         ipv6_context.ms_address = IpAddr::V6(Ipv6Addr::new(0x2001, 0xdb8, 1, 0, 0, 0, 0, 0xbeef));
         ipv6_context.peer_address = IpAddr::V6(Ipv6Addr::new(0x2001, 0xdb8, 3, 0, 0, 0, 0, 10));
         let mut same_prefix_context = ipv6_context.clone();

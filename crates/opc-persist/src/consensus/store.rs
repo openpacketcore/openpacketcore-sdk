@@ -5,6 +5,7 @@ mod audit_continuity;
 mod compatibility;
 #[cfg(any(test, feature = "test-control"))]
 mod diagnostics;
+mod leader_route;
 mod member_repair;
 mod planned_shutdown;
 pub(crate) mod voter_slots;
@@ -31,8 +32,8 @@ use opc_consensus::{
     ConsensusRpcFamily, ConsensusRpcHandler, ConsensusWireRequest, ConsensusWireResponse,
     DurableOpenraftDomain, EnsureLinearizableOutcome, EnsureLinearizableSupervisor,
     LinearizableReadBarrier, LinearizableReadBarrierError, LinearizableReadLease,
-    DURABLE_CONSENSUS_OPERATION_TIMEOUT, DURABLE_OPENRAFT_APPEND_ENTRIES_TARGET_BYTES,
-    DURABLE_OPENRAFT_PROPOSAL_ADMISSION_SLOTS,
+    DURABLE_CONSENSUS_OPERATION_TIMEOUT, DURABLE_CONSENSUS_STALE_LEADER_ROUTE_GRACE,
+    DURABLE_OPENRAFT_APPEND_ENTRIES_TARGET_BYTES, DURABLE_OPENRAFT_PROPOSAL_ADMISSION_SLOTS,
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -46,6 +47,8 @@ use super::{
     ConfigConsensusTopology, ConfigMutationIntent, ConfigRaft, ConfigRaftTypeConfig,
     PreparedConfigCommit, SystemConfigConsensusClock,
 };
+use leader_route::LeaderRoute;
+
 use crate::backend::SqliteBackend;
 use crate::error::PersistError;
 use crate::preflight::PersistCapabilities;
@@ -258,6 +261,19 @@ enum ForwardMutationRejection {
     InvalidCommand,
 }
 
+/// Outcome of one leader-routed peer call that is bounded by this replica's
+/// own view of the current leader.
+enum RouteBoundedReply<Reply> {
+    /// The peer answered within the deadline and the reply decoded.
+    Reply(Reply),
+    /// The local engine named a successor before the peer answered. The call
+    /// was abandoned and may have been transmitted before the abandonment.
+    Retired { leader: Option<ConsensusNodeId> },
+    /// The local engine had already superseded the attempted route, so the
+    /// call was not transmitted.
+    Superseded { leader: ConsensusNodeId },
+}
+
 impl ForwardMutationRejection {
     fn into_persist_error(self) -> PersistError {
         match self {
@@ -317,13 +333,15 @@ struct ConsensusConfigStoreInner {
     admitted: AtomicBool,
     repair_pending: AtomicBool,
     repair_progress: tokio::sync::Mutex<Option<member_repair::RepairDownload>>,
+    /// One verified snapshot descriptor reused by every repair chunk request of
+    /// the same transfer (#1339).
+    repair_source: tokio::sync::Mutex<Option<Arc<member_repair::RepairSource>>>,
     audit_continuity: Option<Arc<crate::audit_authority::continuity::AuditContinuityPolicy>>,
     linearizability: EnsureLinearizableSupervisor<ConfigRaftTypeConfig>,
     proposal_admission: Arc<tokio::sync::Semaphore>,
     metric_leader: std::sync::Mutex<Option<ConsensusNodeId>>,
     durable_progress: Arc<storage::ConfigDurableProgress>,
     storage_shutdown: tokio::sync::watch::Receiver<()>,
-    snapshot_directory_owner: std::sync::Weak<storage::SnapshotDirectoryOwner>,
     voter_profile: Option<Arc<voter_slots::ConfigVoterProfile>>,
     shutdown: planned_shutdown::ConfigShutdownCoordinator,
 }
@@ -634,14 +652,6 @@ impl ConsensusConfigStore {
         .await
         .map_err(|_| ConfigConsensusOpenError::AuditContinuityUnavailable)?;
         let storage_shutdown = log_store.core.storage_shutdown_observer();
-        // Verification outside the storage worker upgrades admission only for
-        // its active I/O. Retained store handles must not own that admission.
-        let snapshot_directory_owner = Arc::downgrade(
-            &log_store
-                .core
-                .snapshot_directory_owner()
-                .map_err(|_| ConfigConsensusOpenError::StorageUnavailable)?,
-        );
         // A repair root has lost the old voter's log and vote. Do not expose
         // that empty state to a live leader or another candidate. A previously
         // restored root retains its ordinary durable restart behavior.
@@ -726,6 +736,7 @@ impl ConsensusConfigStore {
                 admitted: AtomicBool::new(false),
                 repair_pending: AtomicBool::new(repair_pending),
                 repair_progress: tokio::sync::Mutex::new(None),
+                repair_source: tokio::sync::Mutex::new(None),
                 shutdown: planned_shutdown::ConfigShutdownCoordinator::new(),
                 audit_continuity,
                 linearizability,
@@ -735,7 +746,6 @@ impl ConsensusConfigStore {
                 metric_leader: std::sync::Mutex::new(None),
                 durable_progress,
                 storage_shutdown,
-                snapshot_directory_owner,
                 voter_profile,
             }),
         };
@@ -865,6 +875,28 @@ impl ConsensusConfigStore {
             ));
         }
         result
+    }
+
+    /// Inject a controlled whole-file envelope-verification latency. Test-only;
+    /// grants no authority and changes no sizing decision.
+    #[cfg(feature = "dangerous-test-hooks")]
+    #[doc(hidden)]
+    pub fn set_snapshot_verification_delay_for_test(&self, delay: std::time::Duration) {
+        let millis = u64::try_from(delay.as_millis()).unwrap_or(u64::MAX);
+        self.inner
+            .backend
+            .snapshot_work_hooks()
+            .set_verification_delay_millis(millis);
+    }
+
+    /// Count whole-file snapshot envelope verifications served by this store.
+    #[cfg(feature = "dangerous-test-hooks")]
+    #[doc(hidden)]
+    pub fn snapshot_envelope_verifications_for_test(&self) -> u64 {
+        self.inner
+            .backend
+            .snapshot_work_hooks()
+            .envelope_verifications()
     }
 
     /// Fresh status sourced from Openraft metrics, never from a second state machine.
@@ -1180,9 +1212,13 @@ impl ConsensusConfigStore {
     /// listener available until this call finishes. The clone-wide handoff is
     /// bounded within the existing operation budget; failure falls back to
     /// ordinary shutdown and is logged with a typed reason. Use
-    /// [`Self::shutdown_with_report`] to inspect that result. Cancelling a caller
-    /// does not cancel the owned shutdown or reopen local admission. If a caller
-    /// times out, a later clone must observe completion before reopening storage.
+    /// [`Self::shutdown_with_report`] to inspect that result. For an unplanned
+    /// loss (for example a failed replication listener), call
+    /// [`Self::shutdown_unplanned`] instead; it suppresses new handoff
+    /// preparation and cancels and joins an outstanding preparation before the
+    /// same drain. Cancelling a caller does not cancel the owned shutdown or
+    /// reopen local admission. If a caller times out, a later clone must observe
+    /// completion before reopening storage.
     pub async fn shutdown(&self) -> Result<(), PersistError> {
         self.shutdown_with_report().await.map(|_| ())
     }
@@ -1543,10 +1579,10 @@ impl ConsensusConfigStore {
         let mut preferred = None;
         let mut ambiguity_seen = false;
         loop {
-            let leader = match preferred.take() {
-                Some(leader) => leader,
+            let route = match preferred.take() {
+                Some(route) => route,
                 None => match self.wait_for_known_leader(deadline).await {
-                    Ok(leader) => leader,
+                    Ok(leader) => LeaderRoute::from_local_view(leader),
                     Err(error) if ambiguity_seen => {
                         drop(error);
                         return Err(PersistError::outcome_unknown());
@@ -1554,6 +1590,7 @@ impl ConsensusConfigStore {
                     Err(error) => return Err(error),
                 },
             };
+            let leader = route.target;
             let budget = match ForwardedBudget::from_deadline(deadline) {
                 Ok(budget) => budget,
                 Err(error) if ambiguity_seen => {
@@ -1572,15 +1609,27 @@ impl ConsensusConfigStore {
                 self.apply_on_local_leader(request.clone(), deadline).await
             } else {
                 match self
-                    .call_peer::<_, ForwardMutationReply>(
-                        leader,
+                    .call_peer_on_route::<_, ForwardMutationReply>(
+                        route,
                         ConsensusRpcFamily::ForwardMutation,
                         &request,
                         deadline,
                     )
                     .await
                 {
-                    Ok(reply) => reply,
+                    Ok(RouteBoundedReply::Reply(reply)) => reply,
+                    Ok(RouteBoundedReply::Superseded { leader: observed }) => {
+                        preferred = Some(LeaderRoute::from_local_view(observed));
+                        continue;
+                    }
+                    Ok(RouteBoundedReply::Retired { leader: observed }) => {
+                        // The forwarded call may have reached the lost leader
+                        // before the route was abandoned, so its outcome is
+                        // ambiguous even though a retry is attempted.
+                        ambiguity_seen = true;
+                        preferred = observed.map(LeaderRoute::from_local_view);
+                        continue;
+                    }
                     Err(_) => {
                         ambiguity_seen = true;
                         if let Err(error) = self.wait_for_route_refresh(leader, deadline).await {
@@ -1596,15 +1645,22 @@ impl ConsensusConfigStore {
                     return Ok(*response);
                 }
                 ForwardMutationReply::Rejected(rejection) => {
+                    // A refusal of this attempt cannot disprove an earlier
+                    // transmitted attempt's durable effect.
+                    if ambiguity_seen {
+                        return Err(PersistError::outcome_unknown());
+                    }
                     return Err(rejection.into_persist_error());
                 }
                 ForwardMutationReply::NotLeader { leader: next } => {
                     opc_redaction::metrics::METRICS
                         .persist_stale_leader_rejections
                         .fetch_add(1, Ordering::Relaxed);
-                    preferred = next.filter(|candidate| {
-                        *candidate != leader && self.inner.members.contains(candidate)
-                    });
+                    preferred = next
+                        .filter(|candidate| {
+                            *candidate != leader && self.inner.members.contains(candidate)
+                        })
+                        .map(|target| LeaderRoute::redirected(target, self.member_leader_view()));
                     if preferred.is_none() {
                         if let Err(error) = self.wait_for_route_refresh(leader, deadline).await {
                             if ambiguity_seen {
@@ -1767,6 +1823,48 @@ impl ConsensusConfigStore {
         }
     }
 
+    /// Resolve the authenticated transport for one consensus peer target.
+    fn peer_for(&self, target: ConsensusNodeId) -> Result<Arc<dyn ConsensusPeer>, PersistError> {
+        self.inner
+            .voter_profile
+            .as_ref()
+            .map(|profile| profile.transport.peer(target))
+            .or_else(|| {
+                self.inner
+                    .peers
+                    .get(&target)
+                    .filter(|peer| peer.node_id() == target)
+                    .cloned()
+            })
+            .ok_or_else(consensus_unavailable)
+    }
+
+    /// Encode one protocol-family request into an authenticated wire request.
+    fn peer_wire<Req>(
+        &self,
+        family: ConsensusRpcFamily,
+        request: &Req,
+    ) -> Result<ConsensusWireRequest, PersistError>
+    where
+        Req: Serialize + ?Sized,
+    {
+        let payload = encode_config_wire(request).map_err(|_| consensus_unavailable())?;
+        ConsensusWireRequest::try_new(
+            self.inner.identity,
+            self.inner.local_node_id,
+            family,
+            payload,
+        )
+        .map_err(|_| consensus_unavailable())
+    }
+
+    /// One exact leader-routed peer call bounded by the complete operation
+    /// deadline.
+    ///
+    /// This is the unbounded-route variant used by engine-owned handoff and
+    /// member-repair protocols, whose destination is an exact target rather
+    /// than a rediscovered leader. Ordinary client mutations and linearizable
+    /// barriers use [`Self::call_peer_on_route`].
     async fn call_peer<Req, Resp>(
         &self,
         target: ConsensusNodeId,
@@ -1778,27 +1876,8 @@ impl ConsensusConfigStore {
         Req: Serialize + ?Sized,
         Resp: serde::de::DeserializeOwned,
     {
-        let peer = self
-            .inner
-            .voter_profile
-            .as_ref()
-            .map(|profile| profile.transport.peer(target))
-            .or_else(|| {
-                self.inner
-                    .peers
-                    .get(&target)
-                    .filter(|peer| peer.node_id() == target)
-                    .cloned()
-            })
-            .ok_or_else(consensus_unavailable)?;
-        let payload = encode_config_wire(request).map_err(|_| consensus_unavailable())?;
-        let wire = ConsensusWireRequest::try_new(
-            self.inner.identity,
-            self.inner.local_node_id,
-            family,
-            payload,
-        )
-        .map_err(|_| consensus_unavailable())?;
+        let peer = self.peer_for(target)?;
+        let wire = self.peer_wire(family, request)?;
         let response = tokio::time::timeout_at(deadline, peer.call(wire))
             .await
             .map_err(|_| consensus_unavailable())?
@@ -1806,6 +1885,65 @@ impl ConsensusConfigStore {
         response.validate().map_err(|_| consensus_unavailable())?;
         decode_config_wire(&response.result.map_err(|_| consensus_unavailable())?)
             .map_err(|_| consensus_unavailable())
+    }
+
+    /// Current leader named by this replica's own engine, restricted to the
+    /// configured member set.
+    fn member_leader_view(&self) -> Option<ConsensusNodeId> {
+        let metrics = self.inner.raft.metrics();
+        map_watch_snapshot(&metrics, |current| current.current_leader)
+            .filter(|leader| self.inner.members.contains(leader))
+    }
+
+    /// One leader-routed peer call whose lifetime is bounded by this replica's
+    /// own leader view.
+    ///
+    /// The call is not transmitted when the local engine has already superseded
+    /// the route. Once the engine names a successor, an unanswered call is
+    /// abandoned after [`DURABLE_CONSENSUS_STALE_LEADER_ROUTE_GRACE`] instead of
+    /// occupying the complete operation deadline. A redirect retains the view
+    /// under which it was chosen until that view advances.
+    async fn call_peer_on_route<Req, Resp>(
+        &self,
+        mut route: LeaderRoute,
+        family: ConsensusRpcFamily,
+        request: &Req,
+        deadline: tokio::time::Instant,
+    ) -> Result<RouteBoundedReply<Resp>, PersistError>
+    where
+        Req: Serialize + ?Sized,
+        Resp: serde::de::DeserializeOwned,
+    {
+        if let Some(observed) = route.observe(self.member_leader_view()) {
+            return Ok(RouteBoundedReply::Superseded { leader: observed });
+        }
+        let target = route.target;
+        let peer = self.peer_for(target)?;
+        let wire = self.peer_wire(family, request)?;
+        let call = async {
+            let response = tokio::time::timeout_at(deadline, peer.call(wire))
+                .await
+                .map_err(|_| consensus_unavailable())?
+                .map_err(|_| consensus_unavailable())?;
+            response.validate().map_err(|_| consensus_unavailable())?;
+            decode_config_wire(&response.result.map_err(|_| consensus_unavailable())?)
+                .map_err(|_| consensus_unavailable())
+        };
+        tokio::pin!(call);
+        let retirement = leader_route::wait_for_retirement(
+            self.inner.raft.metrics(),
+            &self.inner.members,
+            route,
+            deadline,
+        );
+        tokio::pin!(retirement);
+        tokio::select! {
+            biased;
+            reply = &mut call => reply.map(RouteBoundedReply::Reply),
+            observed = &mut retirement => {
+                observed.map(|leader| RouteBoundedReply::Retired { leader })
+            }
+        }
     }
 
     async fn local_read_barrier(&self, deadline: tokio::time::Instant) -> ReadBarrierReply {
@@ -1854,16 +1992,17 @@ impl ConsensusConfigStore {
             .ok_or_else(consensus_unavailable)?;
         let mut preferred = None;
         loop {
-            let leader = match preferred.take() {
-                Some(leader) => leader,
-                None => self.wait_for_known_leader(deadline).await?,
+            let route = match preferred.take() {
+                Some(route) => route,
+                None => LeaderRoute::from_local_view(self.wait_for_known_leader(deadline).await?),
             };
+            let leader = route.target;
             let reply = if leader == self.inner.local_node_id {
                 self.local_read_barrier(deadline).await
             } else {
                 match self
-                    .call_peer::<_, ReadBarrierReply>(
-                        leader,
+                    .call_peer_on_route::<_, ReadBarrierReply>(
+                        route,
                         ConsensusRpcFamily::ReadBarrier,
                         &ReadBarrierRequest {
                             compatibility: self.peer_compatibility(),
@@ -1874,7 +2013,15 @@ impl ConsensusConfigStore {
                     )
                     .await
                 {
-                    Ok(reply) => reply,
+                    Ok(RouteBoundedReply::Reply(reply)) => reply,
+                    Ok(RouteBoundedReply::Superseded { leader: observed }) => {
+                        preferred = Some(LeaderRoute::from_local_view(observed));
+                        continue;
+                    }
+                    Ok(RouteBoundedReply::Retired { leader: observed }) => {
+                        preferred = observed.map(LeaderRoute::from_local_view);
+                        continue;
+                    }
                     Err(_) => {
                         self.wait_for_route_refresh(leader, deadline).await?;
                         continue;
@@ -1894,9 +2041,11 @@ impl ConsensusConfigStore {
                     opc_redaction::metrics::METRICS
                         .persist_stale_leader_rejections
                         .fetch_add(1, Ordering::Relaxed);
-                    preferred = next.filter(|candidate| {
-                        *candidate != leader && self.inner.members.contains(candidate)
-                    });
+                    preferred = next
+                        .filter(|candidate| {
+                            *candidate != leader && self.inner.members.contains(candidate)
+                        })
+                        .map(|target| LeaderRoute::redirected(target, self.member_leader_view()));
                     if preferred.is_none() {
                         self.wait_for_route_refresh(leader, deadline).await?;
                     }

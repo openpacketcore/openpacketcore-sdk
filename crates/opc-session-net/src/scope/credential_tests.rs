@@ -84,6 +84,125 @@ async fn verifier() -> (BootstrapCredentialVerifier, Arc<Source>) {
             .unwrap();
     (verifier, source)
 }
+
+struct RefreshFailureSource {
+    keys: Mutex<Vec<u8>>,
+    failure: Mutex<Option<BootstrapCredentialError>>,
+    pending: std::sync::atomic::AtomicBool,
+    reads: AtomicUsize,
+}
+#[async_trait::async_trait]
+impl IssuerKeySource for RefreshFailureSource {
+    async fn discovery(&self) -> Result<Vec<u8>, BootstrapCredentialError> {
+        Ok(serde_json::to_vec(&json!({"issuer":ISSUER,"jwks_uri":JWKS})).unwrap())
+    }
+    async fn jwks(&self) -> Result<Vec<u8>, BootstrapCredentialError> {
+        self.reads.fetch_add(1, Ordering::SeqCst);
+        if self.pending.load(Ordering::SeqCst) {
+            return std::future::pending().await;
+        }
+        if let Some(error) = *self.failure.lock().unwrap() {
+            return Err(error);
+        }
+        Ok(self.keys.lock().unwrap().clone())
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn failed_refresh_keeps_its_class_and_rate_limit_until_recovery() {
+    for failure in [
+        BootstrapCredentialError::UnsupportedPrerequisite,
+        BootstrapCredentialError::Unavailable,
+        BootstrapCredentialError::Rejected,
+        BootstrapCredentialError::AuthTimeUnavailable,
+    ] {
+        let source = Arc::new(RefreshFailureSource {
+            keys: Mutex::new(jwks(&key(1), "one")),
+            failure: Mutex::new(None),
+            pending: std::sync::atomic::AtomicBool::new(false),
+            reads: AtomicUsize::new(0),
+        });
+        let verifier =
+            BootstrapCredentialVerifier::activate(ISSUER.into(), JWKS.into(), source.clone())
+                .await
+                .unwrap();
+        let old = token(&key(1), json!({"alg":"ES256","kid":"one"}), claims());
+        let rotated = token(&key(2), json!({"alg":"ES256","kid":"one"}), claims());
+        *source.failure.lock().unwrap() = Some(failure);
+        for _ in 0..3 {
+            assert_eq!(
+                verifier
+                    .verify(&rotated, &observation(), bounds(100, 199))
+                    .await
+                    .err(),
+                Some(failure)
+            );
+        }
+        assert_eq!(
+            source.reads.load(Ordering::SeqCst),
+            2,
+            "failed refreshes keep the shared rate limit"
+        );
+        verifier
+            .verify(&old, &observation(), bounds(100, 199))
+            .await
+            .expect("a cached verified key remains usable");
+        *source.failure.lock().unwrap() = None;
+        *source.keys.lock().unwrap() = jwks(&key(2), "one");
+        tokio::time::advance(std::time::Duration::from_secs(1)).await;
+        verifier
+            .verify(&rotated, &observation(), bounds(100, 199))
+            .await
+            .expect("a later successful refresh recovers");
+        assert_eq!(source.reads.load(Ordering::SeqCst), 3);
+        assert_eq!(
+            verifier
+                .verify(&old, &observation(), bounds(100, 199))
+                .await
+                .err(),
+            Some(BootstrapCredentialError::Rejected),
+            "a successful refresh clears the retained source failure"
+        );
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn cancelled_refresh_stays_unavailable_within_the_shared_rate_limit() {
+    let source = Arc::new(RefreshFailureSource {
+        keys: Mutex::new(jwks(&key(1), "one")),
+        failure: Mutex::new(None),
+        pending: std::sync::atomic::AtomicBool::new(false),
+        reads: AtomicUsize::new(0),
+    });
+    let verifier =
+        BootstrapCredentialVerifier::activate(ISSUER.into(), JWKS.into(), source.clone())
+            .await
+            .unwrap();
+    let rotated = token(&key(2), json!({"alg":"ES256","kid":"one"}), claims());
+    source.pending.store(true, Ordering::SeqCst);
+    assert!(tokio::time::timeout(
+        std::time::Duration::from_millis(100),
+        verifier.verify(&rotated, &observation(), bounds(100, 199))
+    )
+    .await
+    .is_err());
+    source.pending.store(false, Ordering::SeqCst);
+    *source.keys.lock().unwrap() = jwks(&key(2), "one");
+    assert_eq!(
+        verifier
+            .verify(&rotated, &observation(), bounds(100, 199))
+            .await
+            .err(),
+        Some(BootstrapCredentialError::Unavailable)
+    );
+    assert_eq!(source.reads.load(Ordering::SeqCst), 2);
+    tokio::time::advance(std::time::Duration::from_secs(1)).await;
+    verifier
+        .verify(&rotated, &observation(), bounds(100, 199))
+        .await
+        .unwrap();
+    assert_eq!(source.reads.load(Ordering::SeqCst), 3);
+}
 #[tokio::test(start_paused = true)]
 async fn preflight_distinguishes_temporary_discovery_failure() {
     let source = Arc::new(Source {

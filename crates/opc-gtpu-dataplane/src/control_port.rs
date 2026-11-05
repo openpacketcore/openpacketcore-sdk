@@ -9,9 +9,22 @@
 #[cfg(all(test, target_os = "linux"))]
 mod native_tests;
 
+#[cfg(target_os = "linux")]
+mod readiness;
+#[cfg(target_os = "linux")]
+pub(crate) use readiness::ReadinessInner;
+#[cfg(target_os = "linux")]
+pub use readiness::{GtpuControlQueue, GtpuControlReadiness, GtpuDownlinkReadiness};
+#[cfg(target_os = "linux")]
+pub(crate) mod socket_io;
+
 #[cfg(any(test, target_os = "linux"))]
 use std::sync::Arc;
-use std::{fmt, net::SocketAddrV4, num::NonZeroU32};
+use std::{
+    fmt,
+    net::{IpAddr, SocketAddr},
+    num::NonZeroU32,
+};
 
 use bytes::Bytes;
 use opc_proto_gtpu::{
@@ -26,9 +39,9 @@ use opc_protocol::{BorrowDecode, DecodeContext, UnknownIePolicy, ValidationLevel
 
 use crate::{DownlinkOuterProvenance, GTPU_PORT};
 
-/// Maximum UDP payload admitted by this IPv4 socket profile.
+/// Common IPv4/IPv6 control payload ceiling.
 ///
-/// This is the IPv4/UDP envelope limit, not a path-MTU or fragmentation claim.
+/// Uses the smaller IPv4/UDP envelope limit; this is not a path-MTU claim.
 pub const GTPU_CONTROL_MAX_DATAGRAM: usize = 65_507;
 
 /// Backend-neutral nonblocking access to one shared GTP-U receive queue.
@@ -58,11 +71,38 @@ pub trait GtpuControlPort: fmt::Debug + Send + Sync {
         plan: GtpuControlSendPlan,
     ) -> Result<usize, GtpuControlPortError>;
 
+    /// Send a canonical Echo Request through this attachment's shared socket.
+    /// Both tuples use UDP/2152; `source` must be a concrete address bound to
+    /// this attachment. The caller owns peer admission, rate limits, sequence
+    /// allocation, retransmission and matching the received Echo Response.
+    /// TS 29.281 §7.2.1 limits new requests to one per path per 60 seconds;
+    /// retransmissions retain the same sequence. This port starts no timer.
+    /// Success reports kernel acceptance, not peer liveness.
+    ///
+    /// # Errors
+    /// Refuses invalid/foreign tuples, a retired binding, or a send failure.
+    /// Ports without this capability return `Unsupported`.
+    fn send_echo_request(
+        &self,
+        source: SocketAddr,
+        peer: SocketAddr,
+        sequence: u16,
+    ) -> Result<usize, GtpuControlPortError> {
+        let _ = (source, peer, sequence);
+        Err(GtpuControlPortError::Unsupported)
+    }
+
     /// Receive at most one datagram and process it against the backend's own
     /// authoritative forwarding state.
     ///
-    /// This is the production consumer for G-PDUs that the kernel delivers to
-    /// the backend-owned queues. The shared UDP/2152 queue carries
+    /// The Linux kernel-GTP backend returns `UnknownTunnel` only after two equal
+    /// PDP reads in each inner family confirm the TEID is absent. A context in
+    /// either family gives `Dropped(DestinationMismatch)`; a readback error gives
+    /// `Dropped(StateUnavailable)`. The caller remains responsible for peer
+    /// admission and response policy; receiving does not forward or reply.
+    ///
+    /// On the eBPF backend, this is the production consumer for G-PDUs that
+    /// the kernel delivers to the backend-owned queues. The shared UDP/2152 queue carries
     /// outer-fragmented downlink G-PDUs after kernel reassembly (TS 29.281
     /// clauses 4.2.4 and 4.2.5) and unknown-TEID handoffs, and is served
     /// first, for at most eight datagrams in a row. Two more queues carry
@@ -122,6 +162,47 @@ pub trait GtpuControlPort: fmt::Debug + Send + Sync {
         Err(GtpuControlPortError::Unsupported)
     }
 
+    /// Return an SDK-owned readiness source for the downlink queues this port
+    /// serves.
+    ///
+    /// The port keeps ownership of every receive socket. The source owns only
+    /// a private epoll instance in which those sockets are registered; its
+    /// [`std::os::fd::AsFd`] descriptor is that epoll instance, not a socket.
+    /// A consumer can therefore wait with `epoll(7)`,
+    /// `tokio::io::unix::AsyncFd`, or [`GtpuControlReadiness::wait`] without
+    /// polling, and cannot read, close or duplicate a socket through it.
+    ///
+    /// Readiness is advisory and value-free: it consumes no datagram, makes no
+    /// forwarding decision and changes nothing in [`Self::try_receive_downlink`].
+    /// The queue service order documented there is unchanged: the shared
+    /// UDP/2152 queue first for at most eight datagrams, then one turn for the
+    /// UDP/2153 and UDP/2154 hand-off queues, alternating between them. After
+    /// the source reports readiness, consume that notification with
+    /// [`GtpuControlReadiness::try_readiness`] (it also names the ready queue
+    /// classes) and then drain with `try_receive_downlink` as usual; an empty
+    /// readiness snapshot never proves the queues are empty.
+    ///
+    /// The source is bound to this port registration. Removal, replacement or
+    /// backend loss revokes it immediately. Fencing and readback loss are
+    /// detected at the next port operation, which then revokes the source.
+    /// Revocation permanently makes its descriptor readable; readiness methods
+    /// and receive report [`GtpuControlPortError::Unavailable`]. Stop waiting
+    /// on and drop that source, then reopen the port through
+    /// [`crate::GtpuDataplaneBackend::open_gtpu_control_port`] after a fresh
+    /// exact registration. Each call returns an independent source; consumers
+    /// should request one source per registration and keep it for its lifetime.
+    ///
+    /// The default implementation belongs to ports without backend state and
+    /// returns [`GtpuControlPortError::Unsupported`] without binding anything.
+    ///
+    /// # Errors
+    /// Refuses a busy or retired attachment, an unverifiable socket binding, a
+    /// missing backend-owned queue, or an epoll allocation failure.
+    #[cfg(target_os = "linux")]
+    fn downlink_readiness(&self) -> Result<GtpuControlReadiness, GtpuControlPortError> {
+        Err(GtpuControlPortError::Unsupported)
+    }
+
     /// Bounded, value-free counters of [`Self::try_receive_downlink`] for this
     /// attachment registration.
     ///
@@ -135,7 +216,8 @@ pub trait GtpuControlPort: fmt::Debug + Send + Sync {
 
     /// Replace the per-session in-tunnel Packet Too Big rate limit applied by
     /// this attachment registration (see [`crate::GtpuPacketTooBigRateLimit`]);
-    /// every session's bucket restarts full.
+    /// every session's bucket restarts full, including when the limit is
+    /// unchanged. Tracked identities and their eviction grace are retained.
     ///
     /// # Errors
     /// Returns [`GtpuControlPortError::Unsupported`] for ports without a
@@ -152,6 +234,10 @@ pub trait GtpuControlPort: fmt::Debug + Send + Sync {
     /// this attachment registration (see [`crate::GtpuInnerFragmentRateLimit`]).
     /// Tracked destinations keep their Identification sequences and at most
     /// their current tokens.
+    ///
+    /// Every valid limit can be installed during traffic. An independent
+    /// per-destination sliding count preserves the 65,535-admission ceiling
+    /// across replacements, without replacing the attachment registration.
     ///
     /// # Errors
     /// Returns [`GtpuControlPortError::Unsupported`] for ports without a
@@ -209,6 +295,126 @@ impl From<std::io::Error> for GtpuControlPortError {
     }
 }
 
+#[cfg(any(test, target_os = "linux"))]
+pub(crate) fn echo_request_bytes(
+    source: SocketAddr,
+    peer: SocketAddr,
+    sequence: u16,
+) -> Result<Bytes, GtpuControlPortError> {
+    if source.is_ipv4() != peer.is_ipv4() {
+        return Err(GtpuControlPortError::InvalidTuple);
+    }
+    for tuple in [source, peer] {
+        if tuple.port() != GTPU_PORT || !unicast_tuple(tuple) {
+            return Err(GtpuControlPortError::InvalidTuple);
+        }
+    }
+    GtpuControlMessage::EchoRequest(opc_proto_gtpu::GtpuEchoRequest::new(sequence))
+        .to_bytes(EncodeContext::default())
+        .map_err(|_| GtpuControlPortError::Encoding)
+}
+
+fn unicast_tuple(tuple: SocketAddr) -> bool {
+    !tuple.ip().is_unspecified()
+        && !tuple.ip().is_multicast()
+        && match tuple {
+            SocketAddr::V4(v4) => !v4.ip().is_broadcast(),
+            SocketAddr::V6(v6) => {
+                v6.ip().to_ipv4_mapped().is_none()
+                    && v6.flowinfo() == 0
+                    && (v6.ip().is_unicast_link_local() == (v6.scope_id() != 0))
+            }
+        }
+}
+
+/// Kernel-observed transport tuples and ingress interface for one datagram.
+/// IPv6 link-local tuples retain their interface scope. This observation grants
+/// neither peer admission nor installed-tunnel authority.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub struct GtpuControlProvenance {
+    local: SocketAddr,
+    peer: SocketAddr,
+    ingress_ifindex: u32,
+}
+
+impl fmt::Debug for GtpuControlProvenance {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("GtpuControlProvenance(<redacted>)")
+    }
+}
+
+impl GtpuControlProvenance {
+    #[cfg(any(test, target_os = "linux"))]
+    pub(crate) fn new(peer: SocketAddr, local: SocketAddr, ingress_ifindex: u32) -> Option<Self> {
+        if peer.is_ipv4() != local.is_ipv4()
+            || peer.ip().is_unspecified()
+            || local.ip().is_unspecified()
+            || ingress_ifindex == 0
+        {
+            return None;
+        }
+        for tuple in [peer, local] {
+            if let SocketAddr::V6(v6) = tuple {
+                if v6.ip().to_ipv4_mapped().is_some()
+                    || v6.flowinfo() != 0
+                    || v6.scope_id()
+                        != if v6.ip().is_unicast_link_local() {
+                            ingress_ifindex
+                        } else {
+                            0
+                        }
+                {
+                    return None;
+                }
+            }
+        }
+        Some(Self {
+            peer,
+            local,
+            ingress_ifindex,
+        })
+    }
+
+    /// Observed source IP address, without its UDP port.
+    #[must_use]
+    pub const fn peer_address(&self) -> IpAddr {
+        self.peer.ip()
+    }
+    /// Observed destination IP address, without its UDP port.
+    #[must_use]
+    pub const fn local_address(&self) -> IpAddr {
+        self.local.ip()
+    }
+    /// Observed ingress interface index.
+    #[must_use]
+    pub const fn ingress_ifindex(&self) -> u32 {
+        self.ingress_ifindex
+    }
+    /// Observed UDP source port.
+    #[must_use]
+    pub const fn source_port(&self) -> u16 {
+        self.peer.port()
+    }
+    /// Convert only IPv4 observations for the existing reassembly consumer.
+    #[must_use]
+    pub fn ipv4(&self) -> Option<DownlinkOuterProvenance> {
+        let (SocketAddr::V4(peer), SocketAddr::V4(local)) = (self.peer, self.local) else {
+            return None;
+        };
+        DownlinkOuterProvenance::new(*peer.ip(), *local.ip(), self.ingress_ifindex, peer.port())
+    }
+}
+
+impl From<DownlinkOuterProvenance> for GtpuControlProvenance {
+    fn from(provenance: DownlinkOuterProvenance) -> Self {
+        Self {
+            local: SocketAddr::new(provenance.local_address().into(), GTPU_PORT),
+            peer: SocketAddr::new(provenance.peer_address().into(), provenance.source_port()),
+            ingress_ifindex: provenance.ingress_ifindex(),
+        }
+    }
+}
+
 /// Explicit caller policy for one response, excluding IP/UDP headers.
 ///
 /// A cap is not peer authentication or an aggregate rate limiter. Ratios use
@@ -263,6 +469,8 @@ impl GtpuControlResponseBudget {
 pub enum GtpuControlDatagramKind {
     /// One of the existing typed control messages, fully decoded.
     Control,
+    /// Valid Tunnel Status; ignore if charging pause is unsupported or the tunnel is unknown.
+    TunnelStatus,
     /// A structurally complete G-PDU with no unsupported required extension.
     Gpdu,
     /// A required extension cannot be understood by an endpoint.
@@ -285,13 +493,15 @@ pub enum GtpuControlDatagramKind {
 /// ```
 pub struct GtpuControlDatagram {
     bytes: Bytes,
-    provenance: DownlinkOuterProvenance,
+    provenance: GtpuControlProvenance,
     #[cfg(any(test, target_os = "linux"))]
     socket_identity: Arc<()>,
     kind: GtpuControlDatagramKind,
     control: Option<GtpuControlMessage>,
     message_type: Option<u8>,
     teid: Option<NonZeroU32>,
+    #[cfg(any(target_os = "linux", test))]
+    has_tpdu: bool,
 }
 
 impl fmt::Debug for GtpuControlDatagram {
@@ -308,17 +518,19 @@ impl GtpuControlDatagram {
     #[cfg(any(test, target_os = "linux"))]
     pub(crate) fn received(
         bytes: Bytes,
-        provenance: DownlinkOuterProvenance,
+        provenance: impl Into<GtpuControlProvenance>,
         socket_identity: Arc<()>,
     ) -> Self {
         let mut result = Self {
             bytes,
-            provenance,
+            provenance: provenance.into(),
             socket_identity,
             kind: GtpuControlDatagramKind::Malformed,
             control: None,
             message_type: None,
             teid: None,
+            #[cfg(any(target_os = "linux", test))]
+            has_tpdu: false,
         };
         // The network receiver ignores spare bits while retaining exact
         // framing and bounded walks. The shared typed codec applies its own
@@ -349,11 +561,19 @@ impl GtpuControlDatagram {
         }
         if message.header.message_type == GTPU_MESSAGE_G_PDU {
             result.kind = GtpuControlDatagramKind::Gpdu;
+            #[cfg(any(target_os = "linux", test))]
+            {
+                result.has_tpdu = !message.payload.is_empty();
+            }
         } else {
             match GtpuControlMessage::from_message(&message, ctx) {
                 Ok(control) => {
+                    result.kind = if matches!(control, GtpuControlMessage::TunnelStatus(_)) {
+                        GtpuControlDatagramKind::TunnelStatus
+                    } else {
+                        GtpuControlDatagramKind::Control
+                    };
                     result.control = Some(control);
-                    result.kind = GtpuControlDatagramKind::Control;
                 }
                 Err(error)
                     if matches!(
@@ -376,6 +596,12 @@ impl GtpuControlDatagram {
         &self.bytes
     }
 
+    /// Nonzero TEID from the validated header, without a forwarding decision.
+    #[cfg(target_os = "linux")]
+    pub(crate) const fn received_teid(&self) -> Option<NonZeroU32> {
+        self.teid
+    }
+
     /// Disposition of this complete UDP datagram.
     #[must_use]
     pub const fn kind(&self) -> GtpuControlDatagramKind {
@@ -390,23 +616,20 @@ impl GtpuControlDatagram {
 
     /// Exact peer/local/ingress metadata established by the socket.
     #[must_use]
-    pub const fn provenance(&self) -> &DownlinkOuterProvenance {
+    pub const fn provenance(&self) -> &GtpuControlProvenance {
         &self.provenance
     }
 
     /// Local destination tuple. This socket profile binds UDP/2152.
     #[must_use]
-    pub fn local(&self) -> SocketAddrV4 {
-        SocketAddrV4::new(self.provenance.local_address(), GTPU_PORT)
+    pub fn local(&self) -> SocketAddr {
+        self.provenance.local
     }
 
     /// Peer source tuple, including a dynamic source port.
     #[must_use]
-    pub fn peer(&self) -> SocketAddrV4 {
-        SocketAddrV4::new(
-            self.provenance.peer_address(),
-            self.provenance.source_port(),
-        )
+    pub fn peer(&self) -> SocketAddr {
+        self.provenance.peer
     }
 
     /// Type from a structurally complete GTP-U header, if one was admitted.
@@ -470,10 +693,11 @@ impl GtpuControlDatagram {
             return Err(GtpuControlPortError::WrongProcedure);
         }
         let teid = self.teid.ok_or(GtpuControlPortError::WrongProcedure)?;
-        let error = GtpuErrorIndication::new(teid, (*self.local().ip()).into())
+        let error = GtpuErrorIndication::new(teid, self.local().ip())
             .with_triggering_udp_source_port(self.peer().port())
             .map_err(|_| GtpuControlPortError::Encoding)?;
-        let peer = SocketAddrV4::new(*self.peer().ip(), GTPU_PORT);
+        let mut peer = self.peer();
+        peer.set_port(GTPU_PORT);
         self.response(GtpuControlMessage::ErrorIndication(error), peer, budget)
     }
 
@@ -495,7 +719,8 @@ impl GtpuControlDatagram {
         {
             return Err(GtpuControlPortError::WrongProcedure);
         }
-        let peer = SocketAddrV4::new(*self.peer().ip(), GTPU_PORT);
+        let mut peer = self.peer();
+        peer.set_port(GTPU_PORT);
         self.response(
             GtpuControlMessage::SupportedExtensionHeadersNotification(
                 GtpuSupportedExtensionHeadersNotification::new(supported),
@@ -508,17 +733,11 @@ impl GtpuControlDatagram {
     fn response(
         self,
         message: GtpuControlMessage,
-        peer: SocketAddrV4,
+        peer: SocketAddr,
         budget: GtpuControlResponseBudget,
     ) -> Result<GtpuControlSendPlan, GtpuControlPortError> {
         let source = self.local();
-        if peer.port() == 0
-            || peer.ip().is_unspecified()
-            || peer.ip().is_multicast()
-            || peer.ip().is_broadcast()
-            || source.ip().is_multicast()
-            || source.ip().is_broadcast()
-        {
+        if peer.port() == 0 || !unicast_tuple(peer) || !unicast_tuple(source) {
             return Err(GtpuControlPortError::InvalidTuple);
         }
         let bytes = message
@@ -538,6 +757,40 @@ impl GtpuControlDatagram {
     }
 }
 
+/// Map one received datagram to the backend-neutral downlink outcome.
+///
+/// This is the shared classification used by backend control ports whose
+/// receive queue carries both controls and unknown-tunnel G-PDUs. Only
+/// malformed framing is a drop: a bound control, an unmodelled message and a
+/// required-extension event all stay available to the existing control
+/// planners (in particular `extension_notification`), while a structurally
+/// complete G-PDU is returned as an untouched unknown-tunnel observation.
+#[must_use]
+#[cfg(any(target_os = "linux", test))]
+pub(crate) fn downlink_event(datagram: GtpuControlDatagram) -> crate::GtpuDownlinkEvent {
+    match datagram.kind() {
+        GtpuControlDatagramKind::Gpdu => {
+            // The structural decoder already checked the complete GTP frame.
+            // TS 29.281 section 6 also permits unstructured T-PDUs, so this
+            // observation must not impose the IP datapath's minimum length.
+            if datagram.teid.is_some() && datagram.has_tpdu {
+                crate::GtpuDownlinkEvent::UnknownTunnel(datagram)
+            } else {
+                crate::GtpuDownlinkEvent::Dropped(crate::GtpuDownlinkDrop::Malformed)
+            }
+        }
+        GtpuControlDatagramKind::Control
+        | GtpuControlDatagramKind::TunnelStatus
+        | GtpuControlDatagramKind::Unmodelled
+        | GtpuControlDatagramKind::UnsupportedRequiredExtension => {
+            crate::GtpuDownlinkEvent::Control(datagram)
+        }
+        GtpuControlDatagramKind::Malformed => {
+            crate::GtpuDownlinkEvent::Dropped(crate::GtpuDownlinkDrop::Malformed)
+        }
+    }
+}
+
 /// Affine response plan bound to one exact receiving socket.
 ///
 /// Sending consumes the plan even if I/O fails; retries require a new received
@@ -549,8 +802,8 @@ impl GtpuControlDatagram {
 /// ```
 pub struct GtpuControlSendPlan {
     pub(crate) bytes: Bytes,
-    pub(crate) source: SocketAddrV4,
-    pub(crate) peer: SocketAddrV4,
+    pub(crate) source: SocketAddr,
+    pub(crate) peer: SocketAddr,
     #[cfg(any(test, target_os = "linux"))]
     pub(crate) socket_identity: Arc<()>,
     received_length: usize,
@@ -559,12 +812,12 @@ pub struct GtpuControlSendPlan {
 impl GtpuControlSendPlan {
     /// Exact source tuple selected by the message-specific response rule.
     #[must_use]
-    pub const fn source(&self) -> SocketAddrV4 {
+    pub const fn source(&self) -> SocketAddr {
         self.source
     }
     /// Exact destination tuple selected by that rule.
     #[must_use]
-    pub const fn destination(&self) -> SocketAddrV4 {
+    pub const fn destination(&self) -> SocketAddr {
         self.peer
     }
     /// Encoded UDP payload length to charge to the caller's aggregate limiter.
@@ -593,7 +846,7 @@ impl fmt::Debug for GtpuControlSendPlan {
 mod tests {
     use super::*;
     use opc_proto_gtpu::GtpuExtensionHeaderType;
-    use std::net::Ipv4Addr;
+    use std::net::{Ipv4Addr, SocketAddrV4};
 
     const ECHO: &[u8] = &[0x32, 1, 0, 4, 0, 0, 0, 0, 0x12, 0x34, 0, 0];
     const GPDU: &[u8] = &[0x30, 255, 0, 1, 1, 2, 3, 4, 0x45];
@@ -616,6 +869,72 @@ mod tests {
     }
 
     #[test]
+    fn ipv6_control_preserves_link_scope_and_refuses_mapped_or_foreign_scope() {
+        let peer: SocketAddr = "[fe80::2%7]:49152".parse().unwrap();
+        let local: SocketAddr = "[fe80::1%7]:2152".parse().unwrap();
+        let provenance = GtpuControlProvenance::new(peer, local, 7).unwrap();
+        assert!(provenance.ipv4().is_none());
+        assert_eq!(
+            format!("{provenance:?}"),
+            "GtpuControlProvenance(<redacted>)"
+        );
+        let event =
+            GtpuControlDatagram::received(Bytes::from_static(ECHO), provenance, Arc::new(()));
+        let plan = event.echo_response(budget()).unwrap();
+        assert_eq!(plan.source(), local);
+        assert_eq!(plan.destination(), peer);
+        for bad in [
+            "[fe80::2]:49152",
+            "[fe80::2%8]:49152",
+            "[2001:db8::2%7]:49152",
+            "[::ffff:192.0.2.2]:49152",
+            "192.0.2.2:49152",
+        ] {
+            assert!(GtpuControlProvenance::new(bad.parse().unwrap(), local, 7).is_none());
+        }
+        let source: SocketAddr = "[2001:db8::1]:2152".parse().unwrap();
+        for bad in [
+            "[::]:2152",
+            "[ff02::1]:2152",
+            "[::ffff:192.0.2.2]:2152",
+            "192.0.2.2:2152",
+            "[2001:db8::2]:0",
+            "[fe80::2]:2152",
+        ] {
+            assert_eq!(
+                echo_request_bytes(source, bad.parse().unwrap(), 1),
+                Err(GtpuControlPortError::InvalidTuple)
+            );
+        }
+    }
+
+    #[test]
+    fn outgoing_echo_validates_both_tuples_and_encodes_canonical_request() {
+        let source = SocketAddrV4::new(Ipv4Addr::new(127, 0, 0, 2), GTPU_PORT);
+        let peer = SocketAddrV4::new(Ipv4Addr::new(127, 0, 0, 3), GTPU_PORT);
+        assert_eq!(
+            echo_request_bytes(source.into(), peer.into(), 0x1234).unwrap(),
+            ECHO
+        );
+        for invalid in [
+            SocketAddrV4::new(*source.ip(), 0),
+            SocketAddrV4::new(*source.ip(), 2153),
+            SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, GTPU_PORT),
+            SocketAddrV4::new(Ipv4Addr::BROADCAST, GTPU_PORT),
+            SocketAddrV4::new(Ipv4Addr::new(224, 0, 0, 1), GTPU_PORT),
+        ] {
+            assert_eq!(
+                echo_request_bytes(invalid.into(), peer.into(), 1),
+                Err(GtpuControlPortError::InvalidTuple)
+            );
+            assert_eq!(
+                echo_request_bytes(source.into(), invalid.into(), 1),
+                Err(GtpuControlPortError::InvalidTuple)
+            );
+        }
+    }
+
+    #[test]
     fn control_echo_uses_received_dynamic_tuple_sequence_and_zero_recovery() {
         for port in [1, 2152, 49152, 65535] {
             let event = receive(ECHO, port);
@@ -627,11 +946,11 @@ mod tests {
             assert!(Arc::ptr_eq(&identity, &plan.socket_identity));
             assert_eq!(
                 plan.source(),
-                SocketAddrV4::new(Ipv4Addr::new(127, 0, 0, 2), 2152)
+                SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::new(127, 0, 0, 2), 2152))
             );
             assert_eq!(
                 plan.destination(),
-                SocketAddrV4::new(Ipv4Addr::new(127, 0, 0, 3), port)
+                SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::new(127, 0, 0, 3), port))
             );
             assert_eq!(
                 &plan.bytes[..],
@@ -671,6 +990,136 @@ mod tests {
     }
 
     #[test]
+    fn kernel_declined_invalid_gpdus_are_drops() {
+        for packet in [
+            &[0x30, 0xff, 0, 1, 0, 0, 0, 0, 0x45][..],
+            &[0x30, 0xff, 0, 0, 0, 0, 0, 1][..],
+        ] {
+            assert!(matches!(
+                downlink_event(receive(packet, 49152)),
+                crate::GtpuDownlinkEvent::Dropped(crate::GtpuDownlinkDrop::Malformed)
+            ));
+        }
+    }
+
+    #[test]
+    fn unknown_tunnel_error_refuses_every_non_gpdu_and_zero_teid() {
+        // A control message, an unsupported required extension and malformed
+        // framing are observations that never authorize an Error Indication.
+        let required = [0x34, 255, 0, 9, 1, 2, 3, 4, 0, 0, 0, 0x80, 1, 0, 0, 0, 0x45];
+        for event in [
+            receive(ECHO, 49152),
+            receive(&required, 49152),
+            receive(&[0x30, 255, 0], 49152),
+        ] {
+            assert_eq!(
+                event.unknown_tunnel_error(budget()).unwrap_err(),
+                GtpuControlPortError::WrongProcedure
+            );
+        }
+        let mut zero = GPDU.to_vec();
+        zero[4..8].fill(0);
+        assert_eq!(
+            receive(&zero, 49152)
+                .unknown_tunnel_error(budget())
+                .unwrap_err(),
+            GtpuControlPortError::WrongProcedure
+        );
+        // Any nonzero unknown TEID is a candidate; tunnel authority is the
+        // caller's lookup, never this receive event.
+        for teid in [1_u32, 0x0102_0304, u32::MAX] {
+            let mut packet = GPDU.to_vec();
+            packet[4..8].copy_from_slice(&teid.to_be_bytes());
+            let plan = receive(&packet, 49152)
+                .unknown_tunnel_error(budget())
+                .unwrap();
+            assert_eq!(
+                plan.source(),
+                SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::new(127, 0, 0, 2), 2152))
+            );
+            assert_eq!(
+                plan.destination(),
+                SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::new(127, 0, 0, 3), 2152))
+            );
+            assert_eq!(plan.received_length(), packet.len());
+            assert_eq!(plan.response_length(), 28);
+        }
+    }
+
+    #[test]
+    fn unknown_tunnel_error_refuses_invalid_response_tuples() {
+        let packet = GPDU;
+        for (peer, local) in [
+            (Ipv4Addr::new(127, 0, 0, 3), Ipv4Addr::new(224, 0, 0, 2)),
+            (Ipv4Addr::new(224, 0, 0, 1), Ipv4Addr::new(127, 0, 0, 2)),
+        ] {
+            let event = GtpuControlDatagram::received(
+                Bytes::copy_from_slice(packet),
+                DownlinkOuterProvenance::new(peer, local, 1, 49152).unwrap(),
+                Arc::new(()),
+            );
+            assert_eq!(
+                event.unknown_tunnel_error(budget()).unwrap_err(),
+                GtpuControlPortError::InvalidTuple
+            );
+        }
+    }
+
+    #[test]
+    fn unknown_tunnel_error_enforces_byte_and_amplification_budgets() {
+        // 9 received octets, a 28-octet Error Indication.
+        let tight = GtpuControlResponseBudget::new(28, 4).unwrap();
+        assert_eq!(
+            receive(GPDU, 49152)
+                .unknown_tunnel_error(tight)
+                .unwrap()
+                .response_length(),
+            28
+        );
+        for budget in [
+            GtpuControlResponseBudget::new(27, 4).unwrap(),
+            GtpuControlResponseBudget::new(28, 3).unwrap(),
+            GtpuControlResponseBudget::new(1024, 1).unwrap(),
+        ] {
+            assert_eq!(
+                receive(GPDU, 49152)
+                    .unknown_tunnel_error(budget)
+                    .unwrap_err(),
+                GtpuControlPortError::ResponseBudgetExceeded
+            );
+        }
+    }
+
+    #[test]
+    fn downlink_outcome_matches_the_ebpf_verdict() {
+        use crate::GtpuDownlinkEvent;
+        // A complete G-PDU is an untouched unknown-tunnel observation.
+        assert!(matches!(
+            downlink_event(receive(GPDU, 49152)),
+            GtpuDownlinkEvent::UnknownTunnel(event)
+                if event.kind() == GtpuControlDatagramKind::Gpdu
+        ));
+        // Bound controls and required-extension events stay available to the
+        // control planners and are never converted into a malformed drop.
+        assert!(matches!(
+            downlink_event(receive(ECHO, 49152)),
+            GtpuDownlinkEvent::Control(event)
+                if event.kind() == GtpuControlDatagramKind::Control
+        ));
+        let required = [0x34, 255, 0, 9, 1, 2, 3, 4, 0, 0, 0, 0x80, 1, 0, 0, 0, 0x45];
+        assert!(matches!(
+            downlink_event(receive(&required, 49152)),
+            GtpuDownlinkEvent::Control(event)
+                if event.kind() == GtpuControlDatagramKind::UnsupportedRequiredExtension
+        ));
+        // Malformed framing is the only drop.
+        assert!(matches!(
+            downlink_event(receive(&[0x30, 255, 0], 49152)),
+            GtpuDownlinkEvent::Dropped(crate::GtpuDownlinkDrop::Malformed)
+        ));
+    }
+
+    #[test]
     fn control_required_extension_does_not_enter_gpdu_or_echo_paths() {
         // Type 0x80 is currently unmodelled and requires endpoint comprehension.
         let required = [0x34, 255, 0, 9, 1, 2, 3, 4, 0, 0, 0, 0x80, 1, 0, 0, 0, 0x45];
@@ -696,6 +1145,31 @@ mod tests {
         assert_eq!(
             receive(&optional, 49152).kind(),
             GtpuControlDatagramKind::Gpdu
+        );
+    }
+
+    #[test]
+    fn control_tunnel_status_is_ignorable_without_reply_authority() {
+        let wire = [0x30, 253, 0, 4, 0, 0, 0x10, 1, 230, 0, 1, 1];
+        let event = receive(&wire, 49152);
+        assert_eq!(event.kind(), GtpuControlDatagramKind::TunnelStatus);
+        assert!(matches!(
+            downlink_event(receive(&wire, 49152)),
+            crate::GtpuDownlinkEvent::Control(event)
+                if event.kind() == GtpuControlDatagramKind::TunnelStatus
+        ));
+        assert!(matches!(
+            event.control,
+            Some(GtpuControlMessage::TunnelStatus(_))
+        ));
+        assert!(receive(&wire, 49152).echo_response(budget()).is_err());
+        assert!(receive(&wire, 49152)
+            .unknown_tunnel_error(budget())
+            .is_err());
+        let missing = [0x30, 253, 0, 0, 0, 0, 0x10, 1];
+        assert_eq!(
+            receive(&missing, 49152).kind(),
+            GtpuControlDatagramKind::Malformed
         );
     }
 
@@ -831,14 +1305,54 @@ mod tests {
     }
 
     #[test]
+    fn review_known_required_formats_keep_notification_authority_only() {
+        for kind in [0x81, 0x82, 0x83, 0x84, 0xc0] {
+            for message_type in [1, 255] {
+                let extension = if kind == 0x82 {
+                    vec![2, 0, 0, 1, 0, 0, 0, 0]
+                } else {
+                    vec![1, 0, 1, 0]
+                };
+                let mut wire = vec![0x36, message_type, 0, 0, 0, 0, 0, 1, 0, 7, 0, kind];
+                wire.extend_from_slice(&extension);
+                if message_type == 255 {
+                    wire.push(0x45);
+                } else {
+                    wire[7] = 0;
+                }
+                let length = (wire.len() - 8) as u16;
+                wire[2..4].copy_from_slice(&length.to_be_bytes());
+                let event = receive(&wire, 49152);
+                assert_eq!(
+                    event.kind(),
+                    GtpuControlDatagramKind::UnsupportedRequiredExtension,
+                    "kind={kind:#x}, message={message_type}"
+                );
+                let supported =
+                    GtpuExtensionHeaderTypeList::new([GtpuExtensionHeaderType::new(0x85)]).unwrap();
+                let plan = event.extension_notification(supported, budget()).unwrap();
+                assert_eq!(plan.bytes[1], 31);
+                assert_eq!(
+                    receive(&wire, 49152)
+                        .unknown_tunnel_error(budget())
+                        .unwrap_err(),
+                    GtpuControlPortError::WrongProcedure
+                );
+            }
+        }
+    }
+
+    #[test]
     fn control_endpoint_comprehension_domain_preserves_optional_bytes() {
         for extension in 1..=u8::MAX {
-            let packet = [
+            let mut packet = vec![
                 0x34, 255, 0, 9, 1, 2, 3, 4, 0, 0, 0, extension, 1, 0, 0, 0, 0x45,
             ];
+            if matches!(extension, 0x03 | 0x82) {
+                packet.splice(12..16, [2, 0, 1, 2, 0, 0, 0, 0]);
+                packet[3] = 13;
+            }
             let event = receive(&packet, 49152);
-            // Endpoint comprehension bits (TS 29.281 5.2.1); the shared
-            // codec additionally implements PSC (0x85) and UDP Port (0x40).
             let required = extension >= 0x80 && extension != 0x85;
             assert_eq!(event.bytes(), packet);
             assert_eq!(
@@ -883,6 +1397,7 @@ mod tests {
             let event = receive(&wire, 49152);
             let kind = match fields[1] {
                 "C" => GtpuControlDatagramKind::Control,
+                "T" => GtpuControlDatagramKind::TunnelStatus,
                 "G" => GtpuControlDatagramKind::Gpdu,
                 "R" => GtpuControlDatagramKind::UnsupportedRequiredExtension,
                 "U" => GtpuControlDatagramKind::Unmodelled,
@@ -908,6 +1423,6 @@ mod tests {
             }
             count += 1;
         }
-        assert_eq!(count, 1204);
+        assert_eq!(count, 1208);
     }
 }

@@ -629,7 +629,7 @@ where
                 reason = "frame_too_large",
                 "watch response exceeded the negotiated frame limit"
             );
-            let fallback = Response::WatchEntry(Err(StoreError::BackendUnavailable(
+            let fallback = Response::watch_entry(Err(StoreError::BackendUnavailable(
                 WATCH_RESPONSE_LIMIT_MESSAGE.to_string(),
             )));
             write_post_auth_response_until(
@@ -653,7 +653,7 @@ where
 
 fn discard_watch_response_iteratively(response: Response) {
     if let Response::WatchEntry(Ok(entry)) = response {
-        discard_replication_entries_iteratively(vec![entry]);
+        discard_replication_entries_iteratively(vec![*entry]);
     }
 }
 
@@ -663,7 +663,7 @@ fn discard_response_iteratively(response: Response) {
             discard_replication_entries_iteratively(entries);
         }
         Response::WatchEntry(Ok(entry)) => {
-            discard_replication_entries_iteratively(vec![entry]);
+            discard_replication_entries_iteratively(vec![*entry]);
         }
         response => drop(response),
     }
@@ -677,13 +677,49 @@ fn backend_contract_error() -> StoreError {
     StoreError::BackendUnavailable(BACKEND_CONTRACT_MESSAGE.to_string())
 }
 
-fn cas_outcome_is_definitive(result: &Result<CompareAndSetResult, StoreError>) -> bool {
-    !matches!(
-        result,
-        Err(StoreError::BackendUnavailable(_)
-            | StoreError::BackendOperationOutcomeUnavailable
-            | StoreError::CasIdempotencyOutcomeUnavailable)
+fn store_error_is_definitive(error: &StoreError) -> bool {
+    matches!(
+        error,
+        StoreError::NotFound
+            | StoreError::StaleFence
+            | StoreError::CasConflict
+            | StoreError::CasIdempotencyConflict
+            | StoreError::TopologyAuthorityRevoked
+            | StoreError::CapabilityNotSupported(_)
+            | StoreError::InvalidKey(_)
+            | StoreError::InvalidReplicationSequence
+            | StoreError::InvalidReplicationLogRange
+            | StoreError::ReplicationLogPageTooLarge { .. }
+            | StoreError::ReplicationLogCursorCompacted { .. }
+            | StoreError::ReplicationWatchCatchUpRequired
+            | StoreError::ReplicationOperationLimitExceeded
+            | StoreError::InvalidSessionTtl
+            | StoreError::InvalidRecordExpiry
+            | StoreError::RecordExpiryPreflightLimitExceeded
+            | StoreError::LeaseHeld
+            | StoreError::LeaseExpired
+            | StoreError::Crypto(_)
+            | StoreError::Serialization(_)
+            | StoreError::PayloadTooLarge { .. }
+            | StoreError::InvalidRestoreScanRequest(_)
+            | StoreError::InvalidRestoreScanResponse(_)
+            | StoreError::RestoreScanPageTooLarge { .. }
+            | StoreError::RestoreScanCursorStale
+            | StoreError::RestoreScanWorkBudgetExceeded
+            | StoreError::RestoreScanResponseTooLarge { .. }
+            | StoreError::FencedTransitionRequestConflict
+            | StoreError::FencedTransitionHistoryFull
+            | StoreError::FencedTransitionRetentionExhausted
+            | StoreError::FencedTransitionStorageExhausted
+            | StoreError::FencedTransitionHistoryEpochRetired
+            | StoreError::FencedTransitionHistoryEpochNotActive
+            | StoreError::SessionRecordReserved
+            | StoreError::FencedTransitionVoided
     )
+}
+
+fn cas_outcome_is_definitive(result: &Result<CompareAndSetResult, StoreError>) -> bool {
+    result.as_ref().err().is_none_or(store_error_is_definitive)
 }
 
 fn backend_lease_contract_error() -> LeaseError {
@@ -844,7 +880,12 @@ fn store_deadline_error(
         (BackendDeadlineOutcome::CompareAndSet, BackendOperationPhase::Execute) => {
             StoreError::CasIdempotencyOutcomeUnavailable
         }
-        (BackendDeadlineOutcome::RestoreScan, _) => StoreError::RestoreScanWorkBudgetExceeded,
+        // A server transport deadline firing before the store's own operation
+        // timeout is slow progress, not proof that the fixed scan work budget
+        // is exhausted; callers may retry or fail over.
+        (BackendDeadlineOutcome::RestoreScan, _) => {
+            StoreError::BackendUnavailable("backend restore scan deadline exceeded".to_string())
+        }
         (BackendDeadlineOutcome::Preflight, _) => {
             StoreError::BackendUnavailable("backend preflight deadline exceeded".to_string())
         }
@@ -911,34 +952,16 @@ fn normalize_store_backend_outcome<T>(
     result: Result<T, StoreError>,
     outcome: BackendDeadlineOutcome,
 ) -> Result<T, StoreError> {
-    match (outcome, result) {
-        (
-            BackendDeadlineOutcome::Preflight,
-            Err(
-                StoreError::BackendUnavailable(_)
-                | StoreError::BackendOperationOutcomeUnavailable
-                | StoreError::CasIdempotencyOutcomeUnavailable,
-            ),
-        ) => Err(StoreError::BackendUnavailable(
-            "backend record-expiry preflight unavailable".into(),
-        )),
-        (
-            BackendDeadlineOutcome::CompareAndSet,
-            Err(
-                StoreError::BackendUnavailable(_)
-                | StoreError::BackendOperationOutcomeUnavailable
-                | StoreError::CasIdempotencyOutcomeUnavailable,
-            ),
-        ) => Err(StoreError::CasIdempotencyOutcomeUnavailable),
-        (
-            BackendDeadlineOutcome::Mutation,
-            Err(
-                StoreError::BackendUnavailable(_)
-                | StoreError::BackendOperationOutcomeUnavailable
-                | StoreError::CasIdempotencyOutcomeUnavailable,
-            ),
-        ) => Err(StoreError::BackendOperationOutcomeUnavailable),
-        (_, result) => result,
+    match result {
+        Err(error) if !store_error_is_definitive(&error) => Err(match outcome {
+            BackendDeadlineOutcome::Read | BackendDeadlineOutcome::RestoreScan => error,
+            BackendDeadlineOutcome::Preflight => {
+                StoreError::BackendUnavailable("backend record-expiry preflight unavailable".into())
+            }
+            BackendDeadlineOutcome::CompareAndSet => StoreError::CasIdempotencyOutcomeUnavailable,
+            BackendDeadlineOutcome::Mutation => StoreError::BackendOperationOutcomeUnavailable,
+        }),
+        result => result,
     }
 }
 
@@ -3625,10 +3648,15 @@ where
                             check_response_write_control(deadline, &cancellation)?;
                             let (item, close_after) = match item {
                                 Ok(entry) => match entry.into_validated() {
-                                    Ok(entry) if entry.sequence == expected_sequence => {
-                                        let terminal = expected_sequence == u64::MAX;
+                                    Ok(entry)
+                                        if entry
+                                            .matches_watch_cursor(expected_sequence)
+                                            .unwrap_or(false) =>
+                                    {
+                                        let terminal = entry.sequence == u64::MAX;
                                         if !terminal {
-                                            expected_sequence = expected_sequence
+                                            expected_sequence = entry
+                                                .sequence
                                                 .checked_add(1)
                                                 .ok_or(ProtocolError::InvalidWireValue)?;
                                         }
@@ -3645,7 +3673,7 @@ where
                             check_response_write_control(deadline, &cancellation)?;
                             let terminate = write_watch_response_until(
                                 writer,
-                                Response::WatchEntry(item),
+                                Response::watch_entry(item),
                                 effective_response_frame_size,
                                 deadline,
                                 &cancellation,
@@ -3660,7 +3688,7 @@ where
                         let deadline = response_write_deadline(idle_timeout)?;
                         let terminate = write_watch_response_until(
                             writer,
-                            Response::WatchEntry(Err(e)),
+                            Response::watch_entry(Err(e)),
                             effective_response_frame_size,
                             deadline,
                             &cancellation,
@@ -3915,6 +3943,9 @@ where
 
 #[cfg(test)]
 mod tests {
+    #[path = "restore_scan_deadline_tests.rs"]
+    mod restore_scan_deadline_tests;
+
     use super::*;
     use crate::protocol::{
         ensure_frame_fits, ensure_restore_scan_success_frame_fits, read_frame, write_frame,
@@ -4636,6 +4667,7 @@ mod tests {
         let key = record.key.clone();
         let timestamp = opc_types::Timestamp::now_utc();
         ReplicationEntry {
+            replay_policy: opc_session_store::ReplicationReplayPolicy::prune_expired(),
             sequence,
             tx_id: format!("log-{sequence}")
                 .try_into()
@@ -4763,6 +4795,150 @@ mod tests {
         assert!(!cas_outcome_is_definitive(&unavailable));
         drop(permit);
 
+        assert!(matches!(
+            CasIdempotencyCache::begin(&cache, &peer, request_id, epoch, digest, Instant::now()),
+            CasIdempotencyAdmission::Reject(StoreError::CasIdempotencyOutcomeUnavailable)
+        ));
+    }
+
+    #[tokio::test]
+    async fn provider_configuration_never_becomes_a_final_cached_or_integrity_result() {
+        let provider = opc_key::KmsKeyProvider::new("unix://".into(), None, Duration::from_secs(1));
+        let error = EncryptedSessionPayload::encrypt(
+            &provider,
+            &restore_record(b"provider-config", 16),
+            "provider-config",
+        )
+        .await
+        .unwrap_err();
+        let result: Result<CompareAndSetResult, StoreError> = Err(error.clone());
+        assert!(!cas_outcome_is_definitive(&result));
+        assert!(matches!(
+            normalize_store_backend_outcome::<()>(
+                Err(error.clone()),
+                BackendDeadlineOutcome::Mutation
+            ),
+            Err(StoreError::BackendOperationOutcomeUnavailable)
+        ));
+        assert_eq!(
+            opc_session_store::SessionConsumerStoreError::from(error),
+            opc_session_store::SessionConsumerStoreError::Unavailable
+        );
+    }
+
+    #[test]
+    fn legacy_key_provider_outages_are_ambiguous_in_every_mutating_family() {
+        let error = || StoreError::KeyProviderUnavailable("provider unavailable".into());
+        assert!(matches!(
+            normalize_store_backend_outcome::<()>(Err(error()), BackendDeadlineOutcome::Preflight),
+            Err(StoreError::BackendUnavailable(_))
+        ));
+        assert_eq!(
+            normalize_store_backend_outcome::<()>(Err(error()), BackendDeadlineOutcome::Mutation),
+            Err(StoreError::BackendOperationOutcomeUnavailable)
+        );
+        assert_eq!(
+            normalize_store_backend_outcome::<()>(
+                Err(error()),
+                BackendDeadlineOutcome::CompareAndSet
+            ),
+            Err(StoreError::CasIdempotencyOutcomeUnavailable)
+        );
+    }
+
+    #[tokio::test]
+    async fn custody_failures_never_become_cached_final_cas_results() {
+        use opc_key::{
+            EncryptedPayload, EnvelopeAad, KeyCustodyOperationError as C, KeyError, KeyId,
+            RemoteSealProvider, Zeroizing,
+        };
+        struct Provider(C);
+        #[async_trait::async_trait]
+        impl RemoteSealProvider for Provider {
+            async fn seal(&self, _: &EnvelopeAad, _: &[u8]) -> Result<EncryptedPayload, KeyError> {
+                Err(self.0.into())
+            }
+            async fn unseal(
+                &self,
+                _: &KeyId,
+                _: &EnvelopeAad,
+                _: &[u8],
+            ) -> Result<Zeroizing<Vec<u8>>, KeyError> {
+                Err(self.0.into())
+            }
+        }
+        let mut failures = Vec::new();
+        for error in [
+            C::NotInstalled,
+            C::IdentityChanged,
+            C::ValidationChanged,
+            C::CapabilityNotAdmitted,
+            C::CapabilityWithdrawn,
+            C::ProviderOperationFailed,
+            C::InvalidProviderOutput,
+        ] {
+            let mapped = EncryptedSessionPayload::remote_seal(
+                &Provider(error),
+                &restore_record(b"custody", 16),
+                "custody",
+            )
+            .await
+            .unwrap_err();
+            let cache = Arc::new(StdMutex::new(CasIdempotencyCache::default()));
+            let peer = ReplicaId::new("replica-custody").unwrap();
+            let request_id = uuid::Uuid::from_u128(75);
+            let epoch = cache.lock().unwrap().epoch();
+            let CasIdempotencyAdmission::Execute(permit) = CasIdempotencyCache::begin(
+                &cache,
+                &peer,
+                request_id,
+                epoch,
+                [3; 32],
+                Instant::now(),
+            ) else {
+                panic!("execute first request")
+            };
+            let result = Err(mapped);
+            if cas_outcome_is_definitive(&result) {
+                permit.complete(result);
+            } else {
+                drop(permit);
+            }
+            if !matches!(
+                CasIdempotencyCache::begin(
+                    &cache,
+                    &peer,
+                    request_id,
+                    epoch,
+                    [3; 32],
+                    Instant::now()
+                ),
+                CasIdempotencyAdmission::Reject(StoreError::CasIdempotencyOutcomeUnavailable)
+            ) {
+                failures.push(error);
+            }
+        }
+        assert!(
+            failures.is_empty(),
+            "custody state was cached as a final rejection: {failures:?}"
+        );
+    }
+
+    #[test]
+    fn cas_idempotency_cache_tombstones_key_provider_outages() {
+        let cache = Arc::new(StdMutex::new(CasIdempotencyCache::default()));
+        let peer = ReplicaId::new("replica-a").expect("peer");
+        let request_id = uuid::Uuid::from_u128(74);
+        let epoch = cache.lock().expect("cache").epoch();
+        let digest = [3; 32];
+        let CasIdempotencyAdmission::Execute(permit) =
+            CasIdempotencyCache::begin(&cache, &peer, request_id, epoch, digest, Instant::now())
+        else {
+            panic!("first request must execute");
+        };
+        let unavailable = Err(StoreError::KeyProviderUnavailable("provider outage".into()));
+        assert!(!cas_outcome_is_definitive(&unavailable));
+        drop(permit);
         assert!(matches!(
             CasIdempotencyCache::begin(&cache, &peer, request_id, epoch, digest, Instant::now()),
             CasIdempotencyAdmission::Reject(StoreError::CasIdempotencyOutcomeUnavailable)
@@ -5347,7 +5523,7 @@ mod tests {
 
         let terminate = write_watch_response(
             &mut writer,
-            Response::WatchEntry(Ok(replication_log_entry(1, 8192))),
+            Response::watch_entry(Ok(replication_log_entry(1, 8192))),
             budget,
             std::time::Duration::from_secs(1),
             &TEST_SERVER_NOT_CANCELLED,
@@ -5373,7 +5549,8 @@ mod tests {
                 ops: vec![operation],
             };
         }
-        let response = Response::WatchEntry(Ok(ReplicationEntry {
+        let response = Response::watch_entry(Ok(ReplicationEntry {
+            replay_policy: opc_session_store::ReplicationReplayPolicy::prune_expired(),
             sequence: 1,
             tx_id: "malformed-watch-tree"
                 .try_into()
@@ -5522,6 +5699,7 @@ mod tests {
     fn very_wide_malformed_log_and_watch_outputs_are_disposed_iteratively() {
         fn wide_entry(sequence: u64) -> ReplicationEntry {
             ReplicationEntry {
+                replay_policy: opc_session_store::ReplicationReplayPolicy::prune_expired(),
                 sequence,
                 tx_id: format!("wide-{sequence}")
                     .try_into()
@@ -5536,7 +5714,7 @@ mod tests {
         }
 
         discard_response_iteratively(Response::GetReplicationLog(Ok(vec![wide_entry(1)])));
-        discard_watch_response_iteratively(Response::WatchEntry(Ok(wide_entry(2))));
+        discard_watch_response_iteratively(Response::watch_entry(Ok(wide_entry(2))));
     }
 
     #[tokio::test]
@@ -5560,5 +5738,22 @@ mod tests {
                     if error.kind() == std::io::ErrorKind::TimedOut
             ));
         }
+    }
+
+    #[test]
+    fn restore_scan_transport_deadline_is_retryable_availability() {
+        assert!(matches!(
+            store_deadline_error(
+                BackendDeadlineOutcome::RestoreScan,
+                BackendOperationPhase::Queue
+            ),
+            StoreError::BackendUnavailable(_)
+        ));
+    }
+    #[test]
+    fn real_crypto_rejection_remains_a_definitive_store_outcome() {
+        assert!(store_error_is_definitive(&StoreError::Crypto(
+            "authenticated rejection".into()
+        )));
     }
 }

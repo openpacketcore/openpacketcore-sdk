@@ -1,8 +1,16 @@
 #[path = "support/formation_clock.rs"]
 mod formation_clock;
 
+#[path = "support/election_progress.rs"]
+mod election_progress;
+
+use election_progress::wait as wait_for_survivor_election;
+
 #[path = "consensus_openraft/late_acquire.rs"]
 mod late_acquire;
+
+#[path = "consensus_openraft/late_result.rs"]
+mod late_result;
 
 #[path = "consensus_openraft/stepdown.rs"]
 mod stepdown;
@@ -65,9 +73,8 @@ use tempfile::TempDir;
 
 const MEMBER_COUNT: usize = 3;
 const OPERATION_TIMEOUT: Duration = Duration::from_millis(750);
-// Allow one complete resampled election after a split vote, followed by one
-// complete profiled operation. These test-evidence ceilings follow the shared
-// timing authority instead of assuming the former short election window.
+// Election acquisition renews this stall interval only on a higher term.
+// Response and post-election convergence checks retain fixed deadlines.
 const RECOVERY_TIMEOUT: Duration = Duration::from_millis(
     DURABLE_CONSENSUS_TIMING_PROFILE
         .election_timeout_max_millis
@@ -647,6 +654,39 @@ impl SessionConsensusRpcHandler for HoldAppendEntriesForRequest {
     }
 }
 
+struct HoldFencedTransitionBeforeAdmission {
+    inner: Arc<dyn SessionConsensusRpcHandler>,
+    request_id: [u8; 16],
+    clock: Arc<MutableTestClock>,
+    received_at: StdMutex<Option<opc_types::Timestamp>>,
+    arrived: tokio::sync::Notify,
+    release: tokio::sync::Notify,
+}
+
+impl fmt::Debug for HoldFencedTransitionBeforeAdmission {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("HoldFencedTransitionBeforeAdmission(<redacted>)")
+    }
+}
+
+#[async_trait]
+impl SessionConsensusRpcHandler for HoldFencedTransitionBeforeAdmission {
+    async fn handle(
+        &self,
+        authenticated_sender: SessionConsensusNodeId,
+        request: SessionConsensusWireRequest,
+    ) -> SessionConsensusWireResponse {
+        if request.family == SessionConsensusRpcFamily::ForwardMutation
+            && contains_bytes(&request.payload, &self.request_id)
+        {
+            *self.received_at.lock().expect("admission arrival clock") = Some(self.clock.now_utc());
+            self.arrived.notify_one();
+            self.release.notified().await;
+        }
+        self.inner.handle(authenticated_sender, request).await
+    }
+}
+
 struct Baseline36720ActivationProbeHandler {
     inner: Arc<dyn SessionConsensusRpcHandler>,
 }
@@ -855,18 +895,109 @@ impl Clock for MutableTestClock {
     }
 }
 
-async fn commit_snapshot_triggering_commands(store: &ConsensusSessionStore) {
+async fn commit_snapshot_triggering_commands(store: &ConsensusSessionStore) -> usize {
     // Retain the production 4,096-log snapshot threshold and commit every
     // qualification command. Each request must finish before the next begins:
     // concurrent logical-time reads intentionally share one bounded consensus
     // proposal, whereas this helper must commit the full production snapshot
     // threshold without adding an application-visible effect.
+    let mut completed_commands = 0;
     for _ in 0..SNAPSHOT_CATCH_UP_COMMANDS {
         store
             .max_replication_sequence()
             .await
             .expect("advance committed logical time toward snapshot compaction");
+        completed_commands += 1;
     }
+    completed_commands
+}
+
+async fn commit_snapshot_triggering_commands_observed(
+    store: &ConsensusSessionStore,
+    phase: &'static str,
+) {
+    // Retain the preparation checks without sampling storage during the batch.
+    let initial = store.status();
+    let completed_commands = commit_snapshot_triggering_commands(store).await;
+    assert_eq!(
+        completed_commands, SNAPSHOT_CATCH_UP_COMMANDS,
+        "the {phase} preparation batch issues every unchanged snapshot command"
+    );
+    let completed = store.status();
+    assert!(
+        (
+            completed.applied_index,
+            completed.last_log_index,
+            completed.completed_snapshot_count,
+        ) != (
+            initial.applied_index,
+            initial.last_log_index,
+            initial.completed_snapshot_count,
+        ),
+        "the {phase} preparation batch advances the store's published state"
+    );
+}
+
+async fn snapshot_command_batch<F: std::future::Future>(
+    commands: F,
+) -> Result<F::Output, tokio::time::error::Elapsed> {
+    tokio::time::timeout(SNAPSHOT_COMMAND_BATCH_TIMEOUT, commands).await
+}
+
+#[tokio::test(start_paused = true)]
+async fn snapshot_preparation_progress_keeps_the_original_aggregate_bound() {
+    // Each command makes progress inside the store's operation deadline, but
+    // a 900-second batch must still fail at the original 300-second deadline.
+    let completed = std::cell::Cell::new(0);
+    let started = tokio::time::Instant::now();
+    let slow_batch = snapshot_command_batch(async {
+        for _ in 0..180 {
+            tokio::time::sleep(Duration::from_secs(5)).await;
+            completed.set(completed.get() + 1);
+        }
+    });
+    tokio::pin!(slow_batch);
+    assert!(futures_util::poll!(slow_batch.as_mut()).is_pending());
+    for expected in 1..=59 {
+        tokio::time::advance(Duration::from_secs(5)).await;
+        assert!(futures_util::poll!(slow_batch.as_mut()).is_pending());
+        assert_eq!(completed.get(), expected);
+    }
+    tokio::time::advance(Duration::from_secs(4)).await;
+    assert!(futures_util::poll!(slow_batch.as_mut()).is_pending());
+    assert_eq!(started.elapsed(), Duration::from_secs(299));
+    tokio::time::advance(Duration::from_secs(1)).await;
+    assert!(
+        matches!(
+            futures_util::poll!(slow_batch.as_mut()),
+            std::task::Poll::Ready(Err(_))
+        ),
+        "continuous command progress cannot extend the 300-second aggregate deadline"
+    );
+    assert_eq!(started.elapsed(), Duration::from_secs(300));
+    assert!(completed.get() < 180, "the late batch is not accepted");
+
+    // Finishing within the same bound remains successful, including its value.
+    let started = tokio::time::Instant::now();
+    let completed_batch = snapshot_command_batch(async {
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        180
+    })
+    .await;
+    assert_eq!(completed_batch.unwrap(), 180);
+    assert_eq!(started.elapsed(), Duration::from_secs(1));
+
+    // A batch with no progress is bounded too; no storage observer is needed.
+    let started = tokio::time::Instant::now();
+    let stalled_batch = snapshot_command_batch(std::future::pending::<()>());
+    tokio::pin!(stalled_batch);
+    assert!(futures_util::poll!(stalled_batch.as_mut()).is_pending());
+    tokio::time::advance(Duration::from_secs(300)).await;
+    assert!(matches!(
+        futures_util::poll!(stalled_batch.as_mut()),
+        std::task::Poll::Ready(Err(_))
+    ));
+    assert_eq!(started.elapsed(), Duration::from_secs(300));
 }
 
 impl TestCluster {
@@ -1034,20 +1165,31 @@ impl TestCluster {
     }
 
     async fn wait_all_ready(&self, deadline: Duration) -> Result<(), ()> {
-        tokio::time::timeout(deadline, async {
-            loop {
-                let reports = futures_util::future::join_all(
-                    self.stores
-                        .iter()
-                        .map(ConsensusSessionStore::probe_durable_readiness),
-                )
-                .await;
-                if reports.iter().all(|report| report.is_ready()) {
-                    return;
+        let term = self
+            .stores
+            .iter()
+            .map(|store| store.status().term)
+            .max()
+            .unwrap_or(0);
+        election_progress::wait(
+            deadline,
+            term,
+            async {
+                loop {
+                    let reports = futures_util::future::join_all(
+                        self.stores
+                            .iter()
+                            .map(ConsensusSessionStore::probe_durable_readiness),
+                    )
+                    .await;
+                    if reports.iter().all(|report| report.is_ready()) {
+                        return;
+                    }
+                    tokio::time::sleep(POLL_INTERVAL).await;
                 }
-                tokio::time::sleep(POLL_INTERVAL).await;
-            }
-        })
+            },
+            |term| next_election_term(&self.stores, term),
+        )
         .await
         .map_err(|_| ())
     }
@@ -1369,6 +1511,63 @@ impl TestCluster {
             .max()
             .unwrap_or(0)
     }
+}
+
+#[tokio::test(start_paused = true)]
+async fn survivor_election_wait_accepts_higher_terms_past_each_original_envelope() {
+    for watchdog in [RECOVERY_TIMEOUT, SNAPSHOT_RECOVERY_TIMEOUT] {
+        let (published, terms) = tokio::sync::watch::channel(7);
+        let (done, completion) = tokio::sync::oneshot::channel();
+        let wait = wait_for_survivor_election(watchdog, 7, completion, |previous| {
+            let mut terms = terms.clone();
+            async move {
+                let next = *terms
+                    .wait_for(|term| *term > previous)
+                    .await
+                    .expect("term publication remains live");
+                next
+            }
+        });
+        tokio::pin!(wait);
+        assert!(futures_util::poll!(wait.as_mut()).is_pending());
+        for term in 8..=10 {
+            tokio::time::advance(watchdog - Duration::from_secs(1)).await;
+            published.send_replace(term);
+            assert!(
+                futures_util::poll!(wait.as_mut()).is_pending(),
+                "higher survivor terms must preserve acquisition beyond {watchdog:?}"
+            );
+        }
+        done.send(17)
+            .expect("acquisition still awaits its predicate");
+        assert_eq!(
+            wait.await
+                .expect("continued higher terms preserve the watchdog interval")
+                .expect("the full acquisition predicate completed"),
+            17
+        );
+    }
+}
+
+async fn next_election_term(stores: &[ConsensusSessionStore], term: u64) -> u64 {
+    #[cfg(feature = "test-control")]
+    {
+        use futures_util::StreamExt;
+        let mut changes = stores
+            .iter()
+            .map(|store| store.wait_for_status_for_test(move |status| status.term > term))
+            .collect::<futures_util::stream::FuturesUnordered<_>>();
+        let _ = changes.next().await;
+    }
+    #[cfg(not(feature = "test-control"))]
+    while stores.iter().all(|store| store.status().term <= term) {
+        tokio::time::sleep(POLL_INTERVAL).await;
+    }
+    stores
+        .iter()
+        .map(|store| store.status().term)
+        .max()
+        .unwrap_or(term)
 }
 
 struct CountingKeyProvider {
@@ -4756,54 +4955,109 @@ async fn fenced_transition_renew_rejects_absent_or_expired_records_without_effec
 
 #[tokio::test]
 async fn fenced_transition_expired_lease_is_rejected_at_committed_admission() {
-    let cluster = TestCluster::start().await;
-    let (leader, _, _) = cluster.observed_leader();
-    let source = (leader + 1) % MEMBER_COUNT;
-    let store = &cluster.stores[source];
-    let key = session_key(b"fenced-transition-expired-admission");
-    let observation = store
-        .observe_fenced_transition(&key)
-        .await
-        .expect("observe transition key");
-    let request_owner = owner("fenced-transition-owner");
-    let (create, original) = fenced_acquire_create_request(
-        key.clone(),
-        request_owner.clone(),
-        observation.current_fence(),
-        [0x41; 16],
-        Duration::from_millis(50),
-        b"sealed-fenced-transition-expiry",
-    );
-    let created = store
-        .fenced_transition(create)
-        .await
-        .expect("commit short-lived transition");
-    let expiry_request = FencedTransitionRequest::new(
-        FencedTransitionRequestId::from_bytes([0x42; 16]),
-        FencedTransitionLease::renew(created.lease().clone(), Duration::from_secs(30))
-            .expect("build expired renewal"),
-        FencedTransitionMutation::delete(Generation::new(1)),
-    )
-    .expect("build expiry transition");
-    cluster.delay_calls(source, Duration::from_millis(200));
-    let result = store.fenced_transition(expiry_request).await;
-    cluster.stop_delaying_calls(source);
-    assert!(
-        matches!(result, Err(StoreError::LeaseExpired)),
-        "a lease expired before committed admission cannot mutate the record"
-    );
-    assert!(
-        matches!(store.get(&key).await, Ok(Some(record)) if record == original),
-        "expired admission leaves the stored record unchanged"
-    );
-    let after_expiry = store
-        .observe_fenced_transition(&key)
-        .await
-        .expect("observe after expired admission");
-    assert!(
-        after_expiry.current_fence() == created.lease().fence(),
-        "expired admission does not mint another fence"
-    );
+    let clock = Arc::new(MutableTestClock::new(
+        opc_types::Timestamp::from_offset_datetime(
+            time::OffsetDateTime::from_unix_timestamp(1_900_000_000).expect("test timestamp"),
+        ),
+    ));
+    let cluster = TestCluster::start_with_clock(clock.clone()).await;
+    late_result::with_paused_protocol_time(async {
+        let (leader, _, _) = cluster.observed_leader();
+        let source = (leader + 1) % MEMBER_COUNT;
+        let store = &cluster.stores[source];
+        let key = session_key(b"fenced-transition-expired-admission");
+        let observation = store
+            .observe_fenced_transition(&key)
+            .await
+            .expect("observe transition key");
+        let request_owner = owner("fenced-transition-owner");
+        let (create, original) = fenced_acquire_create_request(
+            key.clone(),
+            request_owner.clone(),
+            observation.current_fence(),
+            [0x41; 16],
+            Duration::from_millis(50),
+            b"sealed-fenced-transition-expiry",
+        );
+        let created = store
+            .fenced_transition(create)
+            .await
+            .expect("commit short-lived transition");
+        let expiry_request = FencedTransitionRequest::new(
+            FencedTransitionRequestId::from_bytes([0x42; 16]),
+            FencedTransitionLease::renew(created.lease().clone(), Duration::from_secs(30))
+                .expect("build expired renewal"),
+            FencedTransitionMutation::delete(Generation::new(1)),
+        )
+        .expect("build expiry transition");
+        let admission = Arc::new(HoldFencedTransitionBeforeAdmission {
+            inner: cluster.stores[leader].rpc_handler(),
+            request_id: *expiry_request.request_id().as_bytes(),
+            clock: clock.clone(),
+            received_at: StdMutex::new(None),
+            arrived: tokio::sync::Notify::new(),
+            release: tokio::sync::Notify::new(),
+        });
+        cluster.paths[&(source, leader)].install(admission.clone());
+        assert!(
+            clock.now_utc() < created.lease().expires_at(),
+            "the renewal starts while its lease is still live"
+        );
+        let renewal = store.fenced_transition(expiry_request.clone());
+        tokio::pin!(renewal);
+        assert!(
+            futures_util::poll!(&mut renewal).is_pending(),
+            "the renewal is admitted before the runtime stall"
+        );
+        tokio::select! {
+            biased;
+            result = &mut renewal => panic!("renewal completed before leader admission was released: {result:?}"),
+            () = admission.arrived.notified() => {}
+        }
+        assert!(
+            admission
+                .received_at
+                .lock()
+                .expect("admission arrival clock")
+                .expect("the actual forwarded renewal reached the leader gate")
+                < created.lease().expires_at(),
+            "the forwarded renewal is live before leader admission"
+        );
+        std::thread::sleep(OPERATION_TIMEOUT + Duration::from_millis(250));
+        // The actual renewal arrived while live. Cross the exact expiry
+        // boundary before leader admission, without spending protocol time.
+        clock.set(created.lease().expires_at());
+        admission.release.notify_one();
+        let result = renewal.await;
+        assert!(
+            matches!(result, Err(StoreError::LeaseExpired)),
+            "a lease expired before committed admission cannot mutate the record: {result:?}"
+        );
+        let recorded = store
+            .fenced_transition_status(&expiry_request)
+            .await
+            .expect("read committed expiry receipt");
+        assert!(
+            matches!(recorded,
+                FencedTransitionStatus::Recorded(result)
+                    if result.as_ref() == &Err(StoreError::LeaseExpired)
+            ),
+            "the expired renewal is rejected by committed admission"
+        );
+        assert!(
+            matches!(store.get(&key).await, Ok(Some(record)) if record == original),
+            "expired admission leaves the stored record unchanged"
+        );
+        let after_expiry = store
+            .observe_fenced_transition(&key)
+            .await
+            .expect("observe after expired admission");
+        assert!(
+            after_expiry.current_fence() == created.lease().fence(),
+            "expired admission does not mint another fence"
+        );
+    })
+    .await;
 }
 
 #[tokio::test]
@@ -5699,27 +5953,35 @@ async fn fenced_transition_leader_transfer_preserves_exact_replay_on_surviving_v
         .expect("all live voters apply the durable activation before failover");
 
     cluster.isolate(old_leader);
-    let recovery_deadline = tokio::time::Instant::now() + RECOVERY_TIMEOUT;
-    let (new_leader_id, new_term) = tokio::time::timeout_at(recovery_deadline, async {
-        loop {
-            let statuses = survivors
-                .iter()
-                .map(|index| cluster.stores[*index].status())
-                .collect::<Vec<_>>();
-            if let Some(candidate) = statuses.first().and_then(|status| status.leader_id) {
-                let term = statuses.first().expect("survivor status").term;
-                if candidate != old_leader_id
-                    && term > old_term
-                    && statuses
-                        .iter()
-                        .all(|status| status.leader_id == Some(candidate) && status.term == term)
-                {
-                    break (candidate, term);
+    let survivor_stores = survivors
+        .iter()
+        .map(|index| cluster.stores[*index].clone())
+        .collect::<Vec<_>>();
+    let (new_leader_id, new_term) = wait_for_survivor_election(
+        RECOVERY_TIMEOUT,
+        old_term,
+        async {
+            loop {
+                let statuses = survivors
+                    .iter()
+                    .map(|index| cluster.stores[*index].status())
+                    .collect::<Vec<_>>();
+                if let Some(candidate) = statuses.first().and_then(|status| status.leader_id) {
+                    let term = statuses.first().expect("survivor status").term;
+                    if candidate != old_leader_id
+                        && term > old_term
+                        && statuses.iter().all(|status| {
+                            status.leader_id == Some(candidate) && status.term == term
+                        })
+                    {
+                        break (candidate, term);
+                    }
                 }
+                tokio::time::sleep(POLL_INTERVAL).await;
             }
-            tokio::time::sleep(POLL_INTERVAL).await;
-        }
-    })
+        },
+        |term| next_election_term(&survivor_stores, term),
+    )
     .await
     .expect("surviving voters elect a new leader");
     assert!(new_leader_id != old_leader_id && new_term > old_term);
@@ -6122,34 +6384,42 @@ async fn observed_leader_loss_elects_a_different_higher_term_leader_and_recovers
     let survivors = (0..MEMBER_COUNT)
         .filter(|index| *index != old_leader_index)
         .collect::<Vec<_>>();
-    let recovery_deadline = tokio::time::Instant::now() + RECOVERY_TIMEOUT;
+    let survivor_stores = survivors
+        .iter()
+        .map(|index| cluster.stores[*index].clone())
+        .collect::<Vec<_>>();
 
-    let (new_leader_id, new_term) = tokio::time::timeout_at(recovery_deadline, async {
-        loop {
-            let statuses = survivors
-                .iter()
-                .map(|index| cluster.stores[*index].status())
-                .collect::<Vec<_>>();
-            if let Some(new_leader_id) = statuses.first().and_then(|status| status.leader_id) {
-                let new_term = statuses.first().expect("survivor status").term;
-                if new_leader_id != old_leader_id
-                    && new_term > old_term
-                    && statuses.iter().all(|status| {
-                        status.leader_id == Some(new_leader_id) && status.term == new_term
-                    })
-                {
-                    break (new_leader_id, new_term);
+    let (new_leader_id, new_term) = election_progress::wait(
+        RECOVERY_TIMEOUT,
+        old_term,
+        async {
+            loop {
+                let statuses = survivors
+                    .iter()
+                    .map(|index| cluster.stores[*index].status())
+                    .collect::<Vec<_>>();
+                if let Some(new_leader_id) = statuses.first().and_then(|status| status.leader_id) {
+                    let new_term = statuses.first().expect("survivor status").term;
+                    if new_leader_id != old_leader_id
+                        && new_term > old_term
+                        && statuses.iter().all(|status| {
+                            status.leader_id == Some(new_leader_id) && status.term == new_term
+                        })
+                    {
+                        break (new_leader_id, new_term);
+                    }
                 }
+                tokio::time::sleep(POLL_INTERVAL).await;
             }
-            tokio::time::sleep(POLL_INTERVAL).await;
-        }
-    })
+        },
+        |term| next_election_term(&survivor_stores, term),
+    )
     .await
     .expect("surviving majority elects a different higher-term leader");
     assert_ne!(new_leader_id, old_leader_id);
     assert!(new_term > old_term);
 
-    tokio::time::timeout_at(recovery_deadline, async {
+    tokio::time::timeout(RECOVERY_TIMEOUT, async {
         loop {
             let reports = futures_util::future::join_all(
                 survivors
@@ -6226,20 +6496,31 @@ async fn lagging_replica_installs_compacted_snapshot_without_losing_committed_st
         .local_applied_index()
         .expect("lagging node initial applied index");
     cluster.isolate(0);
-    tokio::time::timeout(SNAPSHOT_RECOVERY_TIMEOUT, async {
-        loop {
-            let reports = futures_util::future::join_all(
-                cluster.stores[1..]
-                    .iter()
-                    .map(ConsensusSessionStore::probe_durable_readiness),
-            )
-            .await;
-            if reports.iter().all(DurableReadinessReport::is_ready) {
-                break;
+    let survivor_stores = &cluster.stores[1..];
+    let initial_term = survivor_stores
+        .iter()
+        .map(|store| store.status().term)
+        .max()
+        .expect("two snapshot survivors");
+    wait_for_survivor_election(
+        SNAPSHOT_RECOVERY_TIMEOUT,
+        initial_term,
+        async {
+            loop {
+                let reports = futures_util::future::join_all(
+                    cluster.stores[1..]
+                        .iter()
+                        .map(ConsensusSessionStore::probe_durable_readiness),
+                )
+                .await;
+                if reports.iter().all(DurableReadinessReport::is_ready) {
+                    break;
+                }
+                tokio::time::sleep(POLL_INTERVAL).await;
             }
-            tokio::time::sleep(POLL_INTERVAL).await;
-        }
-    })
+        },
+        |term| next_election_term(survivor_stores, term),
+    )
     .await
     .expect("surviving majority elects a current leader");
 
@@ -6402,8 +6683,9 @@ async fn compacted_successor_snapshot_catches_up_predecessor_voter_and_survives_
     // First make every voter compact, publish, and purge its predecessor
     // phase. The later isolated voter keeps its selected predecessor P, but
     // has no retained P+1..S log interval from which it can catch up.
-    tokio::time::timeout(SNAPSHOT_COMMAND_BATCH_TIMEOUT, async {
-        commit_snapshot_triggering_commands(&cluster.stores[initial_leader]).await;
+    snapshot_command_batch(async {
+        commit_snapshot_triggering_commands_observed(&cluster.stores[initial_leader], "predecessor")
+            .await;
     })
     .await
     .unwrap_or_else(|error| {
@@ -6467,8 +6749,9 @@ async fn compacted_successor_snapshot_catches_up_predecessor_voter_and_survives_
     .await
     .expect("surviving majority remains ready while predecessor voter is isolated");
 
-    tokio::time::timeout(SNAPSHOT_COMMAND_BATCH_TIMEOUT, async {
-        commit_snapshot_triggering_commands(&cluster.stores[initial_leader]).await;
+    snapshot_command_batch(async {
+        commit_snapshot_triggering_commands_observed(&cluster.stores[initial_leader], "successor")
+            .await;
     })
     .await
     .unwrap_or_else(|error| {
@@ -6671,34 +6954,45 @@ async fn fenced_transition_snapshot_install_preserves_exact_replay_without_secon
         .local_applied_index()
         .expect("lagging leader initial applied index");
     cluster.isolate(lagging_leader);
-    tokio::time::timeout(SNAPSHOT_RECOVERY_TIMEOUT, async {
-        loop {
-            let reports = futures_util::future::join_all(
-                survivors
+    let survivor_stores = survivors
+        .iter()
+        .map(|index| cluster.stores[*index].clone())
+        .collect::<Vec<_>>();
+    wait_for_survivor_election(
+        SNAPSHOT_RECOVERY_TIMEOUT,
+        old_term,
+        async {
+            loop {
+                let reports = futures_util::future::join_all(
+                    survivors
+                        .iter()
+                        .map(|index| cluster.stores[*index].probe_durable_readiness()),
+                )
+                .await;
+                let statuses = survivors
                     .iter()
-                    .map(|index| cluster.stores[*index].probe_durable_readiness()),
-            )
-            .await;
-            let statuses = survivors
-                .iter()
-                .map(|index| cluster.stores[*index].status())
-                .collect::<Vec<_>>();
-            if reports.iter().all(DurableReadinessReport::is_ready) {
-                if let Some(new_leader_id) = statuses.first().and_then(|status| status.leader_id) {
-                    let new_term = statuses.first().expect("survivor status").term;
-                    if new_leader_id != old_leader_id
-                        && new_term > old_term
-                        && statuses.iter().all(|status| {
-                            status.leader_id == Some(new_leader_id) && status.term == new_term
-                        })
+                    .map(|index| cluster.stores[*index].status())
+                    .collect::<Vec<_>>();
+                if reports.iter().all(DurableReadinessReport::is_ready) {
+                    if let Some(new_leader_id) =
+                        statuses.first().and_then(|status| status.leader_id)
                     {
-                        break;
+                        let new_term = statuses.first().expect("survivor status").term;
+                        if new_leader_id != old_leader_id
+                            && new_term > old_term
+                            && statuses.iter().all(|status| {
+                                status.leader_id == Some(new_leader_id) && status.term == new_term
+                            })
+                        {
+                            break;
+                        }
                     }
                 }
+                tokio::time::sleep(POLL_INTERVAL).await;
             }
-            tokio::time::sleep(POLL_INTERVAL).await;
-        }
-    })
+        },
+        |term| next_election_term(&survivor_stores, term),
+    )
     .await
     .expect("surviving voters elect after the committed leader is lost");
 
@@ -7137,30 +7431,43 @@ async fn committed_write_with_a_late_forward_result_is_typed_ambiguous_and_appli
 
         if response_was_delayed {
             assert_eq!(result, Err(StoreError::CasIdempotencyOutcomeUnavailable));
-            let committed = cluster.stores[source]
-                .get(&key)
-                .await
-                .expect("linearizable read after late result");
-            assert_eq!(committed, Some(expected));
-            let after = cluster.stores[source]
-                .max_replication_sequence()
-                .await
-                .expect("replication head after late result");
-            assert_eq!(after, before + 1);
+            // The late-result timeout above still runs on advancing time.
+            // These are functional postconditions, including a read whose
+            // logical-time supervisor runs on this same runtime. Freeze that
+            // clock too, so host scheduling cannot expire its queued request.
+            late_result::with_paused_protocol_time(async {
+                let read = cluster.stores[source].get(&key);
+                tokio::pin!(read);
+                assert!(
+                    futures_util::poll!(&mut read).is_pending(),
+                    "the read queues its logical-time request before the runtime stall"
+                );
+                // Reproduce a descheduled runtime while that admitted request
+                // waits. This must not consume functional protocol time.
+                std::thread::sleep(OPERATION_TIMEOUT + Duration::from_millis(250));
+                let committed = read.await.expect("linearizable read after late result");
+                assert_eq!(committed, Some(expected));
+                let after = cluster.stores[source]
+                    .max_replication_sequence()
+                    .await
+                    .expect("replication head after late result");
+                assert_eq!(after, before + 1);
 
-            let logs = replication_logs(&cluster).await;
-            assert!(logs.windows(2).all(|pair| pair[0] == pair[1]));
-            let matching_events = logs[0]
-                .iter()
-                .filter(|entry| {
-                    matches!(
-                        &entry.op,
-                        ReplicationOp::CompareAndSet { key: event_key, .. }
-                            if event_key == &key
-                    )
-                })
-                .count();
-            assert_eq!(matching_events, 1);
+                let logs = replication_logs(&cluster).await;
+                assert!(logs.windows(2).all(|pair| pair[0] == pair[1]));
+                let matching_events = logs[0]
+                    .iter()
+                    .filter(|entry| {
+                        matches!(
+                            &entry.op,
+                            ReplicationOp::CompareAndSet { key: event_key, .. }
+                                if event_key == &key
+                        )
+                    })
+                    .count();
+                assert_eq!(matching_events, 1);
+            })
+            .await;
             return;
         }
 

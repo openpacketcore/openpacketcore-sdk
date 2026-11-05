@@ -1,7 +1,7 @@
 use std::io;
 use std::mem;
 use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4, SocketAddrV6};
-use std::os::fd::{AsRawFd, BorrowedFd, FromRawFd, OwnedFd};
+use std::os::fd::{AsFd, AsRawFd, BorrowedFd, FromRawFd, OwnedFd};
 use std::ptr;
 
 use zeroize::Zeroizing;
@@ -19,10 +19,12 @@ const SCTP_GET_PEER_ADDRS: libc::c_int = 108;
 const SCTP_GET_LOCAL_ADDRS: libc::c_int = 109;
 const SCTP_SOCKOPT_CONNECTX: libc::c_int = 110;
 const SCTP_AUTH_CHUNK: libc::c_int = 21;
+const SCTP_HMAC_IDENT: libc::c_int = 22;
 const SCTP_AUTH_KEY: libc::c_int = 23;
 const SCTP_AUTH_ACTIVE_KEY: libc::c_int = 24;
 const SCTP_AUTH_DELETE_KEY: libc::c_int = 25;
 const SCTP_PEER_AUTH_CHUNKS: libc::c_int = 26;
+const SCTP_LOCAL_AUTH_CHUNKS: libc::c_int = 27;
 const SCTP_AUTH_DEACTIVATE_KEY: libc::c_int = 35;
 const SCTP_EVENT: libc::c_int = 127;
 const SCTP_AUTH_SUPPORTED: libc::c_int = 129;
@@ -157,7 +159,7 @@ struct SctpPeerAddressParameters(PackedSctpPeerAddressParameters);
 pub fn open_socket(family: AddressFamily, style: SocketStyle) -> io::Result<OwnedFd> {
     let domain = match family {
         AddressFamily::Ipv4 => libc::AF_INET,
-        AddressFamily::Ipv6 => libc::AF_INET6,
+        AddressFamily::Ipv6 | AddressFamily::Ipv6DualStack => libc::AF_INET6,
     };
     let socket_type = match style {
         SocketStyle::OneToOne => libc::SOCK_STREAM,
@@ -174,7 +176,18 @@ pub fn open_socket(family: AddressFamily, style: SocketStyle) -> io::Result<Owne
     } else {
         // SAFETY: `fd` is a fresh descriptor returned by `socket` above and is
         // not owned anywhere else.
-        Ok(unsafe { OwnedFd::from_raw_fd(fd) })
+        let fd = unsafe { OwnedFd::from_raw_fd(fd) };
+        if family == AddressFamily::Ipv6DualStack {
+            // Explicit dual-stack admission must not depend on the host's bindv6only default.
+            set_sockopt(fd.as_fd(), libc::IPPROTO_IPV6, libc::IPV6_V6ONLY, &0_i32)?;
+            set_sockopt(
+                fd.as_fd(),
+                libc::IPPROTO_SCTP,
+                libc::SCTP_I_WANT_MAPPED_V4_ADDR,
+                &0_i32,
+            )?;
+        }
+        Ok(fd)
     }
 }
 
@@ -485,23 +498,90 @@ pub fn peer_authentication_supported(fd: BorrowedFd<'_>, assoc_id: i32) -> io::R
 }
 
 pub fn peer_authenticated_chunks(fd: BorrowedFd<'_>, assoc_id: i32) -> io::Result<Vec<u8>> {
-    let mut option = vec![0_u8; SCTP_AUTH_CHUNKS_HEADER_BYTES + MAX_SCTP_CHUNK_TYPES];
-    option[0..4].copy_from_slice(&assoc_id.to_ne_bytes());
-    let actual_len = raw_getsockopt(fd, SCTP_PEER_AUTH_CHUNKS, &mut option)?;
-    decode_peer_authenticated_chunks(&option, actual_len)
+    authenticated_chunks(fd, assoc_id, SCTP_PEER_AUTH_CHUNKS)
 }
 
-fn decode_peer_authenticated_chunks(option: &[u8], actual_len: usize) -> io::Result<Vec<u8>> {
+pub fn local_authenticated_chunks(fd: BorrowedFd<'_>, assoc_id: i32) -> io::Result<Vec<u8>> {
+    authenticated_chunks(fd, assoc_id, SCTP_LOCAL_AUTH_CHUNKS)
+}
+
+fn authenticated_chunks(
+    fd: BorrowedFd<'_>,
+    assoc_id: i32,
+    option_name: i32,
+) -> io::Result<Vec<u8>> {
+    let mut option = vec![0_u8; SCTP_AUTH_CHUNKS_HEADER_BYTES + MAX_SCTP_CHUNK_TYPES];
+    option[0..4].copy_from_slice(&assoc_id.to_ne_bytes());
+    let actual_len = raw_getsockopt(fd, option_name, &mut option)?;
+    decode_authenticated_chunks(&option, actual_len)
+}
+
+pub fn set_hmac_identifiers(fd: BorrowedFd<'_>, identifiers: &[u16]) -> io::Result<()> {
+    let option = encode_hmac_identifiers(identifiers)?;
+    raw_setsockopt(fd, SCTP_HMAC_IDENT, &option).map(|_| ())
+}
+
+fn encode_hmac_identifiers(identifiers: &[u16]) -> io::Result<Vec<u8>> {
+    // RFC 6458 section 8.1.17 requires SHA-1, optionally SHA-256, in preference order.
+    if !valid_hmac_identifiers(identifiers) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "invalid SCTP HMAC preference",
+        ));
+    }
+    let mut option = (identifiers.len() as u32).to_ne_bytes().to_vec();
+    for identifier in identifiers {
+        option.extend_from_slice(&identifier.to_ne_bytes());
+    }
+    Ok(option)
+}
+
+fn valid_hmac_identifiers(identifiers: &[u16]) -> bool {
+    matches!(identifiers, [1] | [1, 3] | [3, 1])
+}
+
+pub fn hmac_identifiers(fd: BorrowedFd<'_>) -> io::Result<Vec<u16>> {
+    let mut option = [0_u8; 8];
+    let actual_len = raw_getsockopt(fd, SCTP_HMAC_IDENT, &mut option)?;
+    decode_hmac_identifiers(&option[..actual_len])
+}
+
+fn decode_hmac_identifiers(option: &[u8]) -> io::Result<Vec<u16>> {
+    let invalid = || io::Error::new(io::ErrorKind::InvalidData, "invalid SCTP HMAC readback");
+    let count = u32::from_ne_bytes(
+        option
+            .get(..4)
+            .ok_or_else(invalid)?
+            .try_into()
+            .map_err(|_| invalid())?,
+    );
+    if !(1..=2).contains(&count) || option.len() != 4 + 2 * count as usize {
+        return Err(invalid());
+    }
+    let identifiers: Vec<_> = option[4..]
+        .as_chunks::<2>()
+        .0
+        .iter()
+        .copied()
+        .map(u16::from_ne_bytes)
+        .collect();
+    if !valid_hmac_identifiers(&identifiers) {
+        return Err(invalid());
+    }
+    Ok(identifiers)
+}
+
+fn decode_authenticated_chunks(option: &[u8], actual_len: usize) -> io::Result<Vec<u8>> {
     if actual_len > option.len() {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
-            "SCTP peer authentication response exceeded the supplied buffer",
+            "SCTP authentication response exceeded the supplied buffer",
         ));
     }
     if actual_len < SCTP_AUTH_CHUNKS_HEADER_BYTES {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
-            "truncated SCTP peer authentication chunk response",
+            "truncated SCTP authentication chunk response",
         ));
     }
     let chunk_count = u32::from_ne_bytes(
@@ -514,7 +594,7 @@ fn decode_peer_authenticated_chunks(option: &[u8], actual_len: usize) -> io::Res
     if chunk_count > MAX_SCTP_CHUNK_TYPES {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
-            "SCTP peer authentication chunk count exceeds protocol bounds",
+            "SCTP authentication chunk count exceeds protocol bounds",
         ));
     }
     let expected_len = SCTP_AUTH_CHUNKS_HEADER_BYTES
@@ -523,7 +603,7 @@ fn decode_peer_authenticated_chunks(option: &[u8], actual_len: usize) -> io::Res
     if actual_len != expected_len {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
-            "unexpected SCTP peer authentication chunk response length",
+            "unexpected SCTP authentication chunk response length",
         ));
     }
     Ok(option[SCTP_AUTH_CHUNKS_HEADER_BYTES..expected_len].to_vec())
@@ -589,6 +669,18 @@ pub fn shutdown_both(fd: BorrowedFd<'_>) -> io::Result<()> {
     // SAFETY: `shutdown` observes the borrowed live descriptor only. `SHUT_RDWR`
     // makes both directions terminal and wakes blocked socket operations.
     cvt(unsafe { libc::shutdown(fd.as_raw_fd(), libc::SHUT_RDWR) })
+}
+
+pub fn set_abort_on_close(fd: BorrowedFd<'_>) -> io::Result<()> {
+    set_sockopt(
+        fd,
+        libc::SOL_SOCKET,
+        libc::SO_LINGER,
+        &libc::linger {
+            l_onoff: 1,
+            l_linger: 0,
+        },
+    )
 }
 
 fn auth_key_option(assoc_id: i32, key_id: u16, key: &[u8]) -> io::Result<Zeroizing<Vec<u8>>> {
@@ -873,15 +965,6 @@ fn validate_socket_address_set(addrs: &[SocketAddr]) -> io::Result<()> {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
             "SCTP address set exceeds the bounded maximum",
-        ));
-    }
-    if addrs
-        .iter()
-        .any(|address| address.is_ipv4() != first.is_ipv4())
-    {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "SCTP address set mixes address families",
         ));
     }
     if addrs.iter().any(|address| address.port() != first.port()) {
@@ -1254,6 +1337,10 @@ mod tests {
 
     #[test]
     fn libc_sctp_layouts_match_expected_linux_uapi_shape() {
+        assert_eq!(size_of::<libc::linger>(), 8);
+        assert_eq!(align_of::<libc::linger>(), 4);
+        assert_eq!(offset_of!(libc::linger, l_onoff), 0);
+        assert_eq!(offset_of!(libc::linger, l_linger), 4);
         assert_eq!(size_of::<libc::sctp_initmsg>(), 8);
         assert_eq!(align_of::<libc::sctp_initmsg>(), 2);
         assert_eq!(offset_of!(libc::sctp_sndinfo, snd_sid), 0);
@@ -1380,24 +1467,20 @@ mod tests {
         option[4..8].copy_from_slice(&2_u32.to_ne_bytes());
         option[8..10].copy_from_slice(&[0, 192]);
         assert_eq!(
-            decode_peer_authenticated_chunks(&option, option.len()).unwrap(),
+            decode_authenticated_chunks(&option, option.len()).unwrap(),
             vec![0, 192]
         );
 
         assert_eq!(
-            decode_peer_authenticated_chunks(&option, 7)
-                .unwrap_err()
-                .kind(),
+            decode_authenticated_chunks(&option, 7).unwrap_err().kind(),
             io::ErrorKind::InvalidData
         );
         assert_eq!(
-            decode_peer_authenticated_chunks(&option, 9)
-                .unwrap_err()
-                .kind(),
+            decode_authenticated_chunks(&option, 9).unwrap_err().kind(),
             io::ErrorKind::InvalidData
         );
         assert_eq!(
-            decode_peer_authenticated_chunks(&option, option.len() + 1)
+            decode_authenticated_chunks(&option, option.len() + 1)
                 .unwrap_err()
                 .kind(),
             io::ErrorKind::InvalidData
@@ -1406,11 +1489,54 @@ mod tests {
         let mut excessive = vec![0_u8; SCTP_AUTH_CHUNKS_HEADER_BYTES];
         excessive[4..8].copy_from_slice(&257_u32.to_ne_bytes());
         assert_eq!(
-            decode_peer_authenticated_chunks(&excessive, excessive.len())
+            decode_authenticated_chunks(&excessive, excessive.len())
                 .unwrap_err()
                 .kind(),
             io::ErrorKind::InvalidData
         );
+    }
+
+    #[test]
+    fn hmac_options_preserve_native_abi_and_reject_invalid_preferences_or_lengths() {
+        let mut expected = 2_u32.to_ne_bytes().to_vec();
+        expected.extend_from_slice(&3_u16.to_ne_bytes());
+        expected.extend_from_slice(&1_u16.to_ne_bytes());
+        assert_eq!(encode_hmac_identifiers(&[3, 1]).unwrap(), expected);
+        assert_eq!(decode_hmac_identifiers(&expected).unwrap(), [3, 1]);
+        for identifiers in [&[1][..], &[1, 3]] {
+            assert_eq!(
+                decode_hmac_identifiers(&encode_hmac_identifiers(identifiers).unwrap()).unwrap(),
+                identifiers
+            );
+        }
+        for identifiers in [
+            &[][..],
+            &[3],
+            &[1, 1],
+            &[3, 3],
+            &[0, 1],
+            &[1, 2],
+            &[1, 3, 1],
+        ] {
+            assert_eq!(
+                encode_hmac_identifiers(identifiers).unwrap_err().kind(),
+                io::ErrorKind::InvalidInput
+            );
+        }
+        for length in 0..expected.len() {
+            assert!(decode_hmac_identifiers(&expected[..length]).is_err());
+        }
+        let mut trailing = expected.clone();
+        trailing.push(0);
+        assert!(decode_hmac_identifiers(&trailing).is_err());
+        for count in [0_u32, 3, u32::MAX] {
+            let mut invalid = expected.clone();
+            invalid[..4].copy_from_slice(&count.to_ne_bytes());
+            assert!(decode_hmac_identifiers(&invalid).is_err());
+        }
+        let mut duplicate = expected;
+        duplicate[4..6].copy_from_slice(&1_u16.to_ne_bytes());
+        assert!(decode_hmac_identifiers(&duplicate).is_err());
     }
 
     #[test]
@@ -1494,6 +1620,24 @@ mod tests {
     }
 
     #[test]
+    fn link_local_scopes_survive_raw_and_packed_addresses() {
+        for scope in [1_u32, 17, u32::MAX] {
+            let address = SocketAddr::V6(SocketAddrV6::new(
+                "fe80::20".parse().unwrap(),
+                3868,
+                0,
+                scope,
+            ));
+            let (raw, length) = socket_addr_to_raw(&address);
+            assert_eq!(raw_to_socket_addr(&raw, length).unwrap(), address);
+            let packed = pack_socket_addresses(&[address]).unwrap();
+            assert_eq!(packed.len(), size_of::<libc::sockaddr_in6>());
+            assert_eq!(&packed[2..4], &3868_u16.to_be_bytes());
+            assert_eq!(&packed[24..28], &scope.to_ne_bytes());
+        }
+    }
+
+    #[test]
     fn packed_address_sets_are_contiguous_and_bounded() {
         let v4 = [
             "127.0.0.1:38412".parse().unwrap(),
@@ -1534,11 +1678,13 @@ mod tests {
         );
 
         assert!(pack_socket_addresses(&[]).is_err());
-        assert!(pack_socket_addresses(&[
-            "127.0.0.1:38412".parse().unwrap(),
-            "[::1]:38412".parse().unwrap(),
-        ])
-        .is_err());
+        let mixed = pack_socket_addresses(&[v4[0], v6[0]]).unwrap();
+        assert_eq!(mixed.len(), v4_bytes + v6_bytes);
+        assert_eq!(&mixed[..v4_bytes], &packed[..v4_bytes]);
+        assert_eq!(&mixed[v4_bytes..], &packed_v6[..v6_bytes]);
+        let reversed = pack_socket_addresses(&[v6[0], v4[0]]).unwrap();
+        assert_eq!(&reversed[..v6_bytes], &packed_v6[..v6_bytes]);
+        assert_eq!(&reversed[v6_bytes..], &packed[..v4_bytes]);
         assert!(pack_socket_addresses(&[
             "127.0.0.1:38412".parse().unwrap(),
             "127.0.0.2:38413".parse().unwrap(),

@@ -6,6 +6,7 @@
 //! deliberately avoids the generated encoder's inner-container alignment bug.
 
 use super::*;
+use zeroize::Zeroizing;
 
 /// One borrowed protocol IE with an already APER-encoded, opaque value.
 ///
@@ -13,7 +14,6 @@ use super::*;
 /// surrounding open-type length determinant. Construction validates container
 /// policy, not the nested value's semantics or mandatory/conditional presence.
 /// Formatting reveals only the identifier, criticality and value length.
-#[derive(Clone, Copy, PartialEq, Eq)]
 pub struct ProtocolIe<'a> {
     id: u16,
     criticality: Criticality,
@@ -85,7 +85,7 @@ macro_rules! message_types {
                 match self {
                     $(Self::$variant(value) => {
                         for ie in &value.protocol_ies.0 {
-                            visit(ie.id$(.$inner)?, ie.criticality as u8, ie.value.as_bytes())?;
+                            visit(ie.id, ie.criticality as u8, ie.value.as_bytes())?;
                         }
                         Ok(())
                     },)+
@@ -157,7 +157,7 @@ impl Pdu {
         if total > ctx.max_message_len {
             return Err(length_error(total, ctx.max_message_len));
         }
-        let mut body = Vec::with_capacity(body_len);
+        let mut body = Zeroizing::new(Vec::with_capacity(body_len));
         write_prefix(&mut body, ies.len());
         for ie in ies {
             write_ie(&mut body, ie.id, ie.criticality as u8, ie.value);
@@ -182,7 +182,7 @@ impl Pdu {
             },
         };
         Ok(Self {
-            raw: Bytes::new(),
+            raw: SensitiveBytes::default(),
             kind,
         })
     }
@@ -278,7 +278,7 @@ pub(super) fn encode(pdu: &Pdu, ctx: EncodeContext) -> Result<Vec<u8>, EncodeErr
     let total = checked_len(pdu, ctx)?;
     let (outcome, code, criticality, message) = parts(&pdu.kind);
     // The body is smaller than the fully validated complete output bound.
-    let mut body = Vec::with_capacity(total);
+    let mut body = Zeroizing::new(Vec::with_capacity(total));
     write_prefix(&mut body, message.ie_count());
     message.visit_ies(|id, crit, value| {
         write_ie(&mut body, id, crit, value);

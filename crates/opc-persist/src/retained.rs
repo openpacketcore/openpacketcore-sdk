@@ -7,38 +7,54 @@
 use std::fmt;
 #[cfg(test)]
 use std::fs::File;
+#[cfg(target_os = "linux")]
 use std::fs::OpenOptions;
+#[cfg(target_os = "linux")]
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+#[cfg(any(target_os = "linux", all(test, unix)))]
 use hmac::{Hmac, KeyInit, Mac};
-use rand::{rngs::SysRng, TryRng};
+#[cfg(any(target_os = "linux", all(test, unix)))]
 use rusqlite::Connection;
+#[cfg(target_os = "linux")]
+use rusqlite::OptionalExtension;
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 
 #[cfg(unix)]
+use crate::local_sqlite::FileAdmission;
+use crate::local_sqlite::{completion_path, lock_path};
+#[cfg(target_os = "linux")]
 use crate::local_sqlite::{
-    file_identity, identity_for_path, open_file, open_sqlite, AdmissionFileLock, FileAdmission,
+    file_identity, identity_for_path, open_sqlite, reject_symlink_components,
 };
-use crate::local_sqlite::{lock_path, reject_symlink_components};
+#[cfg(any(target_os = "linux", all(test, unix)))]
+use crate::local_sqlite::{open_file, AdmissionFileLock};
 use crate::{AuditKey, ConfigConsensusTopology, SqliteBackend};
 
-#[cfg(unix)]
+#[cfg(target_os = "linux")]
 use std::os::unix::fs::OpenOptionsExt;
 
 mod operation;
+mod provisioning;
 pub use operation::{RetainedConfigOpen, RetainedConfigOpenRetirement};
+pub use provisioning::RetainedConfigProvisionRequest;
 
+#[cfg(any(target_os = "linux", all(test, unix)))]
 const RECORD_MAGIC: &[u8; 8] = b"OPCRET01";
+#[cfg(any(target_os = "linux", all(test, unix)))]
 const RECORD_DOMAIN: &[u8] = b"openpacketcore/config-retained-admission/v1\0";
 const BINDING_DOMAIN: &[u8] = b"openpacketcore/config-retained-scope/v1\0";
+#[cfg(any(target_os = "linux", all(test, unix)))]
 const RECORD_BYTES: usize = 8 + 32 + 32 + 1 + 6 * 8 + 32;
 const MAX_VALIDATION_BYTES: u64 = 64 * 1024 * 1024 * 1024;
+#[cfg(target_os = "linux")]
 const COPY_BUFFER_BYTES: usize = 64 * 1024;
+#[cfg(target_os = "linux")]
 const BINDING_SCHEMA: &str = "CREATE TABLE consensus_retained_binding (singleton INTEGER PRIMARY KEY CHECK(singleton = 1), record BLOB NOT NULL CHECK(length(record) = 153))";
 // Bounds concurrent startup work, including cancelled blocking operations.
 static ADMISSION_GATE: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(4);
@@ -47,7 +63,10 @@ static ADMISSION_GATE: tokio::sync::Semaphore = tokio::sync::Semaphore::const_ne
 enum OpenIntent {
     NewAuthority,
     RepairMember,
+    ResumeAuthority,
+    ResumeRepair,
     Reopen,
+    Transaction(RetainedConfigProvisionRequest, provisioning::OpenMode),
 }
 
 /// Exact caller-admitted configuration authority and local storage/key scope.
@@ -124,6 +143,8 @@ pub enum RetainedConfigDurability {
 
 /// Bounded retained-store admission options, with no automatic create fallback.
 #[derive(Clone)]
+// Keep the same public options on unsupported targets; only Linux executes them.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 pub struct RetainedConfigOptions {
     path: PathBuf,
     binding: RetainedConfigBinding,
@@ -213,6 +234,8 @@ struct AdmissionWork {
     lock_hook: Option<AdmissionLockTestHook>,
     #[cfg(test)]
     completion_hook: Option<AdmissionCompletionTestHook>,
+    #[cfg(test)]
+    provision_fault: Option<AdmissionProvisionFault>,
 }
 
 #[cfg(test)]
@@ -220,6 +243,9 @@ type AdmissionTestHook = Arc<dyn Fn(&AdmissionWork, &str) + Send + Sync>;
 
 #[cfg(test)]
 type AdmissionLockTestHook = Arc<dyn Fn(&File) + Send + Sync>;
+
+#[cfg(test)]
+type AdmissionProvisionFault = Arc<dyn Fn(&str) -> bool + Send + Sync>;
 
 #[cfg(test)]
 type AdmissionCompletionTestHook = Arc<dyn Fn(&SqliteBackend) + Send + Sync>;
@@ -240,6 +266,7 @@ impl AdmissionWork {
         }
     }
 
+    #[cfg(target_os = "linux")]
     fn mutation(&self) -> Result<(), RetainedConfigError> {
         self.check()?;
         self.mutated.store(true, Ordering::Release);
@@ -258,6 +285,15 @@ impl Drop for CancelOnDrop {
 /// Returns only a denial predicate. Presence is never admission authority.
 pub(crate) fn requires_retained_lifecycle(path: &Path) -> bool {
     std::fs::symlink_metadata(lock_path(path)).is_ok()
+        || std::fs::symlink_metadata(completion_path(path)).is_ok()
+        || std::fs::symlink_metadata(obsolete_intent_path(path)).is_ok()
+}
+
+// An earlier-format intent is only a denial signal, never recovery authority.
+fn obsolete_intent_path(path: &Path) -> PathBuf {
+    let mut name = path.as_os_str().to_os_string();
+    name.push(".opc-retained.intent");
+    PathBuf::from(name)
 }
 
 impl SqliteBackend {
@@ -265,8 +301,8 @@ impl SqliteBackend {
     ///
     /// This is an operator-authorized provisioning operation, never a restart
     /// fallback. Existing or interrupted artifacts are preserved and rejected.
-    /// A partial initialization requires explicit recovery/replacement of the
-    /// backing resource; invoking this method again never overwrites it.
+    /// Resume an interrupted request with `begin_resume_config_authority` and
+    /// the same authorization; invoking provision again never overwrites it.
     pub async fn provision_config_authority(
         options: RetainedConfigOptions,
         audit_key: AuditKey,
@@ -331,210 +367,54 @@ fn begin_open_authority(
         lock_hook: None,
         #[cfg(test)]
         completion_hook: None,
+        #[cfg(test)]
+        provision_fault: None,
     });
     RetainedConfigOpen::start(options, audit_key, intent, work)
 }
 
-#[cfg(not(unix))]
-fn open_authority_sync(
-    _options: RetainedConfigOptions,
-    _audit_key: AuditKey,
-    _intent: OpenIntent,
-    _work: &Arc<AdmissionWork>,
-) -> Result<SqliteBackend, RetainedConfigError> {
-    Err(RetainedConfigError::Unsupported)
-}
-
-#[cfg(unix)]
 fn open_authority_sync(
     options: RetainedConfigOptions,
     audit_key: AuditKey,
     intent: OpenIntent,
     work: &Arc<AdmissionWork>,
 ) -> Result<SqliteBackend, RetainedConfigError> {
-    let provision = !matches!(intent, OpenIntent::Reopen);
-    work.check()?;
-    reject_symlink_components(&options.path)?;
-    if provision && std::fs::symlink_metadata(&options.path).is_ok() {
-        return Err(RetainedConfigError::AlreadyExists);
-    }
-    for suffix in ["-wal", "-shm", "-journal"] {
-        let mut sidecar = options.path.as_os_str().to_os_string();
-        sidecar.push(suffix);
-        match std::fs::symlink_metadata(PathBuf::from(&sidecar)) {
-            Ok(_) if provision => return Err(RetainedConfigError::AlreadyExists),
-            Ok(_) => {
-                let _ = open_file(&PathBuf::from(sidecar), false, false)?;
-            }
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-            Err(_) => return Err(RetainedConfigError::Rejected),
-        }
-    }
-    let parent_path = options
-        .path
-        .parent()
-        .ok_or(RetainedConfigError::InvalidRequest)?;
-    let parent = open_file(parent_path, false, true)?;
-    let before_parent = identity_for_path(parent_path, true)?;
-    let lock = if provision {
-        let result = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create_new(true)
-            .mode(0o600)
-            .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
-            .open(lock_path(&options.path));
-        match result {
-            Ok(file) => {
-                work.mutated.store(true, Ordering::Release);
-                #[cfg(test)]
-                work.stage("lock_created");
-                file
-            }
-            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
-                return Err(RetainedConfigError::AlreadyExists);
-            }
-            Err(_) => return Err(RetainedConfigError::Unavailable),
-        }
-    } else {
-        open_file(&lock_path(&options.path), true, false)?
+    use provisioning::OpenMode;
+    let (request, mode) = match intent {
+        OpenIntent::Transaction(request, mode) => (request, mode),
+        OpenIntent::NewAuthority | OpenIntent::ResumeAuthority | OpenIntent::Reopen => (
+            RetainedConfigProvisionRequest::new_authority(options.binding.digest(&audit_key))?,
+            match intent {
+                OpenIntent::NewAuthority => OpenMode::Provision,
+                OpenIntent::ResumeAuthority => OpenMode::Resume,
+                _ => OpenMode::ReopenImplicit,
+            },
+        ),
+        OpenIntent::RepairMember | OpenIntent::ResumeRepair => (
+            RetainedConfigProvisionRequest::member_repair(options.binding.digest(&audit_key))?,
+            if matches!(intent, OpenIntent::RepairMember) {
+                OpenMode::Provision
+            } else {
+                OpenMode::Resume
+            },
+        ),
     };
-    let lock = AdmissionFileLock::acquire(lock)?;
-    #[cfg(test)]
-    if let Some(hook) = &work.lock_hook {
-        hook(&lock);
-    }
-    let mut record = [0u8; RECORD_BYTES];
-    if !provision {
-        if lock
-            .metadata()
-            .map_err(|_| RetainedConfigError::Unavailable)?
-            .len()
-            != RECORD_BYTES as u64
-        {
-            return Err(RetainedConfigError::RecoveryRequired);
-        }
-        (&*lock)
-            .read_exact(&mut record)
-            .map_err(|_| RetainedConfigError::RecoveryRequired)?;
-        validate_record(&record, &options.binding, &audit_key)?;
-    }
-    let database = if provision {
-        work.mutation()?;
-        OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create_new(true)
-            .mode(0o600)
-            .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
-            .open(&options.path)
-            .map_err(|_| RetainedConfigError::AlreadyExists)?
-    } else {
-        open_file(&options.path, false, false)?
-    };
-    #[cfg(test)]
-    if provision {
-        work.stage("database_created");
-    }
-    let identity = file_identity(&parent, &lock, &database)?;
-    if identity[0..2] != before_parent {
-        return Err(RetainedConfigError::Rejected);
-    }
-    if !provision && record_identity(&record)? != identity {
-        return Err(RetainedConfigError::Rejected);
-    }
-    let admission = Arc::new(FileAdmission {
-        path: options.path.clone(),
-        parent,
-        lock,
-        database,
-        identity,
-    });
-    admission.read_back()?;
+    provisioning::open(options, audit_key, request, mode, work)
+}
+
+#[cfg(target_os = "linux")]
+fn finish_open(
+    options: RetainedConfigOptions,
+    audit_key: AuditKey,
+    record: [u8; RECORD_BYTES],
+    admission: Arc<FileAdmission>,
+    work: &Arc<AdmissionWork>,
+    caps: crate::PersistCapabilities,
+) -> Result<SqliteBackend, RetainedConfigError> {
     let (ephemeral, min_free_bytes) = match options.durability {
         RetainedConfigDurability::Durable { min_free_bytes } => (false, min_free_bytes),
         RetainedConfigDurability::Ephemeral => (true, 0),
     };
-    let caps = retained_preflight(&admission, ephemeral, min_free_bytes);
-    if !ephemeral && !caps.is_safe_for_writes() {
-        return Err(RetainedConfigError::Rejected);
-    }
-    if provision {
-        let mut nonce = [0; 32];
-        SysRng
-            .try_fill_bytes(&mut nonce)
-            .map_err(|_| RetainedConfigError::Unavailable)?;
-        record = make_record(
-            &options.binding,
-            &audit_key,
-            identity,
-            nonce,
-            matches!(intent, OpenIntent::RepairMember),
-        )?;
-        let conn = open_sqlite(&options.path)?;
-        crate::schema::apply_pragma_profile(&conn).map_err(|_| RetainedConfigError::Rejected)?;
-        crate::schema::initialize_schema(&conn).map_err(|_| RetainedConfigError::Rejected)?;
-        #[cfg(test)]
-        work.stage("base_initialized");
-        let digest = crate::schema::current_schema_digest(&conn)
-            .map_err(|_| RetainedConfigError::Rejected)?;
-        let transaction = conn
-            .unchecked_transaction()
-            .map_err(|_| RetainedConfigError::Unavailable)?;
-        crate::schema::set_schema_version(&transaction, &digest)
-            .map_err(|_| RetainedConfigError::Unavailable)?;
-        transaction
-            .commit()
-            .map_err(|_| RetainedConfigError::Unavailable)?;
-        crate::consensus::provision_retained_schema(
-            &conn,
-            options.binding.topology(),
-            &audit_key,
-            work.deadline,
-        )
-        .map_err(|_| RetainedConfigError::Rejected)?;
-        #[cfg(test)]
-        work.stage("consensus_initialized");
-        conn.execute_batch(BINDING_SCHEMA)
-            .map_err(|_| RetainedConfigError::Unavailable)?;
-        conn.execute(
-            "INSERT INTO consensus_retained_binding (singleton, record) VALUES (1, ?1)",
-            [record.as_slice()],
-        )
-        .map_err(|_| RetainedConfigError::Unavailable)?;
-        #[cfg(test)]
-        work.stage("binding_stored");
-        conn.close().map_err(|_| RetainedConfigError::Unavailable)?;
-        admission
-            .database
-            .sync_all()
-            .map_err(|_| RetainedConfigError::Unavailable)?;
-        admission
-            .parent
-            .sync_all()
-            .map_err(|_| RetainedConfigError::Unavailable)?;
-        work.check()?;
-        #[cfg(test)]
-        work.stage("database_synced");
-        let mut record_file = &*admission.lock;
-        record_file
-            .write_all(&record)
-            .map_err(|_| RetainedConfigError::Unavailable)?;
-        #[cfg(test)]
-        work.stage("record_written");
-        record_file
-            .sync_all()
-            .map_err(|_| RetainedConfigError::Unavailable)?;
-        admission
-            .parent
-            .sync_all()
-            .map_err(|_| RetainedConfigError::Unavailable)?;
-    }
-    #[cfg(test)]
-    if provision {
-        work.stage("record_synced");
-    }
-    validate_copy(&options, &record, &audit_key, &admission, work)?;
     #[cfg(test)]
     work.stage("before_original_open");
     admission.read_back()?;
@@ -596,6 +476,7 @@ pub(crate) fn retained_preflight(
     }
 }
 
+#[cfg(any(target_os = "linux", all(test, unix)))]
 fn make_record(
     binding: &RetainedConfigBinding,
     key: &AuditKey,
@@ -619,6 +500,7 @@ fn make_record(
     Ok(record)
 }
 
+#[cfg(target_os = "linux")]
 fn validate_record(
     record: &[u8; RECORD_BYTES],
     binding: &RetainedConfigBinding,
@@ -636,6 +518,7 @@ fn validate_record(
     Ok(())
 }
 
+#[cfg(any(target_os = "linux", all(test, unix)))]
 fn record_identity(record: &[u8; RECORD_BYTES]) -> Result<[u64; 6], RetainedConfigError> {
     let mut identity = [0; 6];
     for (i, value) in identity.iter_mut().enumerate() {
@@ -648,7 +531,7 @@ fn record_identity(record: &[u8; RECORD_BYTES]) -> Result<[u64; 6], RetainedConf
     Ok(identity)
 }
 
-#[cfg(unix)]
+#[cfg(target_os = "linux")]
 fn validate_copy(
     options: &RetainedConfigOptions,
     record: &[u8; RECORD_BYTES],
@@ -721,6 +604,39 @@ fn validate_copy(
     admission.read_back()
 }
 
+#[cfg(target_os = "linux")]
+fn retained_read_error(error: rusqlite::Error) -> RetainedConfigError {
+    retained_persist_error(crate::error::sqlite_read_error(error))
+}
+
+#[cfg(target_os = "linux")]
+fn retained_persist_error(error: crate::PersistError) -> RetainedConfigError {
+    match error.kind() {
+        crate::PersistErrorKind::CorruptBlob => RetainedConfigError::Rejected,
+        crate::PersistErrorKind::Unavailable
+        | crate::PersistErrorKind::PreflightFailed(_)
+        | crate::PersistErrorKind::RollbackNotFound
+        | crate::PersistErrorKind::WalRecoveryFailed
+        | crate::PersistErrorKind::AuditChainBroken
+        | crate::PersistErrorKind::InconsistentState(_)
+        | crate::PersistErrorKind::ForeignKeyViolation
+        | crate::PersistErrorKind::ConstraintViolation(_)
+        | crate::PersistErrorKind::RequestIdCollision
+        | crate::PersistErrorKind::ConfigHistoryCompacted
+        | crate::PersistErrorKind::ConfigHistoryFull
+        | crate::PersistErrorKind::ConfigHistoryProtected
+        | crate::PersistErrorKind::OutcomeUnknown
+        | crate::PersistErrorKind::PathNotWritable(_)
+        | crate::PersistErrorKind::DatabaseLocked
+        | crate::PersistErrorKind::OutOfSpace { .. }
+        | crate::PersistErrorKind::Io(_)
+        | crate::PersistErrorKind::SchemaVersionMismatch { .. }
+        | crate::PersistErrorKind::SchemaDigestMismatch { .. }
+        | crate::PersistErrorKind::Sqlite(_) => RetainedConfigError::Unavailable,
+    }
+}
+
+#[cfg(target_os = "linux")]
 fn validate_connection(
     conn: &Connection,
     options: &RetainedConfigOptions,
@@ -733,39 +649,35 @@ fn validate_connection(
         .map_err(|_| RetainedConfigError::Unavailable)?;
     let integrity: String = conn
         .query_row("PRAGMA integrity_check", [], |row| row.get(0))
-        .map_err(|_| RetainedConfigError::Rejected)?;
+        .map_err(retained_read_error)?;
     if integrity != "ok" {
         return Err(RetainedConfigError::Rejected);
     }
     // A digest supplied by the retained database is only a compatibility
     // check. The independent SDK catalog includes the exact replay index.
-    crate::schema::validate_retained_base_schema(conn)
-        .map_err(|_| RetainedConfigError::Rejected)?;
-    let version =
-        crate::schema::get_schema_version(conn).map_err(|_| RetainedConfigError::Rejected)?;
-    let digest =
-        crate::schema::get_schema_digest(conn).map_err(|_| RetainedConfigError::Rejected)?;
+    crate::schema::validate_retained_base_schema(conn).map_err(retained_persist_error)?;
+    let version = crate::schema::get_schema_version(conn).map_err(retained_read_error)?;
+    let digest = crate::schema::get_schema_digest(conn).map_err(retained_read_error)?;
     if version.as_deref() != Some(crate::schema::SCHEMA_VERSION)
-        || digest
-            != Some(
-                crate::schema::current_schema_digest(conn)
-                    .map_err(|_| RetainedConfigError::Rejected)?,
-            )
+        || digest != Some(crate::schema::current_schema_digest(conn).map_err(retained_read_error)?)
     {
         return Err(RetainedConfigError::Rejected);
     }
     let schema_matches: bool = conn.query_row(
         "SELECT COUNT(*) = 1 AND MIN(sql) = ?1 FROM sqlite_schema WHERE name GLOB 'consensus_retained_*' OR tbl_name = 'consensus_retained_binding'",
         [BINDING_SCHEMA], |row| row.get(0),
-    ).map_err(|_| RetainedConfigError::Rejected)?;
+    ).map_err(retained_read_error)?;
+    if !schema_matches {
+        return Err(RetainedConfigError::Rejected);
+    }
     let count: i64 = conn
         .query_row(
             "SELECT COUNT(*) FROM consensus_retained_binding",
             [],
             |row| row.get(0),
         )
-        .map_err(|_| RetainedConfigError::Rejected)?;
-    if !schema_matches || count != 1 {
+        .map_err(retained_read_error)?;
+    if count != 1 {
         return Err(RetainedConfigError::Rejected);
     }
     let stored: Vec<u8> = conn
@@ -774,8 +686,15 @@ fn validate_connection(
             [],
             |row| row.get(0),
         )
+        .optional()
+        .map_err(retained_read_error)?
+        .ok_or(RetainedConfigError::Rejected)?;
+    let stored: &[u8; RECORD_BYTES] = stored
+        .as_slice()
+        .try_into()
         .map_err(|_| RetainedConfigError::Rejected)?;
-    if stored.as_slice() != record {
+    validate_record(stored, &options.binding, key)?;
+    if record_identity(stored)? != record_identity(record)? || stored != record {
         return Err(RetainedConfigError::Rejected);
     }
     crate::consensus::validate_retained_schema(
@@ -784,7 +703,18 @@ fn validate_connection(
         key,
         work.deadline,
     )
-    .map_err(|_| RetainedConfigError::Rejected)?;
+    .map_err(|error| match error {
+        crate::consensus::ConfigConsensusStorageError::BackendUnavailable => {
+            RetainedConfigError::Unavailable
+        }
+        crate::consensus::ConfigConsensusStorageError::CorruptState
+        | crate::consensus::ConfigConsensusStorageError::SchemaVersionMismatch
+        | crate::consensus::ConfigConsensusStorageError::IdentityMismatch
+        | crate::consensus::ConfigConsensusStorageError::InvalidIdentity
+        | crate::consensus::ConfigConsensusStorageError::RecoveryRequired => {
+            RetainedConfigError::Rejected
+        }
+    })?;
     conn.progress_handler(0, None::<fn() -> bool>)
         .map_err(|_| RetainedConfigError::Unavailable)?;
     work.check()
@@ -792,3 +722,6 @@ fn validate_connection(
 
 #[cfg(all(test, unix))]
 mod tests;
+
+#[cfg(all(test, target_os = "linux"))]
+mod provisioning_tests;

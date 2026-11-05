@@ -1278,6 +1278,11 @@ impl fmt::Debug for ProtocolConfigurationOptions {
 }
 
 /// Typed Allocation and Retention Priority carried by Bearer QoS.
+///
+/// TS 29.274 clause 8.15 refers to TS 29.212 clauses 5.3.45-5.3.47:
+/// level 1 is highest, and the capability/vulnerability wire bits are zero
+/// when enabled. The public booleans express permission, so `true` encodes
+/// as a clear PCI/PVI bit.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct AllocationRetentionPriority {
     priority_level: u8,
@@ -1307,28 +1312,39 @@ impl AllocationRetentionPriority {
         })
     }
 
-    /// Decode the TS 29.274 ARP octet, requiring spare bits 8 and 2 to be zero.
+    /// Decode the TS 29.274 ARP octet, ignoring received spare bits 8 and 2.
     ///
     /// # Errors
     ///
-    /// Returns a stable validation error for spare bits or priority level zero.
+    /// Returns a stable validation error for priority level zero.
     pub const fn from_octet(octet: u8) -> Result<Self, BearerQosValidationError> {
-        if octet & 0x82 != 0 {
-            return Err(BearerQosValidationError::InvalidArpSpareBits);
-        }
-        Self::new((octet >> 2) & 0x0f, octet & 0x40 != 0, octet & 0x01 != 0)
+        Self::new((octet >> 2) & 0x0f, octet & 0x40 == 0, octet & 0x01 == 0)
     }
 
     /// Encode the canonical TS 29.274 ARP octet with both spare bits zero.
     pub const fn to_octet(self) -> u8 {
-        ((self.preemption_capability as u8) << 6)
+        ((!self.preemption_capability as u8) << 6)
             | (self.priority_level << 2)
-            | self.preemption_vulnerability as u8
+            | !self.preemption_vulnerability as u8
     }
 
     /// Allocation and Retention Priority level (1 is highest, 15 lowest).
     pub const fn priority_level(self) -> u8 {
         self.priority_level
+    }
+
+    /// Compare priority levels, returning [`std::cmp::Ordering::Greater`] when
+    /// this bearer has higher priority than `other`.
+    ///
+    /// TS 29.274 clause 8.15 refers to TS 29.212 clause 5.3.45: level 1 is
+    /// highest and level 15 is lowest. PCI and PVI do not affect this
+    /// comparison; equal levels compare equal even when those flags differ.
+    /// Admission and pre-emption decisions must separately consider the flags.
+    ///
+    /// This is a priority comparison, not a total ordering of ARP values.
+    #[must_use]
+    pub fn cmp_priority(&self, other: &Self) -> std::cmp::Ordering {
+        other.priority_level.cmp(&self.priority_level)
     }
 
     /// Whether the bearer may pre-empt another bearer.
@@ -1431,6 +1447,10 @@ impl std::error::Error for BearerQosValidationError {}
 /// specific QCIs remain wire-preservable but require an explicit resource
 /// type through [`BearerQos::validate_with_resource_type`] before policy use.
 ///
+/// The IE has a required 22-octet prefix. Decoding ignores unknown trailing
+/// octets per TS 29.274 clause 7.7.7; canonical encoding emits only the known
+/// fields. Raw-preserving message encoding retains the received octets.
+///
 /// @spec 3GPP TS29274 R18 8.15
 /// @req REQ-3GPP-TS29274-R18-S2B-IE-BEARER-QOS-001
 #[derive(Clone, PartialEq, Eq)]
@@ -1486,8 +1506,8 @@ impl BearerQos {
     ///
     /// # Errors
     ///
-    /// Returns a stable error if a directly constructed value contains spare
-    /// bits or an invalid priority level.
+    /// Returns a stable error for an invalid priority level. Spare bits are
+    /// ignored here; sender validation still requires canonical zero spares.
     pub const fn allocation_retention_priority(
         &self,
     ) -> Result<AllocationRetentionPriority, BearerQosValidationError> {
@@ -1539,6 +1559,9 @@ impl BearerQos {
     }
 
     fn validate_common(&self) -> Result<(), BearerQosValidationError> {
+        if self.priority_flags & 0x82 != 0 {
+            return Err(BearerQosValidationError::InvalidArpSpareBits);
+        }
         let _arp = self.allocation_retention_priority()?;
         let _classification = qci_resource_type(self.qci)?;
         if [
@@ -1592,9 +1615,21 @@ impl BearerQos {
     }
 
     fn decode_value(value: &[u8], offset: usize) -> Result<Self, DecodeError> {
-        require_exact_len(value, 22, offset, "Bearer QoS IE must be twenty-two octets")?;
+        // The raw TLIV parser has already checked the declared boundary.
+        // A complete but short value is an invalid length, not truncated input.
+        if value.len() < 22 {
+            return Err(DecodeError::new(
+                DecodeErrorCode::InvalidLength {
+                    reason: "Bearer QoS IE must be twenty-two octets",
+                },
+                offset,
+            )
+            .with_spec_ref(spec_ref()));
+        }
         let decoded = Self {
-            priority_flags: value[0],
+            // TS 29.274 7.7.8: ignore received spares; raw message encoding
+            // retains the received octet separately. Canonical send clears them.
+            priority_flags: value[0] & 0x7d,
             qci: value[1],
             maximum_bitrate_uplink: decode_u40(&value[2..7]),
             maximum_bitrate_downlink: decode_u40(&value[7..12]),
@@ -4816,7 +4851,7 @@ mod tests {
     use super::*;
 
     fn arp() -> AllocationRetentionPriority {
-        let Ok(value) = AllocationRetentionPriority::new(3, true, true) else {
+        let Ok(value) = AllocationRetentionPriority::new(3, false, false) else {
             panic!("test ARP must be valid");
         };
         value
@@ -4826,10 +4861,7 @@ mod tests {
     fn bearer_qos_validates_typed_arp_and_standardized_resource_semantics() {
         assert_eq!(arp().to_octet(), 0x4d);
         assert_eq!(AllocationRetentionPriority::from_octet(0x4d), Ok(arp()));
-        assert_eq!(
-            AllocationRetentionPriority::from_octet(0x4f),
-            Err(BearerQosValidationError::InvalidArpSpareBits)
-        );
+        assert_eq!(AllocationRetentionPriority::from_octet(0x4f), Ok(arp()));
         assert_eq!(
             AllocationRetentionPriority::new(0, false, false),
             Err(BearerQosValidationError::InvalidPriorityLevel)
@@ -4888,20 +4920,26 @@ mod tests {
     }
 
     #[test]
-    fn bearer_qos_decode_rejects_arp_spare_bits() {
-        let mut value = [0u8; 22];
-        value[0] = 0x4f;
-        value[1] = 9;
-        let Err(error) = BearerQos::decode_value(&value, 7) else {
-            panic!("ARP spare bit 2 must fail at the untrusted boundary");
-        };
-        assert!(matches!(
-            error.code(),
-            DecodeErrorCode::Structural {
-                reason: "Bearer QoS ARP spare bits must be zero"
-            }
-        ));
-        assert_eq!(error.offset(), 7);
+    fn bearer_qos_decode_ignores_arp_spare_bits_and_sender_rejects_them() {
+        for spare in [0x02, 0x80, 0x82] {
+            let mut value = [0u8; 22];
+            value[0] = 0x4d | spare;
+            value[1] = 9;
+            let Ok(mut decoded) = BearerQos::decode_value(&value, 7) else {
+                panic!("received ARP spare bits must be ignored");
+            };
+            assert_eq!(decoded.priority_flags, 0x4d);
+            assert_eq!(decoded.allocation_retention_priority(), Ok(arp()));
+            let mut encoded = BytesMut::new();
+            assert!(decoded.encode_value(&mut encoded).is_ok());
+            assert_eq!(encoded[0], 0x4d);
+            decoded.priority_flags |= spare;
+            assert_eq!(
+                decoded.validate(),
+                Err(BearerQosValidationError::InvalidArpSpareBits)
+            );
+            assert!(decoded.encode_value(&mut BytesMut::new()).is_err());
+        }
     }
 
     #[test]

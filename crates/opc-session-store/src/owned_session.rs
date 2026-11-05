@@ -371,6 +371,7 @@ impl OwnedSessionMutationError {
             StoreError::LeaseExpired | StoreError::TopologyAuthorityRevoked => Self::LeaseLost,
             StoreError::StaleFence => Self::StaleFence,
             StoreError::BackendUnavailable(_)
+            | StoreError::KeyProviderUnavailable(_)
             | StoreError::FencedTransitionRecoveryJournalUnavailable => Self::BackendUnavailable,
             StoreError::PayloadTooLarge { actual, max } => Self::PayloadTooLarge { actual, max },
             StoreError::InvalidKey(_) => Self::InvalidRecord("backend rejected record shape"),

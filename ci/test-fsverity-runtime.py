@@ -244,6 +244,27 @@ with runtime.staging_root(parent,uid,deadline) as root:
 assert not os.path.exists(path),'empty staging anchor was not removed'
 ''')
 
+    def test_staging_default_acl_cannot_override_interrupted_creation_umask(self):
+        self.anchor_probe('''
+# Linux default ACLs override umask even when chmod made the parent private.
+acl=runtime.struct.pack('<IHHIHHIHHI',2,1,7,0xffffffff,4,0,0xffffffff,32,0,0xffffffff)
+os.setxattr(ancestor,'system.posix_acl_default',acl)
+with runtime.protected_directory(parent,deadline,uid=uid,
+        transaction={'action':'create','name':runtime.PREFIX+'acl-interrupted'}) as transaction:
+    path=os.path.dirname(os.readlink('/proc/self/fd/'+str(transaction)))
+    mask=os.umask(0o777)
+    try: os.mkdir('runtime',mode=0o700,dir_fd=transaction)
+    finally: os.umask(mask)
+    info=os.stat('runtime',dir_fd=transaction,follow_symlinks=False)
+    assert stat.S_IMODE(info.st_mode)==0 and info.st_uid==0,'default ACL overrode restrictive creation umask'
+    record=json.loads(os.getxattr(transaction,runtime.STAGING_ATTRIBUTE))
+    record['boot']='stopped-fixture'
+    os.setxattr(transaction,runtime.STAGING_ATTRIBUTE,json.dumps(record).encode())
+runtime.Guardian.inventory=lambda *args,**kwargs:([],[])
+runtime.recover_staging(parent,uid,deadline)
+assert not os.path.exists(path),'recovery left the interrupted ACL fixture'
+''')
+
     def test_last_transaction_removes_its_empty_staging_anchor(self):
         self.anchor_probe('''
 with runtime.protected_directory(parent,deadline,uid=uid,

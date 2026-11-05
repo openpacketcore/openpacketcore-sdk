@@ -123,6 +123,21 @@ pub fn set_consensus_restore_scan_unavailable_for_test(
         .store(unavailable, Ordering::Release);
 }
 
+/// Delay the logical-time fence phase of the next restore scan by `delay`.
+///
+/// This deterministically places the caller's absolute operation deadline in
+/// the fence phase without changing any deadline or production behavior.
+pub fn set_consensus_restore_scan_fence_delay_for_test(
+    store: &ConsensusSessionStore,
+    delay: Option<std::time::Duration>,
+) {
+    *store
+        .inner
+        .restore_scan_fence_delay_for_test
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = delay;
+}
+
 /// Number of restore scans that reached the armed dispatch fault.
 pub fn consensus_restore_scan_rejections_for_test(store: &ConsensusSessionStore) -> u64 {
     store
@@ -586,6 +601,42 @@ pub async fn consensus_local_replication_sequence_for_test(
 /// Passive value-free snapshot phase for bounded integration diagnostics.
 pub fn consensus_snapshot_build_phase_for_test(store: &ConsensusSessionStore) -> &'static str {
     store.inner.backend.snapshot_observation().phase_for_test()
+}
+
+/// Fail after creating both cleanup-owned staging children in the real builder.
+pub fn fail_next_consensus_snapshot_builds_for_test(
+    store: &ConsensusSessionStore,
+    failures: usize,
+) {
+    store
+        .inner
+        .backend
+        .snapshot_observation()
+        .inject_build_failures_for_test(failures);
+}
+
+/// Fail at the sealed-candidate publication boundary and latch indeterminacy.
+/// The candidate remains retained for audit by a fresh storage owner.
+pub fn fail_next_consensus_snapshot_builds_with_indeterminate_publication_for_test(
+    store: &ConsensusSessionStore,
+    failures: usize,
+) {
+    store
+        .inner
+        .backend
+        .snapshot_observation()
+        .inject_indeterminate_publications_for_test(failures);
+}
+
+/// Remaining staging and indeterminate-publication faults, respectively.
+pub fn consensus_snapshot_build_failures_remaining_for_test(
+    store: &ConsensusSessionStore,
+) -> (usize, usize) {
+    store
+        .inner
+        .backend
+        .snapshot_observation()
+        .remaining_build_failures_for_test()
 }
 
 /// Return constant-space local WAL timing totals without issuing a read
@@ -1492,6 +1543,52 @@ pub async fn assert_mixed_compacted_roster_status_and_terminal_conflict_for_test
     committed_terminal: &SignedRosterTerminalForTest,
     exercise_terminal_conflict: bool,
 ) -> Result<(), String> {
+    assert_mixed_roster_status_and_terminal_conflict_for_test(
+        store,
+        seed,
+        admission,
+        committed_terminal,
+        exercise_terminal_conflict,
+        MixedRosterHistoryForTest::Compacted,
+    )
+    .await
+}
+
+/// Require the autonomous lane's durable retirement authority before checking
+/// mixed-identity status and terminal refusal across snapshot/reopen. Retired
+/// history remains inconclusive; it cannot authorize absence or a new terminal.
+pub async fn assert_mixed_retired_roster_status_and_terminal_conflict_for_test(
+    store: &ConsensusSessionStore,
+    seed: u8,
+    admission: &SignedFreshRosterAdmissionForTest,
+    committed_terminal: &SignedRosterTerminalForTest,
+    exercise_terminal_conflict: bool,
+) -> Result<(), String> {
+    assert_mixed_roster_status_and_terminal_conflict_for_test(
+        store,
+        seed,
+        admission,
+        committed_terminal,
+        exercise_terminal_conflict,
+        MixedRosterHistoryForTest::Retired,
+    )
+    .await
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum MixedRosterHistoryForTest {
+    Compacted,
+    Retired,
+}
+
+async fn assert_mixed_roster_status_and_terminal_conflict_for_test(
+    store: &ConsensusSessionStore,
+    seed: u8,
+    admission: &SignedFreshRosterAdmissionForTest,
+    committed_terminal: &SignedRosterTerminalForTest,
+    exercise_terminal_conflict: bool,
+    expected_history: MixedRosterHistoryForTest,
+) -> Result<(), String> {
     let (authority_identity, _) = store
         .current_scope()
         .map_err(|_| "current membership scope unavailable".to_owned())?;
@@ -1545,13 +1642,18 @@ pub async fn assert_mixed_compacted_roster_status_and_terminal_conflict_for_test
         .map_err(|_| "expected compacted roster tombstone encoding failed".to_owned())?;
 
     let result = async {
-        assert_exact_compacted_roster_row_for_test(
-            store,
-            admission,
-            &authority,
-            &expected_tombstone,
-        )
-        .await?;
+        match expected_history {
+            MixedRosterHistoryForTest::Compacted => {
+                assert_exact_compacted_roster_row_for_test(
+                    store, admission, &authority, &expected_tombstone,
+                ).await?;
+            }
+            MixedRosterHistoryForTest::Retired => {
+                assert_exact_retired_roster_authority_for_test(
+                    store, admission, committed_terminal, &authority,
+                ).await?;
+            }
+        }
         let now = store.inner.clock.now_utc();
         let issuer = RosterIngressTestIssuer::new(
             root,
@@ -1646,31 +1748,40 @@ pub async fn assert_mixed_compacted_roster_status_and_terminal_conflict_for_test
                 None,
             )
             .await;
-        let status_capsule = match status_response {
-            SessionConsumerResponse::FencedMutationRosterTerminalStatus(
-                crate::consumer::SessionConsumerRosterTerminalReadResponse::Recorded(capsule),
-            ) => capsule,
-            _ => return Err("authenticated compacted terminal status was not recorded".to_owned()),
-        };
-        let status: RosterIngressTerminalResponseWire = crate::fenced_mutation_roster::decode_frame(
-            status_capsule.canonical_bytes(),
-            TERMINAL_RESPONSE_MAGIC,
-            TERMINAL_RESPONSE_DOMAIN,
-            crate::fenced_mutation_roster_transport::MAX_PROTECTED_ROSTER_TERMINAL_CAPSULE_BYTES,
-        )
-        .map_err(|_| "authenticated compacted terminal status was malformed".to_owned())?;
-        match status {
-            RosterIngressTerminalResponseWire::Compacted {
-                scope: returned_scope,
-                history_epoch,
-                tombstone,
-            } if returned_scope == roster_scope.digest()
-                && history_epoch == binding.history_epoch()
-                && tombstone == expected_tombstone_bytes => {}
-            _ => {
-                return Err(
-                    "authenticated compacted terminal status changed its exact body".to_owned(),
-                );
+        if expected_history == MixedRosterHistoryForTest::Retired {
+            if !matches!(status_response,
+                SessionConsumerResponse::FencedMutationRosterTerminalStatus(
+                    crate::consumer::SessionConsumerRosterTerminalReadResponse::Rejected(
+                        SessionConsumerRosterRejection::RecoveryRequired))) {
+                return Err("authenticated retired status did not retain non-definitive history".to_owned());
+            }
+        } else {
+            let status_capsule = match status_response {
+                SessionConsumerResponse::FencedMutationRosterTerminalStatus(
+                    crate::consumer::SessionConsumerRosterTerminalReadResponse::Recorded(capsule),
+                ) => capsule,
+                _ => return Err("authenticated compacted terminal status was not recorded".to_owned()),
+            };
+            let status: RosterIngressTerminalResponseWire = crate::fenced_mutation_roster::decode_frame(
+                status_capsule.canonical_bytes(),
+                TERMINAL_RESPONSE_MAGIC,
+                TERMINAL_RESPONSE_DOMAIN,
+                crate::fenced_mutation_roster_transport::MAX_PROTECTED_ROSTER_TERMINAL_CAPSULE_BYTES,
+            )
+            .map_err(|_| "authenticated compacted terminal status was malformed".to_owned())?;
+            match status {
+                RosterIngressTerminalResponseWire::Compacted {
+                    scope: returned_scope,
+                    history_epoch,
+                    tombstone,
+                } if returned_scope == roster_scope.digest()
+                    && history_epoch == binding.history_epoch()
+                    && tombstone == expected_tombstone_bytes => {}
+                _ => {
+                    return Err(
+                        "authenticated compacted terminal status changed its exact body".to_owned(),
+                    );
+                }
             }
         }
         if !exercise_terminal_conflict {
@@ -1707,8 +1818,13 @@ pub async fn assert_mixed_compacted_roster_status_and_terminal_conflict_for_test
                 SessionConsumerRosterTerminalMutationResponse::Rejected(
                     SessionConsumerRosterRejection::Conflict,
                 ),
-            ) => Ok(()),
-            _ => Err("compacted terminal mutation was definitive or unauthenticated".to_owned()),
+            ) if expected_history == MixedRosterHistoryForTest::Compacted => Ok(()),
+            SessionConsumerResponse::FencedMutationRosterTerminalize(
+                SessionConsumerRosterTerminalMutationResponse::Rejected(
+                    SessionConsumerRosterRejection::RecoveryRequired,
+                ),
+            ) if expected_history == MixedRosterHistoryForTest::Retired => Ok(()),
+            _ => Err("closed terminal mutation was definitive or unauthenticated".to_owned()),
         }
     }
     .await;
@@ -1897,6 +2013,58 @@ pub async fn assert_stale_predecessor_signed_fresh_roster_admission_rejected_for
         return Err("stale predecessor admission reached consensus submission".to_owned());
     }
     Ok(())
+}
+
+/// Prove the exact terminal is covered by the canonical retirement frontier,
+/// then check that its row is absent under the same live successor authority.
+/// Waiting observes the autonomous lane; it does not submit maintenance or
+/// pause it. The public operation budget is unchanged.
+async fn assert_exact_retired_roster_authority_for_test(
+    store: &ConsensusSessionStore,
+    admission: &SignedFreshRosterAdmissionForTest,
+    committed_terminal: &SignedRosterTerminalForTest,
+    authority: &AuthorityBinding,
+) -> Result<(), String> {
+    tokio::time::timeout(store.inner.operation_timeout, async {
+        loop {
+            let (retired_sequence, retired_fence) =
+                crate::sqlite::consensus::protected_roster_retirement_authority_for_test(
+                    &store.inner.backend,
+                    store.inner.storage_identity,
+                )
+                .await
+                .map_err(|_| "canonical retirement authority read failed".to_owned())?;
+            if retired_sequence >= committed_terminal.committed.terminal_sequence() {
+                if retired_fence < admission.admission.admission_fence().get() {
+                    return Err(
+                        "retirement witness omitted the original admission fence".to_owned()
+                    );
+                }
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        let (row, _) = store
+            .inner
+            .backend
+            .consensus_protected_roster_admission_status(
+                store.inner.storage_identity,
+                admission.admission.clone(),
+                authority.clone(),
+                store.inner.clock.now_utc(),
+            )
+            .await
+            .map_err(|_| "authenticated retired row read failed".to_owned())?;
+        if !matches!(
+            row,
+            crate::sqlite::consensus::ProtectedRosterReadResult::Missing
+        ) {
+            return Err("the witnessed retired terminal still has an exact roster row".to_owned());
+        }
+        Ok(())
+    })
+    .await
+    .map_err(|_| "autonomous retirement exceeded the existing operation budget".to_owned())?
 }
 
 /// Observe only the exact compacted row selected by a live successor lease.
@@ -2430,6 +2598,39 @@ pub fn consensus_native_current_snapshot_for_test(
         wal.native_current_snapshot_for_test()?
             .map(|current| current.1),
     ))
+}
+
+/// Join every owned engine and storage lane without certifying a completed
+/// close. This fixture leaves the next asynchronous incarnation subject to
+/// ordinary cold admission; it grants no recovery authority and edits no file.
+#[cfg(target_os = "linux")]
+pub async fn shutdown_consensus_without_close_proof_for_test(
+    store: &ConsensusSessionStore,
+) -> Result<(), StoreError> {
+    store.shutdown_with_closed_proof(false).await
+}
+
+/// Observe the live native installation authority in either persistence mode.
+/// This reads the real owner without SQL or an admission predicate. A volatile
+/// observation is not evidence of durable publication or crash recovery.
+#[cfg(target_os = "linux")]
+pub fn consensus_native_snapshot_install_origin_for_test(
+    store: &ConsensusSessionStore,
+) -> std::io::Result<(bool, Option<String>)> {
+    let Some(wal) = store
+        .inner
+        .private_wal
+        .as_ref()
+        .filter(|wal| wal.is_native())
+    else {
+        return Ok((false, None));
+    };
+    let origin = wal.with_native_read(|state| {
+        Ok(state
+            .snapshot_install_origin_for_test()
+            .map(|current| current.1))
+    })?;
+    Ok((true, origin))
 }
 
 /// A scoped fixture fault. Explicit restoration reports errors; drop also

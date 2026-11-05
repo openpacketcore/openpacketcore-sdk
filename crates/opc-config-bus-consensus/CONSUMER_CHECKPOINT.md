@@ -139,7 +139,11 @@ per process; excess admission returns a bounded outcome. Each I/O or key-provide
 stage has a caller-selected timeout of at most one hour. Coordinator encoding,
 transport and product calls are separately bounded by the consumer call timeout.
 Possible post-dispatch mutation is indeterminate, and a later write requires
-actual readback. A cancelled tail poll discards that in-memory cursor, so it
+actual readback. A completed storage worker retains its successful write or open
+result when observed after its deadline; write results still require authenticated,
+exact readback before success. Waiting for unfinished I/O stays bounded. A timeout
+while the outcome is unknown remains indeterminate and requires actual readback
+before another write. A cancelled tail poll discards that in-memory cursor, so it
 cannot skip an uncheckpointed revision.
 
 `shutdown` consumes the consumer, retires its stream and waits for owned storage

@@ -76,11 +76,14 @@ fn envelope_provider_keeps_transient_failures_distinct_from_missing_keys_and_cor
         provider.fail(Fault::Healthy);
         assert!(envelope::unseal(&provider, key, &row).unwrap().as_slice() == plaintext.as_slice());
     }
-    for fault in [Fault::Missing, Fault::Revoked] {
+    for (fault, expected) in [
+        (Fault::Missing, envelope::Error::KeyLost),
+        (Fault::Revoked, envelope::Error::Integrity),
+    ] {
         provider.fail(fault);
         assert_eq!(
             envelope::unseal(&provider, key, &row).err().unwrap(),
-            envelope::Error::KeyLost
+            expected
         );
     }
     provider.fail(Fault::Healthy);

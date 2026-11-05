@@ -3,6 +3,7 @@
 use std::ops::Deref;
 
 // Internal module imports
+pub(crate) mod ffdhe;
 mod keying;
 
 // Provider traits and implementations
@@ -14,6 +15,9 @@ pub mod rust_crypto;
 
 #[cfg(any(feature = "aws-lc-rs", feature = "rust-crypto"))]
 pub(crate) mod ccm_cipher;
+
+#[cfg(feature = "_crypto-common")]
+mod rsa;
 
 mod dtls_aead;
 pub mod prf_hkdf;

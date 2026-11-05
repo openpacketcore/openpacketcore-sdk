@@ -4,13 +4,13 @@
 //! UDP tuple selection, peer admission, rate limiting, tunnel lookup, and the
 //! decision to send an End Marker remain consumer responsibilities.
 //!
-//! The implemented clauses are TS 29.281 Release 18 §5.1, §5.2.1,
-//! §5.2.2.1, §7.2.1-§7.2.3, §7.3.1-§7.3.2, §8.1-§8.6, and §8.8.
-//! Tunnel Status (§7.3.3 and §8.7) is explicitly not implemented by this
-//! module.
+//! The implemented clauses are TS 29.281 Release 19 §5.1, §5.2.1,
+//! §5.2.2.1, §7.2.1-§7.2.3, §7.3.1-§7.3.3, and §8.1-§8.8.
+//! Tunnel Status decoding conveys SPOC; charging, tunnel lookup and upstream
+//! forwarding remain consumer responsibilities.
 //!
-//! @spec 3GPP TS29281 R18 5.1, 5.2.1, 5.2.2.1, 7.2.1-7.2.3, 7.3.1-7.3.2, 8.1-8.6, 8.8
-//! @req REQ-3GPP-TS29281-R18-CONTROL-CODEC-001
+//! @spec 3GPP TS29281 R19 5.1, 5.2.1, 5.2.2.1, 7.2.1-7.2.3, 7.3.1-7.3.3, 8.1-8.8
+//! @req REQ-3GPP-TS29281-R19-CONTROL-CODEC-001
 //! @conformance control-codec-subset
 
 use std::{
@@ -42,6 +42,8 @@ pub const GTPU_MESSAGE_ECHO_RESPONSE: u8 = 2;
 pub const GTPU_MESSAGE_ERROR_INDICATION: u8 = 26;
 /// GTP-U Supported Extension Headers Notification message type.
 pub const GTPU_MESSAGE_SUPPORTED_EXTENSION_HEADERS_NOTIFICATION: u8 = 31;
+/// GTP-U Tunnel Status message type.
+pub const GTPU_MESSAGE_TUNNEL_STATUS: u8 = 253;
 /// GTP-U End Marker message type.
 pub const GTPU_MESSAGE_END_MARKER: u8 = 254;
 
@@ -334,6 +336,53 @@ impl fmt::Debug for GtpuRecoveryTimeStamp {
         formatter
             .debug_struct("GtpuRecoveryTimeStamp")
             .field("seconds_since_1900", &"<redacted>")
+            .field("additional_data_len", &self.additional_data.len())
+            .finish()
+    }
+}
+
+/// GTP-U Tunnel Status Information (TS 29.281 §8.7).
+#[derive(Clone, PartialEq, Eq)]
+pub struct GtpuTunnelStatusInformation {
+    spoc: bool,
+    received_spare: u8,
+    additional_data: Bytes,
+}
+
+impl GtpuTunnelStatusInformation {
+    /// Construct the standardized one-octet value with sender spare bits zero.
+    #[must_use]
+    pub fn new(spoc: bool) -> Self {
+        Self {
+            spoc,
+            received_spare: 0,
+            additional_data: Bytes::new(),
+        }
+    }
+
+    /// Start Pause Of Charging request; applying it requires an admitted tunnel.
+    #[must_use]
+    pub const fn spoc(&self) -> bool {
+        self.spoc
+    }
+
+    /// Receiver-ignored bits 2–8 in their original positions; canonical send clears them.
+    #[must_use]
+    pub const fn received_spare(&self) -> u8 {
+        self.received_spare
+    }
+
+    /// Opaque future-extension octets, preserved when re-encoding.
+    #[must_use]
+    pub fn additional_data(&self) -> &[u8] {
+        &self.additional_data
+    }
+}
+
+impl fmt::Debug for GtpuTunnelStatusInformation {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("GtpuTunnelStatusInformation")
+            .field("spoc", &self.spoc)
             .field("additional_data_len", &self.additional_data.len())
             .finish()
     }
@@ -914,6 +963,81 @@ impl fmt::Debug for GtpuEndMarker {
     }
 }
 
+/// Typed Tunnel Status.
+#[derive(Clone, PartialEq, Eq)]
+pub struct GtpuTunnelStatus {
+    teid: GtpuTunnelEndpointId,
+    tunnel_status_information: GtpuTunnelStatusInformation,
+    private_extensions: Vec<GtpuPrivateExtension>,
+    unknown_ies: Vec<GtpuUnknownControlIe>,
+    extensions: GtpuExtensionChain,
+}
+
+impl GtpuTunnelStatus {
+    /// Construct an Tunnel Status for a tunnel.
+    #[must_use]
+    pub fn new(
+        teid: GtpuTunnelEndpointId,
+        tunnel_status_information: GtpuTunnelStatusInformation,
+    ) -> Self {
+        Self {
+            teid,
+            tunnel_status_information,
+            private_extensions: Vec::new(),
+            unknown_ies: Vec::new(),
+            extensions: GtpuExtensionChain::none(),
+        }
+    }
+
+    /// Tunnel whose charging state is reported.
+    #[must_use]
+    pub const fn teid(&self) -> GtpuTunnelEndpointId {
+        self.teid
+    }
+
+    /// Mandatory Tunnel Status Information.
+    #[must_use]
+    pub const fn tunnel_status_information(&self) -> &GtpuTunnelStatusInformation {
+        &self.tunnel_status_information
+    }
+
+    /// Append a repeatable Private Extension.
+    pub fn push_private_extension(&mut self, value: GtpuPrivateExtension) {
+        self.private_extensions.push(value);
+    }
+
+    /// Unknown TLVs preserved by the decode policy.
+    #[must_use]
+    pub fn unknown_ies(&self) -> &[GtpuUnknownControlIe] {
+        &self.unknown_ies
+    }
+
+    /// Private Extensions in received/builder order.
+    #[must_use]
+    pub fn private_extensions(&self) -> &[GtpuPrivateExtension] {
+        &self.private_extensions
+    }
+
+    /// Raw-preserved extension-header chain.
+    #[must_use]
+    pub const fn extension_chain(&self) -> &GtpuExtensionChain {
+        &self.extensions
+    }
+}
+
+impl fmt::Debug for GtpuTunnelStatus {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("GtpuTunnelStatus")
+            .field("teid", &self.teid)
+            .field("tunnel_status_information", &self.tunnel_status_information)
+            .field("private_extension_count", &self.private_extensions.len())
+            .field("unknown_ie_count", &self.unknown_ies.len())
+            .field("extensions", &self.extensions)
+            .finish()
+    }
+}
+
 /// Typed GTP-U control message.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum GtpuControlMessage {
@@ -925,6 +1049,8 @@ pub enum GtpuControlMessage {
     ErrorIndication(GtpuErrorIndication),
     /// Supported Extension Headers Notification path-management message.
     SupportedExtensionHeadersNotification(GtpuSupportedExtensionHeadersNotification),
+    /// Tunnel Status tunnel-management message.
+    TunnelStatus(GtpuTunnelStatus),
     /// End Marker tunnel-management message.
     EndMarker(GtpuEndMarker),
 }
@@ -954,6 +1080,7 @@ impl ValidatedControlFrame {
                 | GTPU_MESSAGE_ERROR_INDICATION
                 | GTPU_MESSAGE_SUPPORTED_EXTENSION_HEADERS_NOTIFICATION
                 | GTPU_MESSAGE_END_MARKER
+                | GTPU_MESSAGE_TUNNEL_STATUS
         ) {
             return Err(GtpuControlCodecError::new(
                 GtpuControlCodecErrorCode::UnsupportedMessageType { message_type },
@@ -1012,6 +1139,7 @@ impl GtpuControlMessage {
                 GTPU_MESSAGE_SUPPORTED_EXTENSION_HEADERS_NOTIFICATION
             }
             Self::EndMarker(_) => GTPU_MESSAGE_END_MARKER,
+            Self::TunnelStatus(_) => GTPU_MESSAGE_TUNNEL_STATUS,
         }
     }
 
@@ -1029,11 +1157,16 @@ impl GtpuControlMessage {
             Self::EchoResponse(response) => Some(response.sequence_number()),
             Self::ErrorIndication(_)
             | Self::SupportedExtensionHeadersNotification(_)
-            | Self::EndMarker(_) => None,
+            | Self::EndMarker(_)
+            | Self::TunnelStatus(_) => None,
         }
     }
 
     /// Decode exactly one complete GTP-U control datagram.
+    ///
+    /// The network receiver skips unexpected IEs and unknown TLVs (`Reject`
+    /// acts as `Drop`), and always uses the first singleton occurrence. Generic
+    /// duplicate-policy settings do not override TS 29.060 §11.1.12.
     ///
     /// Unlike [`Self::decode`], this datagram boundary rejects bytes following
     /// the GTP-U Length field instead of returning them as a stream tail.
@@ -1074,13 +1207,12 @@ impl GtpuControlMessage {
             extensions,
             udp_port,
         } = validated;
-        let parsed = parse_ies(message.payload, payload_base, ctx)?;
+        let parsed = parse_ies(message.payload, payload_base, message_type, ctx)?;
 
         match message_type {
             GTPU_MESSAGE_ECHO_REQUEST => {
                 validate_zero_teid_and_sequence(message)?;
                 reject_udp_port(udp_port)?;
-                reject_unexpected(&parsed, &[IE_RECOVERY_TIME_STAMP, IE_PRIVATE_EXTENSION])?;
                 Ok(Self::EchoRequest(GtpuEchoRequest {
                     sequence_number: required_sequence(message)?,
                     optional: parsed.into_optional(),
@@ -1090,10 +1222,6 @@ impl GtpuControlMessage {
             GTPU_MESSAGE_ECHO_RESPONSE => {
                 validate_zero_teid_and_sequence(message)?;
                 reject_udp_port(udp_port)?;
-                reject_unexpected(
-                    &parsed,
-                    &[IE_RECOVERY, IE_RECOVERY_TIME_STAMP, IE_PRIVATE_EXTENSION],
-                )?;
                 if !parsed.recovery {
                     return Err(missing(IE_RECOVERY, message_end));
                 }
@@ -1106,15 +1234,6 @@ impl GtpuControlMessage {
             }
             GTPU_MESSAGE_ERROR_INDICATION => {
                 validate_zero_teid_and_sequence(message)?;
-                reject_unexpected(
-                    &parsed,
-                    &[
-                        IE_TEID_DATA_I,
-                        IE_GTPU_PEER_ADDRESS,
-                        IE_RECOVERY_TIME_STAMP,
-                        IE_PRIVATE_EXTENSION,
-                    ],
-                )?;
                 let teid_data_i = parsed
                     .teid_data_i
                     .ok_or_else(|| missing(IE_TEID_DATA_I, message_end))?;
@@ -1138,10 +1257,6 @@ impl GtpuControlMessage {
             GTPU_MESSAGE_SUPPORTED_EXTENSION_HEADERS_NOTIFICATION => {
                 validate_zero_teid_and_sequence(message)?;
                 reject_udp_port(udp_port)?;
-                reject_unexpected(
-                    &parsed,
-                    &[IE_EXTENSION_HEADER_TYPE_LIST, IE_PRIVATE_EXTENSION],
-                )?;
                 let supported_types = parsed
                     .extension_header_type_list
                     .ok_or_else(|| missing(IE_EXTENSION_HEADER_TYPE_LIST, message_end))?;
@@ -1154,6 +1269,24 @@ impl GtpuControlMessage {
                     },
                 ))
             }
+            GTPU_MESSAGE_TUNNEL_STATUS => {
+                if message.header.seq_num_flag {
+                    return Err(GtpuControlCodecError::new(
+                        GtpuControlCodecErrorCode::InvalidHeaderFlags,
+                        0,
+                    ));
+                }
+                reject_udp_port(udp_port)?;
+                Ok(Self::TunnelStatus(GtpuTunnelStatus {
+                    teid: GtpuTunnelEndpointId::new(message.header.teid),
+                    tunnel_status_information: parsed
+                        .tunnel_status_information
+                        .ok_or_else(|| missing(IE_GTPU_TUNNEL_STATUS, message_end))?,
+                    private_extensions: parsed.private_extensions,
+                    unknown_ies: parsed.unknown_ies,
+                    extensions,
+                }))
+            }
             GTPU_MESSAGE_END_MARKER => {
                 if message.header.seq_num_flag {
                     return Err(GtpuControlCodecError::new(
@@ -1162,7 +1295,6 @@ impl GtpuControlMessage {
                     ));
                 }
                 reject_udp_port(udp_port)?;
-                reject_unexpected(&parsed, &[IE_PRIVATE_EXTENSION])?;
                 Ok(Self::EndMarker(GtpuEndMarker {
                     teid: GtpuTunnelEndpointId::new(message.header.teid),
                     private_extensions: parsed.private_extensions,
@@ -1237,6 +1369,23 @@ impl GtpuControlMessage {
                     Some(0),
                     Cow::Borrowed(&value.extensions),
                     ie_refs_supported(value),
+                )
+            }
+            Self::TunnelStatus(value) => {
+                let count = 1usize
+                    .checked_add(value.private_extensions.len())
+                    .and_then(|count| count.checked_add(value.unknown_ies.len()))
+                    .ok_or_else(length_overflow)?;
+                ensure_control_ie_count(count)?;
+                let mut ies = vec![ControlIeRef::TunnelStatus(&value.tunnel_status_information)];
+                ies.extend(value.private_extensions.iter().map(ControlIeRef::Private));
+                ies.extend(value.unknown_ies.iter().map(ControlIeRef::Unknown));
+                (
+                    GTPU_MESSAGE_TUNNEL_STATUS,
+                    value.teid.value(),
+                    None,
+                    Cow::Borrowed(&value.extensions),
+                    ies,
                 )
             }
             Self::EndMarker(value) => {
@@ -1593,6 +1742,7 @@ fn classify_control_extension(extension_type: u8, message_type: u8) -> ControlEx
 
 #[derive(Default)]
 struct ParsedIes {
+    tunnel_status_information: Option<GtpuTunnelStatusInformation>,
     recovery: bool,
     teid_data_i: Option<GtpuTunnelEndpointId>,
     peer_address: Option<GtpuPeerAddress>,
@@ -1619,15 +1769,54 @@ impl ParsedIes {
     }
 }
 
+// TS 29.060 Table 37: even GTP-C-only TV elements have a known boundary
+// and must be skipped on GTP-U (§11.1.11, via TS 29.281 §9.1).
+fn tv_value_len(ie_type: u8) -> Option<usize> {
+    match ie_type {
+        1 | 8 | 11 | 13..=15 | 19..=21 | 23..=24 | 29 => Some(1),
+        2 => Some(8),
+        3 => Some(6),
+        4..=5 | 16..=17 | 127 => Some(4),
+        9 => Some(28),
+        12 => Some(3),
+        18 => Some(5),
+        22 => Some(9),
+        25..=28 => Some(2),
+        _ => None,
+    }
+}
+
+fn allowed_ies(message_type: u8) -> &'static [u8] {
+    match message_type {
+        GTPU_MESSAGE_ECHO_REQUEST => &[IE_RECOVERY_TIME_STAMP, IE_PRIVATE_EXTENSION],
+        GTPU_MESSAGE_ECHO_RESPONSE => &[IE_RECOVERY, IE_RECOVERY_TIME_STAMP, IE_PRIVATE_EXTENSION],
+        GTPU_MESSAGE_ERROR_INDICATION => &[
+            IE_TEID_DATA_I,
+            IE_GTPU_PEER_ADDRESS,
+            IE_RECOVERY_TIME_STAMP,
+            IE_PRIVATE_EXTENSION,
+        ],
+        GTPU_MESSAGE_SUPPORTED_EXTENSION_HEADERS_NOTIFICATION => {
+            &[IE_EXTENSION_HEADER_TYPE_LIST, IE_PRIVATE_EXTENSION]
+        }
+        GTPU_MESSAGE_END_MARKER => &[IE_PRIVATE_EXTENSION],
+        GTPU_MESSAGE_TUNNEL_STATUS => &[IE_GTPU_TUNNEL_STATUS, IE_PRIVATE_EXTENSION],
+        _ => &[],
+    }
+}
+
 fn parse_ies(
     payload: &[u8],
     payload_base: usize,
+    message_type: u8,
     ctx: DecodeContext,
 ) -> Result<ParsedIes, GtpuControlCodecError> {
     let mut parsed = ParsedIes::default();
     let mut offset = 0usize;
     let mut count = 0usize;
     let mut previous_type = None;
+    let mut seen = [false; 256];
+    let allowed = allowed_ies(message_type);
 
     while offset < payload.len() {
         let datagram_offset = payload_base
@@ -1649,156 +1838,126 @@ fn parse_ies(
         }
         previous_type = Some(ie_type);
 
-        match ie_type {
-            IE_RECOVERY => {
+        let (header_len, value_len) = match ie_type {
+            0..=127 => (
+                1,
+                tv_value_len(ie_type).ok_or_else(|| {
+                    GtpuControlCodecError::new(
+                        GtpuControlCodecErrorCode::UnknownTvIe { ie_type },
+                        datagram_offset,
+                    )
+                })?,
+            ),
+            IE_EXTENSION_HEADER_TYPE_LIST => {
+                // Figure 8.5-1 uses a one-octet count, unlike other TLVs.
                 require_bytes(payload, offset, 2, datagram_offset)?;
-                if parsed.recovery {
-                    return Err(duplicate(ie_type, datagram_offset));
-                }
-                // The restart counter is explicitly receiver-ignored.
-                parsed.recovery = true;
-                parsed.known_ie_offsets.push((ie_type, datagram_offset));
-                offset += 2;
+                (2, usize::from(payload[offset + 1]))
             }
+            _ => {
+                require_bytes(payload, offset, 3, datagram_offset)?;
+                (
+                    3,
+                    usize::from(u16::from_be_bytes([
+                        payload[offset + 1],
+                        payload[offset + 2],
+                    ])),
+                )
+            }
+        };
+        require_bytes(payload, offset, header_len + value_len, datagram_offset)?;
+        let value_start = offset + header_len;
+        offset = value_start + value_len;
+        let value = &payload[value_start..offset];
+
+        // TS 29.060 §11.1.12: first occurrence wins regardless of generic policy;
+        // TS 29.281 §8.6 explicitly permits repeatable Private Extensions.
+        if seen[usize::from(ie_type)] && ie_type != IE_PRIVATE_EXTENSION {
+            continue;
+        }
+        seen[usize::from(ie_type)] = true;
+        let defined = ie_type < 128
+            || matches!(
+                ie_type,
+                IE_GTPU_PEER_ADDRESS
+                    | IE_EXTENSION_HEADER_TYPE_LIST
+                    | IE_GTPU_TUNNEL_STATUS
+                    | IE_RECOVERY_TIME_STAMP
+                    | IE_PRIVATE_EXTENSION
+            );
+        if defined && !allowed.contains(&ie_type) {
+            continue;
+        }
+        if defined {
+            parsed.known_ie_offsets.push((ie_type, datagram_offset));
+        }
+        match ie_type {
+            IE_RECOVERY => parsed.recovery = true, // Restart counter is receiver-ignored.
             IE_TEID_DATA_I => {
-                require_bytes(payload, offset, 5, datagram_offset)?;
-                if parsed.teid_data_i.is_some() {
-                    return Err(duplicate(ie_type, datagram_offset));
-                }
                 parsed.teid_data_i = Some(GtpuTunnelEndpointId::new(u32::from_be_bytes([
-                    payload[offset + 1],
-                    payload[offset + 2],
-                    payload[offset + 3],
-                    payload[offset + 4],
-                ])));
-                parsed.known_ie_offsets.push((ie_type, datagram_offset));
-                offset += 5;
+                    value[0], value[1], value[2], value[3],
+                ])))
             }
             IE_EXTENSION_HEADER_TYPE_LIST => {
-                // TS 29.281 figure 8.5-1: type, one-octet count, then n
-                // extension types. Do not apply the generic TLV u16 length.
-                require_bytes(payload, offset, 2, datagram_offset)?;
-                let value_len = usize::from(payload[offset + 1]);
-                require_bytes(payload, offset, 2 + value_len, datagram_offset)?;
-                if parsed.extension_header_type_list.is_some() {
-                    return Err(duplicate(ie_type, datagram_offset));
-                }
-                let end = offset + 2 + value_len;
-                let types = payload[offset + 2..end]
-                    .iter()
-                    .copied()
-                    .map(GtpuExtensionHeaderType::new);
+                let types = value.iter().copied().map(GtpuExtensionHeaderType::new);
                 parsed.extension_header_type_list = Some(
                     GtpuExtensionHeaderTypeList::new(types)
                         .map_err(|_| invalid_value(ie_type, datagram_offset))?,
                 );
-                parsed.known_ie_offsets.push((ie_type, datagram_offset));
-                offset = end;
             }
-            0..=127 => {
-                return Err(GtpuControlCodecError::new(
-                    GtpuControlCodecErrorCode::UnknownTvIe { ie_type },
-                    datagram_offset,
+            IE_GTPU_PEER_ADDRESS => {
+                let address = match value {
+                    [a, b, c, d] => IpAddr::V4(Ipv4Addr::new(*a, *b, *c, *d)),
+                    bytes if bytes.len() == 16 => {
+                        let octets: [u8; 16] = bytes
+                            .try_into()
+                            .map_err(|_| invalid_length(ie_type, datagram_offset))?;
+                        IpAddr::V6(Ipv6Addr::from(octets))
+                    }
+                    _ => return Err(invalid_length(ie_type, datagram_offset)),
+                };
+                parsed.peer_address = Some(GtpuPeerAddress::new(address));
+            }
+            IE_RECOVERY_TIME_STAMP => {
+                if value.len() < 4 {
+                    return Err(invalid_length(ie_type, datagram_offset));
+                }
+                parsed.recovery_time_stamp = Some(GtpuRecoveryTimeStamp::from_received(
+                    u32::from_be_bytes([value[0], value[1], value[2], value[3]]),
+                    Bytes::copy_from_slice(&value[4..]),
+                ));
+            }
+            IE_GTPU_TUNNEL_STATUS => {
+                let Some((&flags, additional_data)) = value.split_first() else {
+                    return Err(invalid_length(ie_type, datagram_offset));
+                };
+                parsed.tunnel_status_information = Some(GtpuTunnelStatusInformation {
+                    spoc: flags & 1 != 0,
+                    received_spare: flags & 0xfe,
+                    additional_data: Bytes::copy_from_slice(additional_data),
+                });
+            }
+            IE_PRIVATE_EXTENSION => {
+                if value.len() < 2 {
+                    return Err(invalid_length(ie_type, datagram_offset));
+                }
+                parsed.private_extensions.push(GtpuPrivateExtension::new(
+                    u16::from_be_bytes([value[0], value[1]]),
+                    Bytes::copy_from_slice(&value[2..]),
                 ));
             }
             _ => {
-                require_bytes(payload, offset, 3, datagram_offset)?;
-                let value_len = usize::from(u16::from_be_bytes([
-                    payload[offset + 1],
-                    payload[offset + 2],
-                ]));
-                let value_start = offset.checked_add(3).ok_or_else(length_overflow)?;
-                let end = value_start
-                    .checked_add(value_len)
-                    .ok_or_else(length_overflow)?;
-                if end > payload.len() {
-                    return Err(GtpuControlCodecError::new(
-                        GtpuControlCodecErrorCode::TruncatedIe,
-                        datagram_offset,
-                    ));
+                // TS 29.060 §11.1.9 requires skipping unknown TLVs. Preserve
+                // retains opaque bytes; Reject has the same receive effect as Drop.
+                if ctx.unknown_ie_policy == UnknownIePolicy::Preserve {
+                    parsed.unknown_ies.push(GtpuUnknownControlIe {
+                        ie_type,
+                        value: Bytes::copy_from_slice(value),
+                    });
                 }
-                let value = &payload[value_start..end];
-                match ie_type {
-                    IE_GTPU_PEER_ADDRESS => {
-                        if parsed.peer_address.is_some() {
-                            return Err(duplicate(ie_type, datagram_offset));
-                        }
-                        let address = match value {
-                            [a, b, c, d] => IpAddr::V4(Ipv4Addr::new(*a, *b, *c, *d)),
-                            bytes if bytes.len() == 16 => {
-                                let octets: [u8; 16] = bytes
-                                    .try_into()
-                                    .map_err(|_| invalid_length(ie_type, datagram_offset))?;
-                                IpAddr::V6(Ipv6Addr::from(octets))
-                            }
-                            _ => return Err(invalid_length(ie_type, datagram_offset)),
-                        };
-                        parsed.peer_address = Some(GtpuPeerAddress::new(address));
-                        parsed.known_ie_offsets.push((ie_type, datagram_offset));
-                    }
-                    IE_GTPU_TUNNEL_STATUS => {
-                        return Err(GtpuControlCodecError::new(
-                            GtpuControlCodecErrorCode::UnexpectedIe { ie_type },
-                            datagram_offset,
-                        ));
-                    }
-                    IE_RECOVERY_TIME_STAMP => {
-                        if parsed.recovery_time_stamp.is_some() {
-                            return Err(duplicate(ie_type, datagram_offset));
-                        }
-                        if value.len() < 4 {
-                            return Err(invalid_length(ie_type, datagram_offset));
-                        }
-                        parsed.recovery_time_stamp = Some(GtpuRecoveryTimeStamp::from_received(
-                            u32::from_be_bytes([value[0], value[1], value[2], value[3]]),
-                            Bytes::copy_from_slice(&value[4..]),
-                        ));
-                        parsed.known_ie_offsets.push((ie_type, datagram_offset));
-                    }
-                    IE_PRIVATE_EXTENSION => {
-                        if value.len() < 2 {
-                            return Err(invalid_length(ie_type, datagram_offset));
-                        }
-                        parsed.private_extensions.push(GtpuPrivateExtension::new(
-                            u16::from_be_bytes([value[0], value[1]]),
-                            Bytes::copy_from_slice(&value[2..]),
-                        ));
-                        parsed.known_ie_offsets.push((ie_type, datagram_offset));
-                    }
-                    _ => match ctx.unknown_ie_policy {
-                        UnknownIePolicy::Drop => {}
-                        UnknownIePolicy::Preserve => {
-                            parsed.unknown_ies.push(GtpuUnknownControlIe {
-                                ie_type,
-                                value: Bytes::copy_from_slice(value),
-                            });
-                        }
-                        UnknownIePolicy::Reject => {
-                            return Err(GtpuControlCodecError::new(
-                                GtpuControlCodecErrorCode::UnknownIe { ie_type },
-                                datagram_offset,
-                            ));
-                        }
-                    },
-                }
-                offset = end;
             }
         }
     }
-
     Ok(parsed)
-}
-
-fn reject_unexpected(parsed: &ParsedIes, allowed: &[u8]) -> Result<(), GtpuControlCodecError> {
-    for (ie_type, offset) in &parsed.known_ie_offsets {
-        if !allowed.contains(ie_type) {
-            return Err(GtpuControlCodecError::new(
-                GtpuControlCodecErrorCode::UnexpectedIe { ie_type: *ie_type },
-                *offset,
-            ));
-        }
-    }
-    Ok(())
 }
 
 fn require_bytes(
@@ -1815,10 +1974,6 @@ fn require_bytes(
     } else {
         Ok(())
     }
-}
-
-fn duplicate(ie_type: u8, offset: usize) -> GtpuControlCodecError {
-    GtpuControlCodecError::new(GtpuControlCodecErrorCode::DuplicateIe { ie_type }, offset)
 }
 
 fn missing(ie_type: u8, datagram_end: usize) -> GtpuControlCodecError {
@@ -1856,6 +2011,7 @@ enum ControlIeRef<'a> {
     PeerAddress(GtpuPeerAddress),
     ExtensionTypes(&'a GtpuExtensionHeaderTypeList),
     RecoveryTimeStamp(&'a GtpuRecoveryTimeStamp),
+    TunnelStatus(&'a GtpuTunnelStatusInformation),
     Private(&'a GtpuPrivateExtension),
     Unknown(&'a GtpuUnknownControlIe),
 }
@@ -1868,6 +2024,7 @@ impl ControlIeRef<'_> {
             Self::PeerAddress(_) => IE_GTPU_PEER_ADDRESS,
             Self::ExtensionTypes(_) => IE_EXTENSION_HEADER_TYPE_LIST,
             Self::RecoveryTimeStamp(_) => IE_RECOVERY_TIME_STAMP,
+            Self::TunnelStatus(_) => IE_GTPU_TUNNEL_STATUS,
             Self::Private(_) => IE_PRIVATE_EXTENSION,
             Self::Unknown(value) => value.ie_type,
         }
@@ -1882,6 +2039,13 @@ impl ControlIeRef<'_> {
                 IpAddr::V6(_) => 19,
             }),
             Self::ExtensionTypes(value) => value.0.len().checked_add(2).ok_or_else(length_overflow),
+            Self::TunnelStatus(value) => tlv_wire_len(
+                value
+                    .additional_data
+                    .len()
+                    .checked_add(1)
+                    .ok_or_else(length_overflow)?,
+            ),
             Self::RecoveryTimeStamp(value) => tlv_wire_len(
                 value
                     .additional_data
@@ -1932,6 +2096,16 @@ impl ControlIeRef<'_> {
                 for header_type in &value.0 {
                     destination.put_u8(header_type.value());
                 }
+            }
+            Self::TunnelStatus(value) => {
+                let length = value
+                    .additional_data
+                    .len()
+                    .checked_add(1)
+                    .ok_or_else(length_overflow)?;
+                put_tlv_header(destination, IE_GTPU_TUNNEL_STATUS, length)?;
+                destination.put_u8(u8::from(value.spoc));
+                destination.put_slice(&value.additional_data);
             }
             Self::RecoveryTimeStamp(value) => {
                 let length = value

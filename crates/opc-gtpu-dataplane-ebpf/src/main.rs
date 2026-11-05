@@ -75,16 +75,16 @@ use opc_gtpu_ebpf_common::trusted_traffic_observation_abi::{
 use opc_gtpu_ebpf_common::{
     apply_uplink_mtu_policy, build_uplink_encap_with_dscp_and_source_port, classify_gtpu,
     classify_udp_checksum, consumer_is_bound_to_attachment, control_block_flags_word,
-    decide_uplink_pmtu, downlink_frame_end, downlink_ipv4_hand_off_port,
-    downlink_parse_ipv4_total_length, downlink_parse_payload_offset, downlink_parse_teid,
-    gtpu_session_config_wire_owns_local_ipv4, gtpu_session_config_wire_owns_local_ipv6,
-    hand_off_assignment_keeps_datagram, internet_checksum_sum_is_valid,
-    marked_owner_wire_authorizes_downlink, marked_owner_wire_authorizes_uplink,
-    n3_downlink_psc_matches, n3_uplink_extension, outer_ipv4_is_first_fragment,
-    pack_downlink_parse_result, pdp_commit_wire_authorized_source_port,
-    pdp_commit_wire_authorizes_downlink, pdp_commit_wire_authorizes_graph,
-    pdp_commit_wire_downlink_inner_mtu, scoped_consumer_is_established,
-    select_gtpu_session_entry_wire, tft_classifier_filter_matches,
+    count_uplink_far_miss, decide_uplink_pmtu, downlink_frame_end, downlink_ipv4_hand_off_port,
+    downlink_ipv6_exceeds_inner_mtu, downlink_parse_ipv4_total_length,
+    downlink_parse_payload_offset, downlink_parse_teid, gtpu_session_config_wire_owns_local_ipv4,
+    gtpu_session_config_wire_owns_local_ipv6, hand_off_assignment_keeps_datagram,
+    internet_checksum_sum_is_valid, marked_owner_wire_authorizes_downlink,
+    marked_owner_wire_authorizes_uplink, n3_downlink_psc_matches, n3_uplink_extension,
+    outer_ipv4_is_first_fragment, pack_downlink_parse_result,
+    pdp_commit_wire_authorized_source_port, pdp_commit_wire_authorizes_downlink,
+    pdp_commit_wire_authorizes_graph, pdp_commit_wire_downlink_inner_mtu,
+    scoped_consumer_is_established, select_gtpu_session_entry_wire, tft_classifier_filter_matches,
     tft_classifier_schema_is_current, uplink_non_encapsulation_drops,
     validate_ipv4_downlink_binding_wire, vlan_tag_takes_frame_away, DownlinkBindingMismatch,
     DownlinkPdr, GtpuClass, GtpuEnvelopeBounds, GtpuOuterFragmentPolicy, GtpuPmtuProtocol,
@@ -98,19 +98,19 @@ use opc_gtpu_ebpf_common::{
     COUNTER_DL_BINDING_INVALID, COUNTER_DL_BINDING_LOCAL_MISMATCH,
     COUNTER_DL_BINDING_PEER_MISMATCH, COUNTER_DL_BINDING_SOURCE_PORT_MISMATCH, COUNTER_DL_DECAP,
     COUNTER_DL_DST_MISMATCH, COUNTER_DL_MALFORMED, COUNTER_DL_MISSING_CONSUMER,
-    COUNTER_DL_UNKNOWN_TEID, COUNTER_SLOTS, COUNTER_TFT_CLASSIFIER_INVALID_STATE,
-    COUNTER_TFT_CLASSIFIER_MALFORMED, COUNTER_TFT_CLASSIFIER_NO_MATCH, COUNTER_UL_ENCAP,
-    COUNTER_UL_FAR_MISS, COUNTER_UL_MTU_REJECT, COUNTER_UL_PMTU_CORRUPT,
-    COUNTER_UL_REDIRECT_RESOLVED, DOWNLINK_BINDING_COUNTER_SLOTS,
+    COUNTER_DL_UNKNOWN_TEID, COUNTER_SLOTS, COUNTER_TFT_CLASSIFIER_CAPACITY,
+    COUNTER_TFT_CLASSIFIER_INVALID_STATE, COUNTER_TFT_CLASSIFIER_MALFORMED,
+    COUNTER_TFT_CLASSIFIER_NO_MATCH, COUNTER_UL_ENCAP, COUNTER_UL_MTU_REJECT,
+    COUNTER_UL_PMTU_CORRUPT, COUNTER_UL_REDIRECT_RESOLVED, DOWNLINK_BINDING_COUNTER_SLOTS,
     DOWNLINK_ENDPOINT_BINDING_VALUE_LEN, DOWNLINK_PDR_VALUE_LEN, ETH_HDR_LEN, ETH_P_IPV4,
     ETH_P_IPV6, GTPU_ENCAP_LEN, GTPU_FLAGS_V1_GPDU, GTPU_FLAG_E, GTPU_IPV6_ENCAP_LEN,
     GTPU_MANDATORY_HDR_LEN, GTPU_MAX_EXT_HEADERS, GTPU_MSG_TYPE_GPDU, GTPU_OPT_LEN,
-    GTPU_SESSION_CONFIG_KEY, GTPU_SESSION_CONFIG_VALUE_LEN, GTPU_SESSION_DOWNLINK_KEY_LEN,
-    GTPU_SESSION_GROUP_ID_LEN, GTPU_SESSION_GROUP_REF_LEN, GTPU_SESSION_GROUP_VALUE_LEN,
-    GTPU_SESSION_SCHEMA_MARKER_LEN, GTPU_SESSION_SELECTOR_STAMP_VALUE_LEN,
-    GTPU_SESSION_TRANSACTION_VALUE_LEN, GTPU_SESSION_UPLINK_KEY_LEN,
-    GTPU_TRAFFIC_OBSERVATION_EVENT_LEN, GTPU_TRAFFIC_OBSERVATION_GATE_INDEX,
-    GTPU_TRAFFIC_OBSERVATION_GATE_MAX_ENTRIES,
+    GTPU_PACKET_TOO_BIG_QUEUE_PORT, GTPU_SESSION_CONFIG_KEY, GTPU_SESSION_CONFIG_VALUE_LEN,
+    GTPU_SESSION_DOWNLINK_KEY_LEN, GTPU_SESSION_GROUP_ID_LEN, GTPU_SESSION_GROUP_REF_LEN,
+    GTPU_SESSION_GROUP_VALUE_LEN, GTPU_SESSION_SCHEMA_MARKER_LEN,
+    GTPU_SESSION_SELECTOR_STAMP_VALUE_LEN, GTPU_SESSION_TRANSACTION_VALUE_LEN,
+    GTPU_SESSION_UPLINK_KEY_LEN, GTPU_TRAFFIC_OBSERVATION_EVENT_LEN,
+    GTPU_TRAFFIC_OBSERVATION_GATE_INDEX, GTPU_TRAFFIC_OBSERVATION_GATE_MAX_ENTRIES,
     GTPU_TRAFFIC_OBSERVATION_ICMP_ECHO_CHALLENGE_PAYLOAD_LEN,
     GTPU_TRAFFIC_OBSERVATION_ICMP_ECHO_CHALLENGE_PROFILE, GTPU_TRAFFIC_OBSERVATION_ICMP_ECHO_MAGIC,
     GTPU_TRAFFIC_OBSERVATION_ICMP_ECHO_VERSION, GTPU_TRAFFIC_OBSERVATION_REDIRECT_NONCE_LEN,
@@ -1667,7 +1667,19 @@ fn classify_tft_fragment(
             count_tft_classifier_drop(COUNTER_TFT_CLASSIFIER_MALFORMED);
             TftClassifierUplinkResult::Drop
         }
+        TftFragmentDisposition::Capacity => {
+            // The subscriber's owner bucket group is full: fail closed and keep
+            // this refusal distinct from a stale/inconsistent classifier state.
+            count_tft_classifier_drop(COUNTER_TFT_CLASSIFIER_CAPACITY);
+            TftClassifierUplinkResult::Drop
+        }
         TftFragmentDisposition::Drop => {
+            count_tft_classifier_drop(COUNTER_TFT_CLASSIFIER_INVALID_STATE);
+            TftClassifierUplinkResult::Drop
+        }
+        // The shared enum is non-exhaustive: an outcome this datapath does not
+        // know must fail closed, never fall through to forwarding.
+        _ => {
             count_tft_classifier_drop(COUNTER_TFT_CLASSIFIER_INVALID_STATE);
             TftClassifierUplinkResult::Drop
         }
@@ -2537,7 +2549,7 @@ fn grouped_n3_downlink_matches(
             return false;
         }
         if next == 0x85 {
-            let Ok(prefix) = ctx.load::<[u8; 3]>(cursor) else {
+            let Ok(prefix) = ctx.load::<[u8; 4]>(cursor) else {
                 return false;
             };
             if found || !n3_downlink_psc_matches(prefix, qfi) {
@@ -3779,6 +3791,24 @@ fn handle_grouped_downlink_ipv4(
         &mut observation_authority,
     ) {
         Some(entry) => {
+            // A canonical IPv6 PTB profile hands the intact G-PDU to the
+            // consumer before the forwarding/observation phase. Successful
+            // handoff is not successful decapsulation.
+            if let Some(mtu) = entry.downlink_inner_mtu() {
+                if !grouped_inner_payload_is_exact(ctx, payload_offset, entry.inner_family()) {
+                    return Some(malformed_downlink());
+                }
+                let Ok(payload_length) = ctx.load::<u16>(payload_offset + 4) else {
+                    return Some(malformed_downlink());
+                };
+                if downlink_ipv6_exceeds_inner_mtu(mtu.mtu(), u16::from_be(payload_length)) {
+                    return Some(hand_off_to_backend_queue(
+                        ctx,
+                        l4_offset,
+                        GTPU_PACKET_TOO_BIG_QUEUE_PORT,
+                    ));
+                }
+            }
             // Capture before mutation, publish only after the exact grouped
             // decapsulation succeeds, and revalidate against current
             // authority inside the emitter.
@@ -3974,7 +4004,7 @@ fn try_legacy_uplink(ctx: &mut TcContext, mark: u32, eth_proto: u16) -> Result<i
         GTPU_ULM_FAR.get_ptr(marked_key)
     };
     let Some(far_ptr) = far_ptr else {
-        count(COUNTER_UL_FAR_MISS);
+        count_uplink_far_miss(mark, count);
         return Ok(non_encapsulation_action(mark));
     };
     // SAFETY: the map value outlives this program invocation and is only
@@ -4071,7 +4101,7 @@ fn try_legacy_uplink(ctx: &mut TcContext, mark: u32, eth_proto: u16) -> Result<i
         // this exact lookup provenance at the subprogram boundary, and a
         // concurrent owner removal must fail closed in either case.
         let Some(owner_ptr) = GTPU_M_OWNER.get_ptr(marked_key) else {
-            count(COUNTER_UL_FAR_MISS);
+            count_uplink_far_miss(mark, count);
             return Ok(TC_ACT_SHOT);
         };
         // SAFETY: the owner remains map-owned and read-only. Both halves are
@@ -4955,7 +4985,7 @@ fn downlink_inner_hand_off_port(
 /// backend binds its queues when the control port is first opened, and they
 /// close with the process, while tc keeps steering from the pinned graph.
 #[inline(never)]
-fn hand_off_to_backend_queue(ctx: &mut TcContext, l4_offset: usize, port: u16) -> i32 {
+fn hand_off_to_backend_queue(ctx: &TcContext, l4_offset: usize, port: u16) -> i32 {
     let from = u16::from_ne_bytes(GTPU_UDP_PORT.to_be_bytes());
     let to = u16::from_ne_bytes(port.to_be_bytes());
     if ctx

@@ -87,8 +87,9 @@ use opc_session_testkit::qualification::{
     QUALIFICATION_CONCURRENT_COLLECTOR_MAX_RECORDS, QUALIFICATION_CONCURRENT_RESTORE_MAX_PAGES,
     QUALIFICATION_CONCURRENT_STATE_TYPE_PREFIX, QUALIFICATION_CONCURRENT_WATCH_MAX_SUBSCRIPTIONS,
     QUALIFICATION_FAULT_MUTATION_SHUTDOWN_LEAD_MILLIS, QUALIFICATION_INBOUND_CONNECTION_SLOTS,
-    QUALIFICATION_ISOLATED_SCALE_UNIX_SECONDS, QUALIFICATION_MAX_CONFIG_BYTES,
-    QUALIFICATION_MAX_LEASE_HANDLES, QUALIFICATION_OPERATION_TIMEOUT_MILLIS,
+    QUALIFICATION_INSTALLATION_NONCE, QUALIFICATION_ISOLATED_SCALE_UNIX_SECONDS,
+    QUALIFICATION_MAX_CONFIG_BYTES, QUALIFICATION_MAX_LEASE_HANDLES,
+    QUALIFICATION_OPERATION_TIMEOUT_MILLIS,
     QUALIFICATION_TRAFFIC_AVAILABILITY_INTERRUPTION_BUDGET_PER_NODE,
     QUALIFICATION_TRAFFIC_AVAILABILITY_RECOVERY_MILLIS,
     QUALIFICATION_TRAFFIC_AVAILABILITY_RETRY_MILLIS,
@@ -243,6 +244,24 @@ fn node_open_failure(stage: QualificationNodeOpenStage) -> NodeFailure {
     };
     eprintln!("qualification node open failed: {stage}");
     NodeFailure
+}
+
+/// Test-only startup delay injected after the control listener is bound and the
+/// node is open, immediately before readiness is published. The qualification
+/// regression uses it to prove that socket appearance is not readiness and that
+/// waiters observe the publication event instead of polling the socket file.
+#[cfg(feature = "test-control")]
+fn inject_control_startup_delay() {
+    const MAX_INJECTED_STARTUP_DELAY_MILLIS: u64 = 10_000;
+    let Some(millis) = env::var("OPC_QUALIFICATION_CONTROL_STARTUP_DELAY_MILLIS")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+    else {
+        return;
+    };
+    std::thread::sleep(Duration::from_millis(
+        millis.min(MAX_INJECTED_STARTUP_DELAY_MILLIS),
+    ));
 }
 
 #[derive(Clone)]
@@ -1178,6 +1197,7 @@ async fn qualification_activation_attempt(
 fn qualification_store_error_class(error: &StoreError) -> QualificationTrafficErrorClass {
     match error {
         StoreError::BackendUnavailable(_)
+        | StoreError::KeyProviderUnavailable(_)
         | StoreError::FencedTransitionRecoveryJournalUnavailable => {
             QualificationTrafficErrorClass::BackendUnavailable
         }
@@ -1186,6 +1206,9 @@ fn qualification_store_error_class(error: &StoreError) -> QualificationTrafficEr
         }
         StoreError::BackendOperationOutcomeUnavailable => {
             QualificationTrafficErrorClass::BackendOperationOutcomeUnavailable
+        }
+        StoreError::RestoreScanWorkBudgetExceeded => {
+            QualificationTrafficErrorClass::RestoreScanWorkBudgetExceeded
         }
         StoreError::NotFound
         | StoreError::StaleFence
@@ -1345,6 +1368,25 @@ struct QualificationConsumerTransport {
     reauthentication: SessionReauthenticationControl,
 }
 
+fn qualification_manifest(
+    config: &QualificationNodeConfig,
+    descriptors: Vec<QuorumReplicaDescriptor>,
+    bound_roster_root: Option<RosterAttestationTrustRootV1>,
+) -> Result<SessionReplicationManifest, NodeFailure> {
+    SessionReplicationManifest::try_new_with_epoch_and_roster_attestation_root(
+        SessionClusterId::new(config.cluster_id.clone()).map_err(|_| NodeFailure)?,
+        // The deterministic fixture and its probes share one installation.
+        // Production consumers persist their own installation nonce.
+        QUALIFICATION_INSTALLATION_NONCE,
+        SessionConfigurationGeneration::new(config.configuration_generation.clone())
+            .map_err(|_| NodeFailure)?,
+        SessionConfigurationEpoch::new(config.configuration_epoch).map_err(|_| NodeFailure)?,
+        descriptors,
+        bound_roster_root,
+    )
+    .map_err(|_| NodeFailure)
+}
+
 impl QualificationNode {
     async fn open(
         config: &QualificationNodeConfig,
@@ -1379,18 +1421,11 @@ impl QualificationNode {
         } else {
             Some(roster_attestation_root.clone())
         };
-        let manifest = Arc::new(
-            SessionReplicationManifest::try_new_with_epoch_and_roster_attestation_root(
-                SessionClusterId::new(config.cluster_id.clone()).map_err(|_| NodeFailure)?,
-                SessionConfigurationGeneration::new(config.configuration_generation.clone())
-                    .map_err(|_| NodeFailure)?,
-                SessionConfigurationEpoch::new(config.configuration_epoch)
-                    .map_err(|_| NodeFailure)?,
-                descriptors.clone(),
-                bound_roster_root.clone(),
-            )
-            .map_err(|_| NodeFailure)?,
-        );
+        let manifest = Arc::new(qualification_manifest(
+            config,
+            descriptors.clone(),
+            bound_roster_root.clone(),
+        )?);
         let local_replica = ReplicaId::new(config.members[config.node_index].replica_id.clone())
             .map_err(|_| NodeFailure)?;
         let local_binding = manifest
@@ -3204,13 +3239,20 @@ impl QualificationNode {
             let mut expected_sequence = requested_after_journal_sequence.saturating_add(1);
             loop {
                 let entry = match tokio::time::timeout_at(deadline, watch.stream.next()).await {
-                    Ok(Some(Ok(entry))) if entry.sequence == expected_sequence => entry,
+                    Ok(Some(Ok(entry)))
+                        if entry
+                            .matches_watch_cursor(expected_sequence)
+                            .unwrap_or(false) =>
+                    {
+                        entry
+                    }
                     Ok(Some(Ok(_))) | Ok(Some(Err(_))) | Ok(None) | Err(_) => {
                         return QualificationNodeReply::Error {
                             code: QualificationNodeErrorCode::ConcurrentWatchUnavailable,
                         };
                     }
                 };
+                expected_sequence = entry.sequence;
                 if append_concurrent_watch_events(entry, &mut events).is_err() {
                     return QualificationNodeReply::Error {
                         code: QualificationNodeErrorCode::ConcurrentWatchOverflow,
@@ -4187,6 +4229,59 @@ async fn reconcile_traffic_known_authority(
     Ok(())
 }
 
+fn validate_qualification_restore_scan(
+    diagnostics: &mut impl io::Write,
+    result: Result<opc_session_store::RestoreScanPage, StoreError>,
+    expected: &StoredSessionRecord,
+    phase: &'static str,
+    started_at: tokio::time::Instant,
+) -> Result<(), QualificationTrafficFailure> {
+    let stage = QualificationTrafficFailureStage::RestoreScan;
+    let elapsed_ms = started_at.elapsed().as_millis();
+    let page = result.map_err(|error| {
+        let variant = error.variant_name();
+        let _ = writeln!(
+            diagnostics,
+            "qualification restore scan rejected: phase={phase} variant={variant} elapsed_ms={elapsed_ms}"
+        );
+        QualificationTrafficFailure::store(
+            QualificationTrafficFailureCode::RestoreScanRejected,
+            stage,
+            &error,
+        )
+    })?;
+    let failed_check = if !page.complete {
+        Some("complete")
+    } else if page.next_cursor.is_some() {
+        Some("next_cursor")
+    } else if page.cursor_profile != RestoreScanCursorProfile::DurableOpaqueV1 {
+        Some("cursor_profile")
+    } else if page.loaded_count != page.records.len() {
+        Some("loaded_count")
+    } else if page.loaded_count > QUALIFICATION_TRAFFIC_RESTORE_LIMIT {
+        Some("page_limit")
+    } else if !page
+        .records
+        .iter()
+        .any(|candidate| traffic_record_is_exact(expected, candidate))
+    {
+        Some("expected_record")
+    } else {
+        None
+    };
+    if let Some(check) = failed_check {
+        let _ = writeln!(
+            diagnostics,
+            "qualification restore scan rejected: phase={phase} check={check} elapsed_ms={elapsed_ms}"
+        );
+        return Err(QualificationTrafficFailure::fixed(
+            QualificationTrafficFailureCode::RestoreScanRejected,
+            stage,
+        ));
+    }
+    Ok(())
+}
+
 async fn prove_traffic_restore_scan_recovery<P, F>(
     mut scan: P,
     expected: &StoredSessionRecord,
@@ -4210,37 +4305,27 @@ where
         // Cancelling this read observer does not abandon a session mutation
         // or replace the retained lease. Logical-time work stays owned by
         // the store; this observer uses the original recovery deadline.
+        let scan_started_at = tokio::time::Instant::now();
         let result = tokio::time::timeout_at(deadline, scan()).await;
         let failure = match result {
-            Ok(Ok(page)) => {
-                if tokio::time::Instant::now() >= deadline {
+            Ok(result) => {
+                if result.is_ok() && tokio::time::Instant::now() >= deadline {
                     return Err(QualificationTrafficFailure::recovery_deadline_exceeded(
                         stage,
                         recovery_started_at,
                     ));
                 }
-                if !page.complete
-                    || page.next_cursor.is_some()
-                    || page.cursor_profile != RestoreScanCursorProfile::DurableOpaqueV1
-                    || page.loaded_count != page.records.len()
-                    || page.loaded_count > QUALIFICATION_TRAFFIC_RESTORE_LIMIT
-                    || !page
-                        .records
-                        .iter()
-                        .any(|candidate| traffic_record_is_exact(expected, candidate))
-                {
-                    return Err(QualificationTrafficFailure::fixed(
-                        QualificationTrafficFailureCode::RestoreScanRejected,
-                        stage,
-                    ));
+                match validate_qualification_restore_scan(
+                    &mut io::stderr().lock(),
+                    result,
+                    expected,
+                    "recovery_restore_scan",
+                    scan_started_at,
+                ) {
+                    Ok(()) => return Ok(()),
+                    Err(failure) => failure,
                 }
-                return Ok(());
             }
-            Ok(Err(error)) => QualificationTrafficFailure::store(
-                QualificationTrafficFailureCode::RestoreScanRejected,
-                stage,
-                &error,
-            ),
             Err(_) => QualificationTrafficFailure::backend_unavailable(
                 QualificationTrafficFailureCode::RestoreScanRejected,
                 stage,
@@ -4770,31 +4855,17 @@ async fn run_traffic_mutation_task_inner(
             return Ok(());
         }
 
-        let page = protected
+        let scan_started_at = tokio::time::Instant::now();
+        let result = protected
             .scan_restore_records(RestoreScanRequest::all(QUALIFICATION_TRAFFIC_RESTORE_LIMIT))
-            .await
-            .map_err(|error| {
-                QualificationTrafficFailure::store(
-                    QualificationTrafficFailureCode::RestoreScanRejected,
-                    QualificationTrafficFailureStage::RestoreScan,
-                    &error,
-                )
-            })?;
-        if !page.complete
-            || page.next_cursor.is_some()
-            || page.cursor_profile != RestoreScanCursorProfile::DurableOpaqueV1
-            || page.loaded_count != page.records.len()
-            || page.loaded_count > QUALIFICATION_TRAFFIC_RESTORE_LIMIT
-            || !page
-                .records
-                .iter()
-                .any(|candidate| traffic_record_is_exact(&expected_record, candidate))
-        {
-            return Err(QualificationTrafficFailure::fixed(
-                QualificationTrafficFailureCode::RestoreScanRejected,
-                QualificationTrafficFailureStage::RestoreScan,
-            ));
-        }
+            .await;
+        validate_qualification_restore_scan(
+            &mut io::stderr().lock(),
+            result,
+            &expected_record,
+            "traffic_restore_scan",
+            scan_started_at,
+        )?;
         increment(&observation.complete_restore_scans);
         if traffic_cancellation_requested(cancellation, shutdown_deadline) {
             return Ok(());
@@ -5189,7 +5260,9 @@ async fn reconcile_traffic_watch_stream<B: TrafficWatchBackend + ?Sized>(
                         QualificationTrafficFailureStage::Watch,
                     ));
                 };
-                if entry.sequence != expected_sequence
+                if !entry
+                    .matches_watch_cursor(expected_sequence)
+                    .unwrap_or(false)
                     || reconcile_applied_traffic_records(
                         &entry.op,
                         traffic_keys,
@@ -5390,7 +5463,7 @@ async fn run_traffic_watch_task<B: TrafficWatchBackend + 'static>(
                         return Err(failure);
                     }
                 };
-                if entry.sequence != expected_sequence {
+                if !entry.matches_watch_cursor(expected_sequence).unwrap_or(false) {
                     let failure = QualificationTrafficFailure::fixed(
                         QualificationTrafficFailureCode::InvariantViolation,
                         QualificationTrafficFailureStage::Watch,
@@ -5420,7 +5493,7 @@ async fn run_traffic_watch_task<B: TrafficWatchBackend + 'static>(
                 }
                 #[cfg(test)]
                 observation.watch_progress.send_replace(());
-                let Some(next_sequence) = expected_sequence.checked_add(1) else {
+                let Some(next_sequence) = entry.sequence.checked_add(1) else {
                     let failure = QualificationTrafficFailure::fixed(
                         QualificationTrafficFailureCode::InvariantViolation,
                         QualificationTrafficFailureStage::Watch,
@@ -6064,6 +6137,7 @@ fn map_lease_error(error: &LeaseError) -> QualificationNodeErrorCode {
 fn map_store_error(error: &StoreError) -> QualificationNodeErrorCode {
     match error {
         StoreError::BackendUnavailable(_)
+        | StoreError::KeyProviderUnavailable(_)
         | StoreError::BackendOperationOutcomeUnavailable
         | StoreError::CasIdempotencyOutcomeUnavailable
         | StoreError::Crypto(_)
@@ -6862,7 +6936,13 @@ fn run_control_server(arguments: NodeArguments, control_socket: &Path) -> Result
     let runtime = runtime()?;
     let listener = runtime
         .block_on(TcpListener::bind(arguments.bind_addr))
-        .map_err(|_| NodeFailure)?;
+        .map_err(|_| {
+            // Closed stage label only. A competing listener or an address
+            // collision is the common early-exit cause, and no address, path
+            // or port is published here.
+            eprintln!("qualification node transport bind failed");
+            NodeFailure
+        })?;
     let bind_addr = listener.local_addr().map_err(|_| NodeFailure)?;
     // Test-only port-zero startup retains the child listener while the
     // harness writes membership from Bound, just like the stdio harness.
@@ -6896,12 +6976,35 @@ fn run_control_server(arguments: NodeArguments, control_socket: &Path) -> Result
         bind_control_socket(&config.workspace_directory, control_socket)?;
     let mut node = runtime.block_on(QualificationNode::open(&config, listener))?;
     let _terminal_exit = TerminalFailureExit::start(&runtime, Arc::clone(&node.store));
+    // The control socket file exists from `bind_control_socket`, but the
+    // process is not ready to serve commands until the node is open and this
+    // loop starts. Publishing readiness only here prevents a waiter from
+    // mistaking socket appearance for readiness. The port-zero bootstrap has
+    // already published Bound and Started on its stdio handshake, so only the
+    // fixed-address path publishes this single readiness frame.
+    #[cfg(all(target_os = "linux", feature = "test-control"))]
+    let port_zero_bootstrap = startup_writer.is_some();
+    #[cfg(not(all(target_os = "linux", feature = "test-control")))]
+    let port_zero_bootstrap = false;
     #[cfg(all(target_os = "linux", feature = "test-control"))]
     if let Some(mut writer) = startup_writer {
         write_json_line(
             &mut writer,
             &QualificationNodeReply::Started {
                 node_index: config.node_index,
+            },
+        )
+        .map_err(|_| NodeFailure)?;
+    }
+    if !port_zero_bootstrap {
+        #[cfg(feature = "test-control")]
+        inject_control_startup_delay();
+        let mut writer = BufWriter::new(io::stdout());
+        write_json_line(
+            &mut writer,
+            &QualificationNodeReply::Bound {
+                node_index: config.node_index,
+                bind_addr,
             },
         )
         .map_err(|_| NodeFailure)?;
@@ -7065,8 +7168,103 @@ mod readiness_recovery_tests;
 mod restore_scan_recovery_tests;
 
 #[cfg(test)]
+#[path = "opc-session-quorum-node/restore_scan_diagnostics_tests.rs"]
+mod restore_scan_diagnostics_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn rendered_readiness_accepts_the_runtime_installation_manifest() {
+        use opc_session_testkit::qualification_kubernetes::{
+            qualification_kubernetes_readiness_expectations,
+            render_qualification_kubernetes_manifest, QualificationKubernetesManifestConfig,
+        };
+        for member_count in [3, 5] {
+            let rendered =
+                render_qualification_kubernetes_manifest(&QualificationKubernetesManifestConfig {
+                    member_count,
+                    namespace: "session-qualification".into(),
+                    image: format!("registry.invalid/session-node@sha256:{}", "a".repeat(64)),
+                    trust_domain: "qualification.example.test".into(),
+                })
+                .unwrap();
+            let config_map = rendered["items"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|item| item["kind"] == "ConfigMap")
+                .unwrap();
+            let expectations =
+                qualification_kubernetes_readiness_expectations(member_count).unwrap();
+            for (node_index, expectation) in expectations.iter().enumerate() {
+                let config: QualificationNodeConfig = serde_json::from_str(
+                    config_map["data"][format!("node-{node_index}.json")]
+                        .as_str()
+                        .unwrap(),
+                )
+                .unwrap();
+                let descriptors = config
+                    .members
+                    .iter()
+                    .map(|member| {
+                        QuorumReplicaDescriptor::new(
+                            ReplicaId::new(member.replica_id.clone()).unwrap(),
+                            ReplicaEndpoint::new(
+                                member.endpoint_host.clone(),
+                                member.endpoint_port,
+                            )
+                            .unwrap(),
+                            ReplicaTlsIdentity::new(member.tls_identity.clone()).unwrap(),
+                            ReplicaFailureDomain::new(member.failure_domain.clone()).unwrap(),
+                            ReplicaBackingIdentity::new(member.backing_identity.clone()).unwrap(),
+                        )
+                    })
+                    .collect();
+                let manifest = Arc::new(
+                    qualification_manifest(
+                        &config,
+                        descriptors,
+                        Some(QualificationRosterIngressSigner::root().unwrap()),
+                    )
+                    .unwrap(),
+                );
+                let local_replica =
+                    ReplicaId::new(config.members[node_index].replica_id.clone()).unwrap();
+                let binding = manifest
+                    .bind_fixed_durable_quorum_local(local_replica.clone())
+                    .unwrap();
+                let node_id = binding.consensus_node_id(&local_replica).unwrap().get();
+                let mut voters = config
+                    .members
+                    .iter()
+                    .map(|member| {
+                        binding
+                            .consensus_node_id(&ReplicaId::new(member.replica_id.clone()).unwrap())
+                            .unwrap()
+                            .get()
+                    })
+                    .collect::<Vec<_>>();
+                voters.sort_unstable();
+                let reply = QualificationNodeReply::Readiness {
+                    ready: true,
+                    reason_code: QualificationReadinessCode::Ready,
+                    node_id,
+                    term: 1,
+                    leader_id: Some(voters[0]),
+                    configured_voters: member_count,
+                    configured_voter_ids: Some(voters),
+                    fresh_reachable_voters: member_count / 2 + 1,
+                    agreeing_voters: member_count / 2 + 1,
+                    required_quorum: member_count / 2 + 1,
+                    committed_index: Some(1),
+                    applied_index: Some(1),
+                };
+                assert!(expectation.accepts_ready_reply(&reply), "rendered readiness must accept the runtime manifest for {member_count} voters, node {node_index}");
+            }
+        }
+    }
     #[cfg(unix)]
     use std::io::Cursor;
     #[cfg(unix)]
@@ -8443,6 +8641,7 @@ mod tests {
 
     fn scripted_traffic_replication_entry(sequence: u64, op: ReplicationOp) -> ReplicationEntry {
         ReplicationEntry {
+            replay_policy: opc_session_store::ReplicationReplayPolicy::prune_expired(),
             sequence,
             tx_id: opc_session_store::ReplicationTxId::new(
                 format!("scripted-traffic-{sequence}").as_str(),
@@ -9216,12 +9415,14 @@ mod tests {
     fn concurrent_watch_projects_roster_create_direct_and_nested() {
         let timestamp = opc_types::Timestamp::now_utc();
         let direct = ReplicationEntry {
+            replay_policy: opc_session_store::ReplicationReplayPolicy::prune_expired(),
             sequence: 7,
             tx_id: "concurrent-v2-direct".try_into().expect("transaction ID"),
             op: concurrent_roster_create("concurrent-v2-direct"),
             timestamp,
         };
         let nested = ReplicationEntry {
+            replay_policy: opc_session_store::ReplicationReplayPolicy::prune_expired(),
             sequence: 8,
             tx_id: "concurrent-v2-nested".try_into().expect("transaction ID"),
             op: ReplicationOp::Batch {

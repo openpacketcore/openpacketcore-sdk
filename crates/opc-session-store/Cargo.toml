@@ -47,7 +47,7 @@ thiserror = { workspace = true }
 # The bounded SQLite scheduler handoff relies on the validated blocking-pool
 # FIFO retirement order. Enforce it for SDK consumers, whose lockfile is their
 # own; upgrades require the handoff queue/lifetime matrix to be revalidated.
-tokio = { version = "=1.53.1", features = ["rt-multi-thread", "net", "macros", "time", "sync", "io-util", "fs", "rt"] }
+tokio = { version = "=1.53.3", features = ["rt-multi-thread", "net", "macros", "time", "sync", "io-util", "fs", "rt"] }
 tracing = { workspace = true }
 bytes = { workspace = true }
 uuid = { workspace = true }
@@ -67,9 +67,12 @@ futures-util = "0.3"
 rusqlite = { workspace = true, features = ["backup", "bundled", "hooks", "limits"] }
 
 [target.'cfg(unix)'.dependencies]
+opc-tokio-fd-sys = { path = "../opc-tokio-fd-sys", version = "0.2.0" }
 opc-sqlite-file-control-sys = { path = "../opc-sqlite-file-control-sys", version = "0.2.0", features = ["borrowed-file-identity"] }
 
 [dev-dependencies]
+# Reap the owned process group when a fixture teardown cannot complete.
+rustix = { version = "1", features = ["process"] }
 opc-consensus = { path = "../opc-consensus", version = "0.2.0", features = ["dangerous-test-hooks"] }
 # Measure native owner allocations in focused, single-threaded unit tests.
 # This workspace dependency is never linked into the production store.

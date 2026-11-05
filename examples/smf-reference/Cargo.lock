@@ -561,9 +561,9 @@ dependencies = [
 
 [[package]]
 name = "crypto-bigint"
-version = "0.7.5"
+version = "0.7.10"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1a52aa3fcda4e6302a9f48734f234d35d4721b96f8fe07d073f07ce9df4f0271"
+checksum = "9c035cb64cba03dad2fb921f3e218785e8cf9a41790da5eb3a1400f62fa2be11"
 dependencies = [
  "cpubits",
  "ctutils",
@@ -571,6 +571,7 @@ dependencies = [
  "hybrid-array",
  "num-traits",
  "rand_core 0.10.1",
+ "serdect",
  "subtle",
  "zeroize",
 ]
@@ -597,9 +598,9 @@ dependencies = [
 
 [[package]]
 name = "ctutils"
-version = "0.4.2"
+version = "0.4.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7d5515a3834141de9eafb9717ad39eea8247b5674e6066c404e8c4b365d2a29e"
+checksum = "fe3e9d21d39e6f39ff46e03d5b621424f88ee23d8a1672c6bfc9ccc7f2da4f6a"
 dependencies = [
  "cmov",
  "subtle",
@@ -1457,6 +1458,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "opc-api-nnrf"
+version = "0.2.0"
+dependencies = [
+ "opc-types",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "opc-config-bus"
 version = "0.2.0"
 dependencies = [
@@ -1568,6 +1578,7 @@ dependencies = [
  "aes-gcm-siv",
  "async-trait",
  "hkdf",
+ "libc",
  "opc-crypto-provider",
  "opc-identity",
  "opc-tls",
@@ -1666,6 +1677,7 @@ dependencies = [
  "hyper",
  "hyper-util",
  "jsonwebtoken",
+ "opc-api-nnrf",
  "opc-identity",
  "opc-redaction",
  "opc-runtime",
@@ -1683,6 +1695,7 @@ dependencies = [
  "tower",
  "tower-http",
  "tracing",
+ "uuid",
 ]
 
 [[package]]
@@ -1707,6 +1720,7 @@ dependencies = [
  "opc-mgmt-audit",
  "opc-redaction",
  "opc-sqlite-file-control-sys",
+ "opc-tokio-fd-sys",
  "opc-types",
  "p256",
  "postcard",
@@ -1737,6 +1751,7 @@ dependencies = [
 name = "opc-tls"
 version = "0.2.0"
 dependencies = [
+ "crypto-bigint",
  "opc-identity",
  "opc-redaction",
  "opc-types",
@@ -1752,6 +1767,13 @@ dependencies = [
  "tracing",
  "x509-parser",
  "zeroize",
+]
+
+[[package]]
+name = "opc-tokio-fd-sys"
+version = "0.2.0"
+dependencies = [
+ "tokio",
 ]
 
 [[package]]
@@ -2693,9 +2715,9 @@ checksum = "1f3ccbac311fea05f86f61904b462b55fb3df8837a366dfc601a0161d0532f20"
 
 [[package]]
 name = "tokio"
-version = "1.53.1"
+version = "1.53.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "202caea871b69668250d242070849eb495be178ed697a3e98aebce5bc81a0bed"
+checksum = "ce3335fa71841cda333a58d7615b03901380ecf09d59b3296d21f8bbac0dde4e"
 dependencies = [
  "bytes",
  "libc",

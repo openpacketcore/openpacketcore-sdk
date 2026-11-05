@@ -25,6 +25,10 @@ accepted single-replica profile.
   opens require an explicit non-zero `AuditKey`; this API is not reopen-only.
 - Retained configuration voters use explicit `provision_config_authority`,
   `reopen_config_authority`, and `provision_config_member_repair` operations.
+  Provisioning publishes authenticated intent and a complete database atomically;
+  `begin_resume_config_authority` and `begin_resume_config_member_repair` resume
+  the same authorized operation after interruption. Explicit request identifiers
+  are available through `RetainedConfigProvisionRequest` and the transaction APIs.
   Missing retained storage never falls back to creation during reopen. See the
   [retained lifecycle contract](RETAINED_CONFIG.md) for scope binding,
   interruption, repair, durability choices and rollback-freshness limits.
@@ -174,6 +178,32 @@ projection/history reads. Admitted follower-local reads still use local applied
 state without a leader/read-index round. Failed admission needs no store
 replacement, volume cleanup or coordinated restart; the caller retries the
 same store as connectivity returns.
+
+### Snapshot progress and retry ownership
+
+Snapshot work (#1339) has bounded storage progress while each caller retains
+its original deadline. Chunked reads, writes and envelope verification use a
+60 s bound per I/O step. SQLite backup and installation size their work budget
+while retaining the same connection lease: 60 s plus one second per MiB of
+storage and incoming data, rounded up. Whole-file sync uses its bounded
+size-based budget; later stages do not inherit an earlier stage's elapsed time.
+
+- A repair source owns one verification across RPC timeouts and resumes its
+  verified descriptor at the authenticated cursor. It retires on idle, obsolete
+  vote or shutdown. Repair neither probes with an unframed request nor extends
+  the caller's operation deadline.
+- Accepted final snapshot chunks remain owned across caller cancellation.
+  Exact retries join or replay their result, including single-chunk transfers
+  and final chunks containing data. Identity includes source, vote, metadata,
+  original offset and the chunk's digest. Failed inspection releases the receipt
+  so a new transfer can start; an admitted installation retains its outcome.
+- Purge waits for at most one matching owned installation before checking the
+  durable applied position. Replacement admission and reconciliation each have
+  a finite bound; a timed-out RPC does not cancel an admitted installation.
+- Integrity evidence belongs to the verified open descriptor and is invalidated
+  by writes. Replacement reads and installation reuse that evidence without a
+  second whole-file hash. Physical I/O ownership and staging cleanup remain
+  active through shutdown.
 
 The HA composition is:
 
@@ -370,8 +400,11 @@ See [ADR 0002](../../docs/adr/0002-config-store-consensus-ha.md),
   `ConsensusConfigStore::shutdown_unplanned()`. It suppresses new handoff
   preparation and cancels an outstanding preparation before the same owned
   engine/storage drain; already dispatched RPCs cannot be retracted.
-  `PlannedShutdownFallback::Unplanned` distinguishes suppressed preparation
-  from handoff failure. Completed reports remain unchanged. Caller cancellation
+  `PlannedShutdownFallback::Unplanned` reports this route: preparation was
+  suppressed, or an in-flight preparation was cancelled and joined (RPCs
+  already sent cannot be retracted, so a successor may already be campaigning).
+  Already published reports remain unchanged; a result racing the unplanned
+  request is reported as `Unplanned`. Caller cancellation
   or timeout cannot reopen admission or abandon the drain. Config bus adapters
   use this route through `RaftManagedDatastore::consensus_store()`; they own no
   separate consensus lifecycle. Surviving voters use ordinary elections, and

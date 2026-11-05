@@ -113,6 +113,7 @@ pub mod pre_admission;
 pub mod protected_payload_crypto;
 pub mod protocol_key;
 pub mod recovery;
+pub mod redirect;
 pub mod sa_init;
 pub mod sa_init_crypto;
 pub mod sa_init_initiator;
@@ -122,6 +123,7 @@ pub mod software_crypto;
 #[cfg(any(test, feature = "testkit"))]
 pub mod testkit;
 pub mod validation;
+mod xcbc;
 
 pub use certreq::{
     ikev2_certreq_authority_key_hash, Ikev2CertReqAuthorityHash, Ikev2CertReqSubjectPublicKeyInfo,
@@ -239,8 +241,13 @@ pub use ike_auth_signature::{
     compute_ike_auth_signature, verify_ike_auth_signature, verify_local_ike_auth_signature,
     Ikev2LocalAuthSelfVerificationAuthorization, Ikev2SignatureAuthKey, Ikev2SignatureAuthMethod,
     Ikev2SignatureKeyError, Ikev2SignaturePublicKey, IKEV2_AUTH_METHOD_DIGITAL_SIGNATURE,
-    IKEV2_AUTH_METHOD_RSA_DIGITAL_SIGNATURE, RFC7427_ALGORITHM_IDENTIFIER_ECDSA_SHA2_256,
-    RFC7427_ALGORITHM_IDENTIFIER_ECDSA_SHA2_384, RFC7427_ALGORITHM_IDENTIFIER_RSA_SHA2_256,
+    IKEV2_AUTH_METHOD_ECDSA_SHA2_256, IKEV2_AUTH_METHOD_ECDSA_SHA2_384,
+    IKEV2_AUTH_METHOD_ECDSA_SHA2_512, IKEV2_AUTH_METHOD_RSA_DIGITAL_SIGNATURE,
+    RFC7427_ALGORITHM_IDENTIFIER_ECDSA_SHA2_256, RFC7427_ALGORITHM_IDENTIFIER_ECDSA_SHA2_384,
+    RFC7427_ALGORITHM_IDENTIFIER_ECDSA_SHA2_512, RFC7427_ALGORITHM_IDENTIFIER_RSA_PSS_SHA2_256,
+    RFC7427_ALGORITHM_IDENTIFIER_RSA_PSS_SHA2_384, RFC7427_ALGORITHM_IDENTIFIER_RSA_PSS_SHA2_512,
+    RFC7427_ALGORITHM_IDENTIFIER_RSA_SHA2_256, RFC8420_ALGORITHM_IDENTIFIER_ED25519,
+    RFC8420_ALGORITHM_IDENTIFIER_ED448,
 };
 pub use ike_sa_rekey::{
     build_ike_sa_rekey_request, build_ike_sa_rekey_response, decode_ike_sa_rekey_request,
@@ -333,10 +340,10 @@ pub use pre_admission::{
     IKEV2_PRE_ADMISSION_PKCS8_DER_MAX_LEN,
 };
 pub use protected_payload_crypto::{
-    decrypt_ikev2_sa_init_protected_payload, ikev2_aes_cbc_padding_len,
-    ikev2_aes_cbc_protected_body_len, ikev2_aes_cbc_protected_payload_len,
-    ikev2_aes_gcm_protected_body_len, ikev2_aes_gcm_protected_payload_len,
-    seal_ikev2_sa_init_aes_cbc_protected_payload,
+    decrypt_ikev2_sa_init_protected_payload, ikev2_aead_protected_body_len,
+    ikev2_aead_protected_payload_len, ikev2_aes_cbc_padding_len, ikev2_aes_cbc_protected_body_len,
+    ikev2_aes_cbc_protected_payload_len, ikev2_aes_gcm_protected_body_len,
+    ikev2_aes_gcm_protected_payload_len, seal_ikev2_sa_init_aes_cbc_protected_payload,
     seal_ikev2_sa_init_aes_cbc_protected_payload_with_iv_for_test_vector,
     seal_ikev2_sa_init_aes_cbc_protected_payload_with_rng, seal_ikev2_sa_init_protected_payload,
     seal_ikev2_sa_init_protected_payload_with_iv_counter, Ikev2AesGcmExplicitIvCounter,
@@ -344,6 +351,13 @@ pub use protected_payload_crypto::{
     Ikev2ProtectedPayloadDirection, Ikev2ProtectedPayloadOpenError,
     Ikev2SaInitProtectedPayloadProvider, ProtectedPayloadSealContext, IKEV2_AES_CBC_IV_LEN,
     IKEV2_AES_GCM_EXPLICIT_IV_LEN, IKEV2_AES_GCM_NORMAL_IV_END,
+};
+pub use redirect::{
+    build_ikev2_redirect_notify, decode_ikev2_redirect_notify,
+    decode_ikev2_redirect_notify_with_profile, decode_ikev2_redirect_support, Ikev2RedirectContext,
+    Ikev2RedirectGatewayIdentity, Ikev2RedirectNotify, Ikev2RedirectNotifyError,
+    Ikev2RedirectSupport, IKEV2_NOTIFY_REDIRECT, IKEV2_NOTIFY_REDIRECTED_FROM,
+    IKEV2_NOTIFY_REDIRECT_SUPPORTED, IKEV2_REDIRECT_MAX_NOTIFIES,
 };
 pub use sa_init::{
     build_ike_sa_init_invalid_ke_response, build_ike_sa_init_notify_response,

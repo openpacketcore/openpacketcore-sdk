@@ -80,8 +80,16 @@ def comparison_revisions(repo, base=None, head=None):
         main_sha = revision(repo, 'refs/remotes/origin/main')
     except GuardError as error:
         raise GuardError('Local inventory validation requires origin/main; fetch its history before running the guard') from error
-    base_sha = revision(repo, base) if base else git(repo, 'merge-base', current_head, main_sha).decode().strip()
+    backlog_target = head is not None and base in {'origin/backlog', 'refs/remotes/origin/backlog'}
+    base_ref = 'refs/remotes/origin/backlog' if backlog_target else base
+    base_sha = revision(repo, base_ref) if base_ref else git(repo, 'merge-base', current_head, main_sha).decode().strip()
     head_sha = revision(repo, head) if head else current_head
+    if backlog_target:
+        if base_sha == head_sha:
+            raise GuardError(f'Base and head resolve to the same commit ({head_sha}); refusing an empty comparison')
+        if not is_ancestor(repo, base_sha, head_sha) or not is_ancestor(repo, head_sha, current_head):
+            raise GuardError('The backlog base must be an ancestor of its head, and its head must be in the checked-out HEAD')
+        return base_sha, head_sha, 'explicit backlog target'
     if not is_ancestor(repo, base_sha, current_head) or not is_ancestor(repo, base_sha, main_sha):
         raise GuardError(f'Base {base_sha} must be an ancestor of both HEAD ({current_head}) and origin/main ({main_sha}); a branch-only or unrelated base cannot qualify this change')
     if not is_ancestor(repo, base_sha, head_sha):
@@ -99,7 +107,7 @@ def annotation(value, property_value=False):
 def main(argv=None):
     parser = argparse.ArgumentParser(description='Require issue-backed declarations for test and required-CI coverage reductions')
     parser.add_argument('--repo', type=Path, default=Path.cwd())
-    parser.add_argument('--base', help='base commit; locally it must be an ancestor of HEAD and origin/main (default: their merge base)')
+    parser.add_argument('--base', help='base commit; locally an ancestor of HEAD and origin/main (default: their merge base), or origin/backlog with an explicit --head')
     parser.add_argument('--head', help='explicit historical comparison head, used with --base; defaults to HEAD locally')
     parser.add_argument('--repository', default=os.environ.get('GITHUB_REPOSITORY', 'openpacketcore/openpacketcore-sdk'))
     parser.add_argument('--json', type=Path, help='write the complete report, including allowlisted findings')

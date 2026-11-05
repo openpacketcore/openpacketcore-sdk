@@ -39,6 +39,33 @@ pub(crate) fn raise_commit_error(alarm_manager: &SharedAlarmManager, error: &Com
     );
 }
 
+/// A coarse rollback failure must not discard positive data evidence. Absence
+/// of that evidence never creates a corruption alarm.
+pub(crate) fn raise_commit_store_error(
+    alarm_manager: &SharedAlarmManager,
+    error: &CommitError,
+    store_code: StoreErrorCode,
+) {
+    let (severity, _) = commit_error_alarm_spec(error.code);
+    raise_config_error_alarm(
+        alarm_manager,
+        CONFIG_BUS_COMMIT_FAILURE_ALARM_TYPE,
+        "commit",
+        error.code.as_str(),
+        severity,
+        store_failure_cause(store_code),
+    );
+}
+
+pub(crate) fn store_failure_cause(code: StoreErrorCode) -> ProbableCause {
+    match code {
+        StoreErrorCode::Crypto
+        | StoreErrorCode::RestoreSchemaMismatch
+        | StoreErrorCode::InvalidHistorySequence => ProbableCause::StorageCorruption,
+        _ => ProbableCause::ConfigApplyFailed,
+    }
+}
+
 pub(crate) fn raise_startup_error(alarm_manager: &SharedAlarmManager, error: &StoreError) {
     let (severity, probable_cause) = startup_error_alarm_spec(error.code);
     raise_config_error_alarm(
@@ -84,8 +111,10 @@ pub(crate) fn commit_error_alarm_spec(code: CommitErrorCode) -> (Severity, Proba
         CommitErrorCode::PersistFailed
         | CommitErrorCode::OutcomeUnknown
         | CommitErrorCode::RecoveryRequired
-        | CommitErrorCode::RollbackUnavailable
-        | CommitErrorCode::StateMachineFault => (Severity::Major, ProbableCause::StorageCorruption),
+        | CommitErrorCode::RollbackUnavailable => {
+            (Severity::Major, ProbableCause::ConfigApplyFailed)
+        }
+        CommitErrorCode::StateMachineFault => (Severity::Major, ProbableCause::ConfigApplyFailed),
         CommitErrorCode::VersionExhausted => (Severity::Major, ProbableCause::ConfigApplyFailed),
         CommitErrorCode::AdmissionRejected
         | CommitErrorCode::ApplyPlanRejected
@@ -103,18 +132,23 @@ pub(crate) fn commit_error_alarm_spec(code: CommitErrorCode) -> (Severity, Proba
 
 pub(crate) fn startup_error_alarm_spec(code: StoreErrorCode) -> (Severity, ProbableCause) {
     match code {
-        StoreErrorCode::Unavailable
-        | StoreErrorCode::OutcomeUnknown
-        | StoreErrorCode::Internal
-        | StoreErrorCode::Crypto
+        // An unavailable dependency is not evidence of corrupt stored bytes.
+        StoreErrorCode::Unavailable => (Severity::Critical, ProbableCause::ConfigApplyFailed),
+        StoreErrorCode::Crypto
         | StoreErrorCode::RestoreSchemaMismatch
-        | StoreErrorCode::RestoreRecoveryRequired
-        | StoreErrorCode::RestoreConfirmedDeadline
-        | StoreErrorCode::StartupValidationTaskFailed
         | StoreErrorCode::InvalidHistorySequence => {
             (Severity::Critical, ProbableCause::StorageCorruption)
         }
-        StoreErrorCode::NotFound => (Severity::Major, ProbableCause::StorageCorruption),
+        // Control-state fences, unknown outcomes and task failures do not
+        // establish that any stored bytes were read and rejected.
+        StoreErrorCode::OutcomeUnknown
+        | StoreErrorCode::Internal
+        | StoreErrorCode::RestoreRecoveryRequired
+        | StoreErrorCode::RestoreConfirmedDeadline
+        | StoreErrorCode::StartupValidationTaskFailed => {
+            (Severity::Critical, ProbableCause::ConfigApplyFailed)
+        }
+        StoreErrorCode::NotFound => (Severity::Major, ProbableCause::ConfigApplyFailed),
         StoreErrorCode::StartupSyntaxValidationFailed
         | StoreErrorCode::StartupSemanticValidationFailed
         | StoreErrorCode::HistoryPageTooLarge
@@ -212,6 +246,110 @@ pub(crate) fn clear_config_alarm_where(
             AlarmOpResult::Cleared { .. } | AlarmOpResult::ClearWithoutActive { .. }
         ) {
             tracing::warn!(alarm_type, outcome = ?result, "config-bus alarm clear returned unexpected result");
+        }
+    }
+}
+
+#[cfg(test)]
+mod provider_failure_tests {
+    use super::*;
+
+    #[test]
+    fn all_store_codes_preserve_alarm_evidence_and_severity() {
+        for code in [
+            StoreErrorCode::Crypto,
+            StoreErrorCode::RestoreSchemaMismatch,
+            StoreErrorCode::InvalidHistorySequence,
+        ] {
+            assert_eq!(store_failure_cause(code), ProbableCause::StorageCorruption);
+            assert_eq!(
+                startup_error_alarm_spec(code),
+                (Severity::Critical, ProbableCause::StorageCorruption)
+            );
+        }
+        for code in [
+            StoreErrorCode::Unavailable,
+            StoreErrorCode::Internal,
+            StoreErrorCode::OutcomeUnknown,
+            StoreErrorCode::RestoreRecoveryRequired,
+            StoreErrorCode::RestoreConfirmedDeadline,
+            StoreErrorCode::StartupValidationTaskFailed,
+        ] {
+            assert_eq!(store_failure_cause(code), ProbableCause::ConfigApplyFailed);
+            assert_eq!(
+                startup_error_alarm_spec(code),
+                (Severity::Critical, ProbableCause::ConfigApplyFailed)
+            );
+        }
+        for code in [
+            StoreErrorCode::NotFound,
+            StoreErrorCode::StartupSyntaxValidationFailed,
+            StoreErrorCode::StartupSemanticValidationFailed,
+            StoreErrorCode::HistoryPageTooLarge,
+            StoreErrorCode::HistoryCompacted,
+            StoreErrorCode::HistoryCursorAhead,
+        ] {
+            assert_eq!(store_failure_cause(code), ProbableCause::ConfigApplyFailed);
+            assert_eq!(
+                startup_error_alarm_spec(code),
+                (Severity::Major, ProbableCause::ConfigApplyFailed)
+            );
+        }
+    }
+
+    #[test]
+    fn provider_configuration_startup_backpressure_is_not_storage_corruption() {
+        assert_eq!(
+            startup_error_alarm_spec(StoreErrorCode::Unavailable),
+            (Severity::Critical, ProbableCause::ConfigApplyFailed)
+        );
+    }
+
+    #[test]
+    fn provider_configuration_commit_backpressure_is_not_storage_corruption() {
+        // These coarse outcomes can all arise from an unusable key provider.
+        // None alone proves that persisted bytes are corrupt.
+        let observed = [
+            CommitErrorCode::PersistFailed,
+            CommitErrorCode::OutcomeUnknown,
+            CommitErrorCode::RecoveryRequired,
+            CommitErrorCode::RollbackUnavailable,
+        ]
+        .map(commit_error_alarm_spec);
+        assert_eq!(
+            observed,
+            [(); 4].map(|_| (Severity::Major, ProbableCause::ConfigApplyFailed))
+        );
+    }
+    #[test]
+    fn coarse_startup_and_state_machine_failures_are_not_data_evidence() {
+        for code in [
+            StoreErrorCode::OutcomeUnknown,
+            StoreErrorCode::Internal,
+            StoreErrorCode::RestoreRecoveryRequired,
+            StoreErrorCode::RestoreConfirmedDeadline,
+            StoreErrorCode::StartupValidationTaskFailed,
+            StoreErrorCode::NotFound,
+        ] {
+            assert_eq!(
+                startup_error_alarm_spec(code).1,
+                ProbableCause::ConfigApplyFailed,
+                "{code:?}"
+            );
+        }
+        assert_eq!(
+            commit_error_alarm_spec(CommitErrorCode::StateMachineFault).1,
+            ProbableCause::ConfigApplyFailed
+        );
+        for code in [
+            StoreErrorCode::Crypto,
+            StoreErrorCode::RestoreSchemaMismatch,
+            StoreErrorCode::InvalidHistorySequence,
+        ] {
+            assert_eq!(
+                startup_error_alarm_spec(code).1,
+                ProbableCause::StorageCorruption
+            );
         }
     }
 }

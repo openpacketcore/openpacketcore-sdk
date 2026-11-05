@@ -42,7 +42,8 @@ fn native_roster_journal_preserves_transient_rows_and_partitions() {
         assert_journal(&store);
     }
     let due = now.add_seconds(24 * 60 * 60).unwrap();
-    for _ in 0..3 {
+    // Reclaim both rows, then retire their distinct epochs in one prefix.
+    for _ in 0..2 {
         assert!(store.maintain_due(due).unwrap());
         assert_journal(&store);
     }

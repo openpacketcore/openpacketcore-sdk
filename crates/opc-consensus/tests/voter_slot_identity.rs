@@ -77,6 +77,9 @@ fn installation_nonce_separates_reused_cluster_names() {
         ConsensusClusterId::for_installation("cluster-b", [1; 32]).expect("other")
     );
     assert_ne!(first, ConsensusClusterId::new("cluster-a").expect("legacy"));
-    assert!(ConsensusClusterId::for_installation("cluster-a", [0; 32]).is_err());
+    assert_eq!(
+        ConsensusClusterId::for_installation("cluster-a", [0; 32]),
+        Err(opc_consensus::ConsensusIdentityError::InvalidInstallationNonce)
+    );
     assert!(ConsensusClusterId::for_installation(" cluster-a", [1; 32]).is_err());
 }

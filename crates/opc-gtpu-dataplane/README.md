@@ -10,6 +10,11 @@ eBPF, mock, and unsupported backends, and keeps raw syscalls in
 The crate does not implement GTP-C, PFCP, namespace management, route steering,
 XFRM policy, deployment defaults, or traffic-readiness policy.
 
+`GtpPdpContext.peer_teid` and `ReceivedN3UplinkTnl` use `PeerTeid`, which
+accepts the peer-assigned zero value required by TS 29.281 section 5.1.
+Locally allocated TEIDs still use nonzero `Teid`. Convert an existing peer
+value with `PeerTeid::from(teid)` or construct it with `PeerTeid::new(raw)`.
+
 ## Experimental N3 packet and intent boundary
 
 The `n3` module keeps received uplink UPF TNL information separate from
@@ -87,9 +92,13 @@ The [`control_port` module](docs/control-port.md) adds bounded control
 datagrams and response plans on the existing Linux IPv4 reassembly socket.
 One consumer shares its UDP/2152 queue with user-packet reassembly. Plans
 preserve message-specific response tuples and require the exact receiving
-socket; admission and aggregate rate policy remain with the caller. This
-does not yet expose Linux kernel-GTP sockets or qualify backend parity,
-End Marker ordering or N3 forwarding.
+socket; admission and aggregate rate policy remain with the caller. The
+Linux kernel-GTP backend exposes the userspace socket retained by an ordinary
+creation for control observations and Error Indication plans (TS 29.281
+7.3.1). Its downlink path checks PDP absence before reporting `UnknownTunnel`;
+known-TEID G-PDUs declined by the driver are dropped. Kernel-owned recoverable
+attachments remain unsupported.
+End Marker ordering and N3 forwarding parity are still unqualified.
 On an eBPF attachment, `try_receive_downlink` on the same port is the
 backend-authoritative consumer for kernel-reassembled and handed-off G-PDUs:
 it authorizes against the backend's own grouped and v5 maps (commit read
@@ -162,8 +171,18 @@ applies the context's RFC 4459 policy:
   address the PGW's anti-spoofing admits; this departs from RFC 1812 4.3.2.4,
   and the originator attributes the error to the subscriber.
 
-Inner IPv6 contexts refuse both policies: IPv6 has no in-network
-fragmentation (RFC 8200).
+An ordinary inner-IPv6 context accepts only the opt-in: IPv6 has no
+in-network fragmentation (RFC 8200), so the fragment-inner default is refused
+with `downlink_inner_mtu_inner_ipv6_fragmentation`. Its family-tagged entry
+carries the opt-in MTU in a versioned profile (2 bytes at 73..74; byte 75 is
+reserved; schema marker
+`OPC-GROUP-IP-v7`), tc steers an over-MTU packet to the same packet-too-big
+queue, and the consumer sends one in-tunnel RFC 4443 Packet Too Big quoting up
+to 1,232 octets. The MTU must be at least the IPv6 minimum 1,280, the outer
+endpoints must be IPv4, and the uplink source-port policy must be
+`LegacyServicePort`. Grouped and N3 APIs refuse MTU policies. The consumer
+checks the default bearer's own active authority and source-port policy
+before sending; peer TEID zero remains a valid outgoing value.
 
 Under either policy, tc also steers every other inner IPv4 fragment of such
 a context (More Fragments set, or a non-zero fragment offset) to a second
@@ -189,6 +208,14 @@ none of them with an ICMP error toward the peer, and they are not forwarded.
 MTU-bearing contexts must be drained before an SDK downgrade. See
 [control port](docs/control-port.md).
 
+`PeerTeid` represents the full outgoing peer-assigned domain, including zero
+as required by TS 29.281 section 5.1. Linux kernel-GTP and eBPF preserve zero
+through installation, readback, reconciliation and restart. G-PDU and N3 End
+Marker encoding preserve it on the wire. `Teid` remains strictly nonzero for
+local allocation and receive/map keys. `ReceivedN3UplinkTnl::new` accepts both
+`PeerTeid` and existing nonzero `Teid` arguments.
+Before downgrading to an SDK without zero-peer support, remove zero-peer contexts or perform a fresh installation.
+
 - `GtpuDataplaneBackend`: async port for device and PDP lifecycle, typed PDP
   readback, classified installation, authority-safe exact removal, and probes.
   New trait ports retain default unsupported bodies for third-party backend
@@ -211,6 +238,7 @@ MTU-bearing contexts must be drained before an SDK downgrade. See
   preserving trait-object usage on non-Linux or disabled builds.
 - Model exports include `CreateGtpDeviceRequest`, `GtpDevice`,
   `GtpPdpContext`, `GtpBearerMark`, `RemovePdpContextRequest`, `Teid`,
+  `PeerTeid`,
   `GtpuProbe`, `GtpuBackendKind`, `GtpuCapability`,
   `GtpuDownlinkEndpoint`, `GtpuSourcePortPolicy`, `GtpuSourcePortRange`,
   `PdpContextSelector`, `PdpContextReadback`, `PdpContextInstallOutcome`,
@@ -299,7 +327,7 @@ MTU-bearing contexts must be drained before an SDK downgrade. See
   adoption rejects partial pin graphs and promotes an all-zero schema marker
   only after the metadata, filter, and fragment-affinity maps are proven empty
   before hook mutation and rechecked empty immediately before publication.
-  Native eBPF TFT classifier ABI/schema v5 remains IPv4-only: filter-map keys
+  Native eBPF TFT classifier ABI/schema v6 remains IPv4-only: filter-map keys
   include the current owner and snapshot generations, and each value carries
   its dense precedence rank. TC therefore finds only rows named by validated
   metadata; exact userspace readback verifies the redundant value identity and
@@ -354,6 +382,25 @@ MTU-bearing contexts must be drained before an SDK downgrade. See
   log is inspected only to establish that the verifier ran, and is never
   retained.
 
+## Multi-homing peer sources
+
+`GtpPdpContext::downlink_peer_source_policy` defaults explicitly to
+`GtpuPeerSourcePolicy::BackendDefault`: eBPF checks the configured peer address,
+while Linux GTP retains its native TEID lookup. For TS 29.281 sections 4.3.0 and
+4.4.3.3 multi-homing, select `TeidAndLocal` on the eBPF context (or
+`GtpuSessionEntry::with_peer_source_policy` for grouped/N3 entries). Other source
+addresses of the same family can then send to the context's TEID and local
+endpoint. The incoming interface, UDP source-port policy, inner PAA, ownership,
+generation and N3 QFI checks still apply. Outgoing traffic uses the configured
+peer address. Restrict access to the GTP-U transport network: this option is
+not peer authentication or an alternate-address allowlist.
+
+The policy is retained in map ownership, commit records and durable selector
+admissions, and exact readback detects a policy conflict. Default-policy bytes
+retain their existing versions. Opt-in bindings/entries/descriptors use new
+versions that older implementations reject. Linux GTP rejects the explicit
+opt-in because its netlink readback cannot retain that policy.
+
 ## Usage
 
 ```rust,no_run
@@ -361,8 +408,8 @@ use std::net::{IpAddr, Ipv4Addr};
 
 use opc_gtpu_dataplane::{
     CreateGtpDeviceRequest, GtpPdpContext, GtpVersion, GtpuDataplaneBackend,
-    GtpuSourcePortPolicy, GtpuUplinkSourcePortPolicy, MockGtpuDataplaneBackend,
-    RemovePdpContextRequest, Teid,
+    GtpuPeerSourcePolicy, GtpuSourcePortPolicy, GtpuUplinkSourcePortPolicy, MockGtpuDataplaneBackend,
+    PeerTeid, RemovePdpContextRequest, Teid,
 };
 
 #[tokio::main]
@@ -374,15 +421,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let context = GtpPdpContext {
         local_teid: Teid::new(0x1000_0001).unwrap(),
-        peer_teid: Teid::new(0x2000_0001).unwrap(),
+        peer_teid: PeerTeid::new(0x2000_0001),
         ms_address: IpAddr::V4(Ipv4Addr::new(10, 23, 0, 2)),
         peer_address: IpAddr::V4(Ipv4Addr::new(192, 0, 2, 10)),
         link_ifindex: device.ifindex,
+        downlink_peer_source_policy: GtpuPeerSourcePolicy::BackendDefault,
         downlink_source_port_policy: GtpuSourcePortPolicy::Any,
         gtp_version: GtpVersion::V1,
         bearer_mark: None,
         egress_dscp: None,
         uplink_source_port_policy: GtpuUplinkSourcePortPolicy::LegacyServicePort,
+        downlink_inner_mtu: None,
     };
 
     backend.install_pdp_context(context.clone()).await?;
@@ -1235,12 +1284,19 @@ most 64 fragment ranges, including the first, and expires exactly two seconds
 after admission in boot-time nanoseconds. No live entry is evicted, including
 poisoned or completed entries. Expired slots are reused in place; neither a
 successful later fragment nor a duplicate first fragment extends the deadline.
-This is a concurrent-datagram budget shared by the attachment, not a reserved
-slot per subscriber; hash collisions can exhaust a bucket before the global
-limit is reached. There is no per-subscriber admission bound: one subscriber
-can keep all slots occupied and deny new fragmented datagrams to every other
-classified subscriber on the attachment. The host `TftUplinkFragmentTable`
-allocates approximately 24.5 MiB per attachment.
+
+Bucket selection is owner-partitioned. The attachment interface index and the
+subscriber PAA in the key's first eight bytes select one of 256 owner groups of
+64 buckets; the remaining key bytes select a bucket inside that group. One
+subscriber can therefore occupy at most 256 concurrent fragmented datagrams
+(64 buckets times four slots) and cannot deny or reset another owner group's
+capacity. Two PAAs that hash to the same group share that group's bound, so the
+blast radius of a hash collision is one group rather than the whole table.
+The host `TftUplinkFragmentTable` allocates approximately 24.5 MiB per
+attachment; the partition adds no memory and folds the upper hash bits before
+each mask in a single hash pass. The 64-range overlap walk accumulates conflicts
+without data-dependent branches, keeping verifier work bounded without reducing
+the supported range count. Exact key matching compares all five 32-bit words.
 
 A duplicate first fragment is accepted only when its parsed classifier fields,
 selected mark, header length, and first range agree. A conflicting first
@@ -1253,12 +1309,12 @@ host and tc and leaves affinity untouched.
 Later fragments received before their first fragment, or after its expiry,
 drop while a classifier owns the PAA. Valid non-overlapping later fragments
 may arrive in either order after admission. IPv4 ID reuse requires expiry;
-replacement does not clear the old key early. Rejections use the existing
-aggregate TFT malformed, no-match, and invalid-state counters without packet
-values or per-datagram labels. Invalid-state includes ordinary fragment events
-such as orphan, expiry, capacity refusal and overlap, as well as inconsistent
-classifier state; capacity refusal has no distinct slot in the pinned counter
-map.
+replacement does not clear the old key early. Rejections use value-free TFT
+malformed, no-match, invalid-state, and capacity counters without packet
+values or per-datagram labels. Invalid-state covers orphan, expiry and overlap
+events as well as inconsistent classifier state. A new fragmented datagram
+that finds its subscriber's owner group full has its own capacity counter; a
+retained entry is never evicted to admit it.
 
 `GTPU_TFT_FRAG` is a pinned BTF ARRAY with one spin lock per bucket. Each slot
 is 392 bytes; four slots occupy 1,568 bytes, and the lock makes the BTF value
@@ -1389,14 +1445,27 @@ Three limits remain.
   not closable by tightening the check; every discriminator available inside
   the program is in-band and so forgeable by a local sender.
 
-`uplink_far_misses` no longer counts the datapath's own re-emitted outer
-frames. Their source is the local S2b-U address rather than a UE PAA, so before
-the redirect outcome was recognized this counter rose once per *successfully
-delivered* uplink IPv4 packet and made a healthy uplink read as session-state
-corruption. It remains a miss counter for every other mark-zero IPv4 frame
-leaving the attachment whose source is not a provisioned UE PAA -- locally
-originated traffic from the host included -- so read a nonzero value as a
-prompt to investigate rather than as proof of session-state corruption.
+`uplink_far_misses_passed` counts IPv4 FAR misses passed unencapsulated
+because the full packet mark is zero, regardless of the packet's origin.
+Locally sent Echo and Error Indication datagrams can raise it in a healthy
+system. `uplink_far_misses_dropped` counts missing nonzero-mark FARs and
+missing marked owners, which drop the packet. `uplink_far_misses` remains
+their saturating sum for compatibility. All three exclude the datapath's own
+re-emitted outer frames. The two new counters use reserved slots without
+changing the pinned counter map's width or any forwarding decision.
+
+A zero `uplink_far_misses_dropped` is not proof of no uplink loss. Grouped
+selector/graph failures, malformed packets, reserved schema sources, invalid
+FAR/DSCP/commit/PDR/binding state, mismatched or inactive marked owners, MTU
+rejection, and encapsulation/redirect failures drop without counting here.
+The MTU counters report their respective drops separately. Counter snapshots
+are observational reads, not atomic snapshots across CPUs; the public total
+is computed from the two outcome values read in that snapshot.
+
+When a same-width counter pin from a pre-split build is retained, the new
+outcome slots start at zero. The public compatibility total therefore counts
+only misses observed by the split build. Raw slot 1 retains its earlier
+aggregate history, which cannot be attributed to either outcome.
 
 `downlink_missing_consumer` counts the hand-offs that tc gave to no UDP
 socket, because none was bound to receive them or they arrived in a VLAN above
@@ -1766,9 +1835,12 @@ are unchanged.
 #### TFT fragment-affinity upgrade and rollback
 
 The current attachment requires all 35 named maps, including the pinned
-`GTPU_TFT_FRAG` BTF ARRAY, and TFT marker `OPC-TFT-IPv4-v5`. An old 34-map graph
-without this map, a retained v4 TFT marker, or any partial TFT graph is refused
-before attachment mutation. The loader does not fill in the new map beside an
+`GTPU_TFT_FRAG` BTF ARRAY, and TFT marker `OPC-TFT-IPv4-v6`. The version-6 marker
+widens the pinned TFT drop-counter map from three to four slots (the new
+capacity counter); its map definition therefore differs from version 5 even
+though the pin count stays 35. An old 34-map graph without the fragment map, a
+retained v5 or v4 TFT marker, a retained three-slot TFT counter map, or any
+partial TFT graph is refused before attachment mutation. The loader does not fill in the new map beside an
 old classifier. Fresh creation initializes the map to zero. Promotion of an
 all-zero TFT marker requires a complete current TFT graph with empty metadata,
 filters, and affinity state, checked before hook mutation and again before
@@ -1874,7 +1946,7 @@ a build is refused before anything is read through a typed binding or
 changed: with `DatapathGenerationMismatch` while its hooks are still
 attached, and with `ebpf_pin_map_abi` when only its pins remain. Drain it,
 remove the retained graph with the build that created it (or remove its pins
-once nothing references them), and provision again. Eight of the sixteen
+once nothing references them), and provision again. Six of the sixteen
 slots are reserved, so that the next counter does not change the width
 again. Any retained PDR/FAR without an exact binding
 is indeterminate and fails before either hook changes. The SDK never invents
@@ -2366,7 +2438,7 @@ recovery:
 Before granting authority the backend proves the expected name/ifindex pair,
 then performs a complete read-only inventory and ABI/capacity validation of all
 35 current map pins before binding CONFIG or any other typed map. Only the exact
-current PMTU-v5 and TFT-v5 graph is accepted: cleanup acquisition never creates
+current PMTU-v5 and TFT-v6 graph is accepted: cleanup acquisition never creates
 a missing pin, migrates an older schema, or advances a schema marker. A
 canonical nonzero endpoint is then compared with the caller's configured local
 S2b-U address. The independent grouped authority must still be uninitialized:
@@ -2767,7 +2839,7 @@ The frozen v1 and pre-redirect artifacts both carry six-slot counter maps, so
 their authentic retained graphs require drained reprovisioning rather than
 automatic migration. The map has grown once more since, from seven to sixteen
 slots for the missing-consumer counter, and a graph retained with the
-seven-slot map is refused in the same way. Eight of the sixteen slots are
+seven-slot map is refused in the same way. Six of the sixteen slots are
 reserved, so that the next counter leaves the width as it is.
 
 **Program generation and graph identity.** Replacing a hook in place requires
@@ -3191,9 +3263,11 @@ sudo unshare -n -- bash -lc 'ip link set lo up && OPC_GTPU_RUN_PRIVILEGED=1 carg
 ```
 
 The backend trait exposes `open_gtpu_control_port` for eBPF attachments with
-an IPv4 endpoint. Handles share one queue and lose access on removal,
-replacement, backend loss or observed hook loss. Linux kernel/mock adapters
-return an exact unsupported result. See the [control-port contract](docs/control-port.md)
+IPv4 and/or IPv6 endpoints and for Linux kernel-GTP userspace-socket attachments. The
+former lose access on removal, replacement, backend loss or observed hook
+loss; the latter are retired on removal, replacement, adoption or socket
+generation change, and a kernel-owned recoverable attachment returns an exact
+unsupported result. See the [control-port contract](docs/control-port.md)
 for socket lifetime, response budgets and the remaining backend limitations.
 Validated nonzero unknown-TEID G-PDUs can reach only the configured local
 control endpoint without decapsulation. Retained inconsistent ownership stays

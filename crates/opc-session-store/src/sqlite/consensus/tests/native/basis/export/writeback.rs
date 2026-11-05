@@ -217,10 +217,10 @@ fn native_snapshot_writeback_releases_live_owner_and_preserves_captured_cut() {
             encode_json(&expected_application.responses).unwrap(),
             "complete response parity"
         );
-        assert_eq!(
-            encode_json(&applied.notifications).unwrap(),
-            encode_json(&expected_application.notifications).unwrap(),
-            "exact notification parity"
+        policy_oracle::notifications(
+            &applied.notifications,
+            &expected_application.notifications,
+            &later_entries,
         );
         assert_eq!(
             fixture
@@ -254,7 +254,11 @@ fn native_snapshot_writeback_releases_live_owner_and_preserves_captured_cut() {
         finalize_native_snapshot_database_sync(exported, pin, authority(), &cut).unwrap();
     assert!(finalized.file().metadata().unwrap().len() > paused_extent);
     let conn = open_pinned_snapshot_database(&finalized).unwrap();
-    assert_portable_tables_equal(&conn, &open_pinned_snapshot_database(&reference).unwrap());
+    assert_portable_tables_equal(
+        &conn,
+        &open_pinned_snapshot_database(&reference).unwrap(),
+        &fixture.oracle.conn.blocking_lock(),
+    );
     validate_native_snapshot_export_sync(&conn, &finalized, authority(), &cut).unwrap();
     drop(conn);
     drop(finalized);

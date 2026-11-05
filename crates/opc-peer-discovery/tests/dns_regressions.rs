@@ -151,7 +151,7 @@ fn high_bit_record_ttls_are_zero_in_every_chain_position() {
             assert!(cache.finish_refresh(token, Ok(answer), t(0)));
             assert!(matches!(
                 cache.lookup(&q.cache_key(), t(0)).result,
-                DnsCachedResult::Stale { .. }
+                DnsCachedResult::Miss
             ));
             assert!(!cache.refresh_due(t(60 * 365 * DAY)).is_empty());
         }
@@ -208,17 +208,14 @@ fn negative_ttl_defaults_to_three_hours_with_and_without_last_good() {
             );
             assert!(cache.refresh_due(t(expiry - 1)).is_empty());
             assert_eq!(cache.refresh_due(t(expiry)), vec![q.cache_key()]);
-            if last_good {
-                assert!(matches!(
-                    cache.lookup(&q.cache_key(), t(expiry)).result,
-                    DnsCachedResult::Stale { .. }
-                ));
-            } else {
-                assert_eq!(
-                    cache.lookup(&q.cache_key(), t(expiry)).result,
-                    DnsCachedResult::Miss
-                );
-            }
+            assert!(matches!(
+                cache.lookup(&q.cache_key(), t(expiry - 1)).result,
+                DnsCachedResult::Negative(_)
+            ));
+            assert_eq!(
+                cache.lookup(&q.cache_key(), t(expiry)).result,
+                DnsCachedResult::Miss
+            );
         }
     }
 }
@@ -555,7 +552,7 @@ fn tunable_caps_bound_publication_without_restarting_record_deadlines() {
     assert!(cache.finish_refresh(token, Ok(answer(60, 0)), t(0)));
     assert!(matches!(
         cache.lookup(&q.cache_key(), t(0)).result,
-        DnsCachedResult::Stale { .. }
+        DnsCachedResult::Miss
     ));
     assert!(cache.refresh_due(t(0)).is_empty());
     let now = cache
@@ -781,7 +778,11 @@ fn uncacheable_success_default_cadence_is_independent_of_failure_backoff() {
     let bridge_answer = AddressPeerResolver::new(SystemOrder)
         .resolve_dns(&q, Duration::from_secs(1))
         .unwrap();
-    for response in [answer(0, 0), answer(1, 0), bridge_answer] {
+    for (response, retained) in [
+        (answer(0, 0), false),
+        (answer(1, 0), true),
+        (bridge_answer, true),
+    ] {
         let mut cache = DnsCache::new(
             1,
             DnsRetryPolicy::new(Duration::from_millis(1), Duration::from_secs(30), 7),
@@ -792,7 +793,11 @@ fn uncacheable_success_default_cadence_is_independent_of_failure_backoff() {
             let token = start(&mut cache, &q, now);
             assert!(cache.finish_refresh(token, Ok(response.clone()), t(now)));
             let status = cache.lookup(&q.cache_key(), t(now));
-            assert!(matches!(status.result, DnsCachedResult::Stale { .. }));
+            if retained {
+                assert!(matches!(status.result, DnsCachedResult::Stale { .. }));
+            } else {
+                assert_eq!(status.result, DnsCachedResult::Miss);
+            }
             let due = status.retry_at.unwrap().as_millis();
             assert!((2_500..=5_000).contains(&(due - now)));
             assert!(cache.refresh_due(t(due - 1)).is_empty());
@@ -836,7 +841,7 @@ fn custom_success_refresh_interval_does_not_change_failure_backoff() {
         let token = start(&mut cache, &q, now);
         assert!(cache.finish_refresh(token, Ok(answer(0, now)), t(now)));
         let status = cache.lookup(&q.cache_key(), t(now));
-        assert!(matches!(status.result, DnsCachedResult::Stale { .. }));
+        assert_eq!(status.result, DnsCachedResult::Miss);
         let due = status.retry_at.unwrap().as_millis();
         assert!((5_000..=10_000).contains(&(due - now)));
         assert!(cache.refresh_due(t(due - 1)).is_empty());
@@ -907,16 +912,23 @@ fn cache_status_exposes_effective_positive_deadline_through_expiry_and_failure()
         assert_eq!(status.fresh_until, None);
         assert_eq!(status.retry_at, Some(t(expected + 1_000)));
     }
-    for answer in [
-        answer(0, 0),
-        DnsAnswer::new(vec![DnsCandidate::without_ttl(peer())]).unwrap(),
+    for (answer, retained) in [
+        (answer(0, 0), false),
+        (
+            DnsAnswer::new(vec![DnsCandidate::without_ttl(peer())]).unwrap(),
+            true,
+        ),
     ] {
         let mut cache = cache();
         let token = start(&mut cache, &q, 0);
         assert!(cache.finish_refresh(token, Ok(answer), t(0)));
         let status = cache.lookup(&q.cache_key(), t(0));
-        assert_eq!(status.fresh_until, Some(t(0)));
-        assert!(matches!(status.result, DnsCachedResult::Stale { .. }));
+        assert_eq!(status.fresh_until, retained.then_some(t(0)));
+        if retained {
+            assert!(matches!(status.result, DnsCachedResult::Stale { .. }));
+        } else {
+            assert_eq!(status.result, DnsCachedResult::Miss);
+        }
         assert!(status.retry_at.unwrap() > t(0));
     }
 }

@@ -40,7 +40,7 @@ fn insertion(qfi: u8) -> N3UplinkEncapsulation {
 #[test]
 fn ppi_receive_uses_ts_38415_high_bits() {
     // PPP=1, RQI=1, QFI=9; PPI=5 in bits 7..5, with spare bits set.
-    let wire = unhex("34ff000d11223344000000850200c9a300000000aa");
+    let wire = unhex("34ff000d11223344000000850200c9bc00000000aa");
     let view =
         N3PacketView::decode(&wire, N3Direction::Downlink, DecodeContext::default()).unwrap();
     assert_eq!(view.qos().ppi(), Some(5));
@@ -75,7 +75,7 @@ fn qos_monitoring_without_tpdu_has_a_specific_refusal() {
 fn independent_reference_packets() {
     assert_eq!(
         &Sha256::digest(REFERENCE.as_bytes())[..],
-        unhex("87583b7b1a6474d0dc7ea46196bddcc915a3676c809ef6b642cb5273728703f2")
+        unhex("3706c33835e665078c54ea2c3b37d6a31aa3d804b393a16165d711134d67db38")
     );
     let mut counts = [0, 0];
     for row in REFERENCE.lines().filter(|line| !line.starts_with('#')) {
@@ -112,7 +112,7 @@ fn independent_reference_packets() {
             assert!(result.is_err(), "synthetic case {} accepted", columns[0]);
         }
     }
-    assert_eq!(counts, [1511, 1093]);
+    assert_eq!(counts, [1487, 1117]);
 }
 
 #[test]
@@ -436,4 +436,47 @@ fn every_shipped_backend_refuses_n3_forwarding_capability() {
             GtpuCapability::Missing
         );
     }
+}
+
+#[test]
+fn generic_typed_extensions_do_not_expand_n3_endpoint_comprehension() {
+    use opc_protocol::BorrowDecode;
+    for kind in [0x81, 0x83, 0x84, 0xc0] {
+        let wire = [
+            0x34, 255, 0, 13, 0, 0, 0, 1, 0, 0, 0, kind, 1, 0, 0, 0x85, 1, 0, 9, 0, 0x45,
+        ];
+        let ctx = DecodeContext {
+            unknown_ie_policy: UnknownIePolicy::Reject,
+            ..DecodeContext::default()
+        };
+        assert_eq!(
+            opc_proto_gtpu::GtpuMessage::decode(&wire, ctx)
+                .unwrap_err()
+                .code(),
+            &opc_protocol::DecodeErrorCode::UnknownCriticalIe
+        );
+        assert_eq!(
+            N3PacketView::decode(&wire, N3Direction::Downlink, ctx).unwrap_err(),
+            N3PacketError::UnsupportedExtension
+        );
+    }
+    let long = unhex("34ff0011000000010000008202000000000000850100090045");
+    let reject = DecodeContext {
+        unknown_ie_policy: UnknownIePolicy::Reject,
+        ..DecodeContext::default()
+    };
+    assert_eq!(
+        opc_proto_gtpu::GtpuMessage::decode(&long, reject)
+            .unwrap_err()
+            .code(),
+        &opc_protocol::DecodeErrorCode::UnknownCriticalIe
+    );
+    assert_eq!(
+        N3PacketView::decode(&long, N3Direction::Downlink, reject).unwrap_err(),
+        N3PacketError::UnsupportedExtension
+    );
+    assert_eq!(
+        N3PacketView::decode(&long, N3Direction::Downlink, DecodeContext::default()).unwrap_err(),
+        N3PacketError::UnsupportedExtension
+    );
 }

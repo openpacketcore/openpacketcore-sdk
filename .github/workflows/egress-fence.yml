@@ -364,14 +364,19 @@ jobs:
     needs: changes
     if: ${{ !cancelled() && (needs.changes.result != 'success' || needs.changes.outputs.run != 'false') }}
     runs-on: ubuntu-24.04
+    env:
+      CARGO_PROFILE_TEST_DEBUG: "0"
     timeout-minutes: 45
     strategy:
       fail-fast: false
       matrix:
-        shard: [0, 1, 2]
+        shard: [0, 1, 2, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34]
     steps:
       - name: Checkout
         uses: actions/checkout@v7
+
+      - name: Prepare disk-backed scratch
+        run: bash ci/disk-scratch.sh prepare
 
       - name: Install stable Rust
         uses: dtolnay/rust-toolchain@stable
@@ -410,22 +415,35 @@ jobs:
         if: always()
         run: bash ci/egress-fence-cleanup.sh
 
+      - name: Remove disk-backed scratch
+        if: always() && env.OPC_CI_DISK_TMPDIR != ''
+        run: bash ci/disk-scratch.sh cleanup
+
   # Each full-bound proof runs whole on its own runner. The leader's build
   # plus conservative proposal projection is 93 minutes; its 120-minute
-  # budget includes setup, reopen and variation. Other proof jobs retain 75.
+  # budget includes setup, reopen and variation. Other log proofs retain 75;
+  # the 131,073-roster history and cold reconstruction have 240 minutes.
+  # Complete retained snapshots keep checked O0 on separate runners: the
+  # observed hosted slowdown requires a 240-minute allocation, including
+  # compilation and complete transfer/import. Other runner limits are unchanged.
   host-native-log-proofs:
     name: Egress fence full-bound store proof (${{ matrix.shard }})
     needs: changes
     if: ${{ !cancelled() && (needs.changes.result != 'success' || needs.changes.outputs.run != 'false') }}
     runs-on: ubuntu-24.04
-    timeout-minutes: ${{ matrix.shard == 4 && 120 || 75 }}
+    env:
+      CARGO_PROFILE_TEST_DEBUG: "0"
+    timeout-minutes: ${{ (matrix.shard == 18 || matrix.shard == 35 || matrix.shard == 36) && 240 || (matrix.shard == 4 && 120 || 75) }}
     strategy:
       fail-fast: false
       matrix:
-        shard: [4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17]
+        shard: [4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 35, 36]
     steps:
       - name: Checkout
         uses: actions/checkout@v7
+
+      - name: Prepare disk-backed scratch
+        run: bash ci/disk-scratch.sh prepare
 
       - name: Install stable Rust
         uses: dtolnay/rust-toolchain@stable
@@ -464,15 +482,24 @@ jobs:
         if: always()
         run: bash ci/egress-fence-cleanup.sh
 
+      - name: Remove disk-backed scratch
+        if: always() && env.OPC_CI_DISK_TMPDIR != ''
+        run: bash ci/disk-scratch.sh cleanup
+
   host-proofs:
     name: Egress fence isolated and O1 proofs
     needs: changes
     if: ${{ !cancelled() && (needs.changes.result != 'success' || needs.changes.outputs.run != 'false') }}
     runs-on: ubuntu-24.04
+    env:
+      CARGO_PROFILE_TEST_DEBUG: "0"
     timeout-minutes: 45
     steps:
       - name: Checkout
         uses: actions/checkout@v7
+
+      - name: Prepare disk-backed scratch
+        run: bash ci/disk-scratch.sh prepare
 
       - name: Install stable Rust
         uses: dtolnay/rust-toolchain@stable
@@ -501,6 +528,10 @@ jobs:
       - name: Require complete privileged cleanup
         if: always()
         run: bash ci/egress-fence-cleanup.sh
+
+      - name: Remove disk-backed scratch
+        if: always() && env.OPC_CI_DISK_TMPDIR != ''
+        run: bash ci/disk-scratch.sh cleanup
 
   # Preserve the old branch-protection check name. A failed, cancelled or
   # missing matrix member makes host-tests unsuccessful and blocks this gate.

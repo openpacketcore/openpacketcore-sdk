@@ -29,6 +29,7 @@ opc-types = { path = "../opc-types", version = "0.2.0" }
 opc-identity = { path = "../opc-identity", version = "0.2.0" }
 opc-redaction = { path = "../opc-redaction", version = "0.2.0" }
 zeroize = { workspace = true }
+crypto-bigint = { version = "0.7.10", features = ["alloc", "zeroize"] }
 
 [dev-dependencies]
 rcgen = { workspace = true }

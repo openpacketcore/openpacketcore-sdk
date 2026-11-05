@@ -53,6 +53,7 @@ pub(in crate::consensus::native) fn write_row(
     write_carrier(writer, row.binding, &row.projection, row.canonical()?)
 }
 
+#[cfg(test)]
 pub(in crate::consensus::native) fn write_row_detached(
     writer: &mut dyn Write,
     row: &Row,

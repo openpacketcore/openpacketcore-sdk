@@ -137,8 +137,8 @@ pub(super) fn complete_roundtrip(conn: &Connection, target: &Connection, storage
         .unwrap();
     assert_eq!(
         database(target),
-        database(conn),
-        "SQL -> streamed V4 -> complete cold SQL preserves every schema object and column"
+        expected_with_native_profile(target, conn),
+        "SQL -> native generation -> complete cold SQL preserves every original schema object and column plus its canonical native profile"
     );
 }
 
@@ -465,4 +465,111 @@ fn native_snapshot_sqlite_padded_metadata_reservation_spans_header_and_releases_
     drop(probe);
     drop(prepared);
     assert!(source.is_autocommit());
+}
+
+#[test]
+fn retired_admission_witness_native_sqlite_snapshot_roundtrip_preserves_empty_history() {
+    use crate::fenced_mutation_roster_storage::retired_admission_witness_fence_for_test as witness_fence;
+    let (directory, backend, signed, mut wal) = fresh(Phase::Aborted);
+    parity(
+        &wal,
+        &backend,
+        &signed,
+        &[admission(&signed), terminal(&signed, 4)],
+    );
+    let due = signed
+        .authority
+        .acquired_at()
+        .add_seconds(1 + 24 * 60 * 60)
+        .unwrap();
+    for index in [5, 6] {
+        let applied = parity(&wal, &backend, &signed, &[tick(&signed, index, due)]);
+        assert!(applied
+            .responses
+            .iter()
+            .all(|response| response.result.is_ok()));
+    }
+    wal = reopen(&wal, directory.path(), &signed);
+    let snapshot = exported(&wal, &backend, &signed);
+    assert_eq!(
+        count(&snapshot, "consensus_protected_roster_v2_admissions"),
+        0
+    );
+    assert_eq!(count(&snapshot, "consensus_protected_roster_floors"), 0);
+    let read_witness = |conn: &Connection| {
+        protected_roster_read_witness_sync(conn, signed.identity)
+            .unwrap()
+            .unwrap()
+    };
+    let exported_fence = witness_fence(read_witness(&snapshot));
+    let (_import_directory, imported) =
+        admitted(&snapshot, [0xDA; 32], signed.identity, Some(&signed.root));
+    let (imported_rows, imported_witness) = imported.business.roster_history_for_test();
+    assert_eq!(imported_rows, 0);
+    let imported_fence = witness_fence(imported_witness.unwrap());
+    // The cold exporter fills an empty installation template. Replacement of
+    // an occupied ledger must use the normal validated snapshot installer.
+    let cold = SqliteSessionBackend::in_memory().unwrap();
+    initialize(&cold, &signed);
+    let cold_conn = cold.conn.blocking_lock();
+    complete_roundtrip(&snapshot, &cold_conn, &imported);
+    let incoming = crate::sqlite::consensus::tests::sequential_wal::IncomingSnapshot::with_identity(
+        &cold_conn,
+        signed.identity,
+    );
+    let target_directory = tempfile::tempdir().unwrap();
+    let target =
+        SqliteSessionBackend::open(target_directory.path().join("primary.sqlite")).unwrap();
+    initialize(&target, &signed);
+    let target_wal = Wal::create_native_with_root(
+        &target_directory.path().join("wal"),
+        &target.conn.blocking_lock(),
+        signed.identity,
+        [0xED; 32],
+        Some(Arc::new(signed.root.clone())),
+        Limits::default(),
+        IoControl::default(),
+    )
+    .unwrap();
+    let mut entries = setup(&signed);
+    entries.extend([
+        admission(&signed),
+        terminal(&signed, 4),
+        tick(&signed, 5, due),
+    ]);
+    parity(&target_wal, &target, &signed, &entries);
+    let target_conn = target.conn.blocking_lock();
+    assert_eq!(
+        count(&target_conn, "consensus_protected_roster_v2_admissions"),
+        1
+    );
+    // Native policy rows must use the native installation authority. The SQL
+    // cache alone cannot turn a native snapshot into an ordinary-profile image.
+    target_wal
+        .install_snapshot(&target_conn, incoming.source().unwrap())
+        .unwrap();
+    let installed = target_wal.native_export_install_base_for_test().unwrap();
+    let incarnation =
+        crate::sqlite::ops::RestoreScanIncarnation::from_installed_sync(&installed).unwrap();
+    let _authority = incoming
+        .source()
+        .unwrap()
+        .apply_native_original(
+            &target_conn,
+            target_wal.binding(),
+            Some(&signed.root),
+            &incarnation,
+            &|| Ok(()),
+        )
+        .unwrap();
+    assert_eq!(
+        count(&target_conn, "consensus_protected_roster_v2_admissions"),
+        0,
+        "install replacement physically removes the retained target slot"
+    );
+    let installed_fence = witness_fence(read_witness(&target_conn));
+    target_wal.shutdown().unwrap();
+    wal.shutdown().unwrap();
+    assert_eq!([exported_fence, imported_fence, installed_fence], [Some(signed.authority.fence().get()); 3],
+        "native export, cold SQLite import and nonempty install replacement must preserve the same retired maximum");
 }

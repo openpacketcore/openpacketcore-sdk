@@ -19,9 +19,11 @@
 //!
 //! The same authorization serves the G-PDUs that tc steers to the two
 //! backend-owned hand-off queues for a session with a downlink inner MTU:
-//! over-MTU Don't Fragment packets, which leave as a fragmentation or Packet
-//! Too Big plan, and every other inner IPv4 fragment, which is decapsulated
-//! like any authorized G-PDU and returned unmodified.
+//! over-MTU Don't Fragment IPv4 packets, which leave as a fragmentation or
+//! Packet Too Big plan; every other inner IPv4 fragment, which is decapsulated
+//! like any authorized G-PDU and returned unmodified; and an over-MTU inner
+//! IPv6 packet of a family-tagged context, which leaves as one RFC 4443
+//! Packet Too Big plan.
 //!
 //! tc leaves one thing to the kernel that this consumer has to do itself:
 //! after tc decapsulates a packet, the kernel's IPv4 input validates the
@@ -31,14 +33,15 @@
 
 use bytes::Bytes;
 use opc_gtpu_ebpf_common::{
-    downlink_ipv4_exceeds_inner_mtu, downlink_ipv4_is_fragment,
+    downlink_ipv4_exceeds_inner_mtu, downlink_ipv4_is_fragment, downlink_ipv6_exceeds_inner_mtu,
     gtpu_endpoint_requires_extension_control, marked_owner_wire_authorizes_downlink,
     n3_downlink_psc_matches, parse_gtpu_tpdu, pdp_commit_wire_authorized_source_port,
     pdp_commit_wire_authorizes_downlink, pdp_commit_wire_authorizes_graph,
     pdp_commit_wire_downlink_inner_mtu, pdp_commit_wire_downlink_packet_too_big,
     select_gtpu_session_entry_wire, validate_ipv4_downlink_binding_wire, DownlinkBindingMismatch,
-    DownlinkPdr, GtpuSessionDeviceConfig, GtpuSessionIpFamily, MarkedDownlinkPdr, UplinkFar,
-    UplinkFarKey, GTPU_SESSION_DOWNLINK_KEY_LEN, GTPU_SESSION_GROUP_ID_LEN,
+    DownlinkPdr, GtpuSessionDeviceConfig, GtpuSessionIpFamily, GtpuSessionUplinkKey,
+    MarkedDownlinkPdr, UplinkFar, UplinkFarKey, GTPU_SESSION_DOWNLINK_KEY_LEN,
+    GTPU_SESSION_GROUP_ID_LEN,
 };
 
 use super::EbpfGtpuRuntime;
@@ -130,6 +133,9 @@ impl InnerFragmentPlan {
 struct PacketTooBigRoute {
     payload_offset: usize,
     mtu: u16,
+    /// Inner family of the invoking packet; the in-tunnel error is ICMPv4 for
+    /// IPv4 and RFC 4443 ICMPv6 for IPv6.
+    family: GtpAddressFamily,
     session: [u8; 4],
     uplink: Option<DefaultBearerUplink>,
 }
@@ -166,13 +172,20 @@ impl PacketTooBigPlan {
         self.route.session
     }
 
-    /// Build the complete uplink G-PDU carrying one RFC 1191 Fragmentation
-    /// Needed error toward the offending packet's source.
+    /// Inner family of the invoking packet.
+    pub(super) const fn family(&self) -> GtpAddressFamily {
+        self.route.family
+    }
+
+    /// Build the complete uplink G-PDU carrying one in-tunnel Packet Too Big
+    /// error toward the offending packet's source: an RFC 1191 Fragmentation
+    /// Needed for IPv4 or an RFC 4443 Packet Too Big for IPv6.
     ///
     /// The error's source is the session PAA: the invoking packet's own
     /// destination, and the only inner source the peer's uplink anti-spoofing
-    /// admits for this PDN connection. RFC 792/1191 quote exactly the
-    /// invoking IPv4 header and its first 64 bits of data.
+    /// admits for this PDN connection. An IPv4 error quotes exactly the
+    /// invoking header and its first 64 bits (RFC 792/1191); an IPv6 error
+    /// quotes as much as fits in the minimum IPv6 MTU (RFC 4443 section 2.4).
     ///
     /// The invoking header is validated and every never-answer rule is
     /// applied here, before any rate-limit token is taken. Returns the G-PDU
@@ -183,31 +196,10 @@ impl PacketTooBigPlan {
     ) -> Option<(Vec<u8>, std::net::Ipv4Addr, std::net::Ipv4Addr)> {
         let uplink = self.route.uplink?;
         let inner = datagram_payload(&self.datagram, self.route.payload_offset)?;
-        // RFC 1812 section 5.2.2 and RFC 1122 section 3.2.1.2: a bad header
-        // checksum or a truncated datagram is silently discarded.
-        crate::inner_fragment::valid_ipv4_header(inner)?;
-        let source = std::net::Ipv4Addr::new(inner[16], inner[17], inner[18], inner[19]);
-        let destination = std::net::Ipv4Addr::new(inner[12], inner[13], inner[14], inner[15]);
-        // RFC 1122 3.2.2: never answer a source that does not identify one
-        // host: 0/8 ("this network"), 127/8, multicast, or 240/4 including the
-        // limited broadcast.
-        let first = destination.octets()[0];
-        if first == 0 || destination.is_loopback() || destination.is_multicast() || first >= 240 {
-            return None;
-        }
-        // RFC 1122 3.2.2: never answer a non-initial fragment.
-        let fragment_offset = u16::from_be_bytes([inner[6], inner[7]]) & 0x1fff;
-        if fragment_offset != 0 || inner[9] == 1 && is_icmp_error(inner) {
-            return None;
-        }
-        let icmp = crate::icmp::build_icmpv4_packet_too_big(
-            source,
-            destination,
-            opc_gtpu_ebpf_common::GtpuPmtuSignal::Icmpv4FragmentationNeeded {
-                inner_mtu: self.route.mtu,
-            },
-            inner,
-        )?;
+        let icmp = match self.route.family {
+            GtpAddressFamily::Ipv4 => build_icmpv4_quote(inner, self.route.mtu)?,
+            GtpAddressFamily::Ipv6 => build_icmpv6_quote(inner, self.route.mtu)?,
+        };
         let length = u16::try_from(icmp.len()).ok()?;
         let mut gpdu = Vec::with_capacity(8 + icmp.len());
         gpdu.extend_from_slice(&[0x30, 0xff]);
@@ -220,6 +212,126 @@ impl PacketTooBigPlan {
             std::net::Ipv4Addr::from(uplink.peer),
         ))
     }
+}
+
+/// Validate an invoking IPv4 packet and build its RFC 1191 Fragmentation
+/// Needed message, or `None` when a never-answer rule applies.
+fn build_icmpv4_quote(inner: &[u8], mtu: u16) -> Option<Vec<u8>> {
+    // RFC 1812 section 5.2.2 and RFC 1122 section 3.2.1.2: a bad header
+    // checksum or a truncated datagram is silently discarded.
+    crate::inner_fragment::valid_ipv4_header(inner)?;
+    let source = std::net::Ipv4Addr::new(inner[16], inner[17], inner[18], inner[19]);
+    let destination = std::net::Ipv4Addr::new(inner[12], inner[13], inner[14], inner[15]);
+    // RFC 1122 3.2.2: never answer a source that does not identify one host:
+    // 0/8 ("this network"), 127/8, multicast, or 240/4 including the limited
+    // broadcast.
+    let first = destination.octets()[0];
+    if first == 0 || destination.is_loopback() || destination.is_multicast() || first >= 240 {
+        return None;
+    }
+    // RFC 1122 3.2.2: never answer a non-initial fragment.
+    let fragment_offset = u16::from_be_bytes([inner[6], inner[7]]) & 0x1fff;
+    if fragment_offset != 0 || inner[9] == 1 && is_icmp_error(inner) {
+        return None;
+    }
+    crate::icmp::build_icmpv4_packet_too_big(
+        source,
+        destination,
+        opc_gtpu_ebpf_common::GtpuPmtuSignal::Icmpv4FragmentationNeeded { inner_mtu: mtu },
+        inner,
+    )
+}
+
+/// Validate an invoking IPv6 packet and build its RFC 4443 Packet Too Big
+/// message, or `None` when a never-answer rule applies (RFC 4443 section 2.4).
+fn build_icmpv6_quote(inner: &[u8], mtu: u16) -> Option<Vec<u8>> {
+    if inner.len() < 40 || inner[0] >> 4 != 6 {
+        return None;
+    }
+    let payload_length = u16::from_be_bytes([inner[4], inner[5]]);
+    if 40 + usize::from(payload_length) != inner.len() {
+        return None;
+    }
+    if !ipv6_permits_error(inner) {
+        return None;
+    }
+    let mut source = [0_u8; 16];
+    source.copy_from_slice(&inner[8..24]);
+    let mut destination = [0_u8; 16];
+    destination.copy_from_slice(&inner[24..40]);
+    // RFC 4443 section 2.4(e.6): the invoking source must identify one node.
+    // The zero interface identifier is the known subnet-router anycast
+    // address (RFC 4291 section 2.6.1); it cannot be the proxy source either.
+    if source == [0; 16]
+        || source[0] == 0xff
+        || std::net::Ipv6Addr::from(source).is_loopback()
+        || source[8..] == [0; 8]
+        || destination[0] == 0xff
+        || destination[8..] == [0; 8]
+    {
+        return None;
+    }
+    // The error is sent from the subscriber (the invoking destination) to the
+    // originator (the invoking source); the invoking order must not be copied
+    // straight into the outer header.
+    let (error_source, error_destination) = crate::icmp::icmpv6_ptb_addresses(inner)?;
+    crate::icmp::build_icmpv6_packet_too_big(
+        error_source,
+        error_destination,
+        opc_gtpu_ebpf_common::GtpuPmtuSignal::Icmpv6PacketTooBig { inner_mtu: mtu },
+        inner,
+    )
+}
+
+/// RFC 4443 section 2.4(e.1-e.2): do not answer ICMPv6 errors or Redirects,
+/// including those behind extension headers. Unresolved chains and
+/// non-initial fragments are conservatively unsendable: their contents do
+/// not establish that generating another error is permitted.
+fn ipv6_permits_error(inner: &[u8]) -> bool {
+    let Some(&initial_next) = inner.get(6) else {
+        return false;
+    };
+    let mut next = initial_next;
+    let mut offset = 40_usize;
+    let mut seen_fragment = false;
+    for _ in 0..16 {
+        let length = match next {
+            0 | 43 | 60 => {
+                let Some(header) = inner.get(offset..offset + 2) else {
+                    return false;
+                };
+                (usize::from(header[1]) + 1) * 8
+            }
+            51 => {
+                let Some(header) = inner.get(offset..offset + 2) else {
+                    return false;
+                };
+                (usize::from(header[1]) + 2) * 4
+            }
+            44 => {
+                let Some(header) = inner.get(offset..offset + 8) else {
+                    return false;
+                };
+                if seen_fragment || u16::from_be_bytes([header[2], header[3]]) & 0xfff8 != 0 {
+                    return false;
+                }
+                seen_fragment = true;
+                8
+            }
+            58 => {
+                return inner
+                    .get(offset)
+                    .is_some_and(|kind| *kind >= 128 && *kind != 137);
+            }
+            _ => return true,
+        };
+        let Some(header) = inner.get(offset..offset + length) else {
+            return false;
+        };
+        next = header[0];
+        offset += length;
+    }
+    false
 }
 
 /// Resolve the UE's default-bearer uplink from its own complete Active graph,
@@ -258,6 +370,68 @@ fn default_bearer_uplink(
         peer: far.peer_ip,
         local: far.local_ip,
         peer_teid: far.o_teid,
+    })
+}
+
+/// Resolve the default-bearer uplink tunnel of a family-tagged entry.
+///
+/// Both default and dedicated entries independently resolve the same PAA's
+/// authorized default-bearer uplink, exactly as the IPv4 path does. A dedicated
+/// TFT may discard the error. The error can only be injected over an IPv4
+/// S2b-U endpoint here; grouped IPv6 outer endpoints remain unsendable.
+fn family_tagged_default_uplink(
+    runtime: &dyn EbpfGtpuRuntime,
+    ifindex: u32,
+    config_wire: &[u8; opc_gtpu_ebpf_common::GTPU_SESSION_CONFIG_VALUE_LEN],
+    entry: opc_gtpu_ebpf_common::GtpuSessionEntryWireView<'_>,
+    inner_family: GtpuSessionIpFamily,
+) -> Option<DefaultBearerUplink> {
+    if entry.outer_family() != GtpuSessionIpFamily::Ipv4
+        || entry.n3_qfi().is_some()
+        || entry.uplink_source_port() != opc_gtpu_ebpf_common::GTPU_UDP_PORT
+    {
+        return None;
+    }
+    let key = GtpuSessionUplinkKey::new(entry.inner_paa()?, [0; 4]).encode();
+    let reference = runtime.session_uplink_get(ifindex, key).ok()??;
+    let mut group_key = [0_u8; GTPU_SESSION_GROUP_ID_LEN];
+    group_key.copy_from_slice(&reference[..GTPU_SESSION_GROUP_ID_LEN]);
+    let authority = runtime.session_group_get(ifindex, group_key).ok()??;
+    let default_entry = select_gtpu_session_entry_wire(
+        &authority,
+        &reference,
+        config_wire,
+        ifindex,
+        inner_family.slot(),
+    )?;
+    if default_entry.bearer_mark() != [0; 4]
+        || default_entry.inner_paa() != entry.inner_paa()
+        || default_entry.outer_family() != GtpuSessionIpFamily::Ipv4
+        || default_entry.n3_qfi().is_some()
+        || default_entry.uplink_source_port() != opc_gtpu_ebpf_common::GTPU_UDP_PORT
+        || !default_entry.authorizes_uplink_key(&key)
+    {
+        return None;
+    }
+    ipv4_default_uplink(
+        default_entry.peer_outer_wire(),
+        default_entry.local_outer_wire(),
+        default_entry.peer_teid(),
+    )
+}
+
+fn ipv4_default_uplink(
+    peer: [u8; 16],
+    local: [u8; 16],
+    peer_teid: [u8; 4],
+) -> Option<DefaultBearerUplink> {
+    if peer[4..].iter().any(|byte| *byte != 0) || local[4..].iter().any(|byte| *byte != 0) {
+        return None;
+    }
+    Some(DefaultBearerUplink {
+        peer: [peer[0], peer[1], peer[2], peer[3]],
+        local: [local[0], local[1], local[2], local[3]],
+        peer_teid,
     })
 }
 
@@ -378,6 +552,7 @@ fn authorize(
             return Verdict::Drop(GtpuDownlinkDrop::Malformed);
         }
         GtpuControlDatagramKind::Control
+        | GtpuControlDatagramKind::TunnelStatus
         | GtpuControlDatagramKind::Unmodelled
         | GtpuControlDatagramKind::UnsupportedRequiredExtension => return Verdict::Control,
     }
@@ -404,6 +579,26 @@ fn authorize(
         Ok(true) => {}
         Ok(false) | Err(_) => return Verdict::Drop(GtpuDownlinkDrop::StateUnavailable),
     }
+    if let std::net::IpAddr::V6(local) = datagram.local().ip() {
+        let Some(config) = scope.grouped_config else {
+            return Verdict::Drop(GtpuDownlinkDrop::BindingMismatch(
+                DownlinkBindingMismatch::Invalid,
+            ));
+        };
+        let config = config.encode();
+        if !opc_gtpu_ebpf_common::gtpu_session_config_wire_owns_local_ipv6(
+            &config,
+            scope.ifindex,
+            &local.octets(),
+        ) {
+            return Verdict::Drop(GtpuDownlinkDrop::BindingMismatch(
+                DownlinkBindingMismatch::Invalid,
+            ));
+        }
+        if !runtime.grouped_datapath_usable(scope.ifindex, config) {
+            return Verdict::Drop(GtpuDownlinkDrop::StateUnavailable);
+        }
+    }
 
     // tc: `grouped_downlink_authority`. An unknown inner version or zero TEID
     // is a grouped lookup error, never a v5 fallback.
@@ -422,7 +617,11 @@ fn authorize(
         ));
     }
     let mut index_key = [0_u8; GTPU_SESSION_DOWNLINK_KEY_LEN];
-    index_key[0] = GtpuSessionIpFamily::Ipv4 as u8;
+    index_key[0] = if datagram.local().is_ipv4() {
+        GtpuSessionIpFamily::Ipv4
+    } else {
+        GtpuSessionIpFamily::Ipv6
+    } as u8;
     index_key[1] = inner_family as u8;
     index_key[4..8].copy_from_slice(&teid);
     let reference = match runtime.session_downlink_get(scope.ifindex, index_key) {
@@ -439,6 +638,9 @@ fn authorize(
             inner_family,
             payload_offset,
         );
+    }
+    if datagram.local().is_ipv6() {
+        return Verdict::UnknownTunnel;
     }
     authorize_legacy(runtime, scope, datagram, teid, payload_offset)
 }
@@ -505,7 +707,10 @@ fn authorize_grouped(
     if !entry.authorizes_downlink_key(index_key) {
         return invalid;
     }
-    let provenance = datagram.provenance();
+    // IPv6 control observations never acquire IPv4 reassembly authority.
+    let Some(provenance) = datagram.provenance().ipv4() else {
+        return invalid;
+    };
     let mut outer_peer = [0_u8; 16];
     let mut outer_local = [0_u8; 16];
     outer_peer[..4].copy_from_slice(&provenance.peer_address().octets());
@@ -525,6 +730,34 @@ fn authorize_grouped(
     }
     if !inner_payload_is_exact(payload, inner_family) {
         return Verdict::Drop(GtpuDownlinkDrop::Malformed);
+    }
+    // IPv6 has no in-network fragmentation (RFC 8200 section 4.5), so an
+    // over-MTU inner IPv6 packet is signalled in-tunnel by this consumer; tc
+    // steers it undecapsulated from the family-tagged decapsulation path.
+    // The entry can carry only the explicit opt-in, never the IPv4
+    // fragment-inner policy.
+    if inner_family == GtpuSessionIpFamily::Ipv6 {
+        if let Some(mtu) = entry.downlink_inner_mtu() {
+            if !mtu.is_packet_too_big() {
+                return invalid;
+            }
+            let payload_length = u16::from_be_bytes([payload[4], payload[5]]);
+            if downlink_ipv6_exceeds_inner_mtu(mtu.mtu(), payload_length) {
+                return Verdict::PacketTooBig(PacketTooBigRoute {
+                    payload_offset,
+                    mtu: mtu.mtu(),
+                    family: GtpAddressFamily::Ipv6,
+                    session: entry.local_teid(),
+                    uplink: family_tagged_default_uplink(
+                        runtime,
+                        scope.ifindex,
+                        &config_wire,
+                        entry,
+                        inner_family,
+                    ),
+                });
+            }
+        }
     }
     Verdict::Decapsulate {
         payload_offset,
@@ -619,7 +852,10 @@ fn authorize_legacy(
         Ok(None) => return invalid,
         Err(_) => return unavailable,
     };
-    let provenance = datagram.provenance();
+    // IPv6 control observations never acquire IPv4 reassembly authority.
+    let Some(provenance) = datagram.provenance().ipv4() else {
+        return invalid;
+    };
     if let Err(reason) = validate_ipv4_downlink_binding_wire(
         &binding,
         provenance.peer_address().octets(),
@@ -708,6 +944,7 @@ fn authorize_legacy(
         return Verdict::PacketTooBig(PacketTooBigRoute {
             payload_offset,
             mtu,
+            family: GtpAddressFamily::Ipv4,
             session: teid,
             uplink: default_bearer_uplink(runtime, ifindex, pdr.ue_ip),
         });
@@ -766,7 +1003,12 @@ fn n3_downlink_psc_matches_message(message: &[u8], payload_offset: usize, qfi: u
             return false;
         }
         if next == PDU_SESSION_CONTAINER {
-            let prefix = [message[cursor], message[cursor + 1], message[cursor + 2]];
+            let prefix = [
+                message[cursor],
+                message[cursor + 1],
+                message[cursor + 2],
+                message[cursor + 3],
+            ];
             if found || !n3_downlink_psc_matches(prefix, qfi) {
                 return false;
             }
@@ -779,4 +1021,28 @@ fn n3_downlink_psc_matches_message(message: &[u8], payload_offset: usize, qfi: u
         walked += 1;
     }
     found && cursor == payload_offset
+}
+
+#[cfg(test)]
+mod review_burst_fields {
+    use super::n3_downlink_psc_matches_message;
+
+    #[test]
+    fn review_reassembled_n3_psc_rejects_burst_fields() {
+        // Independent TS 38.415 Figure 5.5.2.1-1 DL PSC: QFI 9, PPP and PPI 5.
+        let mut wire = [
+            0x34, 255, 0, 12, 0, 0, 0, 1, 0, 0, 0, 0x85, 2, 0, 0x89, 0xa0, 0, 0, 0, 0,
+        ];
+        for spare in [0, 0x1c] {
+            wire[15] = 0xa0 | spare;
+            assert!(n3_downlink_psc_matches_message(&wire, wire.len(), 9));
+            for burst in [1, 2, 3] {
+                wire[15] = 0xa0 | spare | burst;
+                assert!(
+                    !n3_downlink_psc_matches_message(&wire, wire.len(), 9),
+                    "BSSI/TTNBI {burst} must not be discarded as padding"
+                );
+            }
+        }
+    }
 }

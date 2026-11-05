@@ -428,10 +428,15 @@ struct Traversal<'a> {
 }
 
 impl Traversal<'_> {
-    fn internal_query(&self, owner: &DnsName) -> Result<DnsQuery, DnsError> {
+    fn internal_query(&self, owner: &DnsName, kind: u16) -> Result<DnsQuery, DnsError> {
         let mut input = self.query.input().clone();
         input.target = DiscoveryTarget::new(owner.as_str());
-        input.mode = ServiceDiscoveryMode::Address;
+        input.mode = match kind {
+            1 | 28 => ServiceDiscoveryMode::Address,
+            33 => ServiceDiscoveryMode::Service,
+            35 => ServiceDiscoveryMode::Snaptr,
+            _ => return Err(DnsError::InvalidQuery),
+        };
         // Neutral internal port allows memoization across SRV ports. Public
         // S-NAPTR validation already required a nonzero service default.
         input.default_port = Some(0);
@@ -871,7 +876,7 @@ impl Traversal<'_> {
         if let Some(&kind) = work.kinds.get(work.next) {
             let Some(evaluation) = evaluation else {
                 let supplied = work.srv.as_ref().and_then(|(answer, _)| {
-                    self.internal_query(&work.host)
+                    self.internal_query(&work.host, kind)
                         .ok()
                         .and_then(|query| answer.addresses(&query, kind))
                         .map(|result| {
@@ -1379,7 +1384,7 @@ impl Traversal<'_> {
                             let reserve = client.inner.config.timeout.min(remaining / 2);
                             Box::pin(tokio::time::sleep_until(self.session.deadline - reserve))
                         });
-                        let query = self.internal_query(&question.owner);
+                        let query = self.internal_query(&question.owner, question.kind);
                         let future = Box::pin(Self::lookup(
                             client,
                             query,

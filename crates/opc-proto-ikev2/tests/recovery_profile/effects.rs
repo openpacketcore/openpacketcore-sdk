@@ -159,7 +159,7 @@ impl Effects {
             Direction::Peer => row.direction,
         };
         let request = Wire::new(row.profile, &row.keys, row.spis, receiving)
-            .open(entry.request())
+            .open_message(entry.request())
             .map_err(|_| Error::NotCommitted)?;
         let key = (
             row.key,
@@ -168,11 +168,20 @@ impl Effects {
             request.header.message_id,
         );
         let mut hash = Sha256::new();
-        hash.update(b"ike-fixture-committed-effect-v1\0");
-        for field in [entry.request(), response, outcome] {
-            hash.update(u64::try_from(field.len()).unwrap().to_be_bytes());
-            hash.update(field);
+        hash.update(b"ike-fixture-committed-effect-v2\0");
+        for message in [entry.request(), response] {
+            hash.update(
+                u64::try_from(message.packets().len())
+                    .unwrap()
+                    .to_be_bytes(),
+            );
+            for packet in message.packets() {
+                hash.update(u64::try_from(packet.len()).unwrap().to_be_bytes());
+                hash.update(packet);
+            }
         }
+        hash.update(u64::try_from(outcome.len()).unwrap().to_be_bytes());
+        hash.update(outcome);
         let digest = hash.finalize().into();
         permit
             .while_current(|| {

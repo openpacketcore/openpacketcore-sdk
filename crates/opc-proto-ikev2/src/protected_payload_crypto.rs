@@ -7,13 +7,18 @@
 
 use std::{error::Error, fmt};
 
-use aes::{cipher::consts::U12, Aes128, Aes192, Aes256};
+use aes::{
+    cipher::consts::{U11, U12, U8},
+    Aes128, Aes192, Aes256,
+};
 use aes_gcm::{
-    aead::{Aead, Key, KeyInit, Nonce, Payload},
+    aead::{Aead, KeyInit, Nonce, Payload},
     Aes128Gcm, Aes256Gcm, AesGcm,
 };
 use bytes::Bytes;
 use cbc::cipher::{block_padding::NoPadding, BlockModeDecrypt, BlockModeEncrypt, KeyIvInit};
+use ccm::Ccm;
+use chacha20poly1305::ChaCha20Poly1305;
 use opc_crypto_provider::CryptoOperationErrorCode;
 use rand::TryCryptoRng;
 use subtle::ConstantTimeEq;
@@ -39,7 +44,6 @@ use crate::{
     HEADER_LEN,
 };
 
-const AES_GCM_SALT_LEN: usize = 4;
 const AES_GCM_EXPLICIT_IV_LEN: usize = 8;
 const AES_GCM_ICV_LEN: usize = 16;
 const AES_CBC_IV_LEN: usize = 16;
@@ -101,6 +105,36 @@ pub const fn ikev2_aes_gcm_protected_payload_len(
         Some(value) => value,
         None => return None,
     };
+    GENERIC_PAYLOAD_HEADER_LEN.checked_add(body_len)
+}
+
+/// Return the AEAD protected body length, including explicit IV and tag.
+///
+/// Returns `None` for non-AEAD transforms or arithmetic overflow. The encrypted
+/// data includes zero padding and one required Pad Length octet (RFC 5282).
+pub const fn ikev2_aead_protected_body_len(
+    encryption: Ikev2EncryptionAlgorithm,
+    cleartext_payloads_len: usize,
+    padding_len: u8,
+) -> Option<usize> {
+    if !encryption.is_aead() {
+        return None;
+    }
+    let overhead = AES_GCM_EXPLICIT_IV_LEN + encryption.aead_tag_len() + padding_len as usize + 1;
+    cleartext_payloads_len.checked_add(overhead)
+}
+
+/// Return the AEAD `SK` payload length, including its generic payload header.
+pub const fn ikev2_aead_protected_payload_len(
+    encryption: Ikev2EncryptionAlgorithm,
+    cleartext_payloads_len: usize,
+    padding_len: u8,
+) -> Option<usize> {
+    let body_len =
+        match ikev2_aead_protected_body_len(encryption, cleartext_payloads_len, padding_len) {
+            Some(value) => value,
+            None => return None,
+        };
     GENERIC_PAYLOAD_HEADER_LEN.checked_add(body_len)
 }
 
@@ -637,7 +671,7 @@ pub fn decrypt_ikev2_sa_init_protected_payload(
     strip_ike_padding(plaintext)
 }
 
-/// Authenticate and encrypt one AES-GCM IKEv2 `SK`/`SKF` crypto body.
+/// Authenticate and encrypt one AEAD IKEv2 `SK`/`SKF` crypto body.
 ///
 /// The returned bytes are the protected payload body:
 /// explicit IV || ciphertext || authentication tag. The caller remains
@@ -659,9 +693,10 @@ pub fn decrypt_ikev2_sa_init_protected_payload(
 ///
 /// # Security
 ///
-/// `explicit_iv` is the AES-GCM explicit nonce field from RFC 5282 section 4.
+/// `explicit_iv` is the eight-octet explicit nonce field from RFC 5282 section 4
+/// (AES-GCM/CCM) or RFC 7634 section 4 (ChaCha20-Poly1305).
 /// Callers must ensure it is never reused with the same direction key and salt.
-/// Reusing an AES-GCM nonce under one IKE SA can disclose plaintext relations
+/// Reusing an AEAD nonce under one IKE SA can disclose plaintext relations
 /// and permit tag forgery. Production callers should allocate this value from a
 /// monotonic per-direction counter stored with the IKE SA state. Values at or
 /// above [`IKEV2_AES_GCM_NORMAL_IV_END`] return
@@ -937,13 +972,13 @@ fn select_keys<'a>(
         sk_e.len(),
     )?;
     let (encryption_key, salt) = if profile.encryption().is_aead() {
-        let encryption_key_len = expected_sk_e_len.checked_sub(AES_GCM_SALT_LEN).ok_or(
-            Ikev2ProtectedPayloadCryptoError::InvalidKeyMaterialLength {
+        let encryption_key_len = expected_sk_e_len
+            .checked_sub(profile.encryption().salt_len())
+            .ok_or(Ikev2ProtectedPayloadCryptoError::InvalidKeyMaterialLength {
                 name: direction.encryption_key_name(),
                 expected: expected_sk_e_len,
                 actual: sk_e.len(),
-            },
-        )?;
+            })?;
         sk_e.split_at(encryption_key_len)
     } else {
         (sk_e, &[][..])
@@ -1136,7 +1171,7 @@ pub(crate) fn decrypt_aes_gcm(
     // Preserve the public protocol-boundary validation and stable error shape
     // before delegating to a provider. Providers may use a coarser invalid
     // input error, but callers must still receive the RFC-shaped minimum.
-    let min_len = AES_GCM_EXPLICIT_IV_LEN + AES_GCM_ICV_LEN;
+    let min_len = AES_GCM_EXPLICIT_IV_LEN + encryption.aead_tag_len();
     if protected_body.len() < min_len {
         return Err(Ikev2ProtectedPayloadCryptoError::ProtectedPayloadTooShort {
             min_len,
@@ -1160,7 +1195,7 @@ pub(crate) fn software_decrypt_aes_gcm(
     aad: &[u8],
     protected_body: &[u8],
 ) -> Result<Vec<u8>, Ikev2ProtectedPayloadCryptoError> {
-    let min_len = AES_GCM_EXPLICIT_IV_LEN + AES_GCM_ICV_LEN;
+    let min_len = AES_GCM_EXPLICIT_IV_LEN + encryption.aead_tag_len();
     if protected_body.len() < min_len {
         return Err(Ikev2ProtectedPayloadCryptoError::ProtectedPayloadTooShort {
             min_len,
@@ -1169,73 +1204,32 @@ pub(crate) fn software_decrypt_aes_gcm(
     }
 
     let (explicit_iv, ciphertext_and_tag) = protected_body.split_at(AES_GCM_EXPLICIT_IV_LEN);
-    let mut nonce = Zeroizing::new([0_u8; AES_GCM_SALT_LEN + AES_GCM_EXPLICIT_IV_LEN]);
-    nonce[..AES_GCM_SALT_LEN].copy_from_slice(keys.salt);
-    nonce[AES_GCM_SALT_LEN..].copy_from_slice(explicit_iv);
-
+    let nonce = aead_nonce(encryption, keys, explicit_iv)?;
     let payload = Payload {
         msg: ciphertext_and_tag,
         aad,
     };
     match encryption {
         Ikev2EncryptionAlgorithm::AesGcm16_128 => {
-            validate_key_len(
-                "AES-GCM-128 key",
-                AES_128_KEY_LEN,
-                keys.encryption_key.len(),
-            )?;
-            let key = <&Key<Aes128Gcm>>::try_from(keys.encryption_key).map_err(|_| {
-                Ikev2ProtectedPayloadCryptoError::InvalidKeyMaterialLength {
-                    name: "AES-GCM-128 key",
-                    expected: AES_128_KEY_LEN,
-                    actual: keys.encryption_key.len(),
-                }
-            })?;
-            let nonce = <&Nonce<Aes128Gcm>>::try_from(nonce.as_slice())
-                .map_err(|_| Ikev2ProtectedPayloadCryptoError::InvalidAssociatedData)?;
-            let cipher = Aes128Gcm::new(key);
-            cipher
-                .decrypt(nonce, payload)
-                .map_err(|_| Ikev2ProtectedPayloadCryptoError::AuthenticationFailed)
+            aead_decrypt::<Aes128Gcm>(encryption, keys.encryption_key, &nonce, payload)
         }
         Ikev2EncryptionAlgorithm::AesGcm16_192 => {
-            validate_key_len(
-                "AES-GCM-192 key",
-                AES_192_KEY_LEN,
-                keys.encryption_key.len(),
-            )?;
-            let key = <&Key<Aes192Gcm>>::try_from(keys.encryption_key).map_err(|_| {
-                Ikev2ProtectedPayloadCryptoError::InvalidKeyMaterialLength {
-                    name: "AES-GCM-192 key",
-                    expected: AES_192_KEY_LEN,
-                    actual: keys.encryption_key.len(),
-                }
-            })?;
-            let nonce = <&Nonce<Aes192Gcm>>::try_from(nonce.as_slice())
-                .map_err(|_| Ikev2ProtectedPayloadCryptoError::InvalidAssociatedData)?;
-            Aes192Gcm::new(key)
-                .decrypt(nonce, payload)
-                .map_err(|_| Ikev2ProtectedPayloadCryptoError::AuthenticationFailed)
+            aead_decrypt::<Aes192Gcm>(encryption, keys.encryption_key, &nonce, payload)
         }
         Ikev2EncryptionAlgorithm::AesGcm16_256 => {
-            validate_key_len(
-                "AES-GCM-256 key",
-                AES_256_KEY_LEN,
-                keys.encryption_key.len(),
-            )?;
-            let key = <&Key<Aes256Gcm>>::try_from(keys.encryption_key).map_err(|_| {
-                Ikev2ProtectedPayloadCryptoError::InvalidKeyMaterialLength {
-                    name: "AES-GCM-256 key",
-                    expected: AES_256_KEY_LEN,
-                    actual: keys.encryption_key.len(),
-                }
-            })?;
-            let nonce = <&Nonce<Aes256Gcm>>::try_from(nonce.as_slice())
-                .map_err(|_| Ikev2ProtectedPayloadCryptoError::InvalidAssociatedData)?;
-            let cipher = Aes256Gcm::new(key);
-            cipher
-                .decrypt(nonce, payload)
-                .map_err(|_| Ikev2ProtectedPayloadCryptoError::AuthenticationFailed)
+            aead_decrypt::<Aes256Gcm>(encryption, keys.encryption_key, &nonce, payload)
+        }
+        Ikev2EncryptionAlgorithm::AesCcm8_128 => {
+            aead_decrypt::<Ccm<Aes128, U8, U11>>(encryption, keys.encryption_key, &nonce, payload)
+        }
+        Ikev2EncryptionAlgorithm::AesCcm8_192 => {
+            aead_decrypt::<Ccm<Aes192, U8, U11>>(encryption, keys.encryption_key, &nonce, payload)
+        }
+        Ikev2EncryptionAlgorithm::AesCcm8_256 => {
+            aead_decrypt::<Ccm<Aes256, U8, U11>>(encryption, keys.encryption_key, &nonce, payload)
+        }
+        Ikev2EncryptionAlgorithm::ChaCha20Poly1305 => {
+            aead_decrypt::<ChaCha20Poly1305>(encryption, keys.encryption_key, &nonce, payload)
         }
         unsupported => Err(
             Ikev2ProtectedPayloadCryptoError::UnsupportedEncryptionProfile {
@@ -1272,86 +1266,96 @@ pub(crate) fn software_encrypt_aes_gcm(
     plaintext: &[u8],
     explicit_iv: [u8; IKEV2_AES_GCM_EXPLICIT_IV_LEN],
 ) -> Result<Vec<u8>, Ikev2ProtectedPayloadCryptoError> {
-    let mut nonce = Zeroizing::new([0_u8; AES_GCM_SALT_LEN + AES_GCM_EXPLICIT_IV_LEN]);
-    nonce[..AES_GCM_SALT_LEN].copy_from_slice(keys.salt);
-    nonce[AES_GCM_SALT_LEN..].copy_from_slice(&explicit_iv);
-
+    let nonce = aead_nonce(encryption, keys, &explicit_iv)?;
     let payload = Payload {
         msg: plaintext,
         aad,
     };
     let ciphertext_and_tag = match encryption {
         Ikev2EncryptionAlgorithm::AesGcm16_128 => {
-            validate_key_len(
-                "AES-GCM-128 key",
-                AES_128_KEY_LEN,
-                keys.encryption_key.len(),
-            )?;
-            let key = <&Key<Aes128Gcm>>::try_from(keys.encryption_key).map_err(|_| {
-                Ikev2ProtectedPayloadCryptoError::InvalidKeyMaterialLength {
-                    name: "AES-GCM-128 key",
-                    expected: AES_128_KEY_LEN,
-                    actual: keys.encryption_key.len(),
-                }
-            })?;
-            let nonce = <&Nonce<Aes128Gcm>>::try_from(nonce.as_slice())
-                .map_err(|_| Ikev2ProtectedPayloadCryptoError::InvalidAssociatedData)?;
-            Aes128Gcm::new(key)
-                .encrypt(nonce, payload)
-                .map_err(|_| Ikev2ProtectedPayloadCryptoError::AuthenticationFailed)?
+            aead_encrypt::<Aes128Gcm>(encryption, keys.encryption_key, &nonce, payload)
         }
         Ikev2EncryptionAlgorithm::AesGcm16_192 => {
-            validate_key_len(
-                "AES-GCM-192 key",
-                AES_192_KEY_LEN,
-                keys.encryption_key.len(),
-            )?;
-            let key = <&Key<Aes192Gcm>>::try_from(keys.encryption_key).map_err(|_| {
-                Ikev2ProtectedPayloadCryptoError::InvalidKeyMaterialLength {
-                    name: "AES-GCM-192 key",
-                    expected: AES_192_KEY_LEN,
-                    actual: keys.encryption_key.len(),
-                }
-            })?;
-            let nonce = <&Nonce<Aes192Gcm>>::try_from(nonce.as_slice())
-                .map_err(|_| Ikev2ProtectedPayloadCryptoError::InvalidAssociatedData)?;
-            Aes192Gcm::new(key)
-                .encrypt(nonce, payload)
-                .map_err(|_| Ikev2ProtectedPayloadCryptoError::AuthenticationFailed)?
+            aead_encrypt::<Aes192Gcm>(encryption, keys.encryption_key, &nonce, payload)
         }
         Ikev2EncryptionAlgorithm::AesGcm16_256 => {
-            validate_key_len(
-                "AES-GCM-256 key",
-                AES_256_KEY_LEN,
-                keys.encryption_key.len(),
-            )?;
-            let key = <&Key<Aes256Gcm>>::try_from(keys.encryption_key).map_err(|_| {
-                Ikev2ProtectedPayloadCryptoError::InvalidKeyMaterialLength {
-                    name: "AES-GCM-256 key",
-                    expected: AES_256_KEY_LEN,
-                    actual: keys.encryption_key.len(),
-                }
-            })?;
-            let nonce = <&Nonce<Aes256Gcm>>::try_from(nonce.as_slice())
-                .map_err(|_| Ikev2ProtectedPayloadCryptoError::InvalidAssociatedData)?;
-            Aes256Gcm::new(key)
-                .encrypt(nonce, payload)
-                .map_err(|_| Ikev2ProtectedPayloadCryptoError::AuthenticationFailed)?
+            aead_encrypt::<Aes256Gcm>(encryption, keys.encryption_key, &nonce, payload)
         }
-        unsupported => {
-            return Err(
-                Ikev2ProtectedPayloadCryptoError::UnsupportedEncryptionProfile {
-                    encryption: unsupported,
-                    integrity: None,
-                },
-            );
+        Ikev2EncryptionAlgorithm::AesCcm8_128 => {
+            aead_encrypt::<Ccm<Aes128, U8, U11>>(encryption, keys.encryption_key, &nonce, payload)
         }
-    };
-
+        Ikev2EncryptionAlgorithm::AesCcm8_192 => {
+            aead_encrypt::<Ccm<Aes192, U8, U11>>(encryption, keys.encryption_key, &nonce, payload)
+        }
+        Ikev2EncryptionAlgorithm::AesCcm8_256 => {
+            aead_encrypt::<Ccm<Aes256, U8, U11>>(encryption, keys.encryption_key, &nonce, payload)
+        }
+        Ikev2EncryptionAlgorithm::ChaCha20Poly1305 => {
+            aead_encrypt::<ChaCha20Poly1305>(encryption, keys.encryption_key, &nonce, payload)
+        }
+        unsupported => Err(
+            Ikev2ProtectedPayloadCryptoError::UnsupportedEncryptionProfile {
+                encryption: unsupported,
+                integrity: None,
+            },
+        ),
+    }?;
     let mut protected_body = Vec::with_capacity(AES_GCM_EXPLICIT_IV_LEN + ciphertext_and_tag.len());
     protected_body.extend_from_slice(&explicit_iv);
     protected_body.extend_from_slice(&ciphertext_and_tag);
     Ok(protected_body)
+}
+
+fn aead_nonce(
+    encryption: Ikev2EncryptionAlgorithm,
+    keys: SelectedProtectedPayloadKeys<'_>,
+    explicit_iv: &[u8],
+) -> Result<Zeroizing<Vec<u8>>, Ikev2ProtectedPayloadCryptoError> {
+    validate_key_len("AEAD salt", encryption.salt_len(), keys.salt.len())?;
+    let mut nonce = Zeroizing::new(Vec::with_capacity(keys.salt.len() + explicit_iv.len()));
+    nonce.extend_from_slice(keys.salt);
+    nonce.extend_from_slice(explicit_iv);
+    Ok(nonce)
+}
+
+fn aead_encrypt<C: Aead + KeyInit>(
+    encryption: Ikev2EncryptionAlgorithm,
+    key: &[u8],
+    nonce: &[u8],
+    payload: Payload<'_, '_>,
+) -> Result<Vec<u8>, Ikev2ProtectedPayloadCryptoError> {
+    let cipher = C::new_from_slice(key).map_err(|_| {
+        Ikev2ProtectedPayloadCryptoError::InvalidKeyMaterialLength {
+            name: encryption.name(),
+            expected: encryption.encryption_key_len(),
+            actual: key.len(),
+        }
+    })?;
+    let nonce = <&Nonce<C>>::try_from(nonce)
+        .map_err(|_| Ikev2ProtectedPayloadCryptoError::InvalidAssociatedData)?;
+    cipher
+        .encrypt(nonce, payload)
+        .map_err(|_| Ikev2ProtectedPayloadCryptoError::AuthenticationFailed)
+}
+
+fn aead_decrypt<C: Aead + KeyInit>(
+    encryption: Ikev2EncryptionAlgorithm,
+    key: &[u8],
+    nonce: &[u8],
+    payload: Payload<'_, '_>,
+) -> Result<Vec<u8>, Ikev2ProtectedPayloadCryptoError> {
+    let cipher = C::new_from_slice(key).map_err(|_| {
+        Ikev2ProtectedPayloadCryptoError::InvalidKeyMaterialLength {
+            name: encryption.name(),
+            expected: encryption.encryption_key_len(),
+            actual: key.len(),
+        }
+    })?;
+    let nonce = <&Nonce<C>>::try_from(nonce)
+        .map_err(|_| Ikev2ProtectedPayloadCryptoError::InvalidAssociatedData)?;
+    cipher
+        .decrypt(nonce, payload)
+        .map_err(|_| Ikev2ProtectedPayloadCryptoError::AuthenticationFailed)
 }
 
 fn decrypt_aes_cbc(

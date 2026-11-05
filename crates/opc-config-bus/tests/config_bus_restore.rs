@@ -317,7 +317,7 @@ async fn restore_recovery_required_raises_critical_startup_alarm() {
     assert_eq!(err.code, StoreErrorCode::RestoreRecoveryRequired);
     let alarm = single_active_alarm(&alarms, "config-bus.startup.failure");
     assert_eq!(alarm.severity, Severity::Critical);
-    assert_eq!(alarm.probable_cause, ProbableCause::StorageCorruption);
+    assert_eq!(alarm.probable_cause, ProbableCause::ConfigApplyFailed);
     assert_alarm_details_code(&alarm, "restore_recovery_required");
 }
 
@@ -349,7 +349,7 @@ async fn restore_confirmed_deadline_raises_critical_startup_alarm() {
     assert_eq!(err.code, StoreErrorCode::RestoreConfirmedDeadline);
     let alarm = single_active_alarm(&alarms, "config-bus.startup.failure");
     assert_eq!(alarm.severity, Severity::Critical);
-    assert_eq!(alarm.probable_cause, ProbableCause::StorageCorruption);
+    assert_eq!(alarm.probable_cause, ProbableCause::ConfigApplyFailed);
     assert_alarm_details_code(&alarm, "restore_confirmed_deadline");
 }
 

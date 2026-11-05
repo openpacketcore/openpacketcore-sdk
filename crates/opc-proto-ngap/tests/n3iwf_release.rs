@@ -262,7 +262,7 @@ fn with_extra(pdu: &Pdu, id: u16, criticality: Criticality, value: &[u8]) -> Pdu
                 .0
                 .iter()
                 .map(|ie| {
-                    ProtocolIe::new(ie.id.0, crit_of(ie.criticality as u8), ie.value.as_bytes())
+                    ProtocolIe::new(ie.id, crit_of(ie.criticality as u8), ie.value.as_bytes())
                 })
                 .collect(),
         ),
@@ -275,7 +275,7 @@ fn with_extra(pdu: &Pdu, id: u16, criticality: Criticality, value: &[u8]) -> Pdu
                 .0
                 .iter()
                 .map(|ie| {
-                    ProtocolIe::new(ie.id.0, crit_of(ie.criticality as u8), ie.value.as_bytes())
+                    ProtocolIe::new(ie.id, crit_of(ie.criticality as u8), ie.value.as_bytes())
                 })
                 .collect(),
         ),

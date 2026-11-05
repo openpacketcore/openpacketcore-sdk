@@ -283,6 +283,7 @@ fn manifest_for_replicas(cluster: &str, replicas: &[u16]) -> Arc<SessionReplicat
     Arc::new(
         SessionReplicationManifest::try_new_with_epoch(
             SessionClusterId::new(cluster).expect("cluster ID"),
+            [0x5a; 32],
             SessionConfigurationGeneration::new("fault-matrix-v1").expect("generation"),
             SessionConfigurationEpoch::new(29).expect("configuration epoch"),
             replicas

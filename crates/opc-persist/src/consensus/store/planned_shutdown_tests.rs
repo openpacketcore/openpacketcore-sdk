@@ -556,3 +556,61 @@ async fn standard_snapshot_rejects_incomparable_vote_before_staging() {
         "an engine-rejected incomparable vote must not create staging"
     );
 }
+
+#[test]
+fn unplanned_flag_wins_over_other_fallbacks() {
+    let (sender, receiver) = watch::channel(false);
+    assert_eq!(
+        prefer_unplanned(Err(PlannedShutdownFallback::NotAdmitted), &receiver),
+        Err(PlannedShutdownFallback::NotAdmitted)
+    );
+    sender.send_replace(true);
+    assert_eq!(
+        prefer_unplanned(Err(PlannedShutdownFallback::NotAdmitted), &receiver),
+        Err(PlannedShutdownFallback::Unplanned)
+    );
+    assert_eq!(
+        prefer_unplanned(Err(PlannedShutdownFallback::DeadlineElapsed), &receiver),
+        Err(PlannedShutdownFallback::Unplanned)
+    );
+    // A flag that lands after a completed transfer still yields the weaker
+    // Unplanned report; it never claims successor authority.
+    assert_eq!(
+        prefer_unplanned(Ok(PlannedShutdownOutcome::FollowerRetired), &receiver),
+        Err(PlannedShutdownFallback::Unplanned)
+    );
+}
+
+#[tokio::test]
+async fn unplanned_request_racing_preparation_result_keeps_its_reason() {
+    for result in [
+        Err(PlannedShutdownFallback::NotAdmitted),
+        Err(PlannedShutdownFallback::DeadlineElapsed),
+        Ok(PlannedShutdownOutcome::FollowerRetired),
+    ] {
+        let (requested, mut unplanned) = watch::channel(false);
+        let observed = select_preparation(&mut unplanned, async {
+            // Request unplanned shutdown after its branch was polled but
+            // before this preparation result is retained for every clone.
+            requested.send_replace(true);
+            result
+        })
+        .await;
+        assert_eq!(observed, Err(PlannedShutdownFallback::Unplanned));
+    }
+}
+
+#[tokio::test]
+async fn preparation_result_without_unplanned_request_is_preserved() {
+    for result in [
+        Err(PlannedShutdownFallback::NotAdmitted),
+        Ok(PlannedShutdownOutcome::FollowerRetired),
+    ] {
+        let (requested, mut unplanned) = watch::channel(false);
+        assert_eq!(
+            select_preparation(&mut unplanned, async { result }).await,
+            result
+        );
+        drop(requested);
+    }
+}

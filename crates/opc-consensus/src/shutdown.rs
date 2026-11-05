@@ -31,7 +31,11 @@ pub enum PlannedShutdownOutcome {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
 #[non_exhaustive]
 pub enum PlannedShutdownFallback {
-    /// The caller requested an unplanned drain without leadership transfer.
+    /// The unplanned drain route was taken: new handoff preparation was
+    /// suppressed, and an in-flight preparation (if any) was cancelled and
+    /// joined. Handoff RPCs may already have been sent before the cancellation,
+    /// so a successor may already be campaigning; this reason does not certify
+    /// that no peer observed the retirement attempt.
     #[error("unplanned shutdown requested")]
     Unplanned,
     /// Local durable authority was not admitted for a handoff.

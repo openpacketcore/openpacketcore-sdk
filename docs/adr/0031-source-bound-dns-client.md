@@ -82,7 +82,7 @@ direct dependency edges reuse versions already in the workspace lockfile:
 
 | Dependency | Purpose and features | License | Declared MSRV |
 |---|---|---|---|
-| Tokio 1.53.1 | Existing workspace runtime/net/macros, plus `io-util`, `sync`, `time`; upstream defaults are empty | MIT | 1.71 |
+| Tokio 1.53.3 | Existing workspace runtime/net/macros, plus `io-util`, `sync`, `time`; upstream defaults are empty | MIT | 1.71 |
 | socket2 0.6.4 | Safe socket construction and Linux `SO_BINDTODEVICE`; `all` exposes platform options, no default features | MIT OR Apache-2.0 | 1.70 |
 | getrandom 0.4.2 | Fallible OS entropy, default features disabled; no RNG state shared across queries | MIT OR Apache-2.0 | 1.85 |
 

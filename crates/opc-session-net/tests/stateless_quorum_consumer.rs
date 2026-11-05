@@ -2,6 +2,11 @@
 
 #![cfg(feature = "test-control")]
 
+use crate::controlled_clock;
+
+#[path = "../../opc-session-store/tests/support/election_progress.rs"]
+mod election_progress;
+
 #[cfg(all(target_os = "linux", target_pointer_width = "64"))]
 #[path = "stateless_quorum_consumer/fenced_non_execution.rs"]
 mod fenced_non_execution;
@@ -963,6 +968,7 @@ impl ThreeVoterConsumerFleet {
             SessionReplicationManifest::try_new_with_epoch_and_roster_attestation_root(
                 SessionClusterId::new("consumer-three-voter-transition")
                     .expect("three-voter cluster ID"),
+                [0x5a; 32],
                 SessionConfigurationGeneration::new("consumer-three-voter-v1")
                     .expect("three-voter configuration generation"),
                 ConsensusConfigurationEpoch::new(1).expect("three-voter epoch"),
@@ -1343,32 +1349,43 @@ impl ThreeVoterConsumerFleet {
     }
 
     async fn wait_for_observed_leader(&self) -> (usize, SessionConsensusNodeId, u64) {
-        let observed = tokio::time::timeout(THREE_VOTER_READY_TIMEOUT, async {
-            loop {
-                let statuses = self
-                    .stores
-                    .iter()
-                    .map(ConsensusSessionStore::status)
-                    .collect::<Vec<_>>();
-                if let (Some(leader_id), Some(term)) = (
-                    statuses.first().and_then(|status| status.leader_id),
-                    statuses.first().map(|status| status.term),
-                ) {
-                    if statuses.iter().all(|status| {
-                        status.leader_id == Some(leader_id)
-                            && status.term == term
-                            && status.admitted
-                    }) {
-                        let leader = statuses
-                            .iter()
-                            .position(|status| status.node_id == leader_id)
-                            .expect("elected leader belongs to fleet");
-                        return (leader, leader_id, term);
+        let eligible_voters = [0, 1, 2];
+        let term = eligible_voters
+            .iter()
+            .map(|index| self.stores[*index].status().term)
+            .max()
+            .unwrap_or(0);
+        let observed = election_progress::wait(
+            THREE_VOTER_READY_TIMEOUT,
+            term,
+            async {
+                loop {
+                    let statuses = self
+                        .stores
+                        .iter()
+                        .map(ConsensusSessionStore::status)
+                        .collect::<Vec<_>>();
+                    if let (Some(leader_id), Some(term)) = (
+                        statuses.first().and_then(|status| status.leader_id),
+                        statuses.first().map(|status| status.term),
+                    ) {
+                        if statuses.iter().all(|status| {
+                            status.leader_id == Some(leader_id)
+                                && status.term == term
+                                && status.admitted
+                        }) {
+                            let leader = statuses
+                                .iter()
+                                .position(|status| status.node_id == leader_id)
+                                .expect("elected leader belongs to fleet");
+                            return (leader, leader_id, term);
+                        }
                     }
+                    tokio::time::sleep(Duration::from_millis(20)).await;
                 }
-                tokio::time::sleep(Duration::from_millis(20)).await;
-            }
-        })
+            },
+            |term| self.next_election_term(&eligible_voters, term),
+        )
         .await;
         if let Ok(observed) = observed {
             return observed;
@@ -1425,6 +1442,22 @@ impl ThreeVoterConsumerFleet {
         (engines_running, format!("{durable_progress:?}"))
     }
 
+    async fn next_election_term(&self, eligible_voters: &[usize], term: u64) -> u64 {
+        use futures_util::StreamExt;
+        let mut changes = eligible_voters
+            .iter()
+            .map(|index| {
+                self.stores[*index].wait_for_status_for_test(move |status| status.term > term)
+            })
+            .collect::<futures_util::stream::FuturesUnordered<_>>();
+        let _ = changes.next().await;
+        eligible_voters
+            .iter()
+            .map(|index| self.stores[*index].status().term)
+            .max()
+            .unwrap_or(term)
+    }
+
     async fn wait_for_admitted_quorum_leader(
         &self,
         eligible_voters: &[usize],
@@ -1448,35 +1481,47 @@ impl ThreeVoterConsumerFleet {
             "eligible voters are unique"
         );
 
-        let observed = tokio::time::timeout(THREE_VOTER_READY_TIMEOUT, async {
-            loop {
-                let statuses = eligible_voters
-                    .iter()
-                    .map(|index| (*index, self.stores[*index].status()))
-                    .collect::<Vec<_>>();
-                for (candidate, status) in &statuses {
-                    let Some(leader_id) = status.leader_id else {
-                        continue;
-                    };
-                    if !status.admitted || status.node_id != leader_id || status.term < minimum_term
-                    {
-                        continue;
-                    }
-                    let admitted_reports = statuses
+        let term = eligible_voters
+            .iter()
+            .map(|index| self.stores[*index].status().term)
+            .max()
+            .unwrap_or(0);
+        let observed = election_progress::wait(
+            THREE_VOTER_READY_TIMEOUT,
+            term,
+            async {
+                loop {
+                    let statuses = eligible_voters
                         .iter()
-                        .filter(|(_, observer)| {
-                            observer.admitted
-                                && observer.leader_id == Some(leader_id)
-                                && observer.term == status.term
-                        })
-                        .count();
-                    if admitted_reports >= 2 {
-                        return (*candidate, leader_id, status.term);
+                        .map(|index| (*index, self.stores[*index].status()))
+                        .collect::<Vec<_>>();
+                    for (candidate, status) in &statuses {
+                        let Some(leader_id) = status.leader_id else {
+                            continue;
+                        };
+                        if !status.admitted
+                            || status.node_id != leader_id
+                            || status.term < minimum_term
+                        {
+                            continue;
+                        }
+                        let admitted_reports = statuses
+                            .iter()
+                            .filter(|(_, observer)| {
+                                observer.admitted
+                                    && observer.leader_id == Some(leader_id)
+                                    && observer.term == status.term
+                            })
+                            .count();
+                        if admitted_reports >= 2 {
+                            return (*candidate, leader_id, status.term);
+                        }
                     }
+                    tokio::time::sleep(Duration::from_millis(20)).await;
                 }
-                tokio::time::sleep(Duration::from_millis(20)).await;
-            }
-        })
+            },
+            |term| self.next_election_term(eligible_voters, term),
+        )
         .await;
         if let Ok(observed) = observed {
             return observed;
@@ -1752,36 +1797,42 @@ impl ThreeVoterConsumerFleet {
         excluded: usize,
         previous: SessionConsensusNodeId,
         previous_term: u64,
-        deadline: tokio::time::Instant,
+        watchdog: Duration,
     ) -> usize {
-        tokio::time::timeout_at(deadline, async {
-            loop {
-                let survivors = (0..THREE_VOTER_COUNT)
-                    .filter(|index| *index != excluded)
-                    .collect::<Vec<_>>();
-                let statuses = survivors
-                    .iter()
-                    .map(|index| self.stores[*index].status())
-                    .collect::<Vec<_>>();
-                if let Some(leader) = statuses.first().and_then(|status| status.leader_id) {
-                    let term = statuses.first().expect("survivor status").term;
-                    if leader != previous
-                        && term > previous_term
-                        && statuses.iter().all(|status| {
-                            status.leader_id == Some(leader)
-                                && status.term == term
-                                && status.admitted
-                        })
-                    {
-                        return survivors
-                            .into_iter()
-                            .find(|index| self.stores[*index].status().node_id == leader)
-                            .expect("new leader is a survivor");
+        let survivors = (0..THREE_VOTER_COUNT)
+            .filter(|index| *index != excluded)
+            .collect::<Vec<_>>();
+        election_progress::wait(
+            watchdog,
+            previous_term,
+            async {
+                loop {
+                    let statuses = survivors
+                        .iter()
+                        .map(|index| self.stores[*index].status())
+                        .collect::<Vec<_>>();
+                    if let Some(leader) = statuses.first().and_then(|status| status.leader_id) {
+                        let term = statuses.first().expect("survivor status").term;
+                        if leader != previous
+                            && term > previous_term
+                            && statuses.iter().all(|status| {
+                                status.leader_id == Some(leader)
+                                    && status.term == term
+                                    && status.admitted
+                            })
+                        {
+                            return survivors
+                                .iter()
+                                .copied()
+                                .find(|index| self.stores[*index].status().node_id == leader)
+                                .expect("new leader is a survivor");
+                        }
                     }
+                    tokio::time::sleep(Duration::from_millis(20)).await;
                 }
-                tokio::time::sleep(Duration::from_millis(20)).await;
-            }
-        })
+            },
+            |term| self.next_election_term(&survivors, term),
+        )
         .await
         .unwrap_or_else(|_| {
             let statuses = (0..THREE_VOTER_COUNT)
@@ -2000,6 +2051,7 @@ struct RecordingCompareAndSetConsumer {
     binding_entries: Arc<AtomicUsize>,
     effects: ConsensusSessionStore,
     calls: Mutex<Vec<RecordedCompareAndSetCall>>,
+    reply_delay: Duration,
 }
 
 impl RecordingCompareAndSetConsumer {
@@ -2013,6 +2065,7 @@ impl RecordingCompareAndSetConsumer {
             binding_entries,
             effects,
             calls: Mutex::new(Vec::new()),
+            reply_delay: Duration::ZERO,
         }
     }
 
@@ -2054,6 +2107,10 @@ impl SessionQuorumConsumer for RecordingCompareAndSetConsumer {
                     binding_entries_at_answer,
                     effects_at_answer,
                 });
+            // Model a delayed test observer without adding a quorum operation.
+            if !self.reply_delay.is_zero() {
+                tokio::time::sleep(self.reply_delay).await;
+            }
         }
         response
     }
@@ -6400,8 +6457,20 @@ async fn prepared_cas_three_voter_receipt_converges_with_payload(
 /// different body under the same ID remains a request conflict.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn prepared_cas_binding_reply_loss_fails_over_and_applies_exactly_once() {
+    prepared_cas_binding_reply_loss_case(Duration::ZERO).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn prepared_cas_binding_reply_loss_survives_slow_reply_observation() {
+    prepared_cas_binding_reply_loss_case(
+        PREPARED_CHECKPOINT_MAX_PHYSICAL_ATTEMPT + Duration::from_millis(50),
+    )
+    .await;
+}
+
+async fn prepared_cas_binding_reply_loss_case(reply_delay: Duration) {
     let pki = Arc::new(TestPki::new());
-    let mut fleet = ThreeVoterConsumerFleet::start_fixed_durable(Arc::clone(&pki)).await;
+    let fleet = ThreeVoterConsumerFleet::start_fixed_durable(Arc::clone(&pki)).await;
     let (leader, _, _) = fleet.wait_for_observed_leader().await;
     // The rotating origin must be a follower, so that it forwards its
     // binding to the leader. The successor is the other follower.
@@ -6416,11 +6485,15 @@ async fn prepared_cas_binding_reply_loss_fails_over_and_applies_exactly_once() {
     let mut servers = Vec::with_capacity(THREE_VOTER_COUNT);
     let mut clients = Vec::with_capacity(THREE_VOTER_COUNT);
     for voter in route {
-        let recorder = Arc::new(RecordingCompareAndSetConsumer::new(
+        let mut recorder = RecordingCompareAndSetConsumer::new(
             Arc::new(fleet.stores[voter].consumer_service()),
             Arc::clone(&fleet.consumer_binding_entries),
             fleet.stores[leader].clone(),
-        ));
+        );
+        if voter == origin {
+            recorder.reply_delay = reply_delay;
+        }
+        let recorder = Arc::new(recorder);
         let server_spiffe = three_voter_spiffe(voter);
         let (server, address) = SessionQuorumConsumerServer::new(
             Arc::clone(&recorder) as Arc<dyn SessionQuorumConsumer>,
@@ -6434,16 +6507,13 @@ async fn prepared_cas_binding_reply_loss_fails_over_and_applies_exactly_once() {
         )
         .await
         .expect("start prepared failover listener");
-        clients.push(
-            PersistentSessionConsumerClient::from_stateless(consumer_client(
-                &pki,
-                address,
-                &server_spiffe,
-                &client_spiffe,
-                fleet.voter_authority(voter),
-            ))
-            .expect("prepared failover persistent client"),
-        );
+        clients.push(consumer_client(
+            &pki,
+            address,
+            &server_spiffe,
+            &client_spiffe,
+            fleet.voter_authority(voter),
+        ));
         recorders.push(recorder);
         servers.push(server);
     }
@@ -6468,25 +6538,6 @@ async fn prepared_cas_binding_reply_loss_fails_over_and_applies_exactly_once() {
             payload: EncryptedSessionPayload::new([0xb1]),
         },
     };
-    let provider = CountingKeyProvider::with_active_session_key();
-    // Seal over the leader so the preparation preflight forwards nothing.
-    let protected = SessionConsumerPreparedCheckpointBackend::persistent(
-        Arc::new(EncryptingSessionBackend::new(
-            Arc::new(fleet.stores[leader].clone()),
-            Arc::clone(&provider),
-            "prepared-cas-binding-reply-loss",
-        )),
-        clients.iter().cloned(),
-    )
-    .expect("same-scope protected composite");
-    let request_id = SessionConsumerRequestId::from_bytes([0xb1; 16]);
-    let budget = || {
-        PreparedCheckpointBudget::new(
-            tokio::time::Instant::now() + Duration::from_secs(3),
-            PREPARED_CHECKPOINT_MAX_PHYSICAL_ATTEMPT,
-        )
-        .expect("prepared failover budget")
-    };
     let before = fleet.stores[leader]
         .max_replication_sequence()
         .await
@@ -6498,145 +6549,191 @@ async fn prepared_cas_binding_reply_loss_fails_over_and_applies_exactly_once() {
         .max()
         .expect("three-voter applied index");
     fleet.wait_all_application_sequences(settled).await;
-    // Finish fixture convergence before starting the immutable caller budget.
-    let mut prepared = protected
-        .prepare_compare_and_set(request_id, operation.clone(), budget())
-        .await
-        .expect("prepare the exact protected compare-and-set");
-    fleet.consumer_binding_entries.store(0, Ordering::SeqCst);
-    fleet.withhold_next_forward_mutation_reply(origin, leader);
+    // Only the consumer clock is controlled. Voter engines, disk I/O and the
+    // delayed observer keep running on the original runtime. The shared helper
+    // supplies a wall-clock watchdog and drains accepted client tasks on exit.
+    let mut fleet = controlled_clock::run(async move {
+        let mut persistent_clients = Vec::with_capacity(clients.len());
+        for client in clients {
+            persistent_clients.push(
+                PersistentSessionConsumerClient::from_stateless(client)
+                    .expect("prepared failover persistent client"),
+            );
+        }
+        let clients = persistent_clients;
+        let provider = CountingKeyProvider::with_active_session_key();
+        // Seal over the leader so the preparation preflight forwards nothing.
+        let protected = SessionConsumerPreparedCheckpointBackend::persistent(
+            Arc::new(EncryptingSessionBackend::new(
+                Arc::new(fleet.stores[leader].clone()),
+                Arc::clone(&provider),
+                "prepared-cas-binding-reply-loss",
+            )),
+            clients.iter().cloned(),
+        )
+        .expect("same-scope protected composite");
+        let request_id = SessionConsumerRequestId::from_bytes([0xb1; 16]);
+        let budget = || {
+            PreparedCheckpointBudget::new(
+                tokio::time::Instant::now() + Duration::from_secs(3),
+                PREPARED_CHECKPOINT_MAX_PHYSICAL_ATTEMPT,
+            )
+            .expect("prepared failover budget")
+        };
+        let mut prepared = protected
+            .prepare_compare_and_set(request_id, operation.clone(), budget())
+            .await
+            .expect("prepare the exact protected compare-and-set");
+        fleet.consumer_binding_entries.store(0, Ordering::SeqCst);
+        fleet.withhold_next_forward_mutation_reply(origin, leader);
 
-    let outcome = prepared.execute_once().await;
-    let origin_calls = recorders[0].calls();
-    let successor_calls = recorders[1].calls();
-    assert_eq!(
-        (
-            outcome,
-            fleet.withheld_forward_mutation_replies(),
-            origin_calls
-                .iter()
-                .map(|call| call.response.clone())
-                .collect::<Vec<_>>(),
-            successor_calls
-                .iter()
-                .map(|call| call.response.clone())
-                .collect::<Vec<_>>(),
-            recorders[2].calls().len(),
+        let protocol_started = tokio::time::Instant::now();
+        let wall_started = Instant::now();
+        let outcome = prepared.execute_once().await;
+        assert_eq!(
+            protocol_started.elapsed(),
+            Duration::ZERO,
+            "real voter work and reply observation do not spend the functional client budget"
+        );
+        if !reply_delay.is_zero() {
+            assert!(
+                wall_started.elapsed() >= reply_delay,
+                "the origin actually withholds its reply past the physical attempt's wall-time duration"
+            );
+        }
+        let origin_calls = recorders[0].calls();
+        let successor_calls = recorders[1].calls();
+        assert_eq!(
+            (
+                outcome,
+                fleet.withheld_forward_mutation_replies(),
+                origin_calls
+                    .iter()
+                    .map(|call| call.response.clone())
+                    .collect::<Vec<_>>(),
+                successor_calls
+                    .iter()
+                    .map(|call| call.response.clone())
+                    .collect::<Vec<_>>(),
+                recorders[2].calls().len(),
+                fleet.stores[leader]
+                    .max_replication_sequence()
+                    .await
+                    .expect("sequence after the compare-and-set"),
+            ),
+            (
+                Ok(PreparedCompareAndSetOutcome::Applied),
+                1,
+                vec![SessionConsumerResponse::Rejected(
+                    SessionConsumerRejection::Unavailable
+                )],
+                vec![SessionConsumerResponse::CompareAndSet(Ok(
+                    CompareAndSetResult::Success
+                ))],
+                0,
+                before + 1,
+            ),
+            "the origin loses its committed binding reply; the identical request applies once on the successor"
+        );
+        assert!(
+            origin_calls[0].binding_entries_at_answer > 0,
+            "the origin answered after the leader replicated its binding"
+        );
+        assert_eq!(
+            origin_calls[0].effects_at_answer, before,
+            "the origin answered before any compare-and-set effect"
+        );
+        assert_eq!(
+            successor_calls[0].effects_at_answer,
+            before + 1,
+            "the successor answered after exactly one locally applied effect"
+        );
+        assert!(
+            successor_calls[0].request == origin_calls[0].request,
+            "failover carries the identical request ID and body"
+        );
+        let origin_diagnostics = clients[0].diagnostics().await;
+        assert_eq!(
+            (
+                origin_diagnostics.completed_operations,
+                origin_diagnostics.completed_operation_not_transmitted,
+                origin_diagnostics.completed_operation_unsafe_failures,
+            ),
+            (1, 1, 0),
+            "the closed rejection is a safe completion on the origin"
+        );
+        assert_eq!(
+            prepared.execute_once().await,
+            Err(PreparedCompareAndSetExecuteError::AlreadyExecuted)
+        );
+
+        // An identical retry replays the recorded outcome on every voter.
+        let identical = origin_calls[0].request.clone();
+        for client in &clients {
+            assert_eq!(
+                client.execute(&identical).await,
+                Ok(SessionConsumerResponse::CompareAndSet(Ok(
+                    CompareAndSetResult::Success
+                ))),
+                "an identical retry replays the recorded result without a request conflict"
+            );
+        }
+        assert_eq!(
             fleet.stores[leader]
                 .max_replication_sequence()
                 .await
-                .expect("sequence after the compare-and-set"),
-        ),
-        (
-            Ok(PreparedCompareAndSetOutcome::Applied),
-            1,
-            vec![SessionConsumerResponse::Rejected(
-                SessionConsumerRejection::Unavailable
-            )],
-            vec![SessionConsumerResponse::CompareAndSet(Ok(
-                CompareAndSetResult::Success
-            ))],
-            0,
+                .expect("sequence after identical retries"),
             before + 1,
-        ),
-        "the origin loses its committed binding reply; the identical request applies once on the successor"
-    );
-    assert!(
-        origin_calls[0].binding_entries_at_answer > 0,
-        "the origin answered after the leader replicated its binding"
-    );
-    assert_eq!(
-        origin_calls[0].effects_at_answer, before,
-        "the origin answered before any compare-and-set effect"
-    );
-    assert_eq!(
-        successor_calls[0].effects_at_answer,
-        before + 1,
-        "the successor answered after exactly one locally applied effect"
-    );
-    assert!(
-        successor_calls[0].request == origin_calls[0].request,
-        "failover carries the identical request ID and body"
-    );
-    let origin_diagnostics = clients[0].diagnostics().await;
-    assert_eq!(
-        (
-            origin_diagnostics.completed_operations,
-            origin_diagnostics.completed_operation_not_transmitted,
-            origin_diagnostics.completed_operation_unsafe_failures,
-        ),
-        (1, 1, 0),
-        "the closed rejection is a safe completion on the origin"
-    );
-    assert_eq!(
-        prepared.execute_once().await,
-        Err(PreparedCompareAndSetExecuteError::AlreadyExecuted)
-    );
-
-    // An identical retry replays the recorded outcome on every voter.
-    let identical = origin_calls[0].request.clone();
-    for client in &clients {
-        assert_eq!(
-            client.execute(&identical).await,
-            Ok(SessionConsumerResponse::CompareAndSet(Ok(
-                CompareAndSetResult::Success
-            ))),
-            "an identical retry replays the recorded result without a request conflict"
+            "identical retries add no effect"
         );
-    }
-    assert_eq!(
-        fleet.stores[leader]
-            .max_replication_sequence()
-            .await
-            .expect("sequence after identical retries"),
-        before + 1,
-        "identical retries add no effect"
-    );
 
-    // A different sealed body under the same ID is a closed conflict.
-    let mut conflicting = protected
-        .prepare_compare_and_set(request_id, operation, budget())
-        .await
-        .expect("prepare a different sealed body under the same request ID");
-    assert_eq!(
-        provider.calls(),
-        2,
-        "the second preparation seals a new body"
-    );
-    assert_eq!(
-        conflicting.execute_once().await,
-        Ok(PreparedCompareAndSetOutcome::Rejected(
-            SessionConsumerStoreError::RequestConflict
-        )),
-        "a different body under the same request ID is a request conflict"
-    );
-    let conflicting_request = recorders[1]
-        .calls()
-        .last()
-        .expect("the successor serves the conflicting request")
-        .request
-        .clone();
-    assert_eq!(conflicting_request.request_id(), identical.request_id());
-    assert!(
-        conflicting_request != identical,
-        "the conflicting request carries a different body"
-    );
-    assert_eq!(
-        fleet.stores[leader]
-            .max_replication_sequence()
+        // A different sealed body under the same ID is a closed conflict.
+        let mut conflicting = protected
+            .prepare_compare_and_set(request_id, operation, budget())
             .await
-            .expect("sequence after the conflicting request"),
-        before + 1,
-        "the conflicting body has no effect"
-    );
+            .expect("prepare a different sealed body under the same request ID");
+        assert_eq!(
+            provider.calls(),
+            2,
+            "the second preparation seals a new body"
+        );
+        assert_eq!(
+            conflicting.execute_once().await,
+            Ok(PreparedCompareAndSetOutcome::Rejected(
+                SessionConsumerStoreError::RequestConflict
+            )),
+            "a different body under the same request ID is a request conflict"
+        );
+        let conflicting_request = recorders[1]
+            .calls()
+            .last()
+            .expect("the successor serves the conflicting request")
+            .request
+            .clone();
+        assert_eq!(conflicting_request.request_id(), identical.request_id());
+        assert!(
+            conflicting_request != identical,
+            "the conflicting request carries a different body"
+        );
+        assert_eq!(
+            fleet.stores[leader]
+                .max_replication_sequence()
+                .await
+                .expect("sequence after the conflicting request"),
+            before + 1,
+            "the conflicting body has no effect"
+        );
 
-    for client in &clients {
-        client.shutdown().await;
-    }
+        for client in &clients {
+            client.shutdown().await;
+        }
+        drop((prepared, conflicting, protected, recorders));
+        fleet
+    })
+    .await;
     for server in servers {
         server.abort_and_wait().await;
     }
-    drop((prepared, conflicting, protected, recorders));
     fleet.quiesce().await;
 }
 
@@ -7574,9 +7671,19 @@ async fn persistent_three_voter_fenced_status_converges_after_response_loss_and_
     })
     .await
     .expect("old committed-leader lease drains within the recovery deadline");
-    let new_leader = fleet
-        .wait_for_new_leader(old_leader, old_leader_id, old_term, election_deadline)
-        .await;
+    // The controlled campaign and preceding lease drain keep their original
+    // shared absolute deadline.
+    let new_leader = tokio::time::timeout_at(
+        election_deadline,
+        fleet.wait_for_new_leader(
+            old_leader,
+            old_leader_id,
+            old_term,
+            THREE_VOTER_ELECTION_RECOVERY_TIMEOUT,
+        ),
+    )
+    .await
+    .expect("selected survivor elects within the original recovery deadline");
     assert_ne!(new_leader, old_leader, "leader changes after commit");
     for survivor in [initial_follower, other_survivor] {
         fleet.stores[survivor].set_automatic_election_for_test(true);

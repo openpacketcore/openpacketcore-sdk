@@ -395,7 +395,14 @@ fn canonical_header_matches_the_ordinary_empty_acknowledgement_encoder() {
                     Bytes::new(),
                 )
                 .unwrap();
-            let ordinary = prepared.record().inbound().unwrap().response().unwrap();
+            let ordinary = prepared
+                .record()
+                .inbound()
+                .unwrap()
+                .response()
+                .unwrap()
+                .single_packet()
+                .unwrap();
             assert_eq!(&canonical[..32], &ordinary[..32]);
             assert_ne!(&canonical[32..], &ordinary[32..]);
         }
@@ -426,6 +433,8 @@ fn canonical_ciphertext_never_qualifies_committed_cache_or_ordinary_iv_floor() {
                 id.checked_add(1),
                 None,
                 Some(entry),
+                None,
+                None,
             )
             .unwrap();
             assert_eq!(
@@ -752,13 +761,22 @@ fn every_sync_terminal_or_waiting_state_withholds_canonical_capability() {
             Sa::new(fixture.spis.0, fixture.spis.1, Role::Initiator).unwrap(),
             Mode::Negotiated,
         );
-        let record = WindowRecord::from_persisted(domain.clone(), 1, Some(2), Some(0), None, None)
-            .unwrap()
-            .with_sync_state(
-                SyncRecord::from_persisted(agreement, None, None, Some(1), None, disposition, 0)
-                    .unwrap(),
-            )
-            .unwrap();
+        let record = WindowRecord::from_persisted(
+            domain.clone(),
+            1,
+            Some(2),
+            Some(0),
+            None,
+            None,
+            None,
+            None,
+        )
+        .unwrap()
+        .with_sync_state(
+            SyncRecord::from_persisted(agreement, None, None, Some(1), None, disposition, 0)
+                .unwrap(),
+        )
+        .unwrap();
         let window = Window::restore(
             &domain,
             fixture.profile,

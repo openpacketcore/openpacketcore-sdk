@@ -279,7 +279,8 @@ async fn test_kms_key_provider_behavior() {
         .get_active_key(KeyPurpose::Config, &tenant())
         .await
         .unwrap_err();
-    assert_eq!(err3, opc_key::KeyError::Unavailable);
+    // An unclassified request failure is not evidence against a key or data.
+    assert_eq!(err3, opc_key::KeyError::ProviderUnusable);
 
     // 7. Not found case
     fake_kms.set_behavior(KmsBehavior::default());
@@ -310,7 +311,7 @@ async fn test_kms_active_key_without_backing_key_returns_not_found() {
 }
 
 #[tokio::test]
-async fn test_kms_fault_responses_return_unavailable() {
+async fn test_kms_fault_responses_preserve_failure_class() {
     let cases = [
         KmsBehavior {
             truncated_response: true,
@@ -326,7 +327,14 @@ async fn test_kms_fault_responses_return_unavailable() {
         },
     ];
 
-    for (idx, behavior) in cases.into_iter().enumerate() {
+    // Truncated transport is an outage; invalid replies need provider repair, not data rejection.
+    let expected_errors = [
+        opc_key::KeyError::Unavailable,
+        opc_key::KeyError::ProviderUnusable,
+        opc_key::KeyError::ProviderUnusable,
+    ];
+    assert_eq!(cases.len(), expected_errors.len());
+    for (idx, (behavior, expected)) in cases.into_iter().zip(expected_errors).enumerate() {
         let socket_path = short_unix_socket_path(&format!("kms-fault-{idx}"));
         let fake_kms = FakeKms::new_unix(&socket_path, behavior).await.unwrap();
         fake_kms.insert_key("config-active-1", "config", "tenant-a", [0x44u8; 32]);
@@ -342,7 +350,7 @@ async fn test_kms_fault_responses_return_unavailable() {
             .get_active_key(KeyPurpose::Config, &tenant())
             .await
             .unwrap_err();
-        assert_eq!(err, opc_key::KeyError::Unavailable);
+        assert_eq!(err, expected);
     }
 }
 
@@ -364,5 +372,6 @@ async fn test_kms_tcp_without_tls_fails_closed() {
         .get_active_key(KeyPurpose::Config, &tenant())
         .await
         .unwrap_err();
-    assert_eq!(err, opc_key::KeyError::Unavailable);
+    // Missing TLS configuration needs operator repair and must fail before connecting.
+    assert_eq!(err, opc_key::KeyError::ProviderUnusable);
 }

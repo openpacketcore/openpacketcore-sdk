@@ -47,6 +47,16 @@
 #[cfg(test)]
 extern crate self as opc_session_net;
 
+#[cfg(all(
+    test,
+    any(
+        feature = "test-control",
+        all(feature = "legacy-session-net-compat", feature = "insecure-test")
+    )
+))]
+#[path = "../../opc-session-store/tests/support/controlled_clock.rs"]
+mod controlled_clock;
+
 #[cfg(all(test, feature = "test-control"))]
 #[doc(hidden)]
 pub(crate) use consumer::SessionConsumerFencedTransitionBackend;
@@ -92,11 +102,12 @@ pub use consumer::{
     RosterIngressSigner, RosterIngressSignerError, SessionConsumerAuthorizationError,
     SessionConsumerAuthorizer, SessionConsumerClientError,
     SessionConsumerFencedTransitionMutationError, SessionConsumerFencedTransitionV2AbandonError,
-    SessionConsumerFencedTransitionV2ReclaimReport, SessionConsumerFencedTransitionV2ReleaseError,
-    SessionConsumerLeaseMutationError, SessionConsumerMutationError,
-    SessionConsumerPreparedCheckpointBackend, SessionConsumerPreparedCheckpointBackendError,
-    SessionConsumerPreparedCompareAndSet, SessionConsumerPreparedFencedTransition,
-    SessionConsumerPreparedFencedTransitionBackend,
+    SessionConsumerFencedTransitionV2FailureDiagnostics,
+    SessionConsumerFencedTransitionV2FailureStage, SessionConsumerFencedTransitionV2ReclaimReport,
+    SessionConsumerFencedTransitionV2ReleaseError, SessionConsumerLeaseMutationError,
+    SessionConsumerMutationError, SessionConsumerPreparedCheckpointBackend,
+    SessionConsumerPreparedCheckpointBackendError, SessionConsumerPreparedCompareAndSet,
+    SessionConsumerPreparedFencedTransition, SessionConsumerPreparedFencedTransitionBackend,
     SessionConsumerPreparedFencedTransitionBackendError,
     SessionConsumerPreparedFencedTransitionStatusError, SessionConsumerPreparedFencedTransitionV2,
     SessionConsumerPreparedFencedTransitionV2Backend,
@@ -132,13 +143,13 @@ pub use fenced_mutation_roster::{
     fenced_mutation_roster_terminal_attestation_signing_digest_v1,
     FencedMutationRosterAbortedTerminal, FencedMutationRosterAbsentAdmissionProposal,
     FencedMutationRosterAbsentRecoveryInput, FencedMutationRosterActive,
-    FencedMutationRosterAdmissionInput, FencedMutationRosterAdmissionOutcome,
-    FencedMutationRosterAdmissionProposal, FencedMutationRosterAdmissionUnknown,
-    FencedMutationRosterAttestationTrustRootV1, FencedMutationRosterClient,
-    FencedMutationRosterClientError, FencedMutationRosterCompactTerminalMemberSigningInputV2,
-    FencedMutationRosterCompleteProofSet, FencedMutationRosterDiagnostics,
-    FencedMutationRosterEstablishedMutation, FencedMutationRosterEstablishedPublication,
-    FencedMutationRosterEstablishedPublicationCall,
+    FencedMutationRosterAdmissionClass, FencedMutationRosterAdmissionInput,
+    FencedMutationRosterAdmissionOutcome, FencedMutationRosterAdmissionProposal,
+    FencedMutationRosterAdmissionUnknown, FencedMutationRosterAttestationTrustRootV1,
+    FencedMutationRosterClient, FencedMutationRosterClientError,
+    FencedMutationRosterCompactTerminalMemberSigningInputV2, FencedMutationRosterCompleteProofSet,
+    FencedMutationRosterDiagnostics, FencedMutationRosterEstablishedMutation,
+    FencedMutationRosterEstablishedPublication, FencedMutationRosterEstablishedPublicationCall,
     FencedMutationRosterEstablishedPublicationProvider, FencedMutationRosterEstablishedTerminal,
     FencedMutationRosterExecuteOutcome, FencedMutationRosterExecutorAttestor,
     FencedMutationRosterExecutorAttestorAdapter, FencedMutationRosterExecutorCertificatePartsV1,
@@ -179,9 +190,9 @@ pub use identity::{
     SessionPlacementDisposition, SessionPlacementPolicy, SessionReplicationManifest,
 };
 pub use lifecycle::{
-    ConnectionLifecycleError, ConnectionLifecyclePolicy, SessionReauthenticationControl,
-    DEFAULT_MAX_AUTHENTICATION_AGE, DEFAULT_RECONNECT_BACKOFF_MAX, DEFAULT_RECONNECT_BACKOFF_MIN,
-    DEFAULT_ROTATION_DRAIN_WINDOW, DEFAULT_ROTATION_JITTER,
+    ConnectionLifecycleError, ConnectionLifecyclePolicy, ReconnectCooldownPolicy,
+    SessionReauthenticationControl, DEFAULT_MAX_AUTHENTICATION_AGE, DEFAULT_RECONNECT_BACKOFF_MAX,
+    DEFAULT_RECONNECT_BACKOFF_MIN, DEFAULT_ROTATION_DRAIN_WINDOW, DEFAULT_ROTATION_JITTER,
 };
 pub use membership::{
     SessionMembershipAdmission, SessionMembershipAdmissionError,

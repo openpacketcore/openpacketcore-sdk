@@ -50,6 +50,29 @@ The Rust generator can emit:
 - NETCONF XML render and edit support.
 - Stack metadata fixtures.
 
+### Mandatory and cardinality constraints
+
+Source ingestion and the IR retain `mandatory`, `min-elements`, and
+`max-elements`. Invalid placements, duplicate statements, conflicting defaults,
+and invalid bounds fail during ingestion; hand-built IR is checked before Rust
+generation. Effective constraints contribute to the schema digest and are
+checked against the preserved YANG source.
+
+Generated `OpcConfig::validate_syntax` checks these constraints on configuration
+data before a datastore commit. Absent non-presence containers do not hide
+required descendants. An absent presence container makes its descendant
+requirements inactive; each existing list entry has its own required leaves.
+State-data presence does not constrain a configuration commit. Intermediate
+JSON/patch candidates can remain incomplete until whole-config validation.
+Partial patches still validate supplied scalar values and leaf-list uniqueness;
+they do not demand mandatory siblings or complete list cardinality. Replaying
+individual deltas follows the same rule; validate the completed candidate before
+commit. Sensitive classification is supported on leaves and leaf-lists.
+Sensitive containers and lists are rejected before Rust generation; classify
+their sensitive leaves instead.
+The generated boolean representation remains Rust `bool`; JSON strings and
+numbers are not accepted as booleans.
+
 ### Keyed-list boundary guarantees
 
 Generated RFC 7951 deserialization treats YANG list keys as an integrity
@@ -117,6 +140,19 @@ public constraint IR constants outside a leaf's storage range and chained
 references.
 List-entry Merge, Update, and Replace calls without a value still assign every
 path key to its key leaf and enforce its declared constraints before committing.
+
+Decimal64 retains the required `fraction-digits` (1–18) in its IR and runtime
+metadata. Generated `YangDecimal64<F>` uses an exact signed 64-bit coefficient;
+parse a decimal string or call `YangDecimal64::<2>::from_scaled(123)` for 1.23.
+JSON requires strings, and XML and JSON output use the canonical YANG form,
+including `0.0` for zero. Exponents, non-finite values, excess precision and
+values outside the declared scale's domain are rejected. Redundant trailing
+zeros are accepted when the value is exactly representable. Defaults, keys,
+leaf-lists, leafrefs, patches and gNMI/NETCONF edits use the same exact type.
+XPath numeric comparisons intentionally convert to IEEE 754 numbers as RFC 7950
+§6.4 specifies; that conversion never changes the stored value. Source-level
+`must`/`when` lowering and decimal `range` restrictions remain explicitly rejected
+by this generator's supported profile. Public constraint IR remains supported.
 
 Containers and lists with a shared local name receive deterministic names
 qualified by their parents, with stable suffixes for remaining collisions.

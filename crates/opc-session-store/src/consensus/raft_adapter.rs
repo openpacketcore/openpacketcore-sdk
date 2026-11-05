@@ -1314,6 +1314,8 @@ pub(crate) struct SessionRaftRpcHandler {
     local_node_id: SessionConsensusNodeId,
     fixed_quorum_admission: Option<FixedQuorumEngineAdmission>,
     persistence: PersistenceProtocol,
+    #[cfg(test)]
+    snapshot_dispatch_for_test: Option<Arc<tokio::sync::Notify>>,
 }
 
 impl SessionRaftRpcHandler {
@@ -1328,6 +1330,8 @@ impl SessionRaftRpcHandler {
             local_node_id,
             fixed_quorum_admission: None,
             persistence: PersistenceProtocol::default(),
+            #[cfg(test)]
+            snapshot_dispatch_for_test: None,
         }
     }
 
@@ -1343,6 +1347,8 @@ impl SessionRaftRpcHandler {
             local_node_id,
             fixed_quorum_admission: Some(fixed_quorum_admission),
             persistence: PersistenceProtocol::default(),
+            #[cfg(test)]
+            snapshot_dispatch_for_test: None,
         }
     }
 
@@ -1436,7 +1442,9 @@ impl SessionRaftRpcHandler {
             Ok(payload) => payload,
             Err(error) => return rejected_response(error),
         };
-        let response = if self.persistence.mode() == super::SessionPersistenceMode::Async {
+        let response = if self.persistence.mode() == super::SessionPersistenceMode::Async
+            || request.family == SessionConsensusRpcFamily::InstallSnapshot
+        {
             let permit = match tokio::time::timeout_at(
                 deadline,
                 Arc::clone(&self.persistence.cold_rpc_admission).acquire_owned(),
@@ -1447,20 +1455,27 @@ impl SessionRaftRpcHandler {
                 _ => return rejected_response(SessionConsensusPeerError::Timeout),
             };
             let handler = self.clone();
-            let (send, receive) = tokio::sync::oneshot::channel();
-            // A cancelled transport must not drop the attempt's read guard
-            // while Raft still owns an accepted append or snapshot install.
+            // A cancelled transport must not discard accepted engine work
+            // while Raft still owns an append or snapshot receiver.
+            // Receiver preparation may outlive a snapshot chunk's caller;
+            // retain it so cancellation cannot discard the first chunk and
+            // force every retry to prepare another empty receiver.
             // The finite permit is retained until its real engine completion.
-            tokio::spawn(async move {
-                let response = handler
+            let task = tokio::spawn(async move {
+                let _owner = permit;
+                handler
                     .handle_payload_before(authenticated_sender, request, deadline)
-                    .await;
-                let _ = send.send(response);
-                drop(permit);
+                    .await
             });
-            match tokio::time::timeout_at(deadline, receive).await {
-                Ok(Ok(response)) => response,
-                _ => return rejected_response(SessionConsensusPeerError::Timeout),
+            if self.persistence.mode() == super::SessionPersistenceMode::Async {
+                match tokio::time::timeout_at(deadline, task).await {
+                    Ok(completion) => supervised_engine_response(completion),
+                    Err(_) => return rejected_response(SessionConsensusPeerError::Timeout),
+                }
+            } else {
+                // Preserve durable engine-completion observation. Dropping the
+                // handle detaches accepted work; it does not cancel its owner.
+                supervised_engine_response(task.await)
             }
         } else {
             self.handle_payload_before(authenticated_sender, request, deadline)
@@ -1506,8 +1521,8 @@ impl SessionRaftRpcHandler {
         // Vote and AppendEntries keep this permit through the Openraft
         // response. The pinned engine emits an AppendEntries response before
         // applying commit-index state-machine work, so uniform apply cannot
-        // self-deadlock. The final snapshot cutover carrier is released in its
-        // arm below because snapshot response follows state-machine install.
+        // self-deadlock. Snapshot dispatch releases its reader below before
+        // waiting on the same serial worker that applies membership.
         let mut engine_rpc = Some(self.peer_directory.begin_engine_rpc().await);
         if !self.peer_directory.authorizes_engine(
             authenticated_sender,
@@ -1637,18 +1652,37 @@ impl SessionRaftRpcHandler {
                 if !persistence.permits_snapshot(&rpc) {
                     return rejected_response(SessionConsensusPeerError::Rejected);
                 }
-                if rpc.done
-                    && self
-                        .peer_directory
-                        .requires_uniform_membership_fence(rpc.meta.last_membership.membership())
-                {
-                    // This final chunk carries metadata for a prospective
-                    // exact-uniform cutover. Release its own permit so a valid
-                    // state-machine install can drain every other predecessor
-                    // RPC and atomically publish successor admission. A chunk
-                    // rejected by Openraft or storage never reaches that
-                    // publication point.
-                    drop(engine_rpc.take());
+                // Even a first/non-final chunk can queue receiver preparation
+                // behind membership apply on the serial state-machine worker.
+                // That apply needs the writer, so no snapshot may retain this
+                // reader while waiting for engine work. The bounded supervisor
+                // still owns the operation through its actual completion.
+                drop(engine_rpc.take());
+                let directory = self.peer_directory.clone();
+                let identity = request.identity;
+                let authorized = self
+                    .raft
+                    .with_raft_state(move |_| {
+                        directory.authorizes_engine(
+                            authenticated_sender,
+                            identity,
+                            SessionConsensusRpcFamily::InstallSnapshot,
+                        )
+                    })
+                    .await;
+                match authorized {
+                    Ok(true) => {}
+                    Ok(false) => {
+                        return rejected_response(SessionConsensusPeerError::ScopeMismatch)
+                    }
+                    Err(_) => return rejected_response(SessionConsensusPeerError::Rejected),
+                }
+                // Openraft rechecks the vote and snapshot frontier. Storage
+                // verifies the image's durable authority at installation, and
+                // its existing membership writer still fences final cutover.
+                #[cfg(test)]
+                if let Some(dispatch) = &self.snapshot_dispatch_for_test {
+                    dispatch.notify_one();
                 }
                 encode_engine_result(&self.raft.install_snapshot(rpc).await)
             }
@@ -1796,6 +1830,16 @@ where
     E: Serialize,
 {
     encode_bounded(result).map_err(|_| SessionConsensusPeerError::Protocol)
+}
+
+fn supervised_engine_response(
+    completion: Result<SessionConsensusWireResponse, tokio::task::JoinError>,
+) -> SessionConsensusWireResponse {
+    match completion {
+        Ok(response) => response,
+        Err(error) if error.is_panic() => std::panic::resume_unwind(error.into_panic()),
+        Err(error) => panic!("supervised consensus engine task was cancelled: {error}"),
+    }
 }
 
 fn rejected_response(error: SessionConsensusPeerError) -> SessionConsensusWireResponse {
@@ -2872,6 +2916,301 @@ mod tests {
             handler,
             scope,
             leader,
+        }
+    }
+
+    #[tokio::test]
+    async fn supervised_engine_panic_is_propagated_after_its_permit_is_released() {
+        let admission = Arc::new(tokio::sync::Semaphore::new(16));
+        let permit = Arc::clone(&admission).acquire_owned().await.unwrap();
+        let task: tokio::task::JoinHandle<SessionConsensusWireResponse> =
+            tokio::spawn(async move {
+                let _owner = permit;
+                panic!("supervised snapshot failure");
+            });
+        let observer = tokio::spawn(async move { supervised_engine_response(task.await) });
+        let error = tokio::time::timeout(Duration::from_secs(5), observer)
+            .await
+            .unwrap()
+            .unwrap_err();
+        assert!(error.is_panic());
+        assert_eq!(
+            error.into_panic().downcast_ref::<&str>(),
+            Some(&"supervised snapshot failure")
+        );
+        assert_eq!(admission.available_permits(), 16);
+    }
+
+    #[cfg(target_os = "linux")]
+    async fn snapshot_preparation_with_queued_membership(
+        mode: SessionPersistenceMode,
+        cancel: bool,
+    ) {
+        let mut fixture = real_follower_fixture().await;
+        fixture.raft.runtime_config().elect(false);
+        apply_through_joint(&fixture).await;
+        fixture.handler.persistence = PersistenceProtocol::new(mode, false);
+        let dispatched = Arc::new(tokio::sync::Notify::new());
+        fixture.handler.snapshot_dispatch_for_test = Some(Arc::clone(&dispatched));
+        let previous = LogId::new(CommittedLeaderId::new(1, fixture.leader), 5);
+        let committed = LogId::new(CommittedLeaderId::new(1, fixture.leader), 6);
+        let (_, membership) = fixture.state_machine.clone().applied_state().await.unwrap();
+        let held_apply = Arc::clone(&fixture.backend.consensus_apply_gate)
+            .acquire_owned()
+            .await
+            .unwrap();
+        assert_eq!(
+            fixture
+                .raft
+                .append_entries(append_request(
+                    &fixture,
+                    Some(previous),
+                    vec![membership_entry(
+                        fixture.leader,
+                        6,
+                        vec![fixture.desired_members.clone()],
+                        fixture.desired_members.clone()
+                    )],
+                    Some(committed),
+                ))
+                .await
+                .unwrap(),
+            AppendEntriesResponse::Success
+        );
+        let chunk = InstallSnapshotRequest {
+            vote: Vote::new_committed(1, fixture.leader),
+            meta: opc_consensus::engine::SnapshotMeta {
+                last_log_id: Some(committed),
+                last_membership: membership,
+                snapshot_id: "membership-receiver-order".into(),
+            },
+            offset: 0,
+            data: vec![0x51],
+            done: false,
+        };
+        let mut wire = snapshot_wire(&fixture, fixture.current, &chunk);
+        wire.payload = persistence_protocol::wrap_payload(
+            mode,
+            wire.payload,
+            wire.family.max_request_payload_bytes(),
+        )
+        .unwrap();
+        let handler = fixture.handler.clone();
+        let leader = fixture.leader;
+        let task = tokio::spawn(async move {
+            handler
+                .handle_before(
+                    leader,
+                    wire,
+                    tokio::time::Instant::now() + Duration::from_secs(5),
+                )
+                .await
+        });
+        tokio::time::timeout(Duration::from_secs(5), dispatched.notified())
+            .await
+            .expect("snapshot engine dispatch");
+        fixture.raft.with_raft_state(|_| ()).await.unwrap();
+        if cancel {
+            task.abort();
+            assert!(task.await.unwrap_err().is_cancelled());
+        } else {
+            // The transport server detaches its handler after its caller expires.
+            drop(task);
+        }
+        drop(held_apply);
+        let applied = fixture
+            .raft
+            .wait(Some(Duration::from_secs(7)))
+            .applied_index(
+                Some(committed.index),
+                "membership progresses behind snapshot preparation",
+            )
+            .await;
+        assert!(
+            applied.is_ok(),
+            "{mode:?}/cancel={cancel}: snapshot blocked membership: {applied:?}"
+        );
+        assert_eq!(
+            fixture.directory.current_scope().unwrap(),
+            (fixture.desired, fixture.desired_members.clone())
+        );
+        let admission = Arc::clone(&fixture.handler.persistence.cold_rpc_admission);
+        let drained = tokio::time::timeout(
+            Duration::from_secs(5),
+            Arc::clone(&admission).acquire_many_owned(16),
+        )
+        .await
+        .expect("all sixteen snapshot owners drain after membership apply")
+        .unwrap();
+        drop(drained);
+        assert_eq!(admission.available_permits(), 16);
+        let mut next = chunk;
+        next.offset = 1;
+        let mut stale = snapshot_wire(&fixture, fixture.current, &next);
+        stale.payload = persistence_protocol::wrap_payload(
+            mode,
+            stale.payload,
+            stale.family.max_request_payload_bytes(),
+        )
+        .unwrap();
+        let response = fixture
+            .handler
+            .handle_before(
+                fixture.leader,
+                stale,
+                tokio::time::Instant::now() + Duration::from_secs(5),
+            )
+            .await;
+        assert_eq!(
+            response.result,
+            Err(SessionConsensusPeerError::ScopeMismatch)
+        );
+        let reader =
+            tokio::time::timeout(Duration::from_secs(5), fixture.directory.begin_engine_rpc())
+                .await
+                .expect("later engine readers are not blocked");
+        assert!(!fixture.directory.authorizes_engine(
+            fixture.leader,
+            fixture.current,
+            SessionConsensusRpcFamily::InstallSnapshot
+        ));
+        drop(reader);
+        tokio::time::timeout(Duration::from_secs(5), fixture.raft.shutdown())
+            .await
+            .unwrap()
+            .unwrap();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn nonfinal_snapshot_durable_cancelled_caller_drains_membership() {
+        if crate::test_process::run_completion_parent(Duration::from_secs(30)) {
+            return;
+        }
+        snapshot_preparation_with_queued_membership(SessionPersistenceMode::Durable, true).await;
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn nonfinal_snapshot_durable_detached_caller_drains_membership() {
+        if crate::test_process::run_completion_parent(Duration::from_secs(30)) {
+            return;
+        }
+        snapshot_preparation_with_queued_membership(SessionPersistenceMode::Durable, false).await;
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn nonfinal_snapshot_async_cancelled_caller_drains_membership() {
+        if crate::test_process::run_completion_parent(Duration::from_secs(30)) {
+            return;
+        }
+        snapshot_preparation_with_queued_membership(SessionPersistenceMode::Async, true).await;
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn nonfinal_snapshot_async_detached_caller_drains_membership() {
+        if crate::test_process::run_completion_parent(Duration::from_secs(30)) {
+            return;
+        }
+        snapshot_preparation_with_queued_membership(SessionPersistenceMode::Async, false).await;
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn durable_snapshot_chunk_survives_caller_cancellation_before_receiver_ready() {
+        if crate::test_process::run_completion_parent(Duration::from_secs(60)) {
+            return;
+        }
+        use std::future::Future as _;
+
+        for selected in [FixedAuthorityBackend::Sqlite, FixedAuthorityBackend::Native] {
+            let fixture = fixed_follower_fixture(Duration::from_secs(5), true, selected).await;
+            fixture.raft.runtime_config().elect(false);
+            let (previous, membership) =
+                fixture.state_machine.clone().applied_state().await.unwrap();
+            let committed = LogId::new(CommittedLeaderId::new(1, fixture.leader), 1);
+            let held_apply = Arc::clone(&fixture.backend.consensus_apply_gate)
+                .acquire_owned()
+                .await
+                .unwrap();
+            assert_eq!(
+                fixture
+                    .raft
+                    .append_entries(AppendEntriesRequest {
+                        vote: Vote::new_committed(1, fixture.leader),
+                        prev_log_id: previous,
+                        entries: vec![Entry {
+                            log_id: committed,
+                            payload: EntryPayload::Blank,
+                        }],
+                        leader_commit: Some(committed),
+                    })
+                    .await
+                    .unwrap(),
+                AppendEntriesResponse::Success
+            );
+            let request = |offset| {
+                let rpc = InstallSnapshotRequest::<SessionRaftTypeConfig> {
+                    vote: Vote::new_committed(1, fixture.leader),
+                    meta: opc_consensus::engine::SnapshotMeta {
+                        last_log_id: Some(committed),
+                        last_membership: membership.clone(),
+                        snapshot_id: "cancelled-first-chunk".into(),
+                    },
+                    offset,
+                    data: vec![0x51],
+                    done: false,
+                };
+                SessionConsensusWireRequest::try_new(
+                    fixture.scope,
+                    fixture.leader,
+                    SessionConsensusRpcFamily::InstallSnapshot,
+                    encode_bounded(&rpc).unwrap(),
+                )
+                .unwrap()
+            };
+            let admission = Arc::clone(&fixture.handler.persistence.cold_rpc_admission);
+            let all_permits = u32::try_from(admission.available_permits()).unwrap();
+            let mut first = Box::pin(fixture.handler.handle(fixture.leader, request(0)));
+            std::future::poll_fn(|cx| {
+                assert!(first.as_mut().poll(cx).is_pending());
+                std::task::Poll::Ready(())
+            })
+            .await;
+            fixture.raft.with_raft_state(|_| ()).await.unwrap();
+            drop(first);
+            drop(held_apply);
+            fixture
+                .raft
+                .wait(Some(Duration::from_secs(5)))
+                .applied_index(Some(committed.index), "release receiver preparation")
+                .await
+                .unwrap();
+            let drained = tokio::time::timeout(
+                Duration::from_secs(5),
+                admission.acquire_many_owned(all_permits),
+            )
+            .await
+            .expect("accepted snapshot work drains after the caller is cancelled")
+            .unwrap();
+            drop(drained);
+            let response = tokio::time::timeout(
+                Duration::from_secs(5),
+                fixture.handler.handle(fixture.leader, request(1)),
+            )
+            .await
+            .expect("the next chunk observes the retained receiver");
+            let response: Result<
+                InstallSnapshotResponse<SessionConsensusNodeId>,
+                RaftError<SessionConsensusNodeId, InstallSnapshotError>,
+            > = decode_bounded(&response.result.unwrap()).unwrap();
+            fixture.raft.shutdown().await.unwrap();
+            assert!(
+                response.is_ok(),
+                "{selected:?}: cancellation discarded the accepted first chunk: {response:?}"
+            );
         }
     }
 

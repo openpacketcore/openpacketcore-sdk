@@ -379,9 +379,13 @@ pub const GTPU_SESSION_SCHEMA_MARKER_LEN: usize = 16;
 /// Marker for the additive family-tagged grouped-session ABI.
 ///
 /// This marker lives in the new schema map and never occupies or reinterprets
-/// a legacy four-byte IPv4 selector.
+/// a legacy four-byte IPv4 selector. Version 7 adds the versioned downlink
+/// inner MTU field to family-tagged entries (in-tunnel ICMPv6 Packet Too Big
+/// for ordinary inner-IPv6 contexts); a retained version-6 graph is refused
+/// and needs a fresh attachment, exactly like the earlier pinned-ABI
+/// generations.
 pub const GTPU_SESSION_SCHEMA_MARKER_VALUE: [u8; GTPU_SESSION_SCHEMA_MARKER_LEN] =
-    *b"OPC-GROUP-IP-v6\0";
+    *b"OPC-GROUP-IP-v7\0";
 /// Single-slot key for [`MAP_CONFIG_IPV6`].
 pub const GTPU_SESSION_CONFIG_KEY: u32 = 0;
 
@@ -451,6 +455,9 @@ pub const COUNTER_UL_ENCAP: u32 = 0;
 /// nonzero misses drop under the complete-mark ownership contract. The
 /// datapath's own re-emitted outer frames are excluded and counted under
 /// [`COUNTER_UL_REDIRECT_RESOLVED`] instead.
+/// Each miss also increments [`COUNTER_UL_FAR_MISS_PASSED`] or
+/// [`COUNTER_UL_FAR_MISS_DROPPED`]. A retained pre-split pin can contain earlier
+/// aggregate history here, which cannot be attributed to either outcome.
 pub const COUNTER_UL_FAR_MISS: u32 = 1;
 /// Counter index: downlink G-PDUs decapsulated.
 pub const COUNTER_DL_DECAP: u32 = 2;
@@ -519,12 +526,17 @@ pub const COUNTER_UL_REDIRECT_RESOLVED: u32 = 6;
 /// here: tc leaves it to the stack's own socket lookup, in a frame that the
 /// host does not answer (see [`PACKET_TYPE_MULTICAST`]).
 pub const COUNTER_DL_MISSING_CONSUMER: u32 = 7;
+/// Counter index: IPv4 FAR misses passed unencapsulated because the mark is zero.
+pub const COUNTER_UL_FAR_MISS_PASSED: u32 = 8;
+/// Counter index: IPv4 FAR misses or missing marked owners dropped because
+/// the full packet mark is nonzero. Other authorization failures are excluded.
+pub const COUNTER_UL_FAR_MISS_DROPPED: u32 = 9;
 /// Number of datapath counter slots that carry a counter.
 ///
 /// The slots from here up to [`COUNTER_SLOTS`] are reserved. No program
 /// writes them and they read zero, so a later counter can take the next one
 /// without changing the width of the pinned map.
-pub const COUNTER_SLOTS_IN_USE: u32 = 8;
+pub const COUNTER_SLOTS_IN_USE: u32 = 10;
 /// Number of slots in the pinned per-CPU datapath counter map.
 ///
 /// This is the map's `max_entries`, and part of the retained pin graph's ABI:
@@ -533,6 +545,19 @@ pub const COUNTER_SLOTS_IN_USE: u32 = 8;
 /// [`COUNTER_SLOTS_IN_USE`], so that adding a counter does not change it.
 pub const COUNTER_SLOTS: u32 = 16;
 const _: () = assert!(COUNTER_SLOTS_IN_USE <= COUNTER_SLOTS);
+
+/// Count one IPv4 FAR miss (or missing marked owner) by its forwarding outcome
+/// and in the compatibility total. The caller supplies the per-CPU increment;
+/// neither counter participates in the forwarding decision.
+#[inline(always)]
+pub fn count_uplink_far_miss(mark: u32, mut count: impl FnMut(u32)) {
+    count(COUNTER_UL_FAR_MISS);
+    count(if uplink_non_encapsulation_drops(mark) {
+        COUNTER_UL_FAR_MISS_DROPPED
+    } else {
+        COUNTER_UL_FAR_MISS_PASSED
+    });
+}
 
 /// Binding-drop counter index: no canonical binding exists for the PDR.
 pub const COUNTER_DL_BINDING_INVALID: u32 = 0;
@@ -723,6 +748,21 @@ impl GtpuEndpointAddress {
             Self::Ipv6(value) => value,
         }
     }
+}
+
+/// Inbound peer-address policy; TEID, local endpoint and other checks still apply.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Hash)]
+#[repr(u8)]
+pub enum GtpuPeerSourcePolicy {
+    /// Preserve the backend's existing policy: eBPF requires the configured
+    /// peer address; the Linux GTP module uses its native TEID lookup.
+    #[default]
+    BackendDefault = 0,
+    /// Explicitly allow other peer source addresses for multi-homing.
+    ///
+    /// Supported by the eBPF adapter. The caller must restrict access to the
+    /// GTP-U transport network; this policy does not authenticate the sender.
+    TeidAndLocal = 1,
 }
 
 /// Inclusive, canonical UDP source-port range.
@@ -939,10 +979,10 @@ pub enum DownlinkBindingMismatch {
 ///
 /// | offset | field |
 /// |---|---|
-/// | 0 | format version (`1`) |
+/// | 0 | format version (`1` exact peer, `2` TEID/local policy) |
 /// | 1 | address family (`4` or `6`) |
 /// | 2 | source-port policy (`0` any, `1` exact, `2` range) |
-/// | 3 | reserved zero |
+/// | 3 | peer-source policy (`0` for version 1, `1` for version 2) |
 /// | 4..20 | peer address (IPv4 followed by twelve zero bytes, or IPv6) |
 /// | 20..36 | local address (same family/canonical form) |
 /// | 36..40 | ingress ifindex, big endian |
@@ -956,6 +996,7 @@ pub struct DownlinkEndpointBinding {
     local_address: GtpuEndpointAddress,
     ingress_ifindex: u32,
     source_port_policy: GtpuSourcePortPolicy,
+    peer_source_policy: GtpuPeerSourcePolicy,
     format_valid: bool,
 }
 
@@ -995,12 +1036,26 @@ impl DownlinkEndpointBinding {
                 local_address,
                 ingress_ifindex,
                 source_port_policy,
+                peer_source_policy: GtpuPeerSourcePolicy::BackendDefault,
                 format_valid: true,
             })
         }
     }
 
-    /// Return the peer endpoint address.
+    /// Select the explicit inbound peer-address policy.
+    #[must_use]
+    pub const fn with_peer_source_policy(mut self, policy: GtpuPeerSourcePolicy) -> Self {
+        self.peer_source_policy = policy;
+        self
+    }
+
+    /// Return the retained inbound peer-address policy.
+    #[must_use]
+    pub const fn peer_source_policy(self) -> GtpuPeerSourcePolicy {
+        self.peer_source_policy
+    }
+
+    /// Return the configured peer endpoint address.
     #[must_use]
     pub const fn peer_address(self) -> GtpuEndpointAddress {
         self.peer_address
@@ -1049,7 +1104,10 @@ impl DownlinkEndpointBinding {
             (GtpuEndpointAddress::Ipv4(peer), GtpuEndpointAddress::Ipv4(local)) => (peer, local),
             _ => return Err(DownlinkBindingMismatch::AddressFamily),
         };
-        if peer_address != expected_peer {
+        if peer_address == [0; 4]
+            || (self.peer_source_policy == GtpuPeerSourcePolicy::BackendDefault
+                && peer_address != expected_peer)
+        {
             return Err(DownlinkBindingMismatch::PeerAddress);
         }
         if local_address != expected_local {
@@ -1074,10 +1132,13 @@ impl DownlinkEndpointBinding {
         let first = first.to_be_bytes();
         let last = last.to_be_bytes();
         [
-            1,
+            match self.peer_source_policy {
+                GtpuPeerSourcePolicy::BackendDefault => 1,
+                GtpuPeerSourcePolicy::TeidAndLocal => 2,
+            },
             self.peer_address.family_wire(),
             policy,
-            0,
+            self.peer_source_policy as u8,
             peer[0],
             peer[1],
             peer[2],
@@ -1189,7 +1250,14 @@ impl DownlinkEndpointBinding {
             local_address,
             ingress_ifindex: u32::from_be_bytes([value[36], value[37], value[38], value[39]]),
             source_port_policy,
-            format_valid: value[0] == 1 && value[3] == 0 && family_valid && policy_valid,
+            peer_source_policy: if value[3] == 1 {
+                GtpuPeerSourcePolicy::TeidAndLocal
+            } else {
+                GtpuPeerSourcePolicy::BackendDefault
+            },
+            format_valid: binding_profile_is_canonical(value[0], value[3])
+                && family_valid
+                && policy_valid,
         }
     }
 }
@@ -1245,8 +1313,13 @@ fn binding_policy_wire_is_valid<const N: usize>(value: &[u8; N], base: usize) ->
 }
 
 #[inline(always)]
+const fn binding_profile_is_canonical(version: u8, policy: u8) -> bool {
+    matches!((version, policy), (1, 0) | (2, 1))
+}
+
+#[inline(always)]
 fn binding_ipv4_wire_is_valid<const N: usize>(value: &[u8; N], base: usize) -> bool {
-    if value[base] != 1 || value[base + 1] != 4 || value[base + 3] != 0 {
+    if !binding_profile_is_canonical(value[base], value[base + 3]) || value[base + 1] != 4 {
         return false;
     }
     if wire_u32(value, base + 4) == 0 || wire_u32(value, base + 20) == 0 {
@@ -1263,7 +1336,9 @@ fn binding_ipv4_wire_is_valid<const N: usize>(value: &[u8; N], base: usize) -> b
 
 #[inline(always)]
 fn binding_wire_is_valid<const N: usize>(value: &[u8; N], base: usize) -> bool {
-    if value[base] != 1 || value[base + 3] != 0 || wire_u32(value, base + 36) == 0 {
+    if !binding_profile_is_canonical(value[base], value[base + 3])
+        || wire_u32(value, base + 36) == 0
+    {
         return false;
     }
     let family_valid = match value[base + 1] {
@@ -1339,7 +1414,9 @@ pub fn validate_ipv4_downlink_binding_wire(
     if value[1] != 4 {
         return Err(DownlinkBindingMismatch::AddressFamily);
     }
-    if wire_u32(&peer_address, 0) != wire_u32(value, 4) {
+    if wire_u32(&peer_address, 0) == 0
+        || (value[3] == 0 && wire_u32(&peer_address, 0) != wire_u32(value, 4))
+    {
         return Err(DownlinkBindingMismatch::PeerAddress);
     }
     if wire_u32(&local_address, 0) != wire_u32(value, 20) {
@@ -1393,7 +1470,7 @@ impl DownlinkPdr {
 /// FAR, endpoint binding, managed local address, and ingress attachment must
 /// form one canonical graph. This shared predicate keeps the production Aya
 /// loader and its deterministic fake from accepting different persisted
-/// state. It intentionally rejects zero TEIDs, zero peer TEIDs, unspecified UE
+/// state. It intentionally rejects zero local TEIDs, unspecified UE
 /// addresses, and a UE address equal to the managed local endpoint.
 #[must_use]
 pub fn default_bearer_graph_is_valid(
@@ -1409,7 +1486,6 @@ pub fn default_bearer_graph_is_valid(
         && pdr.ue_ip != managed_local_ip
         && far.peer_ip != [0; 4]
         && far.local_ip == managed_local_ip
-        && far.o_teid != [0; 4]
         && binding.is_valid()
         && binding.ingress_ifindex() == ingress_ifindex
         && binding.peer_address() == GtpuEndpointAddress::Ipv4(far.peer_ip)
@@ -1563,7 +1639,6 @@ impl MarkedBearerOwner {
             && self.local_teid != [0; 4]
             && self.uplink_far.peer_ip != [0; 4]
             && self.uplink_far.local_ip != [0; 4]
-            && self.uplink_far.o_teid != [0; 4]
             && (self.egress_dscp_wire <= 63 || self.egress_dscp_wire == 0xff)
             && self.downlink_binding.is_valid()
             && matches!(
@@ -1949,11 +2024,7 @@ fn bearer_owner_ipv4_wire_is_valid<const N: usize>(value: &[u8; N]) -> bool {
     if value[17] != 2 || !matches!(value[18], 1..=3) || value[19] != 0 {
         return false;
     }
-    if wire_u32(value, 0) == 0
-        || wire_u32(value, 4) == 0
-        || wire_u32(value, 8) == 0
-        || wire_u32(value, 12) == 0
-    {
+    if wire_u32(value, 0) == 0 || wire_u32(value, 4) == 0 || wire_u32(value, 8) == 0 {
         return false;
     }
     if value[16] > 63 && value[16] != 0xff {
@@ -2024,6 +2095,19 @@ pub const fn downlink_ipv4_exceeds_inner_mtu(
 #[inline(always)]
 pub const fn downlink_ipv4_is_fragment(flags_fragment: u16) -> bool {
     flags_fragment & 0x3fff != 0
+}
+
+/// Return whether a complete inner IPv6 packet exceeds the session's tunnel
+/// MTU.
+///
+/// IPv6 has no in-network fragmentation (RFC 8200 section 4.5), so an outer
+/// ICMPv6 Packet Too Big is the only per-packet response; `mtu == 0` (unset)
+/// never matches. `payload_length` is the IPv6 payload length field, so the
+/// complete packet is its fixed 40-octet header plus that payload.
+#[must_use]
+#[inline(always)]
+pub const fn downlink_ipv6_exceeds_inner_mtu(mtu: u16, payload_length: u16) -> bool {
+    mtu != 0 && 40 + payload_length as u32 > mtu as u32
 }
 
 /// Return the backend-owned queue that tc hands an authorized downlink inner
@@ -2584,6 +2668,8 @@ mod tests {
             COUNTER_DL_DST_MISMATCH,
             COUNTER_UL_REDIRECT_RESOLVED,
             COUNTER_DL_MISSING_CONSUMER,
+            COUNTER_UL_FAR_MISS_PASSED,
+            COUNTER_UL_FAR_MISS_DROPPED,
         ];
         let mut seen = std::vec::Vec::new();
         for index in indices {
@@ -2606,6 +2692,25 @@ mod tests {
         // here. Changing it is a pin ABI change with the consequence
         // described above, and must be a deliberate edit of this test.
         assert_eq!(COUNTER_SLOTS, 16);
+    }
+
+    #[test]
+    fn uplink_far_miss_outcomes_keep_exact_counts_and_compatibility_sum() {
+        let mut counters = [0_u64; COUNTER_SLOTS as usize];
+        for (mark, passed, dropped) in [
+            (0, 1, 0),
+            (1, 1, 1),
+            (0x0001_0000, 1, 2),
+            (0, 2, 2),
+            (u32::MAX, 2, 3),
+        ] {
+            count_uplink_far_miss(mark, |index| counters[index as usize] += 1);
+            assert_eq!(counters[COUNTER_UL_FAR_MISS_PASSED as usize], passed);
+            assert_eq!(counters[COUNTER_UL_FAR_MISS_DROPPED as usize], dropped);
+            assert_eq!(counters[COUNTER_UL_FAR_MISS as usize], passed + dropped);
+            assert_eq!(counters[COUNTER_UL_ENCAP as usize], 0);
+            assert_eq!(counters[COUNTER_UL_REDIRECT_RESOLVED as usize], 0);
+        }
     }
 
     #[test]
@@ -2843,6 +2948,45 @@ mod tests {
     }
 
     #[test]
+    fn peer_teid_zero_authorizes_default_and_marked_uplink() {
+        // TS 29.281 section 5.1 requires accepting a peer-assigned zero TEID.
+        let mut legacy_peer = far();
+        legacy_peer.o_teid = [0; 4];
+        let binding = ipv4_binding(GtpuSourcePortPolicy::Any);
+        assert!(default_bearer_graph_is_valid(
+            1_u32.to_be_bytes(),
+            DownlinkPdr {
+                ue_ip: [10, 45, 0, 2]
+            },
+            legacy_peer,
+            binding,
+            legacy_peer.local_ip,
+            7,
+        ));
+        let mut owner = canonical_owner(MarkedBearerOwnerPhase::Active);
+        owner.uplink_far.o_teid = [0; 4];
+        assert!(owner.is_valid());
+        assert!(owner.authorizes_uplink(&owner.uplink_far, owner.egress_dscp_wire()));
+        assert!(marked_owner_wire_authorizes_uplink(
+            &owner.encode(),
+            &owner.uplink_far,
+            owner.egress_dscp_wire(),
+        ));
+        let encap = build_uplink_encap(&legacy_peer, 28).unwrap();
+        assert_eq!(&encap[32..36], &[0; 4]);
+        assert!(!default_bearer_graph_is_valid(
+            [0; 4],
+            DownlinkPdr {
+                ue_ip: [10, 45, 0, 2]
+            },
+            legacy_peer,
+            binding,
+            legacy_peer.local_ip,
+            7,
+        ));
+    }
+
+    #[test]
     fn default_bearer_graph_validation_rejects_noncanonical_session_identity() {
         let local_ip = [192, 0, 2, 1];
         let pdr = DownlinkPdr {
@@ -2870,7 +3014,7 @@ mod tests {
         ));
         let mut zero_peer_teid = canonical_far;
         zero_peer_teid.o_teid = [0; 4];
-        assert!(!default_bearer_graph_is_valid(
+        assert!(default_bearer_graph_is_valid(
             local_teid,
             pdr,
             zero_peer_teid,
@@ -2931,6 +3075,78 @@ mod tests {
         let mut zero_ifindex = canonical;
         zero_ifindex[36..40].fill(0);
         assert!(!DownlinkEndpointBinding::decode(&zero_ifindex).is_valid());
+    }
+
+    #[test]
+    fn endpoint_binding_multihoming_is_explicit_and_preserves_other_checks() {
+        let strict = ipv4_binding(GtpuSourcePortPolicy::Exact(2152));
+        let mut wire = strict.encode();
+        // New policy has its own version so older programs reject it.
+        wire[0] = 2;
+        wire[3] = 1;
+        let binding = DownlinkEndpointBinding::decode(&wire);
+        assert!(binding.is_valid());
+        assert_eq!(binding.encode(), wire);
+        assert_eq!(
+            strict.validate_ipv4_packet([192, 0, 2, 11], [192, 0, 2, 1], 7, 2152),
+            Err(DownlinkBindingMismatch::PeerAddress),
+        );
+        for (peer, local, ifindex, port, expected) in [
+            ([192, 0, 2, 11], [192, 0, 2, 1], 7, 2152, Ok(())),
+            (
+                [0; 4],
+                [192, 0, 2, 1],
+                7,
+                2152,
+                Err(DownlinkBindingMismatch::PeerAddress),
+            ),
+            (
+                [192, 0, 2, 11],
+                [192, 0, 2, 2],
+                7,
+                2152,
+                Err(DownlinkBindingMismatch::LocalAddress),
+            ),
+            (
+                [192, 0, 2, 11],
+                [192, 0, 2, 1],
+                8,
+                2152,
+                Err(DownlinkBindingMismatch::IngressAttachment),
+            ),
+            (
+                [192, 0, 2, 11],
+                [192, 0, 2, 1],
+                7,
+                2153,
+                Err(DownlinkBindingMismatch::SourcePort),
+            ),
+        ] {
+            assert_eq!(
+                binding.validate_ipv4_packet(peer, local, ifindex, port),
+                expected
+            );
+            assert_eq!(
+                validate_ipv4_downlink_binding_wire(&wire, peer, local, ifindex, port),
+                expected
+            );
+        }
+        for (version, policy) in [(1, 1), (2, 0), (2, 2), (3, 1)] {
+            let mut malformed = wire;
+            malformed[0] = version;
+            malformed[3] = policy;
+            assert!(!DownlinkEndpointBinding::decode(&malformed).is_valid());
+            assert_eq!(
+                validate_ipv4_downlink_binding_wire(
+                    &malformed,
+                    [192, 0, 2, 11],
+                    [192, 0, 2, 1],
+                    7,
+                    2152
+                ),
+                Err(DownlinkBindingMismatch::Invalid),
+            );
+        }
     }
 
     #[test]
@@ -3001,6 +3217,101 @@ mod tests {
         for forbidden in ["192", "2152", "7"] {
             assert!(!debug.contains(forbidden));
         }
+    }
+
+    #[test]
+    fn zero_peer_teid_preserves_default_and_marked_authority() {
+        let mut outgoing = far();
+        outgoing.o_teid = [0; 4];
+        let binding = ipv4_binding(GtpuSourcePortPolicy::Any);
+        let local = 0x1000_0001_u32.to_be_bytes();
+        assert!(default_bearer_graph_is_valid(
+            local,
+            DownlinkPdr {
+                ue_ip: [10, 23, 0, 2]
+            },
+            outgoing,
+            binding,
+            outgoing.local_ip,
+            binding.ingress_ifindex()
+        ));
+        assert!(!default_bearer_graph_is_valid(
+            [0; 4],
+            DownlinkPdr {
+                ue_ip: [10, 23, 0, 2]
+            },
+            outgoing,
+            binding,
+            outgoing.local_ip,
+            binding.ingress_ifindex()
+        ));
+        let owner = MarkedBearerOwner::new(
+            local,
+            outgoing,
+            None,
+            binding,
+            MarkedBearerOwnerPhase::Active,
+        );
+        assert!(owner.is_valid());
+        assert!(owner.authorizes_uplink(&outgoing, 0xff));
+        let mut substituted = outgoing;
+        substituted.o_teid = [0, 0, 0, 1];
+        assert!(!owner.authorizes_uplink(&substituted, 0xff));
+    }
+
+    #[test]
+    fn zero_peer_teid_preserves_borrowed_authority() {
+        let mut owner = canonical_owner(MarkedBearerOwnerPhase::Active);
+        owner.uplink_far.o_teid = [0; 4];
+        let wire = owner.encode();
+        assert!(marked_owner_wire_is_valid(&wire));
+        assert!(marked_owner_wire_authorizes_uplink(
+            &wire,
+            &owner.uplink_far,
+            owner.egress_dscp_wire()
+        ));
+        assert!(marked_owner_wire_authorizes_downlink(
+            &wire,
+            owner.local_teid,
+            &owner.downlink_binding.encode()
+        ));
+        let commit = PdpContextCommit::new(
+            owner.local_teid,
+            owner.uplink_far,
+            owner.egress_dscp(),
+            owner.downlink_binding,
+            GtpuUplinkSourcePortPolicy::LegacyServicePort,
+            MarkedBearerOwnerPhase::Active,
+        )
+        .expect("zero-peer typed commit")
+        .encode();
+        assert_eq!(
+            pdp_commit_wire_authorized_source_port(
+                &commit,
+                &owner.uplink_far,
+                owner.egress_dscp_wire()
+            ),
+            Some(2152)
+        );
+        assert!(pdp_commit_wire_authorizes_downlink(
+            &commit,
+            owner.local_teid,
+            &owner.downlink_binding.encode()
+        ));
+        let mut substituted = owner.uplink_far;
+        substituted.o_teid = [0, 0, 0, 1];
+        assert!(!marked_owner_wire_authorizes_uplink(
+            &wire,
+            &substituted,
+            owner.egress_dscp_wire()
+        ));
+        assert_eq!(
+            pdp_commit_wire_authorized_source_port(&commit, &substituted, owner.egress_dscp_wire()),
+            None
+        );
+        let mut zero_local = wire;
+        zero_local[..4].fill(0);
+        assert!(!marked_owner_wire_is_valid(&zero_local));
     }
 
     #[test]
@@ -3165,6 +3476,19 @@ mod tests {
             &owner.uplink_far,
             46,
             &binding,
+        ));
+
+        let multihoming_binding = owner
+            .downlink_binding
+            .with_peer_source_policy(GtpuPeerSourcePolicy::TeidAndLocal);
+        assert!(multihoming_binding.is_valid());
+        assert!(!owner.authorizes_downlink(owner.local_teid, &multihoming_binding));
+        assert!(!pdp_commit_wire_authorizes_graph(
+            &encoded,
+            owner.local_teid,
+            &owner.uplink_far,
+            46,
+            &multihoming_binding.encode(),
         ));
 
         let mut wrong_far = owner.uplink_far;
@@ -3381,6 +3705,25 @@ mod tests {
     }
 
     #[test]
+    fn downlink_ipv6_inner_mtu_compares_the_complete_packet() {
+        // (mtu, IPv6 payload length, exceeds)
+        for (mtu, payload_length, expected) in [
+            (0, 1_400, false),
+            (1_280, 1_240, false),
+            (1_300, 1_260, false),
+            (1_300, 1_261, true),
+            (1_300, u16::MAX, true),
+            (65_535, 65_495, false),
+        ] {
+            assert_eq!(
+                downlink_ipv6_exceeds_inner_mtu(mtu, payload_length),
+                expected,
+                "mtu {mtu} payload {payload_length}"
+            );
+        }
+    }
+
+    #[test]
     fn downlink_inner_fragment_is_more_fragments_or_a_non_zero_offset() {
         // RFC 791 section 3.1: bit 0 reserved, bit 1 DF, bit 2 MF, then the
         // 13-bit fragment offset.
@@ -3506,11 +3849,23 @@ mod tests {
             malformed[offset] = replacement;
             assert!(!MarkedBearerOwner::decode(&malformed).is_valid());
         }
-        for range in [0..4, 4..8, 8..12, 12..16] {
+        for range in [0..4, 4..8, 8..12] {
             let mut malformed = encoded;
             malformed[range].fill(0);
             assert!(!MarkedBearerOwner::decode(&malformed).is_valid());
         }
+        // TS 29.281 section 5.1 permits zero only in the outgoing peer TEID.
+        let mut zero_peer = encoded;
+        zero_peer[12..16].fill(0);
+        let owner = MarkedBearerOwner::decode(&zero_peer);
+        assert!(owner.is_valid());
+        assert_eq!(owner.uplink_far.o_teid, [0; 4]);
+        assert!(owner.authorizes_uplink(&owner.uplink_far, owner.egress_dscp_wire()));
+        assert!(marked_owner_wire_authorizes_uplink(
+            &zero_peer,
+            &owner.uplink_far,
+            owner.egress_dscp_wire(),
+        ));
     }
 
     #[test]

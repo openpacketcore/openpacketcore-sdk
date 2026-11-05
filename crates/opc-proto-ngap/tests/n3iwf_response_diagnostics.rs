@@ -367,7 +367,7 @@ fn metadata_unknown_policy_and_malformed_diagnostics() {
     }) {
         let pdu = read(row, context()).unwrap();
         for change in 0..3 {
-            let mut bad = pdu.clone();
+            let mut bad = opc_proto_ngap::decode(pdu.raw.as_bytes(), context()).unwrap();
             match &mut bad.kind {
                 PduKind::Successful {
                     procedure_code,

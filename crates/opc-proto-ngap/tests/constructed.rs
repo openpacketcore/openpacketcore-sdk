@@ -1,5 +1,8 @@
 //! Construct from independent IE bytes, never from a decoded SDK message.
 
+#[path = "support/pdu_equivalence.rs"]
+mod pdu_equivalence;
+
 use bytes::{Bytes, BytesMut};
 use opc_proto_ngap::{decode, encode, Criticality, Message, MessageType, Pdu, PduKind, ProtocolIe};
 use opc_protocol::{
@@ -91,7 +94,7 @@ fn independent_per_length_and_fragmentation_oracle_matches_all_outcomes() {
             },
         )
         .expect("receive");
-        assert!(received.kind == pdu.kind);
+        assert!(pdu_equivalence::equivalent(&received.kind, &pdu.kind));
         assert!(encode(&received, ctx).expect("receive canonical") == wire);
         // The exact limit succeeds; one byte too small fails before appending.
         let limited = EncodeContext {
@@ -179,7 +182,7 @@ fn construction_applies_existing_count_depth_unknown_and_duplicate_policies() {
         let wire = encode(&pdu, EncodeContext::default()).expect("canonical filtered view");
         assert!(wire == [0, 21, 0, 8, 0, 0, 1, 0, 21, 0x40, 1, retained]);
     }
-    let huge_count = vec![paging_drx(); 65536];
+    let huge_count: Vec<_> = (0..65536).map(|_| paging_drx()).collect();
     assert_eq!(
         Pdu::from_protocol_ies(
             MessageType::NgSetupRequest,
@@ -284,19 +287,18 @@ fn raw_preserving_and_canonical_filtered_output_are_distinct() {
 
 #[test]
 fn canonical_encoding_revalidates_mutable_message_and_wrapper() {
-    let pdu = constructed(&[paging_drx()], DecodeContext::default());
     let mut adversaries = Vec::new();
-    let mut changed = pdu.clone();
+    let mut changed = constructed(&[paging_drx()], DecodeContext::default());
     if let PduKind::Initiating { procedure_code, .. } = &mut changed.kind {
         *procedure_code = 14;
     }
     adversaries.push(changed);
-    let mut changed = pdu.clone();
+    let mut changed = constructed(&[paging_drx()], DecodeContext::default());
     if let PduKind::Initiating { criticality, .. } = &mut changed.kind {
         *criticality = Criticality::ignore;
     }
     adversaries.push(changed);
-    let mut changed = pdu.clone();
+    let mut changed = constructed(&[paging_drx()], DecodeContext::default());
     if let PduKind::Initiating {
         procedure_code,
         criticality,
@@ -310,29 +312,41 @@ fn canonical_encoding_revalidates_mutable_message_and_wrapper() {
         };
     }
     adversaries.push(changed);
-    let mut changed = pdu.clone();
+    let mut changed = constructed(&[paging_drx()], DecodeContext::default());
     if let Message::NgSetupRequest(req) = message_mut(&mut changed) {
-        req.protocol_ies.0.push(req.protocol_ies.0[0].clone());
+        req.protocol_ies
+            .0
+            .push(opc_proto_ngap::messages::ProtocolIeField {
+                id: 21,
+                criticality: Criticality::ignore,
+                value: opc_proto_ngap::SensitiveBytes::new(vec![0x20]),
+            });
     }
     adversaries.push(changed);
-    let mut changed = pdu.clone();
+    let mut changed = constructed(&[paging_drx()], DecodeContext::default());
     if let Message::NgSetupRequest(req) = message_mut(&mut changed) {
         req.protocol_ies.0[0].criticality = rasn::aper::decode(&[0]).expect("reject enum");
     }
     adversaries.push(changed);
-    let mut changed = pdu.clone();
+    let mut changed = constructed(&[paging_drx()], DecodeContext::default());
     if let Message::NgSetupRequest(req) = message_mut(&mut changed) {
         req.protocol_ies
             .0
-            .resize(65536, req.protocol_ies.0[0].clone());
+            .resize_with(65536, || opc_proto_ngap::messages::ProtocolIeField {
+                id: 21,
+                criticality: Criticality::ignore,
+                value: opc_proto_ngap::SensitiveBytes::new(vec![0x20]),
+            });
     }
     adversaries.push(changed);
-    let mut changed = pdu.clone();
-    *message_mut(&mut changed) = Message::Unknown(Bytes::from_static(b"synthetic-private"));
+    let mut changed = constructed(&[paging_drx()], DecodeContext::default());
+    *message_mut(&mut changed) = Message::Unknown(opc_proto_ngap::SensitiveBytes::new(
+        b"synthetic-private".to_vec(),
+    ));
     adversaries.push(changed);
     for mut bad in adversaries {
         // Saved bytes cannot rescue an invalid typed view in canonical mode.
-        bad.raw = Bytes::from_static(&[0, 21, 0, 3, 0, 0, 0]);
+        bad.raw = opc_proto_ngap::SensitiveBytes::new(vec![0, 21, 0, 3, 0, 0, 0]);
         let mut dst = BytesMut::from(&b"retained-prefix"[..]);
         assert!(bad.encode(&mut dst, EncodeContext::default()).is_err());
         assert!(&dst[..] == b"retained-prefix");
@@ -346,7 +360,7 @@ fn canonical_encoding_revalidates_mutable_message_and_wrapper() {
                 }
             )
             .expect("raw path remains available")
-                == bad.raw
+                == bad.raw.as_bytes()
         );
     }
 }
@@ -355,12 +369,12 @@ fn canonical_encoding_revalidates_mutable_message_and_wrapper() {
 fn construction_bounds_include_outer_framing_and_diagnostics_are_redacted() {
     let marker = b"synthetic-private";
     let ie = ProtocolIe::new(65535, Criticality::ignore, marker);
-    let pdu = constructed(&[ie], DecodeContext::default());
+    let pdu = constructed(std::slice::from_ref(&ie), DecodeContext::default());
     let total = pdu.wire_len(EncodeContext::default()).expect("length");
     let make = |max_message_len| {
         Pdu::from_protocol_ies(
             MessageType::NgSetupRequest,
-            &[ie],
+            std::slice::from_ref(&ie),
             DecodeContext {
                 max_message_len,
                 ..DecodeContext::default()
@@ -387,14 +401,14 @@ fn fragmented_outer_boundary_consumes_terminator_and_no_following_message() {
     wire.push(0);
     let pdu = Pdu::decode_owned(Bytes::from(wire.clone()), DecodeContext::default())
         .expect("fragmented PDU");
-    assert!(pdu.raw == wire);
+    assert!(pdu.raw.as_bytes() == wire);
     assert!(encode(&pdu, EncodeContext::default()).expect("canonical") == wire);
     let mut joined = wire.clone();
     joined.extend_from_slice(&[0, 21, 0, 3, 0, 0, 0]);
     let (remainder, first) =
         <Pdu as BorrowDecode>::decode(&joined, DecodeContext::default()).expect("borrow first");
     assert!(remainder == [0, 21, 0, 3, 0, 0, 0]);
-    assert!(first.raw == wire);
+    assert!(first.raw.as_bytes() == wire);
     assert!(Pdu::decode_owned(Bytes::from(joined), DecodeContext::default()).is_err());
     assert!(Pdu::decode_owned(
         Bytes::copy_from_slice(&wire[..wire.len() - 1]),

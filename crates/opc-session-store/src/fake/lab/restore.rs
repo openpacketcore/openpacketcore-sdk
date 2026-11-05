@@ -9,6 +9,7 @@ use std::ops::Bound::{Excluded, Unbounded};
 use super::*;
 use crate::restore::{
     RESTORE_SCAN_MAX_EXAMINED_METADATA_BYTES, RESTORE_SCAN_MAX_EXAMINED_ROWS_PER_PAGE,
+    RESTORE_SCAN_MAX_SQLITE_VM_STEPS,
 };
 
 impl RestoreAuthority {
@@ -32,9 +33,8 @@ impl FakeSessionBackend {
             .lab_restore_authority
             .as_ref()
             .ok_or(StoreError::RestoreScanCursorStale)?;
-        let mut state = self.inner.lock().await;
+        let state = self.inner.lock().await;
         let now = self.clock.now_utc();
-        Self::prune_state(&mut state, now);
         let revision = state.lab_restore_revision;
         if revision == u64::MAX {
             return Err(StoreError::RestoreScanWorkBudgetExceeded);
@@ -46,28 +46,56 @@ impl FakeSessionBackend {
                 if epoch != authority.epoch || cursor_revision != revision || time > now {
                     return Err(StoreError::RestoreScanCursorStale);
                 }
+                // Expiry invalidates the scan view without deleting canonical
+                // rows that a delayed committed entry may still need.
+                if state.records.values().any(|record| {
+                    record
+                        .expires_at
+                        .is_some_and(|expires| time < expires && self.record_expired(record, now))
+                }) {
+                    return Err(StoreError::RestoreScanCursorStale);
+                }
                 (Excluded(Self::map_key(&key)), position, time)
             }
             None => (Unbounded, 0, now),
         };
-        let mut candidates = state.records.range((seek, Unbounded)).peekable();
+        let mut candidates = state.records.range((seek, Unbounded));
         let mut records = Vec::with_capacity(request.limit.min(64));
         let mut payload_bytes = 0_usize;
         let mut retained_bytes = std::mem::size_of::<RestoreScanPage>();
         let mut metadata_bytes = 0_usize;
         let mut examined_count = 0_usize;
+        let mut visited = 0_usize;
         let mut excluded_count = 0_usize;
         let mut last_key = None;
         let mut has_more = false;
-        while let Some((_, record)) = candidates.next() {
+        // Both selection and lookahead use the same bounded live-row source.
+        let mut next_live = || -> Result<Option<&StoredSessionRecord>, StoreError> {
+            for (_, record) in candidates.by_ref() {
+                visited += 1;
+                if visited > RESTORE_SCAN_MAX_SQLITE_VM_STEPS {
+                    return Err(StoreError::RestoreScanWorkBudgetExceeded);
+                }
+                if !self.record_expired(record, snapshot_time) {
+                    return Ok(Some(record));
+                }
+            }
+            Ok(None)
+        };
+        while let Some(record) = next_live()? {
             let record_bytes = restore_record_retained_bytes(record)?;
             let next_metadata = metadata_bytes
                 .checked_add(record_bytes.saturating_sub(record.payload.len()))
                 .ok_or(StoreError::RestoreScanWorkBudgetExceeded)?;
             let cursor_bytes =
                 RestoreScanCursor::durable_retained_token_bytes_for_key(&record.key)?;
-            let matches =
-                !record.is_expired_at(snapshot_time) && request.scope.matches_record(record);
+            let matches = request.scope.matches_record(record);
+            // Continue through a bounded expired tail even after filling the
+            // page. A following matching live row belongs to the next page.
+            if matches && records.len() == request.limit {
+                has_more = true;
+                break;
+            }
             let next_payload = payload_bytes
                 .checked_add(if matches { record.payload.len() } else { 0 })
                 .ok_or(StoreError::RestoreScanWorkBudgetExceeded)?;
@@ -96,17 +124,21 @@ impl FakeSessionBackend {
             } else {
                 excluded_count += 1;
             }
-            if records.len() == request.limit
-                || examined_count == RESTORE_SCAN_MAX_EXAMINED_ROWS_PER_PAGE
-            {
-                has_more = candidates.peek().is_some();
+            if examined_count == RESTORE_SCAN_MAX_EXAMINED_ROWS_PER_PAGE {
+                has_more = next_live()?.is_some();
                 break;
             }
         }
         let next_cursor = if has_more {
+            let live_examined = records.len() + excluded_count;
+            if live_examined == 0 {
+                // An incomplete page still requires live progress. Expired
+                // rows were skipped by the separately bounded row source.
+                return Err(StoreError::RestoreScanWorkBudgetExceeded);
+            }
             let key = last_key.ok_or(StoreError::RestoreScanWorkBudgetExceeded)?;
             let position = position
-                .checked_add(examined_count as u64)
+                .checked_add(live_examined as u64)
                 .ok_or(StoreError::RestoreScanWorkBudgetExceeded)?;
             Some(RestoreScanCursor::durable(
                 &authority.key,

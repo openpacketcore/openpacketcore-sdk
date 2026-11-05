@@ -182,7 +182,7 @@ impl UeRequestMessage<'_> {
                     .protocol_ies
                     .0
                     .iter()
-                    .map(|v| (v.id.0, v.criticality as u8, v.value.as_bytes())),
+                    .map(|v| (v.id, v.criticality as u8, v.value.as_bytes())),
                 ctx,
             ),
             _ => Err(invalid("ue request outcome")),

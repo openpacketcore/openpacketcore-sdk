@@ -75,6 +75,28 @@ impl FakeSessionBackend {
             .request_for_unprotected_backend()
     }
 
+    fn lab_receipt_status(
+        &self,
+        receipt: &Receipt,
+        request: &FencedTransitionRequest,
+        now: Timestamp,
+    ) -> FencedTransitionStatus {
+        let status = receipt.status(request, now);
+        let mut view = self.read_expiry();
+        match status {
+            FencedTransitionStatus::Expired => {
+                view.receipts.insert(request.request_id());
+                FencedTransitionStatus::Expired
+            }
+            FencedTransitionStatus::Recorded(_)
+                if view.receipts.contains(&request.request_id()) =>
+            {
+                FencedTransitionStatus::Expired
+            }
+            status => status,
+        }
+    }
+
     pub(super) async fn lab_status(
         &self,
         prepared: &PreparedFencedTransition,
@@ -82,7 +104,7 @@ impl FakeSessionBackend {
         let request = self.lab_request(prepared)?;
         let state = self.inner.lock().await;
         Ok(match state.lab_transitions.get(&request.request_id()) {
-            Some(receipt) => receipt.status(&request, self.clock.now_utc()),
+            Some(receipt) => self.lab_receipt_status(receipt, &request, self.clock.now_utc()),
             None if state.lab_transitions.len() >= self.limits.max_replication_entries => {
                 FencedTransitionStatus::HistoryFull
             }
@@ -96,9 +118,10 @@ impl FakeSessionBackend {
     ) -> Result<FencedTransitionOutcome, StoreError> {
         let request = self.lab_request(prepared)?;
         let mut state = self.inner.lock().await;
-        let now = self.clock.now_utc();
+        Self::require_complete_replay_command(&state)?;
+        let now = self.command_time(&state);
         if let Some(receipt) = state.lab_transitions.get(&request.request_id()) {
-            return match receipt.status(&request, now) {
+            return match self.lab_receipt_status(receipt, &request, now) {
                 FencedTransitionStatus::Recorded(result) => *result,
                 FencedTransitionStatus::RequestConflict => {
                     Err(StoreError::FencedTransitionRequestConflict)
@@ -111,49 +134,14 @@ impl FakeSessionBackend {
         }
         let retained_until = checked_session_deadline(now, FENCED_TRANSITION_OUTCOME_RETENTION)
             .map_err(|_| StoreError::FencedTransitionRetentionExhausted)?;
-        // Stage both lease and record. A failed record condition cannot leak a
-        // newly minted fence or a renewed lease into the authoritative map.
-        let key = Self::map_key(request.lease().key());
-        Self::ensure_key_capacity(&state, &key, self.limits.max_tracked_keys)?;
-        let mut staged = FakeBackendState::empty();
-        staged.next_fence = state.next_fence;
-        staged.next_credential_id = state.next_credential_id;
-        if let Some(record) = state.records.get(&key) {
-            staged.records.insert(key.clone(), record.clone());
-        }
-        if let Some(lease) = state.leases.get(&key) {
-            staged.leases.insert(key.clone(), lease.clone());
-        }
-        if let Some(fence) = state.key_fences.get(&key) {
-            staged.key_fences.insert(key.clone(), *fence);
-        }
+        // Include expiry cleanup in the transaction. Rejected requests can
+        // bind a receipt, but cannot publish unrelated retirement work.
+        let mut staged = state.stage_data();
+        Self::prune_state(&mut staged, now);
         let result = self.lab_apply(&mut staged, &request, now);
         if let Ok((outcome, replication)) = &result {
             let sequence = self.next_direct_replication_sequence(&state)?;
-            state.invalidate_lab_restore_snapshot();
-            match staged.records.remove(&key) {
-                Some(record) => {
-                    state.records.insert(key.clone(), record);
-                }
-                None => {
-                    state.records.remove(&key);
-                }
-            }
-            match staged.leases.remove(&key) {
-                Some(lease) => {
-                    state.leases.insert(key.clone(), lease);
-                }
-                None => {
-                    state.leases.remove(&key);
-                }
-            }
-            if let Some(fence) = staged.key_fences.remove(&key) {
-                state.key_fences.insert(key, fence);
-            }
-            state.next_fence = staged.next_fence;
-            state.next_credential_id = staged.next_credential_id;
-            self.append_direct_replication_entry(&mut state, sequence, replication.clone(), now);
-            state.lab_transitions.insert(
+            staged.lab_transitions.insert(
                 request.request_id(),
                 Receipt {
                     request,
@@ -161,6 +149,7 @@ impl FakeSessionBackend {
                     retained_until,
                 },
             );
+            self.commit_direct_data(&mut state, staged, sequence, replication.clone(), now)?;
             return Ok(outcome.clone());
         }
         let result = result.map(|(outcome, _)| outcome);
@@ -184,7 +173,6 @@ impl FakeSessionBackend {
         request.validate_at(now)?;
         let key = request.lease().key();
         let mk = Self::map_key(key);
-        Self::ensure_key_capacity(state, &mk, self.limits.max_tracked_keys)?;
         let expires_at = checked_session_deadline(now, request.lease().ttl())?;
         let (lease, lease_op) = match request.lease() {
             FencedTransitionLease::Acquire {
@@ -193,21 +181,30 @@ impl FakeSessionBackend {
                 ttl,
                 ..
             } => {
-                if Self::current_fence(state, &mk) != *expected_fence {
+                let accepted = if state.key_fences.contains_key(&mk) || Self::scope_key(&mk) {
+                    Self::current_fence(state, &mk) == *expected_fence
+                } else {
+                    state
+                        .key_retention
+                        .accepts_absent_fence(expected_fence.get(), state.async_fence_floor)
+                };
+                if !accepted {
                     return Err(StoreError::StaleFence);
                 }
+                Self::apply_async_floor_to_key(state, &mk);
                 if state.leases.get(&mk).is_some_and(|entry| {
                     entry.active && entry.expires_at > now && entry.owner != *owner
                 }) {
                     return Err(StoreError::LeaseHeld);
                 }
+                Self::ensure_key_capacity(state, &mk, self.limits.max_tracked_keys)?;
                 let fence = request.lease().committed_fence()?;
                 let credential_id = state.next_credential_id;
                 state.next_credential_id = credential_id
                     .checked_add(1)
                     .ok_or(StoreError::FencedTransitionStorageExhausted)?;
                 state.next_fence = state.next_fence.max(fence.get().saturating_add(1));
-                state.key_fences.insert(mk.clone(), fence);
+                Self::set_fence(state, mk.clone(), fence);
                 state.leases.insert(
                     mk.clone(),
                     LeaseEntry {

@@ -757,7 +757,9 @@ fn leaf_base_type(node: &SchemaNode, nodes_by_path: &NodeIndex<'_>) -> TokenStre
         Some(TypeRef::Uint32) => quote! { u32 },
         Some(TypeRef::Uint64) => quote! { super::types::YangUint64 },
         Some(TypeRef::Int64) => quote! { super::types::YangInt64 },
-        Some(TypeRef::Decimal64) => quote! { super::types::YangDecimal64 },
+        Some(TypeRef::Decimal64 { fraction_digits }) => {
+            quote! { super::types::YangDecimal64<#fraction_digits> }
+        }
         Some(TypeRef::Empty) => quote! { super::types::YangEmpty },
         Some(TypeRef::IdentityRef { .. }) | Some(TypeRef::LeafRef { .. }) => quote! { String },
         Some(TypeRef::Custom { name }) => {
@@ -810,7 +812,8 @@ fn scalar_to_string_expr(
         | Some(TypeRef::Int32)
         | Some(TypeRef::Uint16)
         | Some(TypeRef::Uint32) => quote! { #value_ident.to_string() },
-        Some(TypeRef::Uint64) | Some(TypeRef::Int64) | Some(TypeRef::Decimal64) => {
+        Some(TypeRef::Decimal64 { .. }) => quote! { #value_ident.to_string() },
+        Some(TypeRef::Uint64) | Some(TypeRef::Int64) => {
             quote! { #value_ident.0.to_string() }
         }
         Some(TypeRef::Empty) => quote! { { let _ = #value_ident; String::new() } },
@@ -886,7 +889,9 @@ fn leaf_list_element_type(node: &SchemaNode, nodes_by_path: &NodeIndex<'_>) -> T
         Some(TypeRef::Uint32) => quote! { u32 },
         Some(TypeRef::Uint64) => quote! { super::types::YangUint64 },
         Some(TypeRef::Int64) => quote! { super::types::YangInt64 },
-        Some(TypeRef::Decimal64) => quote! { super::types::YangDecimal64 },
+        Some(TypeRef::Decimal64 { fraction_digits }) => {
+            quote! { super::types::YangDecimal64<#fraction_digits> }
+        }
         Some(TypeRef::Empty) => quote! { super::types::YangEmpty },
         Some(TypeRef::IdentityRef { .. }) | Some(TypeRef::LeafRef { .. }) => quote! { String },
         Some(TypeRef::Custom { name }) => {

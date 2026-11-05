@@ -163,17 +163,24 @@ where
         &self,
         publication: &mut EstablishedPublication,
     ) -> Result<PublicationEvidence, PublicationAdapterError> {
-        let scheduling_digest = match EstablishedPublicationCall::from_established(publication) {
-            Ok(call) => {
-                super::runtime::provider_scheduling_digest(call.authority().current_authority())
-            }
-            Err(_) => {
-                self.diagnostics
-                    .increment(DiagnosticsCounter::PublicationRecoveryRequired);
-                return Err(PublicationAdapterError::RecoveryRequired);
-            }
-        };
-        let _permit = match self.scheduler.try_acquire(scheduling_digest) {
+        let (scheduling_digest, admission_class) =
+            match EstablishedPublicationCall::from_established(publication) {
+                Ok(call) => (
+                    super::runtime::provider_scheduling_digest(
+                        call.authority().current_authority(),
+                    ),
+                    call.authority().admission_class(),
+                ),
+                Err(_) => {
+                    self.diagnostics
+                        .increment(DiagnosticsCounter::PublicationRecoveryRequired);
+                    return Err(PublicationAdapterError::RecoveryRequired);
+                }
+            };
+        let _permit = match self
+            .scheduler
+            .try_acquire_for_class(scheduling_digest, admission_class)
+        {
             Ok(permit) => permit,
             Err(_) => {
                 self.diagnostics
@@ -219,17 +226,24 @@ where
         &self,
         publication: &mut EstablishedPublication,
     ) -> Result<PublicationEvidence, PublicationAdapterError> {
-        let scheduling_digest = match EstablishedPublicationCall::from_established(publication) {
-            Ok(call) => {
-                super::runtime::provider_scheduling_digest(call.authority().current_authority())
-            }
-            Err(_) => {
-                self.diagnostics
-                    .increment(DiagnosticsCounter::PublicationRecoveryRequired);
-                return Err(PublicationAdapterError::RecoveryRequired);
-            }
-        };
-        let _permit = match self.scheduler.try_acquire(scheduling_digest) {
+        let (scheduling_digest, admission_class) =
+            match EstablishedPublicationCall::from_established(publication) {
+                Ok(call) => (
+                    super::runtime::provider_scheduling_digest(
+                        call.authority().current_authority(),
+                    ),
+                    call.authority().admission_class(),
+                ),
+                Err(_) => {
+                    self.diagnostics
+                        .increment(DiagnosticsCounter::PublicationRecoveryRequired);
+                    return Err(PublicationAdapterError::RecoveryRequired);
+                }
+            };
+        let _permit = match self
+            .scheduler
+            .try_acquire_for_class(scheduling_digest, admission_class)
+        {
             Ok(permit) => permit,
             Err(_) => {
                 self.diagnostics

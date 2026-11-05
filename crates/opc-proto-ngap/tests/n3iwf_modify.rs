@@ -265,7 +265,7 @@ fn shared_policies_metadata_and_invalid_response_construction() {
     else {
         panic!("response")
     };
-    let mut bad = pdu.clone();
+    let mut bad = read(row, context()).unwrap();
     if let PduKind::Successful { procedure_code, .. } = &mut bad.kind {
         *procedure_code = 29;
     }

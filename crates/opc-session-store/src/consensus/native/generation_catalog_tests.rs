@@ -1,5 +1,6 @@
 use super::super::super::changes::tests::{apply, clock, command, fixture, request, time};
 use super::*;
+use crate::consensus::native::test_journal::journal_page_for_test_sync;
 use crate::sqlite::consensus::wal::Operation;
 use opc_consensus::engine::{CommittedLeaderId, SnapshotMeta};
 use std::fs::OpenOptions;
@@ -10,6 +11,9 @@ mod lifecycle;
 
 #[path = "generation_catalog_purge_tests.rs"]
 mod purge_tests;
+
+#[path = "generation_catalog_retention_tests.rs"]
+mod retention_tests;
 
 #[path = "generation_catalog_compat_tests.rs"]
 mod compat_tests;
@@ -543,6 +547,18 @@ fn exact(catalog: &Catalog, storage: &NativeStorage) {
     }
     assert_eq!(catalog.rows.receipts.len(), storage.business.receipts.len());
     for (id, row) in &storage.business.receipts {
+        let resolved = row.cold_range().map(|(source, range)| {
+            cold::ReceiptReadTicket::capture(&storage.business, *id, source, range)
+                .unwrap()
+                .resolve(&|| Ok(()))
+                .unwrap()
+                .copy_guarded(&storage.business)
+                .unwrap()
+        });
+        let row = resolved
+            .as_ref()
+            .map(cold::OwnedReceipt::row)
+            .unwrap_or(row);
         let mut expected = Vec::new();
         cold::write_receipt(&mut expected, *id, row, &|| Ok(())).unwrap();
         assert_eq!(row_bytes(catalog, &catalog.rows.receipts[id]), expected);
@@ -1405,14 +1421,11 @@ fn native_journal_page_admission_preserves_selected_ranges_cancellation_and_inte
     let corrupt_offset = catalog.rows.notifications[32].range.offset;
     let cold = catalog.into_storage(&|| Ok(())).unwrap();
     for (start, limit) in [(0, 0), (0, 1), (0, 65), (17, 19), (64, 10), (65, 10)] {
-        let hot = storage
-            .business
-            .replication_log(start, limit, &|| Ok(()))
-            .unwrap();
-        let selected = cold
-            .business
-            .replication_log(start, limit, &|| Ok(()))
-            .unwrap();
+        let hot = journal_page_for_test_sync(|| {
+            storage.business.replication_log(start, limit, &|| Ok(()))
+        });
+        let selected =
+            journal_page_for_test_sync(|| cold.business.replication_log(start, limit, &|| Ok(())));
         assert_eq!(
             postcard::to_allocvec(&hot).unwrap(),
             postcard::to_allocvec(&selected).unwrap()
@@ -1434,7 +1447,7 @@ fn native_journal_page_admission_preserves_selected_ranges_cancellation_and_inte
         // Cancellation stays set while already-started verification retires;
         // the number of cleanup checks is not a public read contract.
         assert!(calls.get() >= stop);
-        let retry = cold.business.replication_log(0, 8, &|| Ok(())).unwrap();
+        let retry = journal_page_for_test_sync(|| cold.business.replication_log(0, 8, &|| Ok(())));
         assert_eq!(retry.len(), 8);
     }
     let writer = OpenOptions::new()
@@ -1452,11 +1465,7 @@ fn native_journal_page_admission_preserves_selected_ranges_cancellation_and_inte
         "admitted extent length must never replace authenticated content verification"
     );
     assert_eq!(
-        storage
-            .business
-            .replication_log(0, 65, &|| Ok(()))
-            .unwrap()
-            .len(),
+        journal_page_for_test_sync(|| storage.business.replication_log(0, 65, &|| Ok(()))).len(),
         65
     );
 }

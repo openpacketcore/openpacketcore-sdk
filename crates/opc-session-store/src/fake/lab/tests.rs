@@ -7,6 +7,11 @@ use crate::{
 use bytes::Bytes;
 use opc_types::{NetworkFunctionKind, TenantId};
 
+mod commit_visibility_tests;
+mod epoch_floor_tests;
+mod observation_tests;
+mod restore_expiry_tests;
+
 fn key() -> SessionKey {
     SessionKey {
         tenant: TenantId::new("lab").unwrap(),
@@ -42,6 +47,56 @@ fn create_request() -> FencedTransitionRequest {
         FencedTransitionMutation::create(record(1, 1)),
     )
     .unwrap()
+}
+
+#[tokio::test(start_paused = true)]
+async fn fake_key_retention_stages_lab_requests_with_the_absent_floor() {
+    let backend = FakeSessionBackend::in_memory_lab();
+    let stale = backend
+        .prepare_fenced_transition(create_request())
+        .await
+        .unwrap();
+    let old = backend
+        .acquire(&key(), record(1, 1).owner, Duration::from_secs(30))
+        .await
+        .unwrap();
+    tokio::time::advance(Duration::from_secs(31)).await;
+    let observed = backend.observe_fenced_transition(&key()).await.unwrap();
+    assert!(observed.record().is_none());
+    assert_eq!(observed.current_fence(), old.fence());
+    // Expiry filtering preserves the exact retained fence without publication.
+    assert_eq!(
+        backend
+            .inner
+            .lock()
+            .await
+            .key_fences
+            .get(&FakeSessionBackend::map_key(&key())),
+        Some(&old.fence())
+    );
+    assert_eq!(
+        backend.fenced_transition(&stale).await,
+        Err(FencedTransitionExecuteError::Rejected(
+            StoreError::StaleFence
+        ))
+    );
+    let fresh = FencedTransitionRequest::new(
+        FencedTransitionRequestId::new(),
+        FencedTransitionLease::acquire(
+            key(),
+            record(1, 1).owner,
+            observed.current_fence(),
+            Duration::from_secs(30),
+        )
+        .unwrap(),
+        FencedTransitionMutation::create(record(1, observed.current_fence().get() + 1)),
+    )
+    .unwrap();
+    let fresh = backend.prepare_fenced_transition(fresh).await.unwrap();
+    let outcome = backend.fenced_transition(&fresh).await.unwrap();
+    assert!(outcome.lease().fence() > observed.current_fence());
+    assert_eq!(backend.fenced_transition(&fresh).await.unwrap(), outcome);
+    assert_eq!(backend.inner.lock().await.key_fences.len(), 1);
 }
 
 #[tokio::test]

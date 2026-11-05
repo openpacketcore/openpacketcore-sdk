@@ -33,6 +33,31 @@ Activate `BootstrapCredentialVerifier` against the configured issuer discovery
 and keys before serving. Missing discovery access is an unsupported prerequisite;
 there is no TokenReview, cluster-wide grant or `pods/proxy` fallback.
 
+The issuer may instead deliver one authenticated, typed boot refusal on the
+same retained startup stream: `IssuerStartupSession::deliver_boot_refusal` sends
+a closed `BootRefusalReason` (`PlatformInvalid`, `PlatformChanged`,
+`PrerequisiteRefused`) bound to the exact candidate call attempt and proven boot
+(process nonce and boot key digest), under the existing mutual-TLS issuer
+authentication and revision-two startup framing. The worker's
+`StartupSession::receive_ticket_notice` returns the terminal typed
+`StartupError::BootRefused(reason)`; a lost, truncated, mismatched or replayed
+refusal stays an unavailable/invalid startup failure and is never a refusal.
+The refusal carries no authority, closure evidence, credential, identity,
+endpoint or key material and never bypasses an admitted worker's drain/close
+obligations. It exists for the **observation-sandwich limit** of the issuer's
+platform read: two consistent workload-record reads around the proof do not
+establish that the platform has already published the current container restart,
+so when the record later catches up the issuer must refuse the retained key
+before staging anything and let the worker shut down and start a fresh boot.
+Only candidate startup sessions can carry a refusal; liveness sessions and
+already admitted workers keep their existing handling.
+The refusal must be the first and sole response, before any notice page.
+`StartupError::PlatformChanged` also covers opaque Pod resource-version changes:
+re-probe the same boot in that case. Only independently established changed boot
+facts that cannot reconcile the retained key justify `BootRefusalReason::PlatformChanged`.
+Prerequisite refusal is an explicit issuer decision to end an attempt; restarting
+a worker does not repair the issuer's discovery or key access.
+
 The issuer sends a bounded `IssuedTicketNotice` on the retained startup stream.
 Its generation and record reference are hints: `ScopeServer` independently reads
 the current issuance again before a new admission. Each streamed `ClosureNotice`
@@ -95,6 +120,88 @@ The native full ReadIndex barrier retains its existing FIFO admission, described
 in RFC 024. It still needs class arbitration before end-to-end isolation under
 arbitrary read pressure can be claimed.
 
+### Authentication-time source
+
+`PlatformAuthenticationTimeSource` is the supported production
+`AuthenticationTimeSource` for RFC 026 authentication freshness. It brackets two
+read-only `clock_adjtime(CLOCK_REALTIME)` queries (`modes == 0`) with monotonic
+time through the narrow `opc-linux-clock-sys` UAPI boundary. The second query's
+atomic `timex.time` supplies the instant. The symmetric error includes the larger
+maximum/estimated error across both samples, precision, microsecond quantization,
+reported oscillator drift and the full sampling span. Status changes, backward
+progress or excessive progress within that pair are refused. Install one source
+per process with the deployment's fixed budget (never widened on retry).
+
+Size that budget for the whole interval between daemon updates: Linux increases
+`maxerror` by **0.5 ms per second** until the next update. Allow at least
+**root distance + 0.5 ms × longest update interval in seconds + about 1 ms**
+for sampling, precision and quantization; allow more if measured sampling spans
+require it. Chrony's default `maxpoll 10` allows 1,024 seconds between polls,
+which alone adds 512 ms. The example below assumes root distance at most 50 ms,
+actual kernel updates no more than 1,024 seconds apart, and at most 1 ms of
+additional sampling error: 50 + 512 + 1 = 563 ms fits its fixed 600 ms budget.
+A poll setting alone does not guarantee successful updates during packet loss.
+For a 100 ms budget, a deployment could instead require `maxpoll 6` (64 seconds),
+actual updates within that interval, root distance at most 50 ms and the same
+sampling allowance. Verify these bounds at installation.
+See the [Linux error-growth implementation](https://github.com/torvalds/linux/blob/v6.12/kernel/time/ntp.c#L431-L436),
+its [frequency tolerance](https://github.com/torvalds/linux/blob/v6.12/include/linux/timex.h#L129),
+and [chrony's poll settings](https://chrony-project.org/doc/4.6/chrony.conf.html#maxpoll).
+
+```rust
+use opc_session_net::scope::{IntervalClock, PlatformAuthenticationTimeSource};
+use std::sync::Arc;
+use std::time::Duration;
+
+let source = Arc::new(PlatformAuthenticationTimeSource::new());
+// Fixed at installation for the update and root-distance bounds above.
+let clock = IntervalClock::new(source, Duration::from_millis(600))?;
+```
+
+Platform contract:
+
+- Linux only. Other platforms compile, but every read returns the typed
+  retryable `AuthenticationTimeError`; there is no wall-clock fallback.
+- The read is unprivileged and never changes the clock. A seccomp filter, LSM
+  policy or hardened container runtime that refuses `clock_adjtime` makes
+  authentication time unavailable (retryable, no authority).
+- Kernel synchronization and error estimates require a node time daemon.
+  Chrony needs `rtcsync` to publish the kernel synchronization state. A node
+  with no daemon usually reports
+  `STA_UNSYNC` or the boot-default multi-second bound; both fail closed. The
+  default source maximum is 1 s
+  (`PLATFORM_AUTHENTICATION_TIME_MAX_UNCERTAINTY`) and can be fixed lower or
+  higher with `with_maximum_uncertainty` at startup.
+- Containers share the host-global kernel clock and synchronization state; the
+  state is not namespaced per container.
+- Zero/negative maximum bounds, negative estimates, unknown or faulted status,
+  an in-progress leap second (`TIME_OOP`), overflow and over-budget uncertainty
+  are refused. Pending/completed leap states remain usable if the pair is stable.
+
+Operators see one fixed, value-free `tracing` warning on target
+`opc_session_net::scope::auth_time` with a closed `reason` (`unsupported_platform`,
+`io_unavailable`, `permission_denied`, `not_synchronized`, `invalid_observation`,
+`sampling_changed`, `invalid_error_bound`, `uncertainty_exceeded`,
+`generation_exhausted`) when the refusal reason changes, followed by one recovery
+event. Separately, `IntervalClock` emits
+`authentication clock exceeds its fixed uncertainty budget` on target
+`opc_session_net::scope::clock`, once on entering a budget refusal, then one
+recovery event when the reading fits again. This catches a reading accepted by
+the source's bound but exceeding the adapter's fixed budget. Periodic budget
+refusal while the daemon remains healthy means the install-time budget or update
+interval was sized incorrectly; investigate those deployment assumptions.
+Every refused call still returns the typed `AuthTimeUnavailable` in the
+authentication path. Alarm on those warnings and on the node's time-daemon
+health; do not increase the uncertainty budget to silence them. The
+synchronization generation starts at 1 on the first accepted synchronized
+observation and increments once after observed synchronization loss followed by
+a healthy pair. Transient syscall errors or invalid data do not invent a new
+generation. Sampling and generation changes are serialized. Recovery is automatic
+and changes no committed authority, receipt or held effect. Wall-clock steps
+without observed synchronization loss are handled by `IntervalClock`'s existing
+recovery policy (three consistent observations at least one second apart over at
+least three seconds) under the same fixed budget.
+
 Authentication time can refuse an attempt; it never expires ownership or stops
 installed forwarding. Voluntary shutdown must first finish the application's
 emergency-session drain, then call `prepare_close` and deliver its exact Close.
@@ -109,7 +216,16 @@ remain deferred. Crossing the scope stored-format boundary is a fresh install.
 type. A consumer selecting the fixed three- or five-voter profile must pass the
 same policy to `SessionReplicationManifest::try_new_with_epoch_and_placement_policy`
 and to `ValidatedQuorumTopology::try_from_fixed_durable_quorum_with_placement_policy`.
-Construct one descriptor set with distinct `ReplicaId`, `.invalid`
+Generate one **cryptographically random** non-zero 32-byte **installation
+nonce** from a CSPRNG with at least 256 bits of entropy at first install and
+persist it immutably with the manifest; every constructor below requires it.
+The SDK rejects only the all-zero nonce: a constant, reused or low-entropy
+nonce is accepted and will collide its installations into a single authority
+domain, so one nonce must never be shared across deployments or generated by a
+predictable source. Reusing the persisted nonce continues the installation, while a fresh
+nonce with the same cluster name is a different authority domain (fresh-install
+boundary: retained stores from the earlier installation are refused, no
+migration). Construct one descriptor set with distinct `ReplicaId`, `.invalid`
 `ReplicaEndpoint`, example SPIFFE `ReplicaTlsIdentity`, and
 `ReplicaBackingIdentity` values (and distinct `ReplicaFailureDomain` values
 under the strict default), then use the manifest's fixed-profile- and
@@ -119,8 +235,10 @@ local store:
 
 ```rust
 let policy = SessionPlacementPolicy::RequireIndependentFailureDomains;
+let installation_nonce = load_persisted_installation_nonce()?; // non-zero [u8; 32]
 let manifest = Arc::new(SessionReplicationManifest::try_new_with_epoch_and_placement_policy(
     SessionClusterId::new("session-fleet.invalid")?,
+    installation_nonce,
     SessionConfigurationGeneration::new("generation-1")?,
     SessionConfigurationEpoch::new(1)?,
     descriptors.clone(),
@@ -224,9 +342,16 @@ a production consensus endpoint. The `insecure-test` feature does not enable it
 implicitly.
 
 `SessionReplicationManifest::try_new_with_epoch` is the production manifest
-constructor. It derives the exact shared consensus identity from the hashed
-cluster ID, positive numeric configuration epoch, and complete descriptor
-fingerprints. Stable non-zero Openraft node IDs are domain-separated hashes of
+constructor. It takes the caller's persisted non-zero installation nonce —
+generated once from a CSPRNG with at least 256 bits of entropy and never
+reused across installations — and
+derives the exact shared, installation-qualified consensus identity from the
+hashed cluster ID and nonce, positive numeric configuration epoch, and complete
+descriptor fingerprints. The configuration digest
+(`opc-session-net/configuration/v2`) commits the nonce, so the same cluster name
+under a fresh installation is a distinct authority domain and a retained store
+from the earlier installation fails typed store-identity admission. This is a
+deliberate fresh-install boundary with no migration (#1187). Stable non-zero Openraft node IDs are domain-separated hashes of
 the cluster identity and immutable logical `ReplicaId`; they survive member
 reordering, addition, removal, and epoch changes. Derived collisions are
 rejected during admission. The legacy `try_new` constructor is deprecated and
@@ -307,14 +432,15 @@ cap of 128 rather than that planning estimate.
 The election range is `[5,000 ms, 8,000 ms)`, the session/config operation
 default is 10,000 ms, and listener idle/handler ceilings are 30,000 ms.
 The exact consensus contract is transport/wire-schema revision 6, application
-revision 4, and error-set revision 6. Revision 6 requires scheduling metadata on
+revision 5, and error-set revision 6. Application revision 5 requires explicit
+replay policy in application journal entries. Transport revision 6 requires scheduling metadata on
 forwarded mutations, outside canonical commands and their digests. The previous
 forwarding shape fails decoding and bootstrap; this boundary requires a fresh
 installation. Class metadata alone does not partition this transport's shared
 connection pool; RFC 024 records the separate transport integration requirement.
 The profile also retains the explicit forwarded consumer scope, so a peer cannot silently downgrade a
-consumer-scoped operation to an internal call; application revision 4 also
-fences the former 728bc5 application-revision-3 Postcard tag-27
+consumer-scoped operation to an internal call. Application revision 4 previously
+fenced the former 728bc5 application-revision-3 Postcard tag-27
 `FinalizeOperatorRecoveryV2` encoding, which conflicts with the merged roster
 profile's tags 27 through 30. Error revision 6 binds that semantic boundary
 into the exact profile. Any other transport, application, or error-set revision
@@ -795,6 +921,25 @@ discards the staged lanes and releases their admission without entering a runtim
 An unfinished reconnect attempt publishes its cooldown on its admitting runtime
 and retains reconnect admission until publication; runtime shutdown discards that
 publication task and releases admission.
+`PersistentSessionConsumerConfig::with_cooldown_admission` selects the
+reconnect-cooldown admission policy per client. The default
+`ReconnectCooldownPolicy::Wait` waits for the single coalesced cooldown edge (or
+the caller deadline) before one serialized probe, so single-peer callers are
+unchanged. `ReconnectCooldownPolicy::FailOver` is the explicit routed-consumer
+policy: a call that reaches a peer whose shared cooldown is active or whose
+probe is already in flight returns the typed pre-write `SessionConsumerClientError::Cooldown` immediately, carrying only
+the bounded remaining cooldown and gate wait in milliseconds, so a routing loop
+can select another peer without waiting. No request byte was ever written, so
+the caller may route the unchanged request to another voter; once a byte may
+have been accepted, the existing exact-identity/status recovery applies
+unchanged. Both policies keep the same exponential backoff, the same single
+serialized probe at cooldown expiry, and never create caller-local sleeps or
+independent probes. A zero remaining cooldown means another caller holds the
+probe. Admission happens before DNS and pool waits, including retained lanes;
+routed callers also decline to join a pending warm setup. Background maintenance
+retains the shared waiting policy. Debug spans named `session_consumer_attempt`
+contain only operation kind, canonical voter/successor ordinals, gate and
+cooldown microseconds, and `pre_write`/`possibly_written` classification.
 Each unused lane's effective expiry is the earlier of its local publication-based
 idle deadline and its own peer first-Call bound. The latter is measured from the
 monotonic HelloAck receive instant, less the complete measured Hello round trip
@@ -874,6 +1019,25 @@ using owned journals and the void profile can reclaim it after a terminal
 no-effect receipt; other journals follow the existing epoch lifecycle. A resumed
 deferred request retains its earlier binding when a later preflight fails.
 
+After a failed `execute_once`, `execution_failure_diagnostics()` reports a
+stage (`setup`, `send`, `awaiting_reply`, or `reply_lost`) and the remaining
+original caller budget in milliseconds. The stage enum is non-exhaustive so
+future diagnostics can add stages. The snapshot describes local progress:
+`send` includes preparing the Call on an authenticated lane;
+`reply_lost` means a written Call lost its connection or received an unusable
+reply. Neither stage proves a remote commit. The snapshot contains no request,
+peer, journal or store-error values and grants no retry or release authority.
+Transport completion fixes the budget snapshot before local journal cleanup;
+it never creates a fresh deadline. A new execution clears the old snapshot,
+while status and release calls preserve it.
+
+A local journal failure during V2 receipt lookup returns `Unavailable`
+immediately without resolving the handle. A later `status_once` or
+`status_until_terminal` call authenticates the complete original binding again
+and can recover its committed receipt. Missing, corrupt, or substituted rows
+remain unavailable without network dispatch; a matching caller ID alone never
+authorizes adoption of another request or restores mutation authority.
+
 The revision-2 persistent-consumer transport qualification contract remains
 recorded in the v7 profile and the published v6 profile remains the unchanged
 revision-1 contract. Revision 5 retains every bounded persistent-transport
@@ -883,11 +1047,14 @@ observation, rolling fresh prewarm, and pool-wide cold-setup serialization.
 
 ## API Shape
 
-- `SessionReplicationManifest::try_new_with_epoch` validates one cluster ID,
-  positive consensus configuration epoch, one legacy protocol-v5
-  operator-controlled configuration generation, and the complete replica
-  descriptor set. The deprecated `try_new` compatibility constructor uses
-  epoch 1.
+- `SessionReplicationManifest::try_new_with_epoch` requires the persisted
+  non-zero installation nonce and validates one cluster ID, positive consensus
+  configuration epoch, one legacy protocol-v5 operator-controlled
+  configuration generation, and the complete replica descriptor set. The
+  deprecated `try_new` compatibility constructor also requires the nonce and
+  uses epoch 1. Every manifest constructor is a breaking identity change: the
+  nonce is part of the cluster identity, configuration digest and derived node
+  IDs.
 - `SessionReplicationManifest::bind_local` selects the exact local
   `ReplicaId`; `LocalReplicaBinding::bind_remote` derives the only supported
   production client binding for an admitted peer.

@@ -13,10 +13,12 @@ use std::sync::Arc;
 use super::shared::RowValue;
 use super::*;
 use crate::consensus::verified_snapshot::VerificationMemory;
+use crate::fenced_mutation_roster_storage::GlobalChargeWitness;
 use sha2::{Digest as _, Sha256};
 
 #[path = "changes_frames.rs"]
 mod frames;
+pub(super) use frames::notification_payload_op;
 pub(super) use frames::{generic_payload, notification_payload, ordinary_payload};
 
 mod removals;
@@ -330,6 +332,9 @@ struct RowChange<T: RowValue> {
     after: Option<Box<SharedRow<T>>>,
     before_hash: Option<RowStamp>,
     after_hash: Option<RowStamp>,
+    // An absent witness costs one pointer even in a full transient receipt
+    // journal; scratch_size prepays every possible witness box before staging.
+    key_removal: Option<Box<retention::KeyRemoval>>,
 }
 
 impl<T: RowValue> RowChange<T> {
@@ -360,15 +365,39 @@ fn staged<K: Clone + Eq + Hash + Serialize, T: resident::RowFingerprint + RowVal
     tracking: bool,
     summary: &mut TableSummary,
 ) -> io::Result<StagedRows<K, T>> {
-    let mut staged = Vec::with_capacity(rows.len());
-    for (key, value) in rows {
+    staged_optional(
+        table,
+        rows.into_iter().map(|(key, row)| (key, Some(row), None)),
+        base,
+        tracking,
+        summary,
+    )
+}
+
+fn staged_optional<K: Clone + Eq + Hash + Serialize, T: resident::RowFingerprint + RowValue>(
+    table: u8,
+    rows: impl Iterator<Item = (K, Option<T>, Option<retention::KeyRemoval>)>,
+    base: &RowMap<K, SharedRow<T>>,
+    tracking: bool,
+    summary: &mut TableSummary,
+) -> io::Result<StagedRows<K, T>> {
+    let mut staged = Vec::with_capacity(rows.size_hint().0);
+    for (key, value, key_removal) in rows {
         let before = base.get(&key).cloned();
+        // A key created and retired in one delivery has no row at either cut.
+        // Its absent-key fence still belongs to the committed target frontier.
+        if before.is_none() && value.is_none() {
+            continue;
+        }
         let before_hash = before
             .as_ref()
             .map(|value| stamp(table, &key, value))
             .transpose()?;
-        let after = SharedRow::new(value)?;
-        let after_hash = Some(stamp(table, &key, &after)?);
+        let after = value.map(SharedRow::new).transpose()?;
+        let after_hash = after
+            .as_ref()
+            .map(|row| stamp(table, &key, row))
+            .transpose()?;
         summary.replace(before_hash, after_hash)?;
         let journal_key = tracking.then(|| key.clone());
         staged.push(StagedRow {
@@ -376,9 +405,10 @@ fn staged<K: Clone + Eq + Hash + Serialize, T: resident::RowFingerprint + RowVal
             journal_key,
             change: RowChange {
                 before: before.map(Box::new),
-                after: Some(Box::new(after)),
+                after: after.map(Box::new),
                 before_hash,
                 after_hash,
+                key_removal: key_removal.map(Box::new),
             },
         });
     }
@@ -392,7 +422,8 @@ fn scratch_size<K, T: RowValue>(count: usize) -> io::Result<usize> {
         .checked_mul(
             size_of::<StagedRow<K, T>>()
                 + 4 * (size_of::<(K, RowChange<T>)>() + 1)
-                + 2 * (size_of::<SharedRow<T>>() + std::mem::align_of::<SharedRow<T>>()),
+                + 2 * (size_of::<SharedRow<T>>() + std::mem::align_of::<SharedRow<T>>())
+                + size_of::<retention::KeyRemoval>(),
         )
         .and_then(|bytes| bytes.checked_add(64))
         .ok_or_else(|| invalid("native change reservation overflow"))
@@ -417,7 +448,8 @@ pub(super) struct BusinessChanges {
     deleted_rows: usize,
     retained_bytes: usize,
     generic: HashMap<SessionConsensusRequestId, RowChange<NativeGenericReceipt>>,
-    notifications: Vec<NotificationRow>,
+    notifications: std::collections::VecDeque<NotificationRow>,
+    removed_notifications: Vec<NotificationRow>,
     roster: roster::changes::Journal,
     // Conservative container-growth reservations precede allocation. Captures
     // transfer these guards; cloned business images do not clone a journal.
@@ -436,7 +468,8 @@ impl BusinessChanges {
             deleted_rows: 0,
             retained_bytes: 0,
             generic: HashMap::new(),
-            notifications: Vec::new(),
+            notifications: std::collections::VecDeque::new(),
+            removed_notifications: Vec::new(),
             memory: Vec::new(),
         }
     }
@@ -500,11 +533,11 @@ impl BusinessChanges {
             })?;
         }
         current(&self.generic, &state.generic_receipts)?;
-        let start = self.base.tables[3].count;
-        for (offset, row) in self.notifications.iter().enumerate() {
+        for row in &self.notifications {
             if state
-                .notifications
-                .get(start + offset)
+                .frontiers
+                .notification_position(row.sequence())
+                .and_then(|position| state.notifications.get(position))
                 .is_none_or(|current| !current.ptr_eq(row))
             {
                 return Err(invalid(
@@ -550,7 +583,11 @@ impl BusinessChanges {
                 // Such an empty ledger is valid process state even though
                 // an old generation cannot encode the new frontiers.
                 if [&self.base, &self.target].into_iter().any(|proof| {
-                    proof.roster.counts() != [0; 2] || proof.roster.witness().is_some()
+                    proof.roster.counts() != [0; 2]
+                        || proof
+                            .roster
+                            .witness()
+                            .is_some_and(|witness| witness != GlobalChargeWitness::empty())
                 }) {
                     return Err(invalid(
                         "native captured roster rows lack a configured trust root",
@@ -568,7 +605,22 @@ impl BusinessChanges {
         let (deleted_before, deleted_transient, witnessed_journal_removals) =
             self.check_deletions(&mut tables[1], check)?;
         Self::check_rows(2, &self.generic, &mut tables[2], check)?;
-        let start = self.base.tables[3].count;
+        let retired = self.target.frontiers.retention.watch_retired_through;
+        let removed = retired.min(self.base.frontiers.watch_sequence)
+            - self.base.frontiers.retention.watch_retired_through;
+        if self.removed_notifications.len() as u64 != removed {
+            return Err(invalid("native capture omitted notification retirements"));
+        }
+        for (offset, row) in self.removed_notifications.iter().enumerate() {
+            scratch::small(check, || {
+                row.validate(
+                    self.base.frontiers.retention.watch_retired_through + offset as u64 + 1,
+                    &self.base.frontiers,
+                )?;
+                tables[3].replace(Some(notification_stamp(row)?), None)
+            })?;
+        }
+        let start = self.base.frontiers.watch_sequence.max(retired);
         for row in &self.notifications {
             scratch::small(check, || {
                 tables[3].replace(None, Some(notification_stamp(row)?))
@@ -603,6 +655,25 @@ impl BusinessChanges {
                 scratch::key(row, check, || {
                     validation::validate_key(key, row, &self.target.frontiers)
                 })?;
+            } else {
+                self.target
+                    .frontiers
+                    .retention
+                    .validate_key_removal(key, None)?;
+                change
+                    .key_removal
+                    .as_deref()
+                    .copied()
+                    .ok_or_else(|| invalid("native captured key retirement witness absent"))?
+                    .validate(
+                        change.before.as_deref().map(|row| row.fence),
+                        change
+                            .before
+                            .as_deref()
+                            .and_then(|row| row.retired_epoch)
+                            .unwrap_or(self.base.frontiers.retention.keys.epoch),
+                        self.target.frontiers.retention,
+                    )?;
             }
         }
         let mut added = 0usize;
@@ -689,12 +760,10 @@ impl BusinessChanges {
         for (offset, row) in self.notifications.iter().enumerate() {
             check()?;
             let sequence = start
-                .checked_add(offset)
+                .checked_add(offset as u64)
                 .and_then(|index| index.checked_add(1))
                 .ok_or_else(|| invalid("native captured notification sequence overflow"))?;
-            scratch::small(check, || {
-                row.validate(sequence as u64, &self.target.frontiers)
-            })?;
+            scratch::small(check, || row.validate(sequence, &self.target.frontiers))?;
         }
         check()
     }
@@ -715,6 +784,9 @@ impl BusinessChanges {
         self.notifications
             .try_reserve(publication.notifications.len())
             .map_err(|_| invalid("native dirty notification allocation failed"))?;
+        self.removed_notifications
+            .try_reserve(publication.removed_notifications.len())
+            .map_err(|_| invalid("native dirty notification retirement allocation failed"))?;
         self.memory
             .try_reserve(1)
             .map_err(|_| invalid("native dirty reservation allocation failed"))?;
@@ -877,6 +949,13 @@ fn publish_rows<K: Clone + Eq + Hash, T: RowValue>(
                     let prior = slot.get_mut();
                     prior.after = change.after;
                     prior.after_hash = change.after_hash;
+                    prior.key_removal = change.key_removal;
+                    // Coalesce a create/retire pair across publications just
+                    // as staging does within one delivery. The target proof
+                    // independently retains the advanced retirement frontier.
+                    if prior.before.is_none() && prior.after.is_none() {
+                        slot.remove();
+                    }
                 }
             }
         }
@@ -894,6 +973,7 @@ pub(super) struct Publication {
     deletions: DeletedRows,
     generic: StagedRows<SessionConsensusRequestId, NativeGenericReceipt>,
     notifications: Vec<NotificationRow>,
+    removed_notifications: Vec<NotificationRow>,
     delivery: NativeApplied,
     memory: Arc<VerificationMemory>,
     tracking: bool,
@@ -941,12 +1021,14 @@ impl Publication {
             roster,
             roster_changes,
             keys,
+            key_removals,
             receipts,
             receipt_removals,
             reclaim_memory,
             generic_receipts,
             responses,
             notifications,
+            notification_outward_sequences,
             #[cfg(any(test, feature = "test-control"))]
             terminal_remainder_started,
             ..
@@ -955,7 +1037,27 @@ impl Publication {
         validate_frontier_transition(&predecessor.frontiers, &frontiers, false)?;
         let tracking = base.changes.is_some();
         let deleted_before = DeletedRows::before_count(&receipt_removals, &base.receipts)?;
-        let mut bytes = scratch_size::<SessionKey, NativeKeyState>(keys.len())?;
+        let retired = frontiers.retention.watch_retired_through;
+        let removed_count = usize::try_from(
+            retired.min(base.frontiers.watch_sequence)
+                - base.frontiers.retention.watch_retired_through,
+        )
+        .map_err(|_| invalid("native notification retirement count overflow"))?;
+        let key_count = keys
+            .len()
+            .checked_add(key_removals.len())
+            .ok_or_else(|| invalid("native changed key count overflow"))?;
+        if notifications.len() != notification_outward_sequences.len() {
+            return Err(invalid("native notification delivery projection differs"));
+        }
+        let mut bytes = scratch_size::<SessionKey, NativeKeyState>(key_count)?;
+        add_bytes(
+            &mut bytes,
+            notification_outward_sequences
+                .len()
+                .checked_mul(size_of::<u64>())
+                .ok_or_else(|| invalid("native notification delivery reservation overflow"))?,
+        )?;
         add_bytes(
             &mut bytes,
             scratch_size::<FencedTransitionV2RequestId, NativeReceipt>(receipts.len())?,
@@ -971,18 +1073,19 @@ impl Publication {
             &mut bytes,
             notifications
                 .len()
+                .checked_add(removed_count)
+                .ok_or_else(|| invalid("native notification staging count overflow"))?
                 .checked_mul(4 * size_of::<NotificationRow>())
                 .ok_or_else(|| invalid("native change notification reservation overflow"))?,
         )?;
-        for key in keys.keys() {
+        for key in keys.keys().chain(key_removals.keys()) {
             add_bytes(
                 &mut bytes,
                 key.log_row_reuse_allocation_bytes()
                     .ok_or_else(|| invalid("native changed key reservation overflow"))?,
             )?;
         }
-        let staging_bytes = keys
-            .len()
+        let staging_bytes = key_count
             .checked_mul(size_of::<StagedRow<SessionKey, NativeKeyState>>())
             .and_then(|bytes| {
                 receipts
@@ -1001,7 +1104,7 @@ impl Publication {
                     .and_then(|rows| bytes.checked_add(rows))
             })
             .ok_or_else(|| invalid("native staging reservation overflow"))?;
-        let mut memory = VerificationMemory::reserve(bytes)?;
+        let mut memory = VerificationMemory::reserve_journal(bytes)?;
         let scratch = memory.split_off(staging_bytes)?;
         let memory = Arc::new(memory);
         for (key, row) in &keys {
@@ -1020,8 +1123,11 @@ impl Publication {
                 key,
                 base.keys.get(key).map(|row| &**row),
                 |key| {
-                    keys.get(key)
-                        .or_else(|| base.keys.get(key).map(|row| &**row))
+                    keys.get(key).or_else(|| {
+                        (!key_removals.contains_key(key))
+                            .then(|| base.keys.get(key).map(|row| &**row))
+                            .flatten()
+                    })
                 },
             )?;
             if base
@@ -1031,6 +1137,20 @@ impl Publication {
             {
                 return Err(invalid("native changed key floor regressed"));
             }
+        }
+        for (key, witness) in &key_removals {
+            if keys.contains_key(key) {
+                return Err(invalid("native key is both retained and removed"));
+            }
+            frontiers.retention.validate_key_removal(key, None)?;
+            witness.validate(
+                base.keys.get(key).map(|row| row.fence),
+                base.keys
+                    .get(key)
+                    .and_then(|row| row.retired_epoch)
+                    .unwrap_or(base.frontiers.retention.keys.epoch),
+                frontiers.retention,
+            )?;
         }
         let mut introduced = Vec::with_capacity(receipts.len());
         let mut deleted = 0usize;
@@ -1158,7 +1278,7 @@ impl Publication {
         for (offset, row) in notifications.iter().enumerate() {
             validation::validate_notification(
                 row,
-                (predecessor.tables[3].count + offset) as u64 + 1,
+                predecessor.frontiers.watch_sequence + offset as u64 + 1,
                 &frontiers,
             )?;
         }
@@ -1169,6 +1289,9 @@ impl Publication {
         for (key, row) in &keys {
             expiry.replace(key, base.keys.get(key).map(|row| &**row), Some(row));
         }
+        for key in key_removals.keys() {
+            expiry.replace(key, base.keys.get(key).map(|row| &**row), None);
+        }
         for (id, row) in &generic_receipts {
             expiry.replace_request(
                 *id,
@@ -1177,7 +1300,20 @@ impl Publication {
             )?;
         }
         expiry.validate_requests(&frontiers)?;
-        let keys = staged(0, keys, &base.keys, tracking, &mut tables[0])?;
+        expiry.validate_key_retention(&frontiers)?;
+        let keys = staged_optional(
+            0,
+            keys.into_iter()
+                .map(|(key, row)| (key, Some(row), None))
+                .chain(
+                    key_removals
+                        .into_iter()
+                        .map(|(key, witness)| (key, None, Some(witness))),
+                ),
+            &base.keys,
+            tracking,
+            &mut tables[0],
+        )?;
         let receipts = staged(1, receipts, &base.receipts, tracking, &mut tables[1])?;
         let deletions = DeletedRows::prepare(
             receipt_removals,
@@ -1197,18 +1333,37 @@ impl Publication {
             responses,
             notifications: notifications
                 .iter()
-                .filter(|entry| entry.sequence > frontiers.async_watch_before())
                 .cloned()
-                .map(|mut entry| {
-                    entry.sequence = frontiers.outward_watch(entry.sequence)?;
-                    Ok(entry)
+                .zip(notification_outward_sequences)
+                .map(|(mut entry, outward_sequence)| {
+                    entry.sequence = outward_sequence;
+                    entry
                 })
-                .collect::<io::Result<Vec<_>>>()?,
+                .collect(),
         };
         let notifications = notifications
             .into_iter()
+            .filter(|row| row.sequence > retired)
             .map(|row| NotificationRow::new(NativeNotification::new(row)))
             .collect::<io::Result<Vec<_>>>()?;
+        let removed_notifications = base
+            .notifications
+            .iter()
+            .take(removed_count)
+            .cloned()
+            .collect::<Vec<_>>();
+        if removed_notifications.len() != removed_count {
+            return Err(invalid(
+                "native notification retirement exceeds retained prefix",
+            ));
+        }
+        for (offset, row) in removed_notifications.iter().enumerate() {
+            row.validate(
+                predecessor.frontiers.retention.watch_retired_through + offset as u64 + 1,
+                &predecessor.frontiers,
+            )?;
+            tables[3].replace(Some(notification_stamp(row)?), None)?;
+        }
         for row in &notifications {
             tables[3].replace(None, Some(notification_stamp(row)?))?;
         }
@@ -1245,6 +1400,7 @@ impl Publication {
             deletions,
             generic,
             notifications,
+            removed_notifications,
             delivery,
             memory,
             tracking,
@@ -1295,6 +1451,17 @@ impl Publication {
             &state.generic_receipts,
             state.changes.as_ref().map(|dirty| &dirty.generic),
         )?;
+        for (offset, row) in self.removed_notifications.iter().enumerate() {
+            if state
+                .notifications
+                .get(offset)
+                .is_none_or(|current| !current.ptr_eq(row))
+            {
+                return Err(invalid(
+                    "native notification retirement predecessor changed",
+                ));
+            }
+        }
         self.roster_changes.require_base(&state.roster)?;
         // Immutable resident collections allocate only changed tree paths.
         // Journal/output reservations and every fallible precondition have
@@ -1352,10 +1519,26 @@ impl Publication {
             state.changes.as_mut().map(|dirty| &mut dirty.generic),
         );
         if let Some(dirty) = &mut state.changes {
+            dirty.removed_notifications.extend(
+                self.removed_notifications
+                    .iter()
+                    .filter(|row| row.sequence() <= dirty.base.frontiers.watch_sequence)
+                    .cloned(),
+            );
+            while dirty
+                .notifications
+                .front()
+                .is_some_and(|row| row.sequence() <= self.frontiers.retention.watch_retired_through)
+            {
+                dirty.notifications.pop_front();
+            }
             dirty
                 .notifications
                 .extend(self.notifications.iter().cloned());
             dirty.target = Arc::clone(&self.proof);
+        }
+        for _ in &self.removed_notifications {
+            state.notifications.pop_front();
         }
         state.notifications.extend(self.notifications);
         state.roster = self.roster;
@@ -1380,6 +1563,7 @@ pub(super) fn validate_frontier_transition(
     after: &NativeFrontiers,
     snapshot: bool,
 ) -> io::Result<()> {
+    before.retention.transition(after.retention)?;
     if before.fenced_transition_profile != after.fenced_transition_profile
         || before.sequence > after.sequence
         || before.watch_sequence > after.watch_sequence
@@ -1482,9 +1666,16 @@ impl NativeState {
     /// Charges follow the detached journal into its checkpoint owner. Only
     /// this live journal is considered by the local checkpoint trigger.
     pub(crate) fn changed_verification_bytes(&self) -> usize {
+        self.changes.as_ref().map_or(0, |changes| {
+            changes.retained_bytes + changes.roster.retained_bytes()
+        })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn roster_journal_bytes_for_test(&self) -> usize {
         self.changes
             .as_ref()
-            .map_or(0, |changes| changes.retained_bytes)
+            .map_or(0, |changes| changes.roster.retained_bytes())
     }
 
     pub(super) fn clone_for_application(&self) -> io::Result<Self> {
@@ -1600,6 +1791,7 @@ impl NativeState {
             expiry.replace_request(*id, None, Some(row))?;
         }
         expiry.validate_requests(&self.frontiers)?;
+        expiry.validate_key_retention(&self.frontiers)?;
         for row in &self.notifications {
             tables[3].replace(None, Some(notification_stamp(row)?))?;
         }

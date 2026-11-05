@@ -1,7 +1,7 @@
 //! Ordinary commands preserve the established savepoint contract: deterministic
 //! rejection discards the whole business effect, including global expiry
 //! pruning, while binding the response and advancing the application clock.
-//! A successful CAS conflict commits pruning and emits no watch event.
+//! A CAS conflict discards pruning and emits no watch event.
 
 use super::*;
 use crate::backend::{CompareAndSet, CompareAndSetResult, ReplicationOp};
@@ -15,7 +15,56 @@ struct Transaction<'a, 'state> {
     now: Timestamp,
 }
 
+pub(super) struct KeyEffects {
+    frontiers: NativeFrontiers,
+    keys: HashMap<SessionKey, NativeKeyState>,
+    expiry: expiry::ExpiryIndex,
+    removed: Vec<(SessionKey, retention::KeyRemoval)>,
+}
+
+impl KeyEffects {
+    pub(super) fn publish(self, delta: &mut NativeDelta<'_>) {
+        delta.frontiers = self.frontiers;
+        delta.expiry = self.expiry;
+        for (key, witness) in self.removed {
+            delta.keys.remove(&key);
+            delta.key_removals.insert(key, witness);
+        }
+        for key in self.keys.keys() {
+            delta.key_removals.remove(key);
+        }
+        delta.keys.extend(self.keys);
+    }
+}
+
 impl NativeDelta<'_> {
+    pub(super) fn staged_v1(
+        &self,
+        request: &crate::FencedTransitionRequest,
+        now: Timestamp,
+    ) -> Result<(business::BusinessEffect, KeyEffects), StoreError> {
+        let mut transaction = Transaction {
+            base: self,
+            frontiers: self.frontiers.clone(),
+            keys: HashMap::new(),
+            expiry: self.expiry.clone(),
+            now,
+        };
+        transaction.prune()?;
+        let effect = business::transition_v1(
+            request,
+            &transaction.key(request.lease().key()),
+            self.has_key(request.lease().key()),
+            &transaction.frontiers,
+            now,
+        )?;
+        transaction.set_key(effect.key.clone(), effect.value.clone());
+        transaction.frontiers.next_fence = effect.next_fence;
+        transaction.frontiers.next_credential = effect.next_credential;
+        transaction.revision()?;
+        Ok((effect, transaction.finish()?))
+    }
+
     pub(super) fn ordinary(
         &mut self,
         command: &SessionConsensusCommand,
@@ -70,17 +119,32 @@ impl NativeDelta<'_> {
         } else {
             Err(StoreError::TopologyAuthorityRevoked)
         };
+        let executed = executed.and_then(|(outcome, replication)| {
+            if matches!(
+                outcome,
+                SessionMutationOutcome::CompareAndSet(CompareAndSetResult::Conflict { .. })
+            ) {
+                Ok((outcome, replication, None))
+            } else {
+                transaction
+                    .finish()
+                    .map(|effects| (outcome, replication, Some(effects)))
+            }
+        });
         let (result, replication) = match executed {
-            Ok((outcome, replication)) => {
-                let Transaction {
-                    frontiers,
-                    keys,
-                    expiry,
-                    ..
-                } = transaction;
-                self.frontiers = frontiers;
-                self.expiry = expiry;
-                self.keys.extend(keys);
+            Ok((outcome, replication, effects)) => {
+                if matches!(
+                    intent,
+                    SessionMutationIntent::ActivateProtectedRosterProfileV2 { .. }
+                ) {
+                    self.initialize_roster_witness(
+                        !self.frontiers.roster_v1_namespace
+                            && self.frontiers.roster_v2_activation.is_none(),
+                    )?;
+                }
+                if let Some(effects) = effects {
+                    effects.publish(self);
+                }
                 (Ok(outcome), replication)
             }
             Err(error) if business::deterministic(&error) => (Err(error), None),
@@ -97,6 +161,7 @@ impl NativeDelta<'_> {
                 .filter(|next| *next <= COUNTER_MAX)
                 .ok_or_else(|| invalid("native ordinary watch sequence exhausted"))?;
             let notification = ReplicationEntry {
+                replay_policy: crate::ReplicationReplayPolicy::prune_and_retire(),
                 sequence,
                 tx_id: ReplicationTxId::from_request_bytes(*command.request_id.as_bytes()),
                 op,
@@ -122,6 +187,82 @@ impl NativeDelta<'_> {
 }
 
 impl Transaction<'_, '_> {
+    fn finish(mut self) -> Result<KeyEffects, StoreError> {
+        let removed = self.retire_dead_keys()?;
+        Ok(KeyEffects {
+            frontiers: self.frontiers,
+            keys: self.keys,
+            expiry: self.expiry,
+            removed,
+        })
+    }
+
+    // Finalize each successful committed command, not each delivery batch:
+    // follower packaging must never change the namespace fence.
+    // Preserve lease rows until ordinary pruning removes them, including the
+    // inactive row deliberately retained by a successful release.
+    fn retire_dead_keys(&mut self) -> Result<Vec<(SessionKey, retention::KeyRemoval)>, StoreError> {
+        let mut retired: Vec<_> = self
+            .keys
+            .iter()
+            .filter(|(key, row)| {
+                row.record.is_none()
+                    && row.lease.is_none()
+                    && !row.reserved
+                    && row.retired_epoch.is_none()
+                    && !crate::scope_storage::is_scope_record_key(key)
+            })
+            .map(|(key, _)| expiry::OrderedKey(Arc::new(key.clone())))
+            .collect();
+        retired.sort_unstable();
+        let mut removed = Vec::new();
+        for key in retired {
+            let key = key.0.as_ref();
+            let before = self.keys.get(key).cloned().ok_or_else(unavailable)?;
+            let mut row = before.clone();
+            row.retired_epoch = Some(self.frontiers.retention.keys.epoch);
+            self.frontiers.retention.keys.retired_max =
+                self.frontiers.retention.keys.retired_max.max(row.fence);
+            self.frontiers.retention.keys.retired_count = self
+                .frontiers
+                .retention
+                .keys
+                .retired_count
+                .checked_add(1)
+                .ok_or_else(unavailable)?;
+            self.expiry.replace(key, Some(&before), Some(&row));
+            self.keys.insert(key.clone(), row);
+            if self.frontiers.retention.keys.retired_count
+                == crate::key_retention::RETIRED_KEYS_PER_EPOCH
+            {
+                let through = self
+                    .frontiers
+                    .rotate_keys(crate::key_retention::RotationReason::Threshold)?;
+                if let Some(through) = through {
+                    while let Some(key) = self.expiry.oldest_retired_through(through) {
+                        let before = self
+                            .keys
+                            .get(&key)
+                            .cloned()
+                            .unwrap_or_else(|| self.base.physical_key(&key));
+                        self.frontiers
+                            .retention
+                            .validate_key_removal(&key, Some(&before))
+                            .map_err(|_| unavailable())?;
+                        self.expiry.replace(&key, Some(&before), None);
+                        self.keys.remove(&key);
+                        removed.push((
+                            key.clone(),
+                            retention::KeyRemoval::new(&key, &before, self.frontiers.retention)
+                                .map_err(|_| unavailable())?,
+                        ));
+                    }
+                }
+            }
+        }
+        Ok(removed)
+    }
+
     fn key(&self, key: &SessionKey) -> NativeKeyState {
         self.keys
             .get(key)
@@ -129,13 +270,18 @@ impl Transaction<'_, '_> {
             .unwrap_or_else(|| self.base.key(key))
     }
 
-    fn set_key(&mut self, key: SessionKey, row: NativeKeyState) {
+    fn set_key(&mut self, key: SessionKey, mut row: NativeKeyState) {
+        if row.record.is_some() || row.lease.is_some() || row.reserved {
+            row.retired_epoch = None;
+        }
         let before = self
             .keys
             .get(&key)
             .cloned()
             .unwrap_or_else(|| self.base.physical_key(&key));
-        self.expiry.replace(&key, Some(&before), Some(&row));
+        let exists = self.keys.contains_key(&key) || self.base.has_key(&key);
+        self.expiry
+            .replace(&key, exists.then_some(&before), Some(&row));
         self.keys.insert(key, row);
     }
 
@@ -245,6 +391,16 @@ impl Transaction<'_, '_> {
                 let record = crate::scope_storage::ScopeRow::Activation((**certificate).clone())
                     .to_record()
                     .map_err(|_| unavailable())?;
+                if self.frontiers.watch_sequence >= COUNTER_MAX
+                    && self
+                        .base
+                        .requires_capacity_notification(usize::from(
+                            !self.base.has_key(&record.key),
+                        ))
+                        .map_err(|_| unavailable())?
+                {
+                    return Err(StoreError::FencedTransitionStorageExhausted);
+                }
                 self.set_key(
                     record.key.clone(),
                     NativeKeyState {

@@ -2,20 +2,26 @@
 
 use std::fs;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use opc_n3iwf_fixtures::{
     ContractErrorCode, FixtureCatalog, FixtureManifest, REQUIRED_CASE_CLASSES,
 };
 
 fn scratch_copy() -> PathBuf {
+    static NEXT_COPY: AtomicU64 = AtomicU64::new(0);
     let src = FixtureCatalog::fixture_root();
     let dest = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join(format!(
-        "n3iwf-fixtures-{}",
+        "n3iwf-fixtures-{}-{}-{}",
+        std::process::id(),
+        NEXT_COPY.fetch_add(1, Ordering::Relaxed),
         std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|value| value.as_nanos())
             .unwrap_or(0)
     ));
+    // Clock resolution cannot give concurrent mutations separate ownership.
+    fs::create_dir(&dest).expect("exclusive scratch directory");
     copy_dir(&src, &dest);
     dest
 }

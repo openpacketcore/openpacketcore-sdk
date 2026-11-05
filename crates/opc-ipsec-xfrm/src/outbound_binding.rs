@@ -24,6 +24,9 @@ const IPPROTO_ESP: u8 = 50;
 /// freshly validated through its namespace-bound actor. `from_bytes` exists so
 /// persisted plans can decode the correlation value; constructing or matching
 /// an ID alone cannot mint a binding.
+///
+/// Enabled TFC targets are part of this identity. An absent target preserves
+/// the original fingerprint encoding.
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
 pub struct OutboundSaBindingId([u8; 32]);
 
@@ -460,6 +463,8 @@ fn template_matches_sa(template: &XfrmTemplate, sa: &SaParameters) -> bool {
         && template.mode == sa.mode
 }
 
+/// Versioned keyed fingerprint of one outbound SA install identity.
+///
 fn fingerprint_sa(parameters: &SaParameters) -> [u8; 32] {
     let mut digest = Sha256::new();
     digest.update(b"opc-xfrm-outbound-sa-binding-v1\0");
@@ -506,6 +511,12 @@ fn fingerprint_sa(parameters: &SaParameters) -> [u8; 32] {
             digest.update((key.len() as u64).to_be_bytes());
         }
         None => digest.update([0]),
+    }
+    // An enabled target extends the complete previous encoding; None leaves
+    // every existing no-TFC correlation ID unchanged.
+    if let Some(target) = parameters.tfc_pad {
+        digest.update(b"tfc-padding\0");
+        digest.update(target.to_be_bytes());
     }
     digest.finalize().into()
 }
@@ -685,6 +696,7 @@ pub(crate) mod tests_support {
             output_mark: None,
             if_id: Some(19),
             egress_dscp: None,
+            tfc_pad: None,
         };
         let policy = PolicyParameters {
             selector,
@@ -854,6 +866,19 @@ mod tests {
             expected.fingerprint.sa,
             fingerprint_sa(&changed_identity.sa.parameters)
         );
+    }
+
+    #[test]
+    fn tfc_binding_fingerprint_distinguishes_disabled_and_each_target() {
+        let mut parameters = outbound_request().sa.parameters;
+        let disabled = fingerprint_sa(&parameters);
+        parameters.tfc_pad = Some(1280);
+        let first = fingerprint_sa(&parameters);
+        parameters.tfc_pad = Some(1400);
+        let second = fingerprint_sa(&parameters);
+        assert_ne!(disabled, first);
+        assert_ne!(disabled, second);
+        assert_ne!(first, second);
     }
 
     #[test]

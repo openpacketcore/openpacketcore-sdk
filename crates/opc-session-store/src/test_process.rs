@@ -20,7 +20,56 @@ use std::process::{Child, Command, Output};
 use std::sync::RwLock;
 
 #[cfg(target_os = "linux")]
-pub(crate) static SNAPSHOT_PROCESS_FD_GATE: RwLock<()> = RwLock::new(());
+pub(crate) static SNAPSHOT_PROCESS_FD_GATE: SnapshotProcessFdGate =
+    SnapshotProcessFdGate(RwLock::new(()));
+
+/// The fixture descriptor gate cannot hide a stuck owner indefinitely.
+#[cfg(target_os = "linux")]
+pub(crate) struct SnapshotProcessFdGate(RwLock<()>);
+
+#[cfg(target_os = "linux")]
+impl SnapshotProcessFdGate {
+    fn acquire<'a, T>(
+        &'a self,
+        mut attempt: impl FnMut(&'a RwLock<()>) -> std::sync::TryLockResult<T>,
+        timeout: std::time::Duration,
+        step: &str,
+    ) -> io::Result<T> {
+        let deadline = std::time::Instant::now() + timeout;
+        loop {
+            match attempt(&self.0) {
+                Ok(guard) => return Ok(guard),
+                Err(std::sync::TryLockError::Poisoned(_)) => {
+                    return Err(io::Error::other("test snapshot descriptor gate poisoned"))
+                }
+                Err(std::sync::TryLockError::WouldBlock) => {}
+            }
+            if std::time::Instant::now() >= deadline {
+                return Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    format!("test snapshot descriptor gate: {step} still blocked by an owner"),
+                ));
+            }
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+    }
+
+    pub(crate) fn read(&self) -> io::Result<std::sync::RwLockReadGuard<'_, ()>> {
+        self.acquire(
+            RwLock::try_read,
+            std::time::Duration::from_secs(180),
+            "read admission",
+        )
+    }
+
+    pub(crate) fn write(&self) -> io::Result<std::sync::RwLockWriteGuard<'_, ()>> {
+        self.acquire(
+            RwLock::try_write,
+            std::time::Duration::from_secs(180),
+            "child launch",
+        )
+    }
+}
 
 #[cfg(target_os = "linux")]
 mod snapshot_descriptor_probe;
@@ -56,6 +105,9 @@ pub(crate) trait CommandExt {
     /// Capture both output streams, with null stdin, for an isolated libtest
     /// fixture. Its initial harness output is the userspace readiness signal.
     fn test_output(&mut self) -> io::Result<Output>;
+    /// Bound a fixture, including blocking teardown, without releasing its owners.
+    #[cfg(target_os = "linux")]
+    fn test_output_with_deadline(&mut self, timeout: std::time::Duration) -> io::Result<Output>;
 }
 
 impl CommandExt for Command {
@@ -112,6 +164,136 @@ impl CommandExt for Command {
             Ok(output)
         }
     }
+    #[cfg(target_os = "linux")]
+    fn test_output_with_deadline(&mut self, timeout: std::time::Duration) -> io::Result<Output> {
+        use std::os::unix::process::CommandExt as _;
+        use std::time::{Duration, Instant};
+
+        const OWNED_GROUP: &str = "OPC_TEST_FIXTURE_OWNED_GROUP";
+        let nested = std::env::var(OWNED_GROUP).as_deref() == Ok("1");
+        // Descendants stay in the outer fixture's group so a failed nested
+        // witness cannot leave another process holding its output or owners.
+        if !nested {
+            self.process_group(0);
+        }
+        self.env(OWNED_GROUP, "1");
+        let (mut child, prefix) = {
+            let _launch = SNAPSHOT_PROCESS_FD_GATE.write()?;
+            let mut child = self
+                .stdin(Stdio::null())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()?;
+            match captured_readiness(&mut child, Duration::from_secs(5)) {
+                Ok(prefix) => (child, prefix),
+                Err(error) => {
+                    terminate_fixture_group(&child, nested, "test fixture readiness stalled");
+                    let _ = child.wait();
+                    return Err(error);
+                }
+            }
+        };
+        let stdout = child.stdout.take().expect("test child stdout");
+        let stderr = child.stderr.take().expect("test child stderr");
+        if nested {
+            if let Some(prefix) = prefix {
+                use std::io::Write as _;
+                let mut stream = io::stdout().lock();
+                let _ = stream.write_all(&[prefix]);
+                let _ = stream.flush();
+            }
+        }
+        // Nested progress must reach the outer owner before its deadline can
+        // terminate the whole group. Keep the same captured bytes for normal
+        // assertions while forwarding each chunk outside libtest buffering.
+        let out = std::thread::spawn(move || capture_fixture_output(stdout, nested, false));
+        let err = std::thread::spawn(move || capture_fixture_output(stderr, nested, true));
+        let deadline = Instant::now() + timeout;
+        let mut timed_out = false;
+        let status = (|| -> io::Result<ExitStatus> {
+            let mut status = None;
+            loop {
+                if status.is_none() {
+                    status = child.try_wait()?;
+                }
+                if let Some(status) = status.filter(|_| out.is_finished() && err.is_finished()) {
+                    break Ok(status);
+                }
+                if Instant::now() >= deadline {
+                    timed_out = true;
+                    // The child owns this group. Include descendants which
+                    // may retain captured output after their parent exits.
+                    terminate_fixture_group(&child, nested, "test fixture exceeded its completion deadline; stuck blocking teardown or wait");
+                    break child.wait();
+                }
+                std::thread::sleep(Duration::from_millis(1));
+            }
+        })();
+        if status.is_err() {
+            terminate_fixture_group(&child, nested, "test fixture completion observation failed");
+            let _ = child.wait();
+        }
+        let mut stdout = out.join().expect("test stdout reader")?;
+        if let Some(prefix) = prefix {
+            stdout.insert(0, prefix);
+        }
+        let stderr = err.join().expect("test stderr reader")?;
+        if timed_out {
+            return Err(io::Error::new(io::ErrorKind::TimedOut, format!(
+                "test fixture exceeded its {timeout:?} completion deadline; stuck blocking teardown or wait\n{}\n{}",
+                String::from_utf8_lossy(&stdout), String::from_utf8_lossy(&stderr))));
+        }
+        Ok(Output {
+            status: status?,
+            stdout,
+            stderr,
+        })
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn capture_fixture_output(
+    mut reader: impl io::Read,
+    forward: bool,
+    stderr: bool,
+) -> io::Result<Vec<u8>> {
+    use std::io::Write as _;
+    let mut captured = Vec::new();
+    let mut buffer = [0; 4096];
+    loop {
+        let count = reader.read(&mut buffer)?;
+        if count == 0 {
+            return Ok(captured);
+        }
+        let bytes = &buffer[..count];
+        if forward {
+            // Losing an observer must not abandon its still-owned child.
+            if stderr {
+                let mut stream = io::stderr().lock();
+                let _ = stream.write_all(bytes);
+                let _ = stream.flush();
+            } else {
+                let mut stream = io::stdout().lock();
+                let _ = stream.write_all(bytes);
+                let _ = stream.flush();
+            }
+        }
+        captured.extend_from_slice(bytes);
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn terminate_fixture_group(child: &Child, nested: bool, message: &str) {
+    let group = if nested {
+        // Write outside libtest capture before terminating this failed owned
+        // group, which includes the nested observer itself.
+        use std::io::Write as _;
+        let _ = writeln!(std::io::stderr().lock(), "{message}");
+        rustix::process::getpgrp()
+    } else {
+        rustix::process::Pid::from_child(child)
+    };
+    let _ = rustix::process::kill_process_group(group, rustix::process::Signal::KILL);
 }
 
 /// Wait for one byte from userspace, or a silent child's reaped exit. A child
@@ -175,6 +357,13 @@ mod tests {
 
     #[test]
     fn captured_readiness_timeout_reaps_child_and_releases_snapshot_gate() {
+        const NESTED_PROBE: &str = "OPC_TEST_NESTED_FIXTURE_DEADLINE";
+        if std::env::var_os(NESTED_PROBE).is_some() {
+            let _ = Command::new("/bin/sh")
+                .args(["-c", "printf ready; sleep 60 & wait"])
+                .test_output_with_deadline(Duration::from_millis(20));
+            panic!("a nested deadline must terminate its owned fixture group");
+        }
         for script in [
             "exec 1>&-; exec sleep 60",
             "while :; do printf 'fill captured stderr before stdout readiness\\n' >&2; done",
@@ -196,6 +385,80 @@ mod tests {
                 "a child that never becomes ready is killed and reaped"
             );
             let _seal = SNAPSHOT_PROCESS_FD_GATE.read().unwrap();
+        }
+        let gate = SnapshotProcessFdGate(RwLock::new(()));
+        let held = gate.write().unwrap();
+        let error = gate
+            .acquire(
+                RwLock::try_read,
+                Duration::from_millis(20),
+                "read admission",
+            )
+            .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+        assert!(error.to_string().contains("snapshot descriptor gate"));
+        drop(held);
+        let started = Instant::now();
+        let error = Command::new("/bin/sh")
+            .args(["-c", "printf ready; exec sleep 60"])
+            .test_output_with_deadline(Duration::from_millis(20))
+            .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+        assert!(error
+            .to_string()
+            .contains("stuck blocking teardown or wait"));
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "bounded child teardown did not finish promptly"
+        );
+        let name = std::thread::current().name().unwrap().to_owned();
+        let started = Instant::now();
+        let output = Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", &name, "--test-threads=1", "--nocapture"])
+            .env(NESTED_PROBE, "1")
+            .test_output_with_deadline(Duration::from_secs(5))
+            .unwrap();
+        assert!(!output.status.success());
+        assert!(String::from_utf8_lossy(&output.stdout).contains("running 1 test"));
+        assert!(String::from_utf8_lossy(&output.stderr).contains("stuck blocking teardown or wait"));
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "nested fixture deadline left an owned descendant running"
+        );
+    }
+
+    #[test]
+    fn outer_deadline_retains_nested_output_and_reaps_descendants() {
+        const CHILD: &str = "OPC_NESTED_OUTPUT_DEADLINE_CHILD";
+        if let Some(pid_file) = std::env::var_os(CHILD) {
+            let _ = Command::new("/bin/sh")
+                .args(["-c", "printf nested-stdout-marker; printf nested-stderr-marker >&2; printf %s $$ > \"$1\"; exec sleep 60", "nested-output"])
+                .arg(pid_file)
+                .test_output_with_deadline(Duration::from_secs(60));
+            panic!("outer deadline must terminate the nested owner");
+        }
+        let directory = tempfile::tempdir().unwrap();
+        let pid_file = directory.path().join("nested-pid");
+        let name = std::thread::current().name().unwrap().to_owned();
+        let started = Instant::now();
+        let error = Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", &name, "--test-threads=1", "--nocapture"])
+            .env(CHILD, &pid_file)
+            .test_output_with_deadline(Duration::from_millis(500))
+            .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+        let message = error.to_string();
+        assert!(message.contains("nested-stdout-marker"), "{message}");
+        assert!(message.contains("nested-stderr-marker"), "{message}");
+        assert!(started.elapsed() < Duration::from_secs(5));
+        let pid = std::fs::read_to_string(pid_file).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while std::path::Path::new(&format!("/proc/{pid}")).exists() {
+            assert!(
+                Instant::now() < deadline,
+                "nested descendant remains after group teardown"
+            );
+            std::thread::sleep(Duration::from_millis(1));
         }
     }
 
@@ -251,5 +514,146 @@ mod tests {
             assert_eq!(output.stderr, b"finished");
             before_exit.expect("snapshot sealing proceeds while captured child stays alive");
         });
+    }
+}
+
+/// Give a unit fixture a bounded private process, including blocking teardown.
+#[cfg(target_os = "linux")]
+#[track_caller]
+pub(crate) fn with_completion_deadline(timeout: std::time::Duration, run: impl FnOnce()) {
+    if !run_completion_parent(timeout) {
+        run();
+    }
+}
+
+/// Observe an async fixture in a private process before it creates any owners.
+#[cfg(target_os = "linux")]
+#[track_caller]
+pub(crate) fn run_completion_parent(timeout: std::time::Duration) -> bool {
+    const CHILD: &str = "OPC_TEST_COMPLETION_DEADLINE_CASE";
+    let current = std::thread::current();
+    let name = current.name().expect("libtest names its fixture thread");
+    if std::env::var(CHILD).as_deref() == Ok(name) {
+        return false;
+    }
+    let output = Command::new(std::env::current_exe().expect("test executable"))
+        .args(["--exact", name, "--test-threads=1", "--nocapture"])
+        .env(CHILD, name)
+        .test_output_with_deadline(timeout)
+        .unwrap_or_else(|error| panic!("{name}: {error}"));
+    assert!(
+        output.status.success(),
+        "{name}: fixture failed\n{}\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&output.stdout)
+            .contains("test result: ok. 1 passed; 0 failed; 0 ignored;"),
+        "{name}: isolated fixture did not run exactly one test"
+    );
+    true
+}
+
+/// Finite observation guards for test-only synchronization witnesses.
+#[cfg(target_os = "linux")]
+pub(crate) mod witness {
+    use std::sync::{mpsc, Condvar, LockResult, MutexGuard, PoisonError};
+    use std::time::{Duration, Instant};
+
+    const DEADLINE: Duration = Duration::from_secs(180);
+
+    pub(crate) trait CondvarExt {
+        #[track_caller]
+        fn test_wait<'a, T>(&self, state: MutexGuard<'a, T>) -> LockResult<MutexGuard<'a, T>>;
+        #[track_caller]
+        fn test_wait_while<'a, T: std::fmt::Debug>(
+            &self,
+            state: MutexGuard<'a, T>,
+            pending: impl FnMut(&mut T) -> bool,
+        ) -> LockResult<MutexGuard<'a, T>>;
+    }
+
+    impl CondvarExt for Condvar {
+        fn test_wait<'a, T>(&self, state: MutexGuard<'a, T>) -> LockResult<MutexGuard<'a, T>> {
+            let (state, elapsed) = self
+                .wait_timeout(state, DEADLINE)
+                .map_err(|error| PoisonError::new(error.into_inner().0))?;
+            assert!(
+                !elapsed.timed_out(),
+                "test condition-variable notification stalled at {}",
+                std::panic::Location::caller()
+            );
+            Ok(state)
+        }
+
+        fn test_wait_while<'a, T: std::fmt::Debug>(
+            &self,
+            state: MutexGuard<'a, T>,
+            mut pending: impl FnMut(&mut T) -> bool,
+        ) -> LockResult<MutexGuard<'a, T>> {
+            let (mut state, elapsed) = self
+                .wait_timeout_while(state, DEADLINE, &mut pending)
+                .map_err(|error| PoisonError::new(error.into_inner().0))?;
+            assert!(
+                !elapsed.timed_out() || !pending(&mut state),
+                "test condition-variable predicate stalled at {}: state={state:?}",
+                std::panic::Location::caller()
+            );
+            Ok(state)
+        }
+    }
+
+    pub(crate) trait ReceiverExt<T> {
+        #[track_caller]
+        fn test_recv(&self) -> Result<T, mpsc::RecvError>;
+    }
+
+    impl<T> ReceiverExt<T> for mpsc::Receiver<T> {
+        fn test_recv(&self) -> Result<T, mpsc::RecvError> {
+            match self.recv_timeout(DEADLINE) {
+                Ok(value) => Ok(value),
+                Err(mpsc::RecvTimeoutError::Disconnected) => Err(mpsc::RecvError),
+                Err(mpsc::RecvTimeoutError::Timeout) => panic!(
+                    "test channel completion stalled at {}",
+                    std::panic::Location::caller()
+                ),
+            }
+        }
+    }
+
+    pub(crate) trait JoinExt<T> {
+        #[track_caller]
+        fn test_join(self) -> std::thread::Result<T>;
+    }
+
+    impl<'scope, T> JoinExt<T> for std::thread::ScopedJoinHandle<'scope, T> {
+        fn test_join(self) -> std::thread::Result<T> {
+            let deadline = Instant::now() + DEADLINE;
+            while !self.is_finished() {
+                assert!(
+                    Instant::now() < deadline,
+                    "test scoped worker completion stalled at {}",
+                    std::panic::Location::caller()
+                );
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            self.join()
+        }
+    }
+
+    impl<T> JoinExt<T> for std::thread::JoinHandle<T> {
+        fn test_join(self) -> std::thread::Result<T> {
+            let deadline = Instant::now() + DEADLINE;
+            while !self.is_finished() {
+                assert!(
+                    Instant::now() < deadline,
+                    "test worker completion stalled at {}",
+                    std::panic::Location::caller()
+                );
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            self.join()
+        }
     }
 }

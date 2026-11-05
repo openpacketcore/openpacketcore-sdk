@@ -50,7 +50,11 @@ impl SchemaRegistry for Registry {
     fn nodes(&self) -> &'static [NodeMeta] {
         static NODES: &[NodeMeta] = &[
             leaf("/m:bool", LeafType::Boolean, Some("true")),
-            leaf("/m:decimal", LeafType::Decimal64, Some("1.25")),
+            leaf(
+                "/m:decimal",
+                LeafType::Decimal64 { fraction_digits: 2 },
+                Some("1.25"),
+            ),
             leaf("/m:int", LeafType::Int64, Some("-11")),
             NodeMeta {
                 kind: NodeKind::Container,
@@ -172,8 +176,8 @@ fn projection_observes_each_typed_default_and_scalar_rendering() {
         ),
         (
             "/m:decimal",
-            SubtreeScalar::Decimal(1.25),
-            SubtreeScalar::Decimal(2.5),
+            SubtreeScalar::Decimal(opc_mgmt_schema::Decimal64::parse("1.25", 2).unwrap()),
+            SubtreeScalar::Decimal(opc_mgmt_schema::Decimal64::parse("2.5", 2).unwrap()),
             "2.5",
         ),
         (

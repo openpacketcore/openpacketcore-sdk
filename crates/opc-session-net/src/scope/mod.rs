@@ -7,9 +7,13 @@ mod boot;
 pub(crate) mod child_read_wire;
 mod clock;
 mod notice;
+mod platform_clock;
+#[cfg(all(test, target_os = "linux"))]
+pub(crate) use platform_clock::test_support as linux_clock_test_support;
 mod policy;
 mod pool;
 mod proof;
+mod refusal;
 mod revision;
 #[cfg(test)]
 mod revision_tests;
@@ -21,8 +25,12 @@ pub use clock::{
     AuthenticationClock, AuthenticationTimeError, AuthenticationTimeSource, IntervalClock,
     RealtimeReading,
 };
+pub use platform_clock::{
+    PlatformAuthenticationTimeSource, PLATFORM_AUTHENTICATION_TIME_MAX_UNCERTAINTY,
+};
 pub use policy::{PolicyError, PrincipalGrant, ScopePolicy, ScopeRole};
 pub use pool::{ProofBudgets, ProofPoolError};
+pub use refusal::BootRefusalReason;
 pub use revision::{
     scope_transport_revision_diagnostics, ScopeTransportDirection, ScopeTransportPurpose,
     ScopeTransportRevisionDiagnostic, ScopeTransportRole,
@@ -82,6 +90,8 @@ pub use issuer::{
 };
 #[cfg(test)]
 mod issuer_tests;
+#[cfg(all(test, feature = "test-control", target_os = "linux"))]
+pub(crate) use issuer_tests::assert_admitted_liveness_refusal;
 
 mod evidence;
 pub use evidence::{

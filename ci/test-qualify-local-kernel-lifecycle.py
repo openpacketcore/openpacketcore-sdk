@@ -12,6 +12,7 @@ from pathlib import Path
 import re
 import shlex
 import signal
+import struct
 import subprocess
 import tempfile
 import textwrap
@@ -227,6 +228,9 @@ class CleanupTests(unittest.TestCase):
         after = copy.deepcopy(self.before)
         after["net"].append("102")
         after["mnt"].append("202")
+        # A shared runner may gain even a software interface during the job.
+        # Its absence from the baseline does not make it qualification-owned.
+        after["interfaces"].append("unrelated-veth")
         service = {
             "pid": 20, "ppid": 1, "start_time": 200, "state": "S",
             "comm": "systemd-hostnamed",
@@ -271,12 +275,281 @@ class CleanupTests(unittest.TestCase):
             self.assertEqual(owner["pid"], 30)
             self.assertTrue(owner["qualification_owned"])
 
-    def verify_fixture(self, directory, after, processes=None, errors=None):
+        # Explicitly recorded host-namespace resources must also be refused,
+        # even after their creating process has exited. Ordinary qualification
+        # interfaces and routes remain covered by their owning namespace above.
+        with tempfile.TemporaryDirectory() as directory:
+            self.owner_fixture(directory)
+            path = Path(directory) / "run-fixture.json"
+            record = json.loads(path.read_text())
+            record["owned_interfaces"] = ["owned-veth"]
+            record["interface_namespace"] = "500"
+            record["owned_links"] = [{"namespace": "500", "ifindex": 7,
+                                      "declared_name": "owned-veth", "deleted": False}]
+            record["link_capture_complete"] = True
+            path.write_text(json.dumps(record))
+            after = copy.deepcopy(self.before)
+            after["interfaces"].extend(["owned-veth", "unrelated-veth"])
+            code, result = self.verify_fixture(directory, after)
+            self.assertEqual(code, 1)
+            self.assertEqual(result["differences"]["interfaces"]["added"], ["owned-veth"])
+            self.assertEqual(result["interface_owners"]["owned-veth"], ["run-fixture.json"])
+            # The final inventory, rather than a fresh before/after subtraction,
+            # must still refuse that same owned resource on another verification.
+            self.assertEqual(self.verify_fixture(directory, after)[0], 1)
+            self.assertEqual(self.verify_fixture(directory, self.before)[0], 0)
+            renamed = copy.deepcopy(self.before)
+            renamed["interfaces"].append("renamed-veth")
+            code, result = self.verify_fixture(directory, renamed)
+            self.assertEqual(code, 1, "renaming an owned link must not hide its kernel identity")
+            self.assertEqual(result["differences"]["interfaces"]["added"], ["renamed-veth"])
+            self.assertEqual(result["interface_owners"]["renamed-veth"], ["run-fixture.json"])
+            # A different link reusing the declared name is not the recorded
+            # link. An identical index in another namespace is not it either.
+            for namespace, index in [("500", 99), ("501", 7)]:
+                code, result = self.verify_fixture(directory, after, links={
+                    "namespace": "500", "links": [{"namespace": namespace,
+                    "ifindex": index, "ifname": "owned-veth"}],
+                })
+                self.assertEqual(code, 0)
+            code, result = self.verify_fixture(directory, after, links={"namespace": "501", "links": []})
+            self.assertEqual(code, 1)
+            self.assertIn("declared interface belongs to another network namespace", result["errors"])
+            record.update(owned_links=[], link_capture_complete=False)
+            path.write_text(json.dumps(record))
+            code, result = self.verify_fixture(directory, renamed)
+            self.assertEqual(code, 1)
+            self.assertIn("declared link capture is incomplete", result["errors"])
+            record["link_capture_complete"] = True
+            # Isolate the baseline-claim refusal: the claimed interface has
+            # departed, so the ordinary leftover path cannot reject it.
+            record["owned_interfaces"] = ["eth0"]
+            record["owned_links"] = []
+            path.write_text(json.dumps(record))
+            departed = {**self.before, "interfaces": ["lo"]}
+            code, result = self.verify_fixture(directory, departed)
+            self.assertEqual(code, 1)
+            self.assertIn("owned interface already existed in the cleanup baseline", result["errors"])
+            with patch.object(CLEANUP.subprocess, "Popen") as launched, \
+                    patch.object(CLEANUP, "DeclaredLinks") as monitored, \
+                    patch.object(CLEANUP.sys, "argv", ["cleanup", "run", "--owned-interface", "eth0",
+                        directory, "--", "must-not-start"]):
+                self.assertEqual(self.run_cleanup(), 1)
+                launched.assert_not_called()
+                monitored.assert_not_called()
+            for names in [["eth0"], ["../bad"], ["same", "same"], "owned-veth", [None]]:
+                with self.subTest(names=names):
+                    record["owned_interfaces"] = names
+                    path.write_text(json.dumps(record))
+                    self.assertEqual(self.verify_fixture(directory, self.before)[0], 1)
+
+        # Kernel notifications are queued before exec: even an add/rename/delete
+        # sequence completed before the next controller poll retains its identity.
+        def event(kind, index, name, family=0):
+            value = name.encode() + b"\0"
+            attr = struct.pack("=HH", len(value) + 4, 3) + value
+            attr += b"\0" * (-len(attr) % 4)
+            body = struct.pack("=BBHiII", family, 0, 0, index, 0, 0) + attr
+            return struct.pack("=IHHII", len(body) + 16, kind, 0, 0, 0) + body
+
+        with self.subTest(lifetime="successive-records"):
+            monitor = CLEANUP.DeclaredLinks(["owned-veth"])
+            monitor.observe(event(16, 7, "owned-veth") + event(16, 7, "renamed-veth"))
+            self.assertEqual(monitor.links, [{"namespace": monitor.namespace, "ifindex": 7,
+                             "declared_name": "owned-veth", "deleted": False}])
+            monitor.observe(event(17, 7, "renamed-veth") + event(16, 9, "owned-veth") + event(16, 7, "foreign0"))
+            self.assertEqual([link["ifindex"] for link in monitor.links], [7, 9])
+            self.assertEqual([link["deleted"] for link in monitor.links], [True, False])
+        for data in [b"\0" * 15, struct.pack("=IHHII", 100, 16, 0, 0, 0),
+                     struct.pack("=IHHII", 16, 4, 0, 0, 0)]:
+            with self.assertRaises(ValueError):
+                list(CLEANUP.link_events(data))
+        for truncated, sender, error in [(True, 0, None), (False, 123, None), (False, 0, OSError("overflow"))]:
+            with patch.object(CLEANUP.socket, "socket") as opened:
+                monitor = CLEANUP.DeclaredLinks(["owned-veth"])
+                monitor.socket = opened.return_value
+                monitor.socket.recvmsg.return_value = (event(16, 7, "owned-veth"), [],
+                                                       CLEANUP.socket.MSG_TRUNC if truncated else 0, (sender, 0))
+                monitor.socket.recvmsg.side_effect = error
+                monitor.drain()
+                self.assertTrue(monitor.errors)
+                self.assertIsNone(monitor.socket)
+                opened.return_value.close.assert_called_once()
+
+        cases = [
+            ("bridge-port", ["owned-veth"], set(), event(16, 7, "owned-veth") +
+             event(17, 7, "owned-veth", CLEANUP.socket.AF_BRIDGE) + event(16, 7, "owned-veth"),
+             "owned-veth", 7, False),
+            ("recreated", ["owned-veth"], set(), event(16, 7, "owned-veth") +
+             event(17, 7, "owned-veth") + event(16, 8, "owned-veth"), "owned-veth", 8, True),
+            ("recreated-renamed", ["owned-veth"], set(), event(16, 7, "owned-veth") +
+             event(17, 7, "owned-veth") + event(16, 8, "owned-veth") +
+             event(16, 8, "renamed-veth"), "renamed-veth", 8, False),
+            ("recreated-renamed-same-index", ["owned-veth"], set(), event(16, 7, "owned-veth") +
+             event(17, 7, "owned-veth") + event(16, 7, "owned-veth") +
+             event(16, 7, "renamed-veth"), "renamed-veth", 7, False),
+            ("late-child", ["owned-veth"], set(), b"", "owned-veth", 8, True),
+            ("second-declaration", ["owned-a", "owned-b"], set(), event(16, 7, "owned-a") +
+             event(17, 7, "owned-a") + event(16, 7, "owned-b"), "owned-b", 7, False),
+            ("initial-index", ["owned-veth"], {7}, event(17, 7, "foreign0") +
+             event(16, 7, "owned-veth"), "owned-veth", 7, False),
+            ("rename-control", ["owned-veth"], set(), event(16, 7, "owned-veth") +
+             event(16, 7, "renamed-veth"), "renamed-veth", 7, False),
+            ("name-and-index-control", ["owned-veth"], set(), event(16, 7, "owned-veth"),
+             "owned-veth", 7, True),
+        ]
+        for label, names, initial, events, live_name, index, own_run in cases:
+            with self.subTest(lifetime=label), tempfile.TemporaryDirectory() as directory:
+                monitor = CLEANUP.DeclaredLinks(names)
+                monitor.namespace, monitor.initial = "500", initial
+                monitor.observe(events)
+                self.owner_fixture(directory)
+                path = Path(directory) / "run-fixture.json"
+                record = json.loads(path.read_text())
+                record.update(owned_interfaces=names, interface_namespace="500", owned_links=monitor.links,
+                              link_capture_complete=True)
+                run_id = "a" * 32 if own_run else None
+                if own_run:
+                    path.unlink()
+                    path = Path(directory) / ("run-" + run_id + ".json")
+                    record["status"] = "running"
+                path.write_text(json.dumps(record))
+                after = {**self.before, "interfaces": [*self.before["interfaces"], live_name]}
+                code, result = self.verify_fixture(directory, after, run_id=run_id, links={
+                    "namespace": "500", "links": [{"namespace": "500", "ifindex": index,
+                                                     "ifname": live_name}],
+                })
+                self.assertEqual(code, 1, label)
+                self.assertEqual(result["interface_owners"][live_name], [path.name])
+                self.assertEqual(result["errors"], [], "must refuse the link, not a mock ancestry error")
+        with self.subTest(lifetime="bridge-family-is-not-creation"):
+            self.assertEqual(list(CLEANUP.link_events(event(16, 7, "owned-veth", CLEANUP.socket.AF_BRIDGE))), [])
+        with self.subTest(lifetime="late-delete"), tempfile.TemporaryDirectory() as directory:
+            self.owner_fixture(directory)
+            path = Path(directory) / "run-fixture.json"
+            record = json.loads(path.read_text())
+            record.update(status="running", owned_interfaces=["owned-veth"], interface_namespace="500",
+                          owned_links=[{"namespace": "500", "ifindex": 7,
+                                        "declared_name": "owned-veth", "deleted": False}],
+                          link_capture_complete=True)
+            path.unlink()
+            run_id = "b" * 32
+            path = Path(directory) / ("run-" + run_id + ".json")
+            path.write_text(json.dumps(record))
+            self.assertEqual(self.verify_fixture(directory, self.before, run_id=run_id)[0], 0)
+            self.assertTrue(json.loads(path.read_text())["owned_links"][0]["deleted"])
+            after = {**self.before, "interfaces": [*self.before["interfaces"], "foreign0"]}
+            self.assertEqual(self.verify_fixture(directory, after, links={"namespace": "500", "links": [
+                {"namespace": "500", "ifindex": 7, "ifname": "foreign0"}]} )[0], 0)
+        with self.subTest(lifetime="late-controller-rename"):
+            self.assert_late_renamed_capture(event)
+        with self.subTest(lifetime="preliminary-failure-is-sticky"):
+            self.assert_late_renamed_capture(event, disposal_failed=True)
+        with self.subTest(lifetime="clean-repeated-lifetimes"), tempfile.TemporaryDirectory() as directory:
+            monitor = CLEANUP.DeclaredLinks(["owned-veth"])
+            monitor.namespace = "500"
+            monitor.observe(event(16, 7, "owned-veth") + event(17, 7, "owned-veth") +
+                            event(16, 8, "owned-veth") + event(17, 8, "owned-veth"))
+            self.owner_fixture(directory)
+            path = Path(directory) / "run-fixture.json"
+            record = json.loads(path.read_text())
+            record.update(owned_interfaces=["owned-veth"], interface_namespace="500",
+                          owned_links=monitor.links, link_capture_complete=True)
+            path.write_text(json.dumps(record))
+            self.assertEqual(self.verify_fixture(directory, self.before)[0], 0)
+
+    def assert_late_renamed_capture(self, event, disposal_failed=False):
+        # Drive the real controller and verifier. Its first helper starts only
+        # after the primary exits; link events arrive while that helper runs.
+        root = {**self.init, **CLEANUP.read_stat(Path("/proc/self/stat")), "ppid": 0}
+        after = {**self.before, "interfaces": [*self.before["interfaces"], "renamed-veth"]}
+        events = event(16, 7, "owned-veth") + event(16, 7, "renamed-veth")
+        state, snapshots = {"ready": False, "emitted": False, "cleaned": False, "delete_ready": False}, []
+        with tempfile.TemporaryDirectory() as directory:
+            self.owner_fixture(directory)
+
+            def start(monitor):
+                monitor.namespace = "500"
+                monitor.socket = SimpleNamespace(close=lambda: None)
+
+            def drain(monitor):
+                if state["ready"] and monitor.socket is not None and not state["emitted"]:
+                    monitor.observe(events)
+                    state["emitted"] = True
+                if state["delete_ready"] and monitor.socket is not None:
+                    monitor.observe(event(17, 7, "renamed-veth"))
+                    state["delete_ready"] = False
+
+            class Process:
+                def __init__(self, command, **_kwargs):
+                    self.command, self.pid, self.waited = command, 999999, False
+                    self.returncode = 0 if command == ["late-primary"] else None
+                    if self.returncode is None:
+                        state["ready"] = True
+
+                def poll(self):
+                    if self.returncode is not None:
+                        return self.returncode
+                    if not self.waited:
+                        self.waited = True
+                        return None
+                    run_id = self.command[self.command.index("--run-id") + 1]
+                    kwargs = {"capture_pending": True} if "--capture-pending" in self.command else {}
+                    self.returncode = CLEANUP.verify(Path(directory), run_id, 0, **kwargs)
+                    snapshots.append(json.loads((Path(directory) / ("run-" + run_id + ".json")).read_text()))
+                    if disposal_failed and "--dispose-descendants" in self.command:
+                        state.update(cleaned=True, delete_ready=True)
+                        self.returncode = 1
+                    return self.returncode
+
+            with redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()), \
+                    patch.object(CLEANUP.os, "geteuid", return_value=0), \
+                    patch.object(CLEANUP.ctypes, "CDLL", return_value=SimpleNamespace(prctl=lambda *_: 0)), \
+                    patch.object(CLEANUP.DeclaredLinks, "start", start), \
+                    patch.object(CLEANUP.DeclaredLinks, "drain", drain), \
+                    patch.object(CLEANUP.subprocess, "Popen", Process), \
+                    patch.object(CLEANUP.time, "sleep"), \
+                    patch.object(CLEANUP, "snapshot", side_effect=lambda: self.before if state["cleaned"] else after), \
+                    patch.object(CLEANUP, "link_inventory", side_effect=lambda: {"namespace": "500", "links": []
+                        if state["cleaned"] else [{"namespace": "500", "ifindex": 7, "ifname": "renamed-veth"}]}), \
+                    patch.object(CLEANUP, "process_inventory", return_value=({root["pid"]: root}, [])), \
+                    patch.object(CLEANUP, "direct_children", return_value=set()):
+                code = CLEANUP.run_owned_command(Path(directory), ["late-primary"], ["owned-veth"])
+            self.assertEqual(code, 1, "late creation and rename must survive the controller's capture boundary")
+            self.assertTrue(state["emitted"])
+            self.assertEqual(snapshots[0]["status"], "running")
+            self.assertFalse(snapshots[0]["link_capture_complete"])
+            self.assertEqual(snapshots[-1]["status"], "complete")
+            self.assertTrue(snapshots[-1]["link_capture_complete"])
+            self.assertEqual(snapshots[-1]["owned_links"][0]["ifindex"], 7)
+            self.assertEqual(snapshots[-1]["owned_links"][0]["deleted"], disposal_failed)
+            final = json.loads((Path(directory) / snapshots[-1]["attribution"]).read_text())
+            self.assertFalse(final["passed"])
+            self.assertEqual(final["errors"], [])
+            if disposal_failed:
+                self.assertEqual(final["differences"], {})
+                self.assertFalse(snapshots[-1]["preliminary_cleanup_passed"])
+            else:
+                self.assertEqual(list(final["interface_owners"]), ["renamed-veth"])
+
+    def verify_fixture(self, directory, after, processes=None, errors=None, links=None, run_id=None):
+        indices = {"lo": 1, "eth0": 2, "owned-veth": 7, "renamed-veth": 7, "unrelated-veth": 8}
+        if links is None:
+            links = {"namespace": "500", "links": [{"namespace": "500", "ifindex": indices.get(name, 9),
+                     "ifname": name} for name in after["interfaces"]]}
+        argv = ["cleanup", "verify", directory]
+        if run_id:
+            argv += ["--run-id", run_id, "--command-exit-code", "0"]
+            processes = {1: self.init, 10: {**self.init, "pid": 10, "ppid": 1, "start_time": 100},
+                         os.getpid(): {**self.init, "pid": os.getpid(), "ppid": 10, "start_time": 200}}
         with patch.object(CLEANUP, "snapshot", return_value=after), \
+                patch.object(CLEANUP, "link_inventory", return_value=links, create=True), \
                 patch.object(CLEANUP, "process_inventory", return_value=(processes or {}, errors or [])), \
-                patch.object(CLEANUP.sys, "argv", ["cleanup", "verify", directory]):
+                patch.object(CLEANUP, "direct_children", return_value={os.getpid()}), \
+                patch.object(CLEANUP.sys, "argv", argv):
             code = self.run_cleanup()
-        return code, json.loads((Path(directory) / "result.json").read_text())
+        name = "result.json" if not run_id else "attribution-" + run_id + ".json"
+        return code, json.loads((Path(directory) / name).read_text())
 
     def test_reused_owner_pid_and_shared_cgroup_do_not_own_a_service(self):
         after = copy.deepcopy(self.before)
@@ -334,7 +607,8 @@ class CleanupTests(unittest.TestCase):
             self.assertEqual(result["namespace_owners"]["net"]["102"], {"status": "gone", "owners": []})
 
     def test_incomplete_corrupt_and_mismatched_ownership_fail_closed(self):
-        for fault in ["interrupted", "missing", "bad-json", "wrong-type", "baseline"]:
+        for fault in ["interrupted", "missing", "bad-json", "wrong-type", "baseline", "unclaimed-links",
+                      "duplicate-active-index", "invalid-preliminary-verdict"]:
             with self.subTest(fault=fault), tempfile.TemporaryDirectory() as directory:
                 self.owner_fixture(directory)
                 evidence = Path(directory)
@@ -347,6 +621,22 @@ class CleanupTests(unittest.TestCase):
                     (evidence / "ownership.json").unlink()
                 elif fault in {"bad-json", "wrong-type"}:
                     record.write_text("{" if fault == "bad-json" else "[]")
+                elif fault == "unclaimed-links":
+                    value = json.loads(record.read_text())
+                    value["owned_links"] = [{"namespace": "500", "ifindex": 7,
+                                             "declared_name": "owned-veth", "deleted": False}]
+                    record.write_text(json.dumps(value))
+                elif fault == "duplicate-active-index":
+                    value = json.loads(record.read_text())
+                    value.update(owned_interfaces=["owned-a", "owned-b"], interface_namespace="500",
+                                 link_capture_complete=True, owned_links=[
+                                     {"namespace": "500", "ifindex": 7, "declared_name": name, "deleted": False}
+                                     for name in ["owned-a", "owned-b"]])
+                    record.write_text(json.dumps(value))
+                elif fault == "invalid-preliminary-verdict":
+                    value = json.loads(record.read_text())
+                    value["preliminary_cleanup_passed"] = "yes"
+                    record.write_text(json.dumps(value))
                 else:
                     (evidence / "before.json").write_text(json.dumps(self.before) + " ")
                 self.assertEqual(self.verify_fixture(directory, self.before)[0], 1)
@@ -494,7 +784,7 @@ class CleanupTests(unittest.TestCase):
                         self.assertIn("pid 30", errors[0])
                         self.assertIn("fixture task", errors[0])
 
-    def test_surviving_namespaces_and_host_residue_fail_cleanup(self):
+    def test_raw_inventory_differences_retain_host_interface_diagnostics(self):
         for kind, value in [
             ("net", "102"), ("mnt", "202"), ("named_netns", "leaked-netns"),
             ("bpffs_entries", "leaked-pin f 13"), ("bpffs_mounts", "new bpffs mount"),
@@ -571,6 +861,7 @@ class WorkflowTests(unittest.TestCase):
     ]
     NATIVE_GTPU_DATAPATH_MARKERS = [
         "OPC_GTPU_OFF_SLOT_GENERATION_GUARD_PROVEN",
+        "OPC_GTPU_MULTIHOMING_PROVEN",
         "OPC_GTPU_WRONG_CURRENT_GRAPH_GUARD_PROVEN",
         "OPC_GTPU_TFT_IPV4_LIVE_PROVEN",
         "OPC_GTPU_TFT_REMOVAL_FENCE_DEFAULT_PROVEN:",
@@ -680,7 +971,7 @@ class WorkflowTests(unittest.TestCase):
                 with self.subTest(job=name, proof=check):
                     self.assertEqual([line.strip() for line in job.splitlines()].count(check),
                                      1 if name == "privileged-gtpu" else 0)
-        for name, minutes in [("privileged-gtpu", 30), ("privileged-gtpu-regressions", 20),
+        for name, minutes in [("privileged-gtpu", 45), ("privileged-gtpu-regressions", 45),
                               ("privileged-gtpu-resets", 20)]:
             self.assertIn(f"timeout-minutes: {minutes}\n", native[name])
             self.assertIn("runs-on: ubuntu-latest\n", native[name])
@@ -741,7 +1032,7 @@ class WorkflowTests(unittest.TestCase):
 
     def test_native_gtpu_proof_checks_reject_incomplete_or_skipped_runs(self):
         jobs = workflow_jobs("gtpu-privileged.yml")
-        self.assertEqual(len(set(self.NATIVE_GTPU_DATAPATH_MARKERS)), 44)
+        self.assertEqual(len(set(self.NATIVE_GTPU_DATAPATH_MARKERS)), 45)
         leaf_markers = [f"OPC_GTPU_ATTACHMENT_LEAF_PASSED: kind={kind} case={case} "
                         for kind in ("macvlan", "ipvlan", "veth")
                         for case in ("plain", "vrf", "collision", "siblings")]
@@ -805,7 +1096,7 @@ class WorkflowTests(unittest.TestCase):
         host = jobs["rust-local-kernel-lifecycle"]
         legacy = workflow_jobs("gtpu-privileged.yml")["privileged-gtpu"]
         self.assertNotIn("qualify-local-kernel-lifecycle.py", legacy)
-        self.assertIn("timeout-minutes: 30\n", legacy)
+        self.assertIn("timeout-minutes: 45\n", legacy)
         self.assertIn("runs-on: ubuntu-latest\n", host)
         self.assertLessEqual(int(re.search(r"timeout-minutes: (\d+)", host)[1]), 45)
         self.assertNotRegex(host, r"(?m)^    (needs|if):")
@@ -990,6 +1281,20 @@ class QualificationTests(unittest.TestCase):
         self.assertIsNone(record["source_unchanged"])
         self.assertEqual(record["source"], self.record["source"])
         self.assertEqual(record["build_kernel"], {"release": "build-host"})
+
+    def test_native_cases_keep_configured_scratch_after_sudo(self):
+        scratch = str(self.root / "private disk scratch")
+        with patch.dict(RUNNER.os.environ, {"TMPDIR": scratch}), \
+                patch.object(RUNNER.os, "geteuid", return_value=1000):
+            code, record, invocations = self.run_guest()
+        self.assertEqual(code, 0)
+        self.assertTrue(record["complete"] and record["passed"])
+        self.assertEqual(len(invocations), 2)
+        for command in invocations:
+            self.assertEqual(command[:2], ["sudo", "-n"])
+            self.assertIn("TMPDIR=" + scratch, command)
+            self.assertLess(command.index("env"), command.index("TMPDIR=" + scratch))
+            self.assertLess(command.index("TMPDIR=" + scratch), command.index("unshare"))
 
     def test_guest_failure_is_retained_and_stops_the_suite(self):
         code, record, invocations = self.run_guest(code=101)

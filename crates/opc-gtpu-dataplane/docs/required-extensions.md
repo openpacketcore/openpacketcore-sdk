@@ -61,6 +61,9 @@ executed source-test count, zero skips and the new completion marker on its
 full native lanes. The PR retains source guard-removal failures, an independent
 wire mutation, restored passes, tool versions and exact base/head/tree.
 
-This increment does not qualify the Linux kernel-GTP backend, backend parity,
-IPv6 typed responses, End Marker ordering, PSC insertion or installed N3
-selector receipts. Those remaining #341/#790 contracts stay explicit.
+The [control-port qualification](control-port.md) separately verifies Linux
+kernel-GTP and eBPF typed responses for both families. Linux kernel-GTP
+decapsulates G-PDUs for installed TEIDs without extension-comprehension checks,
+so this handoff and notification apply to the eBPF backend and to G-PDUs the
+kernel passes up. This extension handoff proof does not confer End Marker
+ordering, PSC insertion or installed N3 selector authority.

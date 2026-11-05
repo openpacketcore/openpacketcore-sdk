@@ -25,7 +25,7 @@ def corpus():
         add(f"count-{count}", True, wire)
         add(f"private-{count}", True, packet(body + bytes([255, 0, 3, 0x12, 0x34, 0xa5])))
         add(f"old-wide-{count}", False, packet(bytes([141, 0, count]) + values))
-        add(f"duplicate-ie-{count}", False, packet(body + bytes([141, 0])))
+        add(f"duplicate-ie-{count}", True, packet(body + bytes([141, 0])))
         add(f"tail-{count}", False, wire + b"\x00")
         add(f"truncated-{count}", False, wire[:-1])
         if count:

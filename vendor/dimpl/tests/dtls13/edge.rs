@@ -1005,6 +1005,227 @@ fn dtls13_alert_bad_certificate() {
     // and assert the handshake fails with an appropriate error.
 }
 
+/// Walk the first plaintext record's unfragmented ClientHello and return
+/// one extension body. This test helper does not reassemble fragments.
+///
+/// Lengths are scoped to each enclosing container: random bytes, session IDs,
+/// other extension bodies and following records cannot supply an extension.
+fn client_hello_extension(packet: &[u8], extension_type: u16) -> Option<&[u8]> {
+    fn take<'a>(input: &mut &'a [u8], length: usize) -> Option<&'a [u8]> {
+        let (value, rest) = input.split_at_checked(length)?;
+        *input = rest;
+        Some(value)
+    }
+
+    fn vector<'a>(input: &mut &'a [u8], length_bytes: usize) -> Option<&'a [u8]> {
+        let length = take(input, length_bytes)?
+            .iter()
+            .fold(0, |length, byte| (length << 8) | usize::from(*byte));
+        take(input, length)
+    }
+
+    // Helper scope (RFC 9147 Section 5.5): the first record must contain only
+    // one complete ClientHello. Never borrow bytes from a following record.
+    let mut packet = packet;
+    let record_header = take(&mut packet, 11)?;
+    if record_header[0] != 22 || record_header[3..5] != [0, 0] {
+        return None;
+    }
+    let mut record = vector(&mut packet, 2)?;
+    let handshake_header = take(&mut record, 12)?;
+    if handshake_header[0] != 1
+        || handshake_header[6..9] != [0, 0, 0]
+        || handshake_header[1..4] != handshake_header[9..12]
+    {
+        return None;
+    }
+    let body_length = u32::from_be_bytes([
+        0,
+        handshake_header[1],
+        handshake_header[2],
+        handshake_header[3],
+    ]) as usize;
+    let mut body = take(&mut record, body_length)?;
+    if !record.is_empty() {
+        return None;
+    }
+
+    // RFC 9147 Section 5.3: follow each vector's length to the extensions.
+    take(&mut body, 2 + 32)?; // legacy_version and random
+    vector(&mut body, 1)?; // legacy_session_id
+    vector(&mut body, 1)?; // legacy_cookie
+    vector(&mut body, 2)?; // cipher_suites
+    vector(&mut body, 1)?; // legacy_compression_methods
+    let mut extensions = vector(&mut body, 2)?;
+    if !body.is_empty() {
+        return None;
+    }
+
+    // RFC 8446 Section 4.2: finish walking the extension vector before
+    // accepting a match; malformed tails or duplicates of the requested type fail.
+    let mut found = None;
+    while !extensions.is_empty() {
+        let current_type = take(&mut extensions, 2)?;
+        let data = vector(&mut extensions, 2)?;
+        if current_type == extension_type.to_be_bytes() {
+            if found.is_some() {
+                return None;
+            }
+            found = Some(data);
+        }
+    }
+    found
+}
+
+const SIGNATURE_ALGORITHMS_EXTENSION: [u8; 10] =
+    [0x00, 0x0D, 0x00, 0x06, 0x00, 0x04, 0x04, 0x03, 0x05, 0x03];
+
+fn client_hello_signature_fixture(extensions: &[u8]) -> Vec<u8> {
+    // RFC 9147 Sections 4, 5.2 and 5.3: one unfragmented plaintext ClientHello.
+    let mut body = vec![0xFE, 0xFD];
+    body.extend_from_slice(&[0x55; 32]); // random
+    body.push(8); // legacy_session_id length
+    body.extend_from_slice(&[0x55; 8]);
+    body.push(0); // legacy_cookie length
+    body.extend_from_slice(&[0x00, 0x02, 0x13, 0x01]); // cipher_suites
+    body.extend_from_slice(&[0x01, 0x00]); // legacy_compression_methods
+    body.extend_from_slice(&(extensions.len() as u16).to_be_bytes());
+    body.extend_from_slice(extensions);
+
+    let mut handshake = vec![1]; // client_hello
+    handshake.extend_from_slice(&(body.len() as u32).to_be_bytes()[1..]);
+    handshake.extend_from_slice(&[0; 5]); // message_seq and fragment_offset
+    handshake.extend_from_slice(&(body.len() as u32).to_be_bytes()[1..]);
+    handshake.extend_from_slice(&body);
+
+    let mut packet = vec![22, 0xFE, 0xFD]; // handshake, legacy_record_version
+    packet.extend_from_slice(&[0; 8]); // epoch and sequence_number
+    packet.extend_from_slice(&(handshake.len() as u16).to_be_bytes());
+    packet.extend_from_slice(&handshake);
+    packet
+}
+
+#[test]
+fn dtls13_signature_schemes_ignore_extension_type_in_random() {
+    let mut packet = client_hello_signature_fixture(&SIGNATURE_ALGORITHMS_EXTENSION);
+    // This looks like an extension advertising Ed25519, but is only random data.
+    let random_start = 13 + 12 + 2;
+    packet[random_start..random_start + 8]
+        .copy_from_slice(&[0x00, 0x0D, 0x00, 0x04, 0x00, 0x02, 0x08, 0x07]);
+    assert_eq!(
+        client_hello_extension(&packet, 0x000D),
+        Some(&SIGNATURE_ALGORITHMS_EXTENSION[4..])
+    );
+}
+
+#[test]
+fn dtls13_signature_schemes_ignore_other_fields_and_extension_contents() {
+    let decoy = [0x00, 0x0D, 0x00, 0x04, 0x00, 0x02, 0x08, 0x07];
+    let mut packet = client_hello_signature_fixture(&SIGNATURE_ALGORITHMS_EXTENSION);
+    let session_id_start = 13 + 12 + 2 + 32 + 1;
+    packet[session_id_start..session_id_start + decoy.len()].copy_from_slice(&decoy);
+    assert_eq!(
+        client_hello_extension(&packet, 0x000D),
+        Some(&SIGNATURE_ALGORITHMS_EXTENSION[4..])
+    );
+
+    let mut extensions = vec![0x12, 0x34, 0x00, 0x08];
+    extensions.extend_from_slice(&decoy);
+    extensions.extend_from_slice(&SIGNATURE_ALGORITHMS_EXTENSION);
+    assert_eq!(
+        client_hello_extension(&client_hello_signature_fixture(&extensions), 0x000D),
+        Some(&SIGNATURE_ALGORITHMS_EXTENSION[4..])
+    );
+}
+
+#[test]
+fn dtls13_signature_schemes_reject_truncated_packets() {
+    let packet = client_hello_signature_fixture(&SIGNATURE_ALGORITHMS_EXTENSION);
+    for length in 0..packet.len() {
+        assert_eq!(
+            client_hello_extension(&packet[..length], 0x000D),
+            None,
+            "truncated at byte {length}"
+        );
+    }
+}
+
+#[test]
+fn dtls13_signature_schemes_reject_malformed_extension_lengths() {
+    for extensions in [
+        vec![0x00, 0x0D, 0xFF, 0xFF, 0x00, 0x04, 0x04, 0x03, 0x05, 0x03],
+        [
+            SIGNATURE_ALGORITHMS_EXTENSION.as_slice(),
+            &[0x12, 0x34, 0x00],
+        ]
+        .concat(),
+        [
+            SIGNATURE_ALGORITHMS_EXTENSION.as_slice(),
+            &[0x12, 0x34, 0x00, 0x01],
+        ]
+        .concat(),
+        [
+            SIGNATURE_ALGORITHMS_EXTENSION.as_slice(),
+            SIGNATURE_ALGORITHMS_EXTENSION.as_slice(),
+        ]
+        .concat(),
+    ] {
+        assert_eq!(
+            client_hello_extension(&client_hello_signature_fixture(&extensions), 0x000D),
+            None,
+            "malformed extensions: {extensions:02X?}"
+        );
+    }
+}
+
+#[test]
+fn dtls13_signature_schemes_require_the_real_extension() {
+    let mut packet = client_hello_signature_fixture(&[]);
+    let random_start = 13 + 12 + 2;
+    packet[random_start..random_start + 8]
+        .copy_from_slice(&[0x00, 0x0D, 0x00, 0x04, 0x00, 0x02, 0x08, 0x07]);
+    assert_eq!(client_hello_extension(&packet, 0x000D), None);
+}
+
+#[test]
+fn dtls13_signature_schemes_reject_invalid_record_framing() {
+    let packet = client_hello_signature_fixture(&SIGNATURE_ALGORITHMS_EXTENSION);
+    for (offset, value) in [(0, 23), (4, 1), (11, 0xFF), (12, 12)] {
+        let mut malformed = packet.clone();
+        malformed[offset] = value;
+        assert_eq!(
+            client_hello_extension(&malformed, 0x000D),
+            None,
+            "invalid record header at byte {offset}"
+        );
+    }
+}
+
+#[test]
+fn dtls13_signature_schemes_reject_invalid_handshake_framing() {
+    let packet = client_hello_signature_fixture(&SIGNATURE_ALGORITHMS_EXTENSION);
+    for (offset, value) in [(13, 2), (14, 1), (19, 1)] {
+        let mut malformed = packet.clone();
+        malformed[offset] = value;
+        assert_eq!(
+            client_hello_extension(&malformed, 0x000D),
+            None,
+            "invalid handshake header at byte {offset}"
+        );
+    }
+}
+
+#[test]
+fn dtls13_signature_schemes_reject_trailing_body_bytes() {
+    let mut packet = client_hello_signature_fixture(&SIGNATURE_ALGORITHMS_EXTENSION);
+    packet.push(0);
+    // Include the byte in all three outer containers, beyond the extension vector.
+    packet[12] += 1;
+    packet[16] += 1;
+    packet[24] += 1;
+    assert_eq!(client_hello_extension(&packet, 0x000D), None);
+}
+
 /// Regression test for bug #1: advertised signature schemes must all be functional.
 ///
 /// Previously, Ed25519 (0x0807) and RSA_PSS_RSAE_SHA256 (0x0804) were advertised
@@ -1037,29 +1258,37 @@ fn dtls13_only_functional_signature_schemes_advertised() {
     //                   + extensions_len(2) + extensions...
     let ch_packet = &out.packets[0];
 
-    // Find signature_algorithms extension (type 0x000D) in the packet.
-    // Scan for the 2-byte extension type.
-    let sig_alg_type: [u8; 2] = [0x00, 0x0D];
-    let pos = ch_packet
-        .windows(2)
-        .position(|w| w == sig_alg_type)
+    // Find signature_algorithms extension (type 0x000D) by walking the
+    // ClientHello structure, not by scanning for its type bytes: random fields
+    // can contain the pair `00 0D` and a scan then indexes out of bounds.
+    let sig_alg_data = client_hello_extension(ch_packet, 0x000D)
         .expect("signature_algorithms extension should be present in ClientHello");
+    assert!(
+        sig_alg_data.len() >= 2,
+        "signature_algorithms extension has no list length"
+    );
 
-    // Extension format: type(2) + ext_len(2) + list_len(2) + schemes(2 each)
-    let ext_len_offset = pos + 2;
-    let list_len_offset = ext_len_offset + 2;
-    let list_len =
-        u16::from_be_bytes([ch_packet[list_len_offset], ch_packet[list_len_offset + 1]]) as usize;
-    let schemes_start = list_len_offset + 2;
+    // Extension data format: list_len(2) + schemes(2 each)
+    let list_len = u16::from_be_bytes([sig_alg_data[0], sig_alg_data[1]]) as usize;
+    assert_eq!(
+        list_len + 2,
+        sig_alg_data.len(),
+        "signature_algorithms list length must match the extension body"
+    );
+    let schemes = &sig_alg_data[2..];
+    assert_eq!(
+        schemes.len() % 2,
+        0,
+        "signature_algorithms schemes must be 2 bytes each"
+    );
 
     // Extract all advertised scheme codes
-    let mut advertised: Vec<u16> = Vec::new();
-    let mut i = schemes_start;
-    while i < schemes_start + list_len {
-        let scheme = u16::from_be_bytes([ch_packet[i], ch_packet[i + 1]]);
-        advertised.push(scheme);
-        i += 2;
-    }
+    let advertised: Vec<u16> = schemes
+        .as_chunks::<2>()
+        .0
+        .iter()
+        .map(|scheme| u16::from_be_bytes(*scheme))
+        .collect();
 
     // Only ECDSA P-256 (0x0403) and P-384 (0x0503) should be advertised.
     let non_functional: Vec<u16> = advertised
@@ -1081,6 +1310,53 @@ fn dtls13_only_functional_signature_schemes_advertised() {
         vec![0x0403, 0x0503],
         "Expected exactly ECDSA P-256 and P-384"
     );
+}
+
+/// Regression for the raw-byte-scan bug: a `00 0D` pair inside the client
+/// random must not be mistaken for the signature_algorithms extension.
+#[test]
+fn structural_extension_walk_ignores_random_byte_pairs() {
+    let extensions: &[u8] = &[
+        // signature_algorithms (0x000D), body length 4.
+        0x00, 0x0d, 0x00, 0x04, // extension type and body length.
+        0x00, 0x02, 0x04, 0x03,
+    ];
+    let mut body = Vec::new();
+    body.extend_from_slice(&[0xfe, 0xfd]); // legacy_version
+    body.extend_from_slice(&[0x00, 0x0d]); // random begins with a false 00 0D
+    body.extend_from_slice(&[0u8; 30]);
+    body.push(0); // empty legacy_session_id
+    body.push(0); // empty cookie
+    body.extend_from_slice(&2u16.to_be_bytes()); // one cipher suite
+    body.extend_from_slice(&0x1301u16.to_be_bytes());
+    body.push(1); // one compression method
+    body.push(0);
+    body.extend_from_slice(&(extensions.len() as u16).to_be_bytes());
+    body.extend_from_slice(extensions);
+
+    let body_len = body.len() as u32;
+    let mut handshake = Vec::new();
+    handshake.push(1); // ClientHello
+    handshake.extend_from_slice(&body_len.to_be_bytes()[1..]);
+    handshake.extend_from_slice(&0u16.to_be_bytes()); // message_seq
+    handshake.extend_from_slice(&[0, 0, 0]); // fragment_offset
+    handshake.extend_from_slice(&body_len.to_be_bytes()[1..]); // fragment_length
+
+    let mut packet = Vec::new();
+    packet.push(22); // handshake content type
+    packet.extend_from_slice(&[0xfe, 0xfd]); // DTLS 1.2 record version
+    packet.extend_from_slice(&0u16.to_be_bytes()); // epoch
+    packet.extend_from_slice(&[0u8; 6]); // record sequence number
+    let record_len = (handshake.len() + body.len()) as u16;
+    packet.extend_from_slice(&record_len.to_be_bytes());
+    packet.extend_from_slice(&handshake);
+    packet.extend_from_slice(&body);
+
+    let extension = client_hello_extension(&packet, 0x000d)
+        .expect("structural walk must find the real extension");
+    assert_eq!(extension, &[0x00, 0x02, 0x04, 0x03]);
+    // The false pair is present in the random, at the start of the body.
+    assert_eq!(packet[27..29], [0x00, 0x0d]);
 }
 
 /// Regression test for bug #2: a bad record in a multi-record datagram must not

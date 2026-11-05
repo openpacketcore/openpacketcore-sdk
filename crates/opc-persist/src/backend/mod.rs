@@ -32,6 +32,8 @@ use crate::types::{extract_tenant, AuditKey, AuditOpType, AuditRecord, CommitSou
 use opc_types::TxId;
 
 mod ops;
+#[cfg(test)]
+mod tests;
 
 /// Connection storage shared with detached workers. Field order is deliberate:
 /// rusqlite must finish closing before the final retained admission is dropped.
@@ -127,7 +129,7 @@ pub(crate) fn validate_uuid_bytes(name: &str, bytes: &[u8]) -> Result<(), Persis
 }
 
 /// Deserialize a CommitSource from a DB-stored lowercase string.
-/// Returns `PersistError::inconsistent_state()` if the value is unrecognized.
+/// Returns `PersistError::corrupt_blob()` if the stored value is unrecognized.
 pub(crate) fn deserialize_commit_source(source: &str) -> Result<CommitSource, PersistError> {
     match source {
         "gnmi" => Ok(CommitSource::Gnmi),
@@ -136,9 +138,7 @@ pub(crate) fn deserialize_commit_source(source: &str) -> Result<CommitSource, Pe
         "startup_restore" => Ok(CommitSource::StartupRestore),
         "rollback" => Ok(CommitSource::Rollback),
         "commit_confirmed_restore" => Ok(CommitSource::CommitConfirmedRestore),
-        _ => Err(PersistError::inconsistent_state(
-            "unrecognized CommitSource in config_history",
-        )),
+        _ => Err(PersistError::corrupt_blob()),
     }
 }
 
@@ -194,6 +194,9 @@ pub struct SqliteBackend {
     pub(crate) consensus_apply_gate: Arc<tokio::sync::Semaphore>,
     #[cfg(test)]
     pub(crate) consensus_snapshot_test_hooks: Arc<crate::consensus::SnapshotTestHooks>,
+    /// Always-compiled snapshot work accounting. Production only counts
+    /// envelope verifications; test features may inject latency.
+    pub(crate) consensus_snapshot_work_hooks: Arc<crate::consensus::SnapshotWorkHooks>,
     /// Audit HMAC key used to seal and verify local audit-trail rows.
     audit_key: Arc<AuditKey>,
     management_audit_keys:
@@ -317,6 +320,10 @@ impl SqliteBackend {
         self.conn.clone()
     }
 
+    pub(crate) fn snapshot_work_hooks(&self) -> Arc<crate::consensus::SnapshotWorkHooks> {
+        Arc::clone(&self.consensus_snapshot_work_hooks)
+    }
+
     pub(crate) fn config_consensus_worker_gate(&self) -> Arc<tokio::sync::Semaphore> {
         self.config_consensus_worker_gate.clone()
     }
@@ -382,8 +389,12 @@ impl SqliteBackend {
         }
 
         let conn = Self::open_connection(&path, &audit_key)?;
+        #[cfg(test)]
+        let heap_pressure = tests::before_metadata_read(&conn);
         let consensus_required = crate::consensus::history::has_consensus_metadata_sync(&conn)
-            .map_err(|_| PersistError::corrupt_blob())?;
+            .map_err(crate::error::history_read_error)?;
+        #[cfg(test)]
+        drop(heap_pressure);
 
         let backend = Self {
             db_path: path,
@@ -398,6 +409,7 @@ impl SqliteBackend {
             consensus_apply_gate: Arc::new(tokio::sync::Semaphore::new(1)),
             #[cfg(test)]
             consensus_snapshot_test_hooks: Arc::new(crate::consensus::SnapshotTestHooks::default()),
+            consensus_snapshot_work_hooks: Arc::new(crate::consensus::SnapshotWorkHooks::default()),
             audit_key: Arc::new(audit_key),
             management_audit_keys: Arc::new(std::sync::OnceLock::new()),
             management_audit_data_version: Arc::new(AtomicU64::new(0)),
@@ -416,6 +428,7 @@ impl SqliteBackend {
     }
 
     #[allow(clippy::too_many_arguments)]
+    #[cfg(target_os = "linux")]
     pub(crate) fn from_retained_connection(
         path: PathBuf,
         ephemeral: bool,
@@ -440,6 +453,7 @@ impl SqliteBackend {
             consensus_apply_gate: Arc::new(tokio::sync::Semaphore::new(1)),
             #[cfg(test)]
             consensus_snapshot_test_hooks: Arc::new(crate::consensus::SnapshotTestHooks::default()),
+            consensus_snapshot_work_hooks: Arc::new(crate::consensus::SnapshotWorkHooks::default()),
             audit_key: Arc::new(audit_key),
             management_audit_keys: Arc::new(std::sync::OnceLock::new()),
             management_audit_data_version: Arc::new(AtomicU64::new(0)),

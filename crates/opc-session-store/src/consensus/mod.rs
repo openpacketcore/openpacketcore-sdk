@@ -19,6 +19,9 @@ mod snapshot_integrity;
 pub(crate) mod storage;
 pub(crate) mod store;
 pub mod types;
+#[cfg(test)]
+#[path = "native/roster/v1_fixture.rs"]
+pub(crate) mod v1_fixture;
 #[cfg(target_os = "linux")]
 pub(crate) mod verified_snapshot;
 

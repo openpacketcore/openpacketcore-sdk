@@ -9,7 +9,7 @@ use opc_protocol::{DecodeContext, EncodeContext};
 
 fn rebuild_tunnel(value: &DownlinkQosTunnel) -> DownlinkQosTunnel {
     DownlinkQosTunnel::new(
-        DownlinkTransport::new(value.downlink().address(), value.downlink().teid()),
+        DownlinkTransport::with_address(value.downlink().address(), value.downlink().teid()),
         value
             .flows()
             .map(|flow| AssociatedQosFlow {

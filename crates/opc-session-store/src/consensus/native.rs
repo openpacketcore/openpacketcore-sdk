@@ -6,10 +6,19 @@
 //! receipts. Infrastructure failure discards it. Publication is owned by the
 //! same mutex as every physical read; an unwind poisons/fences that owner.
 
+/// Shared typed-shape admission for native retention notifications in snapshots.
+pub(crate) fn validate_retention_notification_op(op: &crate::ReplicationOp) -> io::Result<()> {
+    changes::notification_payload_op(op).map(|_| ())
+}
+
 mod application;
 pub(crate) mod async_recovery;
 mod business;
 mod changes;
+#[cfg(all(test, feature = "lab-memory"))]
+mod epoch_command_parity_tests;
+#[cfg(test)]
+mod epoch_floor_tests;
 mod expiry;
 mod export;
 mod frontier_encoding;
@@ -17,6 +26,9 @@ mod history_order;
 mod image;
 #[cfg(all(test, target_os = "linux"))]
 mod isolated_snapshot_memory;
+mod key_codec;
+#[cfg(test)]
+pub(crate) mod key_retention_tests;
 mod lifecycle;
 #[cfg(test)]
 pub(crate) mod lifecycle_tests;
@@ -26,11 +38,18 @@ mod memory_observation;
 #[cfg(test)]
 mod memory_tests;
 mod ordinary;
+#[cfg(test)]
+pub(crate) mod ordinary_retention_tests;
+#[cfg(test)]
+mod replay_policy_parity_tests;
+pub(crate) mod retention;
 pub(crate) mod roster;
 mod row_map;
 mod scope_authority;
 mod scope_batch;
 mod scope_records;
+#[cfg(test)]
+pub(crate) mod test_journal;
 pub(crate) use scope_records::ScopeRecordCapture;
 mod shared;
 use row_map::RowMap;
@@ -56,9 +75,11 @@ pub(crate) mod owned;
 mod reads;
 pub(crate) use reads::{ReceiptCopies, ReceiptReads, ResolvedReceipts};
 pub(crate) mod generation;
-pub(crate) use capture::NativeChanges;
+pub(crate) use capture::{NativeChanges, SnapshotCapture};
 pub(crate) use changes::SnapshotSelection;
 pub(crate) mod prefix;
+#[cfg(test)]
+pub(crate) mod rollover_costs;
 use crate::sqlite::consensus::wal::snapshot::NativeSnapshotAuthority;
 pub(crate) use image::snapshot_prefix;
 use shared::SharedRow;
@@ -133,13 +154,33 @@ impl NativeLease {
     }
 }
 
-#[derive(Clone, Default, Serialize, Deserialize)]
+#[derive(Clone, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct NativeKeyState {
     record: Option<StoredSessionRecord>,
     lease: Option<NativeLease>,
     fence: u64,
     reserved: bool,
+    #[serde(default)]
+    retired_epoch: Option<u64>,
+}
+
+impl Serialize for NativeKeyState {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::SerializeStruct;
+        // Preserve the JSON commitment of untagged rows. The positional row
+        // vocabulary always carries the option and has its own discriminator.
+        let tagged = !serializer.is_human_readable() || self.retired_epoch.is_some();
+        let mut row = serializer.serialize_struct("NativeKeyState", 4 + usize::from(tagged))?;
+        row.serialize_field("record", &self.record)?;
+        row.serialize_field("lease", &self.lease)?;
+        row.serialize_field("fence", &self.fence)?;
+        row.serialize_field("reserved", &self.reserved)?;
+        if tagged {
+            row.serialize_field("retired_epoch", &self.retired_epoch)?;
+        }
+        row.end()
+    }
 }
 
 #[derive(Clone, Deserialize)]
@@ -286,6 +327,7 @@ impl<'de> Deserialize<'de> for NativeFrontiers {
             digest: value.digest,
             logical_time: value.logical_time,
             watch_sequence: value.watch_sequence,
+            retention: retention::Retention::default(),
             next_fence: value.next_fence,
             next_credential: value.next_credential,
             restore_revision: value.restore_revision,
@@ -329,6 +371,8 @@ struct NativeFrontierValues {
     digest: SessionConsensusEntryDigest,
     logical_time: Option<Timestamp>,
     watch_sequence: u64,
+    #[serde(default)]
+    retention: retention::Retention,
     next_fence: u64,
     next_credential: u64,
     restore_revision: u64,
@@ -358,6 +402,7 @@ impl Serialize for NativeFrontierValues {
         if !serializer.is_human_readable()
             && (self.voter_slots.is_some()
                 || self.async_recovery.is_some()
+                || self.retention != retention::Retention::default()
                 || self.fenced_transition_profile != FencedTransitionV2Profile::V2)
         {
             return Err(serde::ser::Error::custom(
@@ -365,6 +410,7 @@ impl Serialize for NativeFrontierValues {
             ));
         }
         let include_async_recovery = self.async_recovery.is_some();
+        let include_retention = self.retention != retention::Retention::default();
         let include_fenced_profile =
             self.fenced_transition_profile != FencedTransitionV2Profile::V2;
         let mut value = serializer.serialize_struct(
@@ -373,6 +419,7 @@ impl Serialize for NativeFrontierValues {
                 + usize::from(include_roster_v1)
                 + usize::from(include_roster_v2)
                 + usize::from(include_async_recovery)
+                + usize::from(include_retention)
                 + usize::from(include_fenced_profile)
                 + usize::from(self.voter_slots.is_some()),
         )?;
@@ -382,6 +429,9 @@ impl Serialize for NativeFrontierValues {
         value.serialize_field("digest", &self.digest)?;
         value.serialize_field("logical_time", &self.logical_time)?;
         value.serialize_field("watch_sequence", &self.watch_sequence)?;
+        if include_retention {
+            value.serialize_field("retention", &self.retention)?;
+        }
         value.serialize_field("next_fence", &self.next_fence)?;
         value.serialize_field("next_credential", &self.next_credential)?;
         value.serialize_field("restore_revision", &self.restore_revision)?;
@@ -580,26 +630,31 @@ impl NativeStorage {
         Ok(Self { business, log })
     }
 
-    #[cfg(test)]
-    pub(crate) fn replay_committed(&mut self) -> io::Result<()> {
-        self.replay_committed_with_check(&|| Ok(()))
+    pub(crate) fn changed_verification_bytes(&self) -> usize {
+        self.business.changed_verification_bytes() + self.log.changed_verification_bytes()
     }
 
-    pub(crate) fn replay_committed_with_check(
+    #[cfg(test)]
+    pub(crate) fn replay_committed(&mut self) -> io::Result<()> {
+        self.replay_committed_observed(&|| Ok(()), &mut |_| Ok(()))
+    }
+
+    pub(crate) fn replay_committed_observed(
         &mut self,
         check: &impl Fn() -> io::Result<()>,
+        completed: &mut impl FnMut(&mut Self) -> io::Result<()>,
     ) -> io::Result<()> {
         check()?;
         // Recovery owns its decoder/application cohort. Transport packaging
         // cannot enlarge preparation, and every durable entry is still
         // audited before any recovery publication or file repair.
-        // This bounds preparation, not arbitrary retained mixed-load suffixes.
+        // Exclusive recovery can authenticate and release completed journals
+        // between cohorts, then select a full base after the complete audit.
         // A full eight-epoch generation permits at most two retired epochs
         // without new receipts: 262144 * 72 B + <=34 * 64 KiB ranges and <=33
         // publication guards is <21 MiB. The full-generation cold-replay test
         // pins a <64 MiB process peak, then validates/appends that whole journal.
-        // Consumer/log/roster growth is a separate, pre-existing exposure; see
-        // docs/sdk-1122-reclaim-memory-evidence.md. No audit or repair cut moves.
+        // No durable audit or repair cut moves while these cohorts replay.
         const REPLAY_ENTRIES: usize = 8;
         let Some(committed) = self.log.committed else {
             return Ok(());
@@ -626,6 +681,11 @@ impl NativeStorage {
             let reads = self.business.capture_apply_reads(entries)?.resolve(check)?;
             let copies = reads.copy_current(&self.business)?;
             self.business.apply_with_receipts(entries, &copies)?;
+            drop(copies);
+            drop(reads);
+            drop(rows);
+            drop(capture);
+            completed(self)?;
             next = end;
         }
         Ok(())
@@ -682,6 +742,7 @@ struct NativeDelta<'a> {
     roster: roster::Ledger,
     roster_changes: roster::changes::Journal,
     keys: HashMap<SessionKey, NativeKeyState>,
+    key_removals: HashMap<SessionKey, retention::KeyRemoval>,
     expiry: expiry::ExpiryIndex,
     receipts: HashMap<FencedTransitionV2RequestId, NativeReceipt>,
     receipt_removals: changes::Removals,
@@ -690,6 +751,7 @@ struct NativeDelta<'a> {
     generic_receipts: HashMap<SessionConsensusRequestId, NativeGenericReceipt>,
     responses: Vec<SessionConsensusResponse>,
     notifications: Vec<ReplicationEntry>,
+    notification_outward_sequences: Vec<u64>,
     #[cfg(any(test, feature = "test-control"))]
     terminal_remainder_started: Option<std::time::Instant>,
 }
@@ -756,6 +818,7 @@ impl NativeState {
                 digest: SessionConsensusEntryDigest::GENESIS,
                 logical_time: None,
                 watch_sequence: 0,
+                retention: retention::Retention::default(),
                 next_fence: 1,
                 next_credential: 1,
                 restore_revision: 0,
@@ -837,6 +900,16 @@ impl NativeState {
         self.frontiers.current_snapshot.clone()
     }
 
+    /// Live installation authority; observing it does not prove durability.
+    #[cfg(feature = "test-control")]
+    pub(crate) fn snapshot_install_origin_for_test(
+        &self,
+    ) -> Option<crate::sqlite::consensus::CurrentSnapshot> {
+        self.snapshot_origin
+            .as_ref()
+            .map(|origin| origin.candidate().clone())
+    }
+
     pub(crate) fn retained_snapshots(&self) -> Vec<crate::sqlite::consensus::CurrentSnapshot> {
         let mut retained = self
             .snapshot_origin
@@ -902,8 +975,6 @@ impl NativeState {
     /// This bounded V2 fixture witness rejects any protected-roster namespace.
     #[cfg(any(test, feature = "test-control"))]
     pub(crate) fn business_digest_for_test(&self) -> io::Result<[u8; 32]> {
-        use sha2::{Digest, Sha256};
-
         if self.roster_root.is_some()
             || !self.roster.rows.is_empty()
             || !self.roster.partitions.is_empty()
@@ -916,6 +987,85 @@ impl NativeState {
                 "test V2 business witness does not admit a roster namespace",
             ));
         }
+        self.business_rows_digest_for_test()
+    }
+
+    /// Include the complete canonical roster carriers, partitions and witness
+    /// in a detached mixed-state crash comparison. The original V2-only
+    /// witness above continues to reject every roster namespace.
+    #[cfg(test)]
+    pub(crate) fn mixed_business_digest_for_test(&self) -> io::Result<[u8; 32]> {
+        use sha2::{Digest, Sha256};
+
+        struct HashWriter(Sha256);
+        impl io::Write for HashWriter {
+            fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+                self.0.update(bytes);
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> io::Result<()> {
+                Ok(())
+            }
+        }
+
+        let root = self
+            .roster_root
+            .as_deref()
+            .ok_or_else(|| invalid("test mixed business witness requires a roster root"))?;
+        let bytes = self
+            .roster
+            .rows
+            .len()
+            .checked_mul(std::mem::size_of::<[u8; 32]>())
+            .and_then(|bytes| bytes.checked_add(64 * 1024))
+            .ok_or_else(|| invalid("test mixed witness reservation overflow"))?;
+        let _memory = crate::consensus::verified_snapshot::VerificationMemory::reserve(bytes)?;
+        let mut digest = HashWriter(Sha256::new());
+        digest.0.update(b"OPC-native-test-mixed-business-v1\0");
+        digest.0.update(self.business_rows_digest_for_test()?);
+        let mut frontiers = self.frontiers.clone();
+        frontiers.current_snapshot = None; // Background persistence is not business content.
+        serde_json::to_writer(
+            &mut digest,
+            &(
+                self.identity,
+                &self.members,
+                frontiers,
+                root,
+                self.roster.witness,
+            ),
+        )
+        .map_err(|_| invalid("test mixed business metadata cannot encode"))?;
+        let scope = roster::fixed_scope(self.identity, &self.members);
+        let mut rows = Vec::new();
+        rows.try_reserve_exact(self.roster.rows.len())
+            .map_err(|_| invalid("test mixed witness allocation failed"))?;
+        for (binding, row) in &self.roster.rows {
+            if *binding != row.binding() {
+                return Err(invalid("test mixed roster binding differs"));
+            }
+            let mut encoded = HashWriter(Sha256::new());
+            roster::frame::write_row_detached(&mut encoded, row, root, &scope, &|| Ok(()))?;
+            rows.push(<[u8; 32]>::from(encoded.0.finalize()));
+        }
+        rows.sort_unstable();
+        digest.0.update((rows.len() as u64).to_be_bytes());
+        for row in rows {
+            digest.0.update(row);
+        }
+        digest
+            .0
+            .update((self.roster.partitions.len() as u64).to_be_bytes());
+        for (key, partition) in &self.roster.partitions {
+            roster::frame::write_partition(&mut digest, *key, partition)?;
+        }
+        Ok(digest.0.finalize().into())
+    }
+
+    #[cfg(any(test, feature = "test-control"))]
+    fn business_rows_digest_for_test(&self) -> io::Result<[u8; 32]> {
+        use sha2::{Digest, Sha256};
+
         // JSON object keys cannot encode SessionKey or request-ID structs.
         // Hash sorted complete rows instead; HAMT traversal order may change
         // on a cold reconstruction even when every stored byte is identical.
@@ -1078,6 +1228,17 @@ impl NativeState {
         Ok(Sha256::digest(bytes).into())
     }
 
+    /// Raw retained roster count and witness, independent of recovery classification.
+    #[cfg(test)]
+    pub(crate) fn roster_history_for_test(
+        &self,
+    ) -> (
+        usize,
+        Option<crate::fenced_mutation_roster_storage::GlobalChargeWitness>,
+    ) {
+        (self.roster.rows.len(), self.roster.witness)
+    }
+
     /// Raw per-key fence, independent of read or acceptance validation.
     #[cfg(test)]
     pub(crate) fn key_fence_for_test(&self, key: &SessionKey) -> u64 {
@@ -1197,7 +1358,10 @@ impl NativeState {
             crate::FenceToken::new(
                 self.keys
                     .get(key)
-                    .map_or(0, |state| state.fence)
+                    .map_or_else(
+                        || self.frontiers.retention.absent_fence(key),
+                        |state| state.fence,
+                    )
                     .max(self.frontiers.async_fence_floor()),
             ),
         )
@@ -1351,6 +1515,7 @@ impl NativeState {
             resolved,
             frontiers: self.frontiers.clone(),
             keys: HashMap::new(),
+            key_removals: HashMap::new(),
             roster: self.roster.clone(),
             roster_changes: roster::changes::Journal::empty(&self.roster)?,
             expiry: self.require_business_proof()?.expiry.clone(),
@@ -1361,6 +1526,7 @@ impl NativeState {
             generic_receipts: HashMap::new(),
             responses: Vec::with_capacity(entries.len()),
             notifications: Vec::new(),
+            notification_outward_sequences: Vec::new(),
             #[cfg(any(test, feature = "test-control"))]
             terminal_remainder_started: None,
         };
@@ -1368,6 +1534,7 @@ impl NativeState {
             check()?;
             delta.entry(entry, check)?;
         }
+        delta.frontiers.retire_notifications();
         check()?;
         Ok(delta)
     }
@@ -1386,6 +1553,11 @@ impl NativeState {
 }
 
 impl NativeDelta<'_> {
+    fn has_key(&self, key: &SessionKey) -> bool {
+        self.keys.contains_key(key)
+            || (!self.key_removals.contains_key(key) && self.base.keys.contains_key(key))
+    }
+
     fn key(&self, key: &SessionKey) -> NativeKeyState {
         let mut state = self.physical_key(key);
         state.apply_async_floor(self.frontiers.async_fence_floor());
@@ -1395,14 +1567,22 @@ impl NativeDelta<'_> {
     fn physical_key(&self, key: &SessionKey) -> NativeKeyState {
         self.keys
             .get(key)
-            .or_else(|| self.base.keys.get(key).map(|row| &**row))
+            .or_else(|| {
+                (!self.key_removals.contains_key(key))
+                    .then(|| self.base.keys.get(key).map(|row| &**row))
+                    .flatten()
+            })
             .cloned()
-            .unwrap_or_default()
+            .unwrap_or_else(|| NativeKeyState {
+                fence: self.frontiers.retention.absent_fence(key),
+                ..NativeKeyState::default()
+            })
     }
 
     fn set_key(&mut self, key: SessionKey, value: NativeKeyState) {
-        self.expiry
-            .replace(&key, Some(&self.physical_key(&key)), Some(&value));
+        let before = self.has_key(&key).then(|| self.physical_key(&key));
+        self.expiry.replace(&key, before.as_ref(), Some(&value));
+        self.key_removals.remove(&key);
         self.keys.insert(key, value);
     }
 
@@ -1441,6 +1621,12 @@ impl NativeDelta<'_> {
                 "native apply position is not contiguous and monotonic",
             ));
         }
+        let notification_start = self.notifications.len();
+        let internal_before = self.expiry.internal_key_count()?;
+        let floor_before = self.frontiers.async_fence_floor();
+        let outward_before = self
+            .frontiers
+            .outward_watch(self.frontiers.watch_sequence)?;
         let response = match &entry.payload {
             EntryPayload::Blank => empty_response(entry.log_id.index),
             EntryPayload::Membership(membership) => {
@@ -1495,6 +1681,35 @@ impl NativeDelta<'_> {
             EntryPayload::Normal(command) => self.command(command, entry.log_id.index, check)?,
         };
         if let EntryPayload::Normal(command) = &entry.payload {
+            if response.result.is_ok()
+                && !matches!(
+                    response.result,
+                    Ok(SessionMutationOutcome::CompareAndSet(
+                        crate::CompareAndSetResult::Conflict { .. }
+                    ))
+                )
+            {
+                let before = self.frontiers.retention.keys.epoch;
+                self.rotate_key_capacity()?;
+                let rotations = self
+                    .frontiers
+                    .retention
+                    .keys
+                    .epoch
+                    .checked_sub(before)
+                    .and_then(|count| u8::try_from(count).ok())
+                    .ok_or_else(|| invalid("native command capacity rotation count invalid"))?;
+                // Capacity is decided once for the committed command. The
+                // mutation tree and number of notifications carry no policy.
+                if let Some(first) = self.notifications.get_mut(notification_start) {
+                    first.replay_policy.capacity_rotations = rotations;
+                } else if rotations != 0 {
+                    self.append_replay_context(command, &response)?;
+                    self.notifications[notification_start]
+                        .replay_policy
+                        .capacity_rotations = rotations;
+                }
+            }
             if !crate::sqlite::consensus::contains_protected_roster_command(&command.intent)
                 && crate::sqlite::consensus::scope_authority::operation(&command.intent).is_none()
                 && crate::sqlite::consensus::scope_batch::operation(&command.intent).is_none()
@@ -1504,8 +1719,77 @@ impl NativeDelta<'_> {
                 }
             }
         }
+        if let EntryPayload::Normal(command) = &entry.payload {
+            let internal_key_count = self.expiry.internal_key_count()?;
+            let floor = self.frontiers.async_fence_floor();
+            if self.notifications.len() == notification_start
+                && (internal_key_count != internal_before || floor != floor_before)
+            {
+                self.append_replay_context(command, &response)?;
+            }
+            let count = self.notifications.len() - notification_start;
+            let following = u16::try_from(count.saturating_sub(1))
+                .ok()
+                .filter(|count| *count <= 255)
+                .ok_or_else(|| invalid("native application command entry count invalid"))?;
+            for (position, notification) in self.notifications[notification_start..]
+                .iter_mut()
+                .enumerate()
+            {
+                let policy = &mut notification.replay_policy;
+                policy.async_fence_floor = floor;
+                policy.internal_key_count = internal_key_count;
+                policy.command = if count == 1 {
+                    crate::ReplicationCommandBoundary::Single
+                } else if position == 0 {
+                    crate::ReplicationCommandBoundary::Start {
+                        id: *command.request_id.as_bytes(),
+                        following_entries: following,
+                    }
+                } else {
+                    crate::ReplicationCommandBoundary::Continue {
+                        id: *command.request_id.as_bytes(),
+                        remaining_entries: following - position as u16,
+                    }
+                };
+                if floor != floor_before {
+                    policy.recovery = crate::ReplicationRecoveryBoundary::Recover {
+                        previous_sequence: outward_before,
+                    };
+                }
+                notification
+                    .validate()
+                    .map_err(|_| invalid("native application replay policy invalid"))?;
+                // Freeze delivery coordinates under this command's frontier.
+                // The stored row retains its original raw sequence.
+                self.notification_outward_sequences
+                    .push(self.frontiers.outward_watch(notification.sequence)?);
+            }
+        }
         self.frontiers.applied = Some(entry.log_id);
         self.responses.push(response);
+        Ok(())
+    }
+
+    fn append_replay_context(
+        &mut self,
+        command: &SessionConsensusCommand,
+        response: &SessionConsensusResponse,
+    ) -> io::Result<()> {
+        let sequence = self
+            .frontiers
+            .watch_sequence
+            .checked_add(1)
+            .filter(|sequence| *sequence <= COUNTER_MAX)
+            .ok_or_else(|| invalid("native application context sequence exhausted"))?;
+        self.notifications.push(ReplicationEntry {
+            sequence,
+            tx_id: ReplicationTxId::from_request_bytes(*command.request_id.as_bytes()),
+            op: crate::ReplicationOp::Batch { ops: Vec::new() },
+            timestamp: response.logical_time.unwrap_or(command.logical_time),
+            replay_policy: crate::ReplicationReplayPolicy::preserve(),
+        });
+        self.frontiers.watch_sequence = sequence;
         Ok(())
     }
 
@@ -1849,7 +2133,13 @@ impl NativeDelta<'_> {
         };
         let mut result = if void {
             let current = self.key(request.lease().key());
-            match business::transition(request, &current, &self.frontiers, now) {
+            match business::transition(
+                request,
+                &current,
+                self.has_key(request.lease().key()),
+                &self.frontiers,
+                now,
+            ) {
                 Ok(_) => Err(StoreError::FencedTransitionVoided),
                 Err(error) if business::deterministic(&error) => Err(error),
                 Err(_) => return Err(invalid("native void authority check failed")),
@@ -2053,7 +2343,13 @@ impl NativeDelta<'_> {
         terminal: bool,
     ) -> io::Result<Result<FencedTransitionOutcome, StoreError>> {
         let current = self.key(request.lease().key());
-        match business::transition(request, &current, &self.frontiers, now) {
+        match business::transition(
+            request,
+            &current,
+            self.has_key(request.lease().key()),
+            &self.frontiers,
+            now,
+        ) {
             Ok(_) if terminal => Ok(Err(StoreError::FencedTransitionStorageExhausted)),
             Ok(effect) => {
                 let watch_sequence = self
@@ -2062,6 +2358,7 @@ impl NativeDelta<'_> {
                     .checked_add(1)
                     .ok_or_else(|| invalid("native watch sequence exhausted"))?;
                 let notification = ReplicationEntry {
+                    replay_policy: crate::ReplicationReplayPolicy::preserve(),
                     sequence: watch_sequence,
                     tx_id: ReplicationTxId::from_request_bytes(
                         fenced_transition_v2_outer_request_id(request.request_id()),

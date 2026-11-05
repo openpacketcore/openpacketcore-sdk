@@ -32,6 +32,59 @@
   planner cover the Release 18 protocol-error response boundary without
   retaining packet bodies or transaction state.
 
+Procedure-aware Create/Update Bearer receive applies TS 29.274 clause 7.7.9
+before decoding unexpected values. Create Bearer user-plane F-TEIDs use request
+instance 4 and response instances 8/9; Update Bearer has no user-plane F-TEID.
+Update Bearer PCO at either scope and SGW-only load/overload entries in
+Create/Update/Delete Bearer requests are discarded. Nested Update request APCO
+instance 0 remains supported, and the existing Create Bearer PCO compatibility
+view is retained. Raw-preserving encoding retains received octets; canonical
+encoding omits discarded IEs. The profile-less structural view and canonical
+builders retain their stricter projection checks. `tests/s2b_receive_policy.rs`
+and `tests/dedicated_bearer.rs` cover wrong instances, discarded values,
+mandatory fields, framing, literal payloads and bearer correlation.
+
+## Typed FQ-CSID values
+
+`FqCsid` adds typed FQ-CSID (IE 132) support beside the generic IE layer, using
+TS 29.274 **V19.6.0**, clauses **8.62**, **7.7.7** and **7.7.8**. Decode an existing
+`RawIe` with `FqCsid::decode_from_raw`; unrelated IE types return `Ok(None)`.
+The generic decoder remains responsible for TLIV framing and instance selection.
+
+`FqCsid::new` bounds storage to 0–15 unsigned 16-bit CSIDs. Node-ID forms are
+IPv4, IPv6, or the four-octet binary MCC/MNC-plus-operator-ID form. Numeric MCC
+and MNC each fit three decimal digits, and the operator ID fits twelve bits;
+this is not PLMN TBCD encoding and carries no separate MNC digit-count flag.
+Use `to_raw_ie(instance)` with a four-bit instance, then the existing raw IE
+encoder. Canonical output has zero header spare bits and no unknown extensions.
+
+The value decoder does not evaluate the header spare nibble; Strict and
+ProcedureAware framing rejects nonzero header spares before this decoder.
+It ignores unknown trailing octets of this extendable IE while requiring the
+complete Node-ID and every declared CSID. Reserved
+Node-ID Types 3–15 are invalid values, not spare bits. Errors contain no received
+values: missing/truncated known fields classify as Invalid Length (67), and a
+reserved type or invalid binary MCC/MNC classifies as Mandatory IE Incorrect (69)
+when the IE is mandatory or verifiably conditional in an applicable Request.
+`mandatory_request_cause` supplies that classification only; it does not plan or
+send a response. Optional-IE discard, erroneous Response notification and Echo
+special handling remain with the enclosing procedure.
+
+Clause 8.62 permits counts other than one only in Delete PDN Connection Set
+Requests. Procedure presence/count rules remain caller-owned, as do suitable
+global-unicast address selection, allocation and Node-ID/CSID uniqueness.
+Address fields are fixed-width wire representations, not a network allocation
+or reachability check. No new message procedure or transport is added.
+
+The specification is available from the
+[official TS 29.274 V19.6.0 publication](https://www.etsi.org/deliver/etsi_ts/129200_129299/129274/19.06.00_60/ts_129274v190600p.pdf).
+
+Evidence is specification-authored: `tests/fq_csid.rs` covers independent exact
+vectors for all three forms, empty values and reserved Node-ID types, each known
+prefix truncation, count/numeric boundaries, every spare nibble, raw/generic IE
+boundaries, maximum-length extension input, and deterministic randomized value
+layouts and round trips. It makes no independent-peer interoperability claim.
+
 ## N1-mode APCO value boundary
 
 `src/n1_mode.rs` implements the ordinary APCO value format from TS 24.008
@@ -194,8 +247,10 @@ The profile owns the typed IE families required by the S2b messages above:
 - Unknown, private, and unsupported future IEs follow the caller's
   `UnknownIePolicy` at every typed sequence scope: `Drop` omits them from the
   interpreted view, `Preserve` retains byte-exact `TypedIeValue::Raw`, and
-  `Reject` returns `UnknownCriticalIe`. They are never interpreted as product
-  policy.
+  `Reject` returns `UnknownCriticalIe`. `Reject` is a diagnostic mode and is
+  not conformant for network receive of unknown optional IEs under TS 29.274
+  §7.7.1; use the default `Preserve` or `Drop` there. These IEs are never
+  interpreted as product policy.
 
 ### Required semantic validation
 
@@ -496,9 +551,26 @@ coverage.
      to prevent. The first *usable* value wins, so an unusable instance does
      not shadow a later usable one; `is_empty()` reports on addresses only, so
      an MTU-only value is still empty.
-   - Bearer QoS decodes the fixed 22-octet shape into a typed
+   - Bearer QoS decodes the required 22-octet prefix into a typed
      Allocation/Retention Priority, QCI, and 40-bit integer-kbit/s maximum and
-     guaranteed bit-rate fields. ARP priority level and spare bits are checked.
+     guaranteed bit-rate fields. ARP priority level is checked; received spare
+     bits are ignored under §7.7.8 and canonical encoding clears them. Direct
+     sender construction still rejects nonzero spares.
+     TS 29.274 Table 8.1-1 classifies this IE as Extendable: unknown trailing
+     octets are ignored on decode per clause 7.7.7, omitted by canonical
+     encoding, and retained by raw-preserving message encoding. The rates use
+     the GTP encoding in clause 8.15; NAS extended-rate octets from
+     TS 24.008 clause 10.5.6.5 are a separate encoding. Construction and
+     encoding reject rates wider than 40 bits. `tests/extended_bearer_qos.rs`
+     covers these wire bounds, prefix length, invalid rate relationships,
+     TLIV overruns and nested S2b receive.
+     `AllocationRetentionPriority::cmp_priority` ranks level 1 highest and
+     level 15 lowest per TS 29.274 clause 8.15 and TS 29.212 clause 5.3.45.
+     Equal levels compare equal regardless of PCI/PVI. Capability and
+     vulnerability follow TS 29.212 clauses 5.3.46-5.3.47: a clear wire bit
+     means enabled; the public booleans express that permission. Tests cover
+     all levels and flag combinations, literal wire values, spare bits and
+     range rejection. Consumers apply the flags separately from priority.
      GBR QCIs require a non-zero maximum in at least one direction and each GBR
      must be no greater than its same-direction MBR; a direction may
      intentionally carry zero MBR/GBR. Standardized non-GBR QCIs require all

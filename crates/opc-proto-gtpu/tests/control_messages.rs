@@ -88,7 +88,13 @@ fn extension_list_independent_complete_count_domain_and_mutations() {
         let result = GtpuControlMessage::decode_datagram(&wire, DecodeContext::default());
         if fields[1] == "1" {
             let message = result.unwrap_or_else(|error| panic!("{}: {error}", fields[0]));
-            assert_eq!(encode(&message).as_ref(), wire, "{}", fields[0]);
+            let mut canonical = wire.clone();
+            if fields[0].starts_with("duplicate-ie-") {
+                canonical.truncate(canonical.len() - 2);
+                let length = u16::try_from(canonical.len() - 8).unwrap();
+                canonical[2..4].copy_from_slice(&length.to_be_bytes());
+            }
+            assert_eq!(encode(&message).as_ref(), canonical, "{}", fields[0]);
             // All positive corpus frames have exactly the authored n values,
             // including zero and the maximum 255 distinct nonzero types.
             let GtpuControlMessage::SupportedExtensionHeadersNotification(value) = message else {
@@ -107,7 +113,7 @@ fn extension_list_independent_complete_count_domain_and_mutations() {
             refused += 1;
         }
     }
-    assert_eq!((admitted, refused), (512, 2043));
+    assert_eq!((admitted, refused), (768, 1787));
 }
 
 #[test]
@@ -995,7 +1001,7 @@ fn builders_round_trip_supported_notification_and_end_marker_private_data() {
 }
 
 #[test]
-fn unknown_tlv_policy_preserves_drops_or_rejects_without_exposing_value() {
+fn unknown_tlv_policy_preserves_or_skips_without_exposing_value() {
     let wire = [0x32, 0x01, 0, 8, 0, 0, 0, 0, 0, 1, 0, 0, 200, 0, 1, 0xab];
     let preserved = decode(&wire);
     let request = match &preserved {
@@ -1025,12 +1031,9 @@ fn unknown_tlv_policy_preserves_drops_or_rejects_without_exposing_value() {
         unknown_ie_policy: UnknownIePolicy::Reject,
         ..DecodeContext::default()
     };
-    let error = GtpuControlMessage::decode(&wire, reject_ctx)
-        .expect_err("reject policy must reject an unknown TLV");
-    assert_eq!(
-        error.code(),
-        &GtpuControlCodecErrorCode::UnknownIe { ie_type: 200 }
-    );
+    let (_, skipped) =
+        GtpuControlMessage::decode(&wire, reject_ctx).expect("network receivers skip unknown TLVs");
+    assert_eq!(skipped, dropped);
 }
 
 #[test]
@@ -1087,6 +1090,9 @@ fn comprehension_bits_drive_unknown_extension_handling() {
 
     let pdcp = GtpuExtensionHeaderType::new(0xc0);
     assert!(pdcp.unsupported_requires_comprehension_by(GtpuExtensionHeaderRecipient::Intermediate));
+    assert!(pdcp
+        .comprehension()
+        .is_required_by(GtpuExtensionHeaderRecipient::Intermediate));
     assert!(!pdcp.unsupported_requires_comprehension_by(
         GtpuExtensionHeaderRecipient::ServingGatewayReceivingGpdu
     ));
@@ -1094,9 +1100,13 @@ fn comprehension_bits_drive_unknown_extension_handling() {
 
 #[test]
 fn generic_decoder_rejects_only_unknown_comprehension_required_extensions() {
-    for (extension_type, should_reject) in
-        [(0x04, false), (0x44, false), (0x84, true), (0xc4, true)]
-    {
+    for (extension_type, should_reject) in [
+        (0x04, false),
+        (0x44, false),
+        (0x84, true),
+        (0x87, true),
+        (0xc4, true),
+    ] {
         let wire = [
             0x34,
             0xff,
@@ -1136,7 +1146,7 @@ fn generic_decoder_rejects_only_unknown_comprehension_required_extensions() {
             let error = result.expect_err("required extension must be rejected");
             assert_eq!(error.code(), &DecodeErrorCode::UnknownCriticalIe);
         } else {
-            assert!(result.is_ok(), "optional extension must be skipped");
+            assert!(result.is_ok(), "optional extension must decode");
         }
     }
 }
@@ -1196,10 +1206,8 @@ fn mandatory_cardinality_order_flags_and_teid_fail_closed() {
 
     let duplicate_recovery = [0x32, 0x02, 0, 8, 0, 0, 0, 0, 0, 1, 0, 0, 14, 0, 14, 0];
     assert_eq!(
-        GtpuControlMessage::decode(&duplicate_recovery, DecodeContext::default())
-            .expect_err("duplicate Recovery must fail")
-            .code(),
-        &GtpuControlCodecErrorCode::DuplicateIe { ie_type: 14 }
+        encode(&decode(&duplicate_recovery)).as_ref(),
+        &[0x32, 0x02, 0, 6, 0, 0, 0, 0, 0, 1, 0, 0, 14, 0]
     );
 
     let out_of_order = [
@@ -1294,50 +1302,52 @@ fn error_indication_mandatory_ie_cardinality_and_offsets_are_exact() {
         0x32, 0x1a, 0, 21, 0, 0, 0, 0, 0, 0, 0, 0, 16, 0x11, 0x22, 0x33, 0x44, 16, 0x55, 0x66,
         0x77, 0x88, 133, 0, 4, 192, 0, 2, 1,
     ];
-    let error = GtpuControlMessage::decode(&duplicate_teid, DecodeContext::default())
-        .expect_err("duplicate TEID Data I must fail");
+    let value = decode(&duplicate_teid);
     assert_eq!(
-        error.code(),
-        &GtpuControlCodecErrorCode::DuplicateIe { ie_type: 16 }
+        value,
+        decode(&[
+            0x32, 0x1a, 0, 16, 0, 0, 0, 0, 0, 0, 0, 0, 16, 0x11, 0x22, 0x33, 0x44, 133, 0, 4, 192,
+            0, 2, 1
+        ])
     );
-    assert_eq!(error.offset(), 17);
+    assert_eq!(encode(&value).len(), duplicate_teid.len() - 5);
 
     let duplicate_peer = [
         0x32, 0x1a, 0, 23, 0, 0, 0, 0, 0, 0, 0, 0, 16, 0x11, 0x22, 0x33, 0x44, 133, 0, 4, 192, 0,
         2, 1, 133, 0, 4, 198, 51, 100, 1,
     ];
-    let error = GtpuControlMessage::decode(&duplicate_peer, DecodeContext::default())
-        .expect_err("duplicate GTP-U Peer Address must fail");
+    let value = decode(&duplicate_peer);
     assert_eq!(
-        error.code(),
-        &GtpuControlCodecErrorCode::DuplicateIe { ie_type: 133 }
+        value,
+        decode(&[
+            0x32, 0x1a, 0, 16, 0, 0, 0, 0, 0, 0, 0, 0, 16, 0x11, 0x22, 0x33, 0x44, 133, 0, 4, 192,
+            0, 2, 1
+        ])
     );
-    assert_eq!(error.offset(), 24);
+    assert_eq!(encode(&value).len(), duplicate_peer.len() - 7);
 }
 
 #[test]
-fn duplicate_timestamp_and_supported_type_list_fail_at_datagram_offsets() {
+fn duplicate_timestamp_and_supported_type_list_use_first_occurrence() {
     let duplicate_timestamp = [
         0x32, 0x01, 0, 18, 0, 0, 0, 0, 0, 1, 0, 0, 231, 0, 4, 1, 2, 3, 4, 231, 0, 4, 5, 6, 7, 8,
     ];
-    let error = GtpuControlMessage::decode(&duplicate_timestamp, DecodeContext::default())
-        .expect_err("duplicate Recovery Time Stamp must fail");
+    let value = decode(&duplicate_timestamp);
     assert_eq!(
-        error.code(),
-        &GtpuControlCodecErrorCode::DuplicateIe { ie_type: 231 }
+        value,
+        decode(&[0x32, 0x01, 0, 11, 0, 0, 0, 0, 0, 1, 0, 0, 231, 0, 4, 1, 2, 3, 4])
     );
-    assert_eq!(error.offset(), 19);
+    assert_eq!(encode(&value).len(), duplicate_timestamp.len() - 7);
 
     let duplicate_type_list = [
         0x32, 0x1f, 0, 10, 0, 0, 0, 0, 0, 0, 0, 0, 141, 1, 0x40, 141, 1, 0x85,
     ];
-    let error = GtpuControlMessage::decode(&duplicate_type_list, DecodeContext::default())
-        .expect_err("duplicate Extension Header Type List must fail");
+    let value = decode(&duplicate_type_list);
     assert_eq!(
-        error.code(),
-        &GtpuControlCodecErrorCode::DuplicateIe { ie_type: 141 }
+        value,
+        decode(&[0x32, 0x1f, 0, 7, 0, 0, 0, 0, 0, 0, 0, 0, 141, 1, 0x40])
     );
-    assert_eq!(error.offset(), 15);
+    assert_eq!(encode(&value).len(), duplicate_type_list.len() - 3);
 }
 
 #[test]
@@ -1376,15 +1386,11 @@ fn error_and_supported_notification_require_sequence_and_zero_header_teid() {
 }
 
 #[test]
-fn unexpected_ie_offset_is_datagram_relative() {
+fn unexpected_ie_is_skipped() {
     let recovery_on_echo_request = [0x32, 0x01, 0, 6, 0, 0, 0, 0, 0, 1, 0, 0, 14, 0];
-    let error = GtpuControlMessage::decode(&recovery_on_echo_request, DecodeContext::default())
-        .expect_err("Recovery is not valid on Echo Request");
-    assert_eq!(
-        error.code(),
-        &GtpuControlCodecErrorCode::UnexpectedIe { ie_type: 14 }
-    );
-    assert_eq!(error.offset(), 12);
+    let value = decode(&recovery_on_echo_request);
+    assert_eq!(value, decode(&[0x32, 0x01, 0, 4, 0, 0, 0, 0, 0, 1, 0, 0]));
+    assert_eq!(encode(&value).len(), 12);
 }
 
 #[test]
@@ -1430,7 +1436,7 @@ fn known_ie_and_udp_extension_lengths_fail_closed() {
 }
 
 #[test]
-fn duplicate_udp_extension_and_wrong_procedure_ie_fail_closed() {
+fn duplicate_udp_extension_fails_and_wrong_procedure_ie_is_skipped() {
     let duplicate_udp_extension = [
         0x36, 0x1a, 0, 24, 0, 0, 0, 0, 0, 0, 0, 0x40, 1, 0x08, 0x68, 0x40, 1, 0x08, 0x68, 0, 16, 0,
         0, 0, 1, 133, 0, 4, 192, 0, 2, 1,
@@ -1446,10 +1452,8 @@ fn duplicate_udp_extension_and_wrong_procedure_ie_fail_closed() {
 
     let tunnel_status_on_echo = [0x32, 0x01, 0, 8, 0, 0, 0, 0, 0, 1, 0, 0, 230, 0, 1, 0];
     assert_eq!(
-        GtpuControlMessage::decode(&tunnel_status_on_echo, DecodeContext::default())
-            .expect_err("Tunnel Status IE is not valid on Echo")
-            .code(),
-        &GtpuControlCodecErrorCode::UnexpectedIe { ie_type: 230 }
+        encode(&decode(&tunnel_status_on_echo)).as_ref(),
+        &[0x32, 0x01, 0, 4, 0, 0, 0, 0, 0, 1, 0, 0]
     );
 
     let gpdu = [0x30, 0xff, 0, 2, 0, 0, 0, 1, 42, 0];

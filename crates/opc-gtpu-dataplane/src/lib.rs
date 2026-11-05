@@ -69,6 +69,23 @@
 //!
 //! Raw Linux netlink and socket syscalls stay in [`opc_linux_gtpu_sys`]; this
 //! crate is safe Rust and never performs `unsafe` operations.
+//!
+//! Canonical backend persistence formats are internal. An ordinary caller
+//! cannot mint selector adapter capabilities from arbitrary stored bytes.
+//!
+//! ```compile_fail
+//! use opc_gtpu_dataplane::selector_adapter_codec::GtpuSelectorAdapterBinding;
+//! let _ = GtpuSelectorAdapterBinding::decode(&[1_u8; 145]);
+//! ```
+//! ```compile_fail
+//! use opc_gtpu_dataplane::selector_adapter_codec::GtpuSelectorAdapterTerminalCapsule;
+//! let _ = GtpuSelectorAdapterTerminalCapsule::decode(&[1_u8; 110]);
+//! ```
+//! ```compile_fail
+//! use opc_gtpu_dataplane::selector_adapter_codec::GtpuSelectorAdapterOperationStamp;
+//! let _ = GtpuSelectorAdapterOperationStamp::decode(&[1_u8; 208]);
+//! ```
+//!
 
 #![forbid(unsafe_code)]
 
@@ -88,6 +105,7 @@ pub mod mock;
 pub mod model;
 pub mod n3;
 pub mod reassembly;
+mod selector_adapter_codec;
 pub mod selector_namespace;
 mod selector_namespace_v2;
 pub mod testkit;
@@ -144,10 +162,10 @@ pub use model::{
     GtpDevice, GtpPdpContext, GtpRole, GtpVersion, GtpuBackendKind, GtpuCapability,
     GtpuDownlinkEndpoint, GtpuDownlinkFragmentContract, GtpuDownlinkInnerMtu,
     GtpuDownlinkOversizePolicy, GtpuIpFamilyCapabilities, GtpuLocalEndpointSet,
-    GtpuOuterFragmentPolicy, GtpuProbe, GtpuReassemblyBounds, GtpuSessionAttachmentSelector,
-    GtpuSessionDeviceId, GtpuSessionEntry, GtpuSessionGroup, GtpuSessionGroupConflict,
-    GtpuSessionGroupId, GtpuSessionGroupIndeterminateReason, GtpuSessionGroupReadback,
-    GtpuSessionGroupReconcileOutcome, GtpuSessionGroupReconcileRequest,
+    GtpuOuterFragmentPolicy, GtpuPeerSourcePolicy, GtpuProbe, GtpuReassemblyBounds,
+    GtpuSessionAttachmentSelector, GtpuSessionDeviceId, GtpuSessionEntry, GtpuSessionGroup,
+    GtpuSessionGroupConflict, GtpuSessionGroupId, GtpuSessionGroupIndeterminateReason,
+    GtpuSessionGroupReadback, GtpuSessionGroupReconcileOutcome, GtpuSessionGroupReconcileRequest,
     GtpuSessionGroupRemovalOutcome, GtpuSessionGroupSelector, GtpuSessionModelError,
     GtpuSessionPaa, GtpuSessionSelectorProvenance, GtpuSessionSelectorReuseEvidence,
     GtpuSessionSelectorReuseProof, GtpuSourcePortPolicy, GtpuSourcePortRange,
@@ -174,7 +192,7 @@ pub use model::{
     PdpContextRemovalOutcome, PdpContextRepairReason, PdpContextSelector,
     PdpContextSelectorOccupancy, PdpContextUplinkIdentity, PdpContextUplinkSelector,
     PdpDeviceIncarnation, PdpLiveWriterProof, PdpLiveWriterRemovalRequest, PdpRestartRecoveryProof,
-    PdpRestartRecoveryRequest, RemovePdpContextRequest, RetainedDeviceConflictReason,
+    PdpRestartRecoveryRequest, PeerTeid, RemovePdpContextRequest, RetainedDeviceConflictReason,
     RetainedDeviceIdentityAcquisition, RetainedDeviceIdentityOutcome,
     RetainedDeviceIdentityRequest, RetainedDeviceIndeterminateReason, RetainedDeviceRepairReason,
     RetainedGraphCleanupClassification, RetainedGraphCleanupRefusal, RetainedGraphCleanupRequest,
@@ -269,10 +287,11 @@ mod integration_tests {
     fn context() -> GtpPdpContext {
         GtpPdpContext {
             local_teid: teid(0x1000_0001),
-            peer_teid: teid(0x2000_0001),
+            peer_teid: teid(0x2000_0001).into(),
             ms_address: IpAddr::V4(Ipv4Addr::new(10, 23, 0, 2)),
             peer_address: IpAddr::V4(Ipv4Addr::new(192, 0, 2, 10)),
             link_ifindex: 7,
+            downlink_peer_source_policy: crate::GtpuPeerSourcePolicy::BackendDefault,
             downlink_source_port_policy: GtpuSourcePortPolicy::Any,
             gtp_version: GtpVersion::V1,
             bearer_mark: None,

@@ -248,7 +248,7 @@ async fn automatic_repeated_split_outlasts_both_acquisition_envelopes() {
     .unwrap()
     .unwrap();
     tokio::time::pause();
-    schedule::with_frozen_time(async {
+    let acquisition = schedule::with_frozen_time(async {
         let millis = (Instant::now() + late.tick - origin)
             .as_nanos()
             .div_ceil(1_000_000);
@@ -306,6 +306,15 @@ async fn automatic_repeated_split_outlasts_both_acquisition_envelopes() {
             .iter()
             .map(|index| cluster.stores[*index].clone())
             .collect();
+        let continuing_stores = surviving_stores.clone();
+        let continuous = tokio::spawn(async move {
+            AssertUnwindSafe(ConsensusTestCluster::wait_ready_stores(
+                &continuing_stores,
+                false,
+            ))
+            .catch_unwind()
+            .await
+        });
         let wait26 = async {
             // The unchanged helper checks its budget after each probe. A
             // probe already in flight must not stop the controlled clock at
@@ -387,6 +396,7 @@ async fn automatic_repeated_split_outlasts_both_acquisition_envelopes() {
         };
         let (result26, result30, ()) = tokio::join!(wait26, wait30, drive);
         assert_eq!(Instant::now() - started, Duration::from_secs(30));
+        let ended_before_election = continuous.is_finished();
         match result26 {
             Ok(Err(panic26)) => assert_eq!(
                 panic26
@@ -443,10 +453,22 @@ async fn automatic_repeated_split_outlasts_both_acquisition_envelopes() {
         for script in &scripts {
             script.finish();
         }
+        // Let an already scheduled readiness probe observe the committed
+        // leader. The election itself still completed at exactly 35.7 s.
+        tokio::time::advance(Duration::from_millis(20)).await;
+        (ended_before_election, continuous.await.unwrap())
     })
     .await;
     // Planned shutdown has its own bounded waits and needs a running clock.
     cluster.shutdown().await;
+    assert!(
+        !acquisition.0,
+        "the readiness helper ended during legitimate split-vote progress"
+    );
+    assert!(
+        acquisition.1.is_ok(),
+        "the readiness helper must observe the eventual automatic election"
+    );
 }
 
 #[tokio::test(start_paused = true)]

@@ -92,7 +92,7 @@ results, and rejects incorrect procedure criticality before typed decoding.
 The complete existing Echo Request/Response and downlink PSC literals are
 compared to the published GTP-U bytes. Twenty-two additional PSC packets reuse
 unchanged cases from the independent `opc-gtpu-dataplane/tests/n3_reference.tsv`
-corpus (SHA-256 `87583b7b1a6474d0dc7ea46196bddcc915a3676c809ef6b642cb5273728703f2`).
+corpus (SHA-256 `3706c33835e665078c54ea2c3b37d6a31aa3d804b393a16165d711134d67db38`).
 At QFI 9 they cover both downlink RQI values and all absent/present PPI values;
 QFI 0/63 also cover uplink and downlink. The source is generated without SDK
 codec or catalog imports under TS 38.415 V18.2.0 5.5.2/5.5.3 and the framing

@@ -12,18 +12,19 @@
     "document": "3GPP TS 29.281",
     "release": "V18.4.0",
     "clauses": [
-      "8.2"
+      "8.2",
+      "9.1"
     ]
   },
   "direction": "peer-to-local",
   "role": "gtpu-endpoint",
   "prerequisite": "Recovery is a singleton IE",
   "provenance": {
-    "class": "synthetic-negative",
+    "class": "spec-authored",
     "synthetic": true,
     "independent_capture": false,
     "referenced_public_vector": null,
-    "notes": "Echo Response with two Recovery IEs"
+    "notes": "First Recovery wins per TS 29.060 11.1.12; receiver ignores its counter"
   },
   "sanitized_fields": [
     {
@@ -37,8 +38,10 @@
     "digest_sha256": "2fb9bba76659500cab6014b7cf3ee65687a903bea3508554eb516e9b39afe08c"
   },
   "semantic_assertions": [
-    "duplicate_ie=recovery"
+    "duplicate_ie=recovery",
+    "first_occurrence_wins",
+    "canonical_recovery_count=1"
   ],
-  "expected_outcome": "reject",
+  "expected_outcome": "receive",
   "runtime_claim": false
 }

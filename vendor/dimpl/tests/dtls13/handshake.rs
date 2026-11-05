@@ -345,7 +345,7 @@ fn dtls13_handshake_aes_256_gcm() {
     let server_cert = generate_self_signed_certificate().expect("gen server cert");
 
     // Build a custom provider that only offers AES_256_GCM_SHA384
-    let default = aws_lc_rs::default_provider();
+    let default = ecdhe_provider(aws_lc_rs::default_provider());
     let aes256_only: Vec<_> = default
         .dtls13_cipher_suites
         .iter()
@@ -426,7 +426,7 @@ fn dtls13_handshake_chacha20_poly1305() {
     let client_cert = generate_self_signed_certificate().expect("gen client cert");
     let server_cert = generate_self_signed_certificate().expect("gen server cert");
 
-    let default = aws_lc_rs::default_provider();
+    let default = ecdhe_provider(aws_lc_rs::default_provider());
     let chacha_only: Vec<_> = default
         .dtls13_cipher_suites
         .iter()
@@ -510,7 +510,7 @@ fn dtls13_handshake_secp256r1_key_exchange() {
     let server_cert = generate_self_signed_certificate().expect("gen server cert");
 
     // Build a custom provider where the client only offers P-256
-    let default = aws_lc_rs::default_provider();
+    let default = ecdhe_provider(aws_lc_rs::default_provider());
     let p256_only: Vec<_> = default
         .kx_groups
         .iter()
@@ -799,7 +799,7 @@ fn dtls13_hrr_with_p256_then_x25519() {
     let client_cert = generate_self_signed_certificate().expect("gen client cert");
     let server_cert = generate_self_signed_certificate().expect("gen server cert");
 
-    let default = aws_lc_rs::default_provider();
+    let default = ecdhe_provider(aws_lc_rs::default_provider());
 
     // Client: offers both groups but P-256 is first (sends P-256 key_share)
     let client_groups: Vec<_> = default
@@ -928,7 +928,7 @@ fn dtls13_hrr_handshake_completes_after_packet_loss() {
     let client_cert = generate_self_signed_certificate().expect("gen client cert");
     let server_cert = generate_self_signed_certificate().expect("gen server cert");
 
-    let default = aws_lc_rs::default_provider();
+    let default = ecdhe_provider(aws_lc_rs::default_provider());
 
     // Client: P-256 first (sends P-256 key_share)
     let client_groups: Vec<_> = default
@@ -1245,7 +1245,7 @@ fn dtls13_handshake_chacha20_poly1305_rust_crypto() {
     let client_cert = generate_self_signed_certificate().expect("gen client cert");
     let server_cert = generate_self_signed_certificate().expect("gen server cert");
 
-    let default = rust_crypto::default_provider();
+    let default = ecdhe_provider(rust_crypto::default_provider());
     let chacha_only: Vec<_> = default
         .dtls13_cipher_suites
         .iter()
@@ -1328,7 +1328,7 @@ fn dtls13_handshake_x25519_rust_crypto() {
     let client_cert = generate_self_signed_certificate().expect("gen client cert");
     let server_cert = generate_self_signed_certificate().expect("gen server cert");
 
-    let default = rust_crypto::default_provider();
+    let default = ecdhe_provider(rust_crypto::default_provider());
     let x25519_only: Vec<_> = default
         .kx_groups
         .iter()
@@ -1396,4 +1396,17 @@ fn dtls13_handshake_x25519_rust_crypto() {
         server_connected,
         "Server should be connected with rust_crypto X25519"
     );
+}
+
+fn ecdhe_provider(mut provider: dimpl::crypto::CryptoProvider) -> dimpl::crypto::CryptoProvider {
+    provider.cipher_suites = Box::leak(
+        provider
+            .cipher_suites
+            .iter()
+            .copied()
+            .filter(|cs| !cs.suite().has_dhe())
+            .collect::<Vec<_>>()
+            .into_boxed_slice(),
+    );
+    provider
 }

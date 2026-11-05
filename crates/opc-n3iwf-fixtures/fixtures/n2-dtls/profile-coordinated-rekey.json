@@ -4,7 +4,7 @@
   "context": {
     "source_vector": {
       "path": "crates/opc-n3iwf-fixtures/oracles/dtls-profiles.json",
-      "sha256": "b651d8dc071ecde2fc3c35879d3eb0db59f8035ba7a580466c5a3c11e335e9c9",
+      "sha256": "2b399d2e269b6ab37db3db0487c86d42fdbea8d0ce0708ad89af6d9d96cd67d3",
       "case": "coordinated-rekey"
     },
     "cases": 25,
@@ -55,7 +55,7 @@
   ],
   "wire": {
     "path": "wire/profile-coordinated-rekey.hex",
-    "digest_sha256": "cbe6a512ede9dfb0526300098ea0808b4c9525556c98807f4c98aed07a3ad665"
+    "digest_sha256": "05c3beb5fe77b87996b4363881a9d4ea1f79aefd23dffa5f98cf61bad3725dac"
   },
   "semantic_assertions": [
     "family=coordinated-rekey",

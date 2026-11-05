@@ -1,0 +1,20 @@
+module decimal64-proof {
+  yang-version 1.1;
+  namespace "urn:decimal64-proof";
+  prefix d;
+  container root {
+    leaf amount { type decimal64 { fraction-digits 2; } }
+    leaf fine { type decimal64 { fraction-digits 18; } }
+    leaf amount-ref { type leafref { path "/d:root/d:amount"; } }
+    leaf chained-ref { type leafref { path "/d:root/d:amount-ref"; } }
+    leaf defaulted { type decimal64 { fraction-digits 2; } default "900719925474099.23"; }
+    leaf-list values { type decimal64 { fraction-digits 2; } ordered-by user; }
+    leaf api-token { type decimal64 { fraction-digits 2; } }
+    list row {
+      key "id";
+      leaf id { type decimal64 { fraction-digits 2; } }
+      leaf label { type string; }
+    }
+    leaf xpath-number { type decimal64 { fraction-digits 2; } }
+  }
+}

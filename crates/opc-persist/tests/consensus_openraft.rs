@@ -3,6 +3,9 @@ mod management_audit_authority;
 #[path = "../../opc-session-store/tests/support/formation_clock.rs"]
 mod formation_clock;
 
+#[path = "../../opc-session-store/tests/support/election_progress.rs"]
+mod election_progress;
+
 #[path = "consensus_openraft/fixture_formation.rs"]
 mod fixture_formation;
 
@@ -23,6 +26,13 @@ mod planned_shutdown;
 
 #[path = "consensus_openraft/member_repair.rs"]
 mod member_repair;
+
+#[cfg(feature = "dangerous-test-hooks")]
+#[path = "consensus_openraft/route_retirement.rs"]
+mod route_retirement;
+
+#[path = "consensus_openraft/leader_rediscovery.rs"]
+mod leader_rediscovery;
 
 use quorum_admission::rolling_election;
 
@@ -85,6 +95,7 @@ struct LoopbackPeer {
     handler: Arc<tokio::sync::RwLock<Option<Arc<dyn ConsensusRpcHandler>>>>,
     enabled: Arc<AtomicBool>,
     drop_forward_responses: Arc<AtomicUsize>,
+    forward_mutation_attempts: Arc<AtomicUsize>,
     stall_forward_mutation: Arc<AtomicBool>,
     stall_read_barrier: Arc<AtomicBool>,
     stall_read_proof: Arc<AtomicBool>,
@@ -108,6 +119,7 @@ impl LoopbackPeer {
             handler: Arc::new(tokio::sync::RwLock::new(None)),
             enabled: Arc::new(AtomicBool::new(true)),
             drop_forward_responses: Arc::new(AtomicUsize::new(0)),
+            forward_mutation_attempts: Arc::new(AtomicUsize::new(0)),
             stall_forward_mutation: Arc::new(AtomicBool::new(false)),
             stall_read_barrier: Arc::new(AtomicBool::new(false)),
             stall_read_proof: Arc::new(AtomicBool::new(false)),
@@ -134,6 +146,11 @@ impl LoopbackPeer {
 
     fn drop_forward_responses(&self, count: usize) {
         self.drop_forward_responses.store(count, Ordering::SeqCst);
+    }
+
+    #[cfg(feature = "dangerous-test-hooks")]
+    fn forward_mutation_attempts(&self) -> usize {
+        self.forward_mutation_attempts.load(Ordering::SeqCst)
     }
 
     fn stall_family(&self, family: ConsensusRpcFamily, stalled: bool) {
@@ -191,6 +208,10 @@ impl ConsensusPeer for LoopbackPeer {
     ) -> Result<opc_consensus::ConsensusCallResponse, ConsensusPeerError> {
         if !self.enabled.load(Ordering::SeqCst) {
             return Err(ConsensusPeerError::Unavailable);
+        }
+        if request.family == ConsensusRpcFamily::ForwardMutation {
+            self.forward_mutation_attempts
+                .fetch_add(1, Ordering::SeqCst);
         }
         self.captured_payloads
             .lock()
@@ -559,21 +580,58 @@ impl ThreeNodeCluster {
     }
 
     async fn wait_ready(&self) {
-        tokio::time::timeout(CLUSTER_TRANSITION_TIMEOUT, async {
-            loop {
-                let (one, two, three) = tokio::join!(
-                    self.stores[0].probe_durable_readiness(),
-                    self.stores[1].probe_durable_readiness(),
-                    self.stores[2].probe_durable_readiness(),
-                );
-                if one.is_ok() && two.is_ok() && three.is_ok() {
-                    return;
+        let term = self
+            .stores
+            .iter()
+            .map(|store| store.status().term)
+            .max()
+            .unwrap_or(0);
+        election_progress::wait(
+            CLUSTER_TRANSITION_TIMEOUT,
+            term,
+            async {
+                loop {
+                    let (one, two, three) = tokio::join!(
+                        self.stores[0].probe_durable_readiness(),
+                        self.stores[1].probe_durable_readiness(),
+                        self.stores[2].probe_durable_readiness(),
+                    );
+                    if one.is_ok() && two.is_ok() && three.is_ok() {
+                        return;
+                    }
+                    tokio::time::sleep(Duration::from_millis(25)).await;
                 }
-                tokio::time::sleep(Duration::from_millis(25)).await;
-            }
-        })
+            },
+            |term| self.next_election_term(term),
+        )
         .await
         .expect("cluster ready");
+    }
+
+    async fn next_election_term(&self, term: u64) -> u64 {
+        #[cfg(feature = "dangerous-test-hooks")]
+        {
+            use futures_util::StreamExt;
+            let mut changes = self
+                .stores
+                .iter()
+                .map(|store| store.wait_for_raft_status_for_test(move |status| status.term > term))
+                .collect::<futures_util::stream::FuturesUnordered<_>>();
+            changes
+                .next()
+                .await
+                .expect("config voters")
+                .expect("live config engine during election wait");
+        }
+        #[cfg(not(feature = "dangerous-test-hooks"))]
+        while self.stores.iter().all(|store| store.status().term <= term) {
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        self.stores
+            .iter()
+            .map(|store| store.status().term)
+            .max()
+            .unwrap_or(term)
     }
 
     fn leader(&self) -> usize {
@@ -1194,7 +1252,7 @@ async fn history_retention_releases_acknowledged_rolled_back_pending_commit() {
 
 #[tokio::test]
 async fn history_retention_authenticated_boundary_rejects_missing_or_tampered_state() {
-    for mutation in ["floor", "anchor", "record"] {
+    for mutation in ["floor", "anchor", "identity", "record"] {
         let dir = tempfile::tempdir().expect("directory");
         let database = dir.path().join("config.sqlite");
         let (store, _) = open_singleton(&database, &dir.path().join("snapshots")).await;
@@ -1231,6 +1289,11 @@ async fn history_retention_authenticated_boundary_rejects_missing_or_tampered_st
                     .execute("DELETE FROM config_raft_history_retention", [])
                     .expect("remove authenticated boundary");
             }
+            "identity" => {
+                attacker
+                    .execute("DELETE FROM config_raft_identity", [])
+                    .expect("remove mandatory identity");
+            }
             "record" => {
                 attacker
                     .execute_batch("PRAGMA foreign_keys = OFF")
@@ -1241,9 +1304,13 @@ async fn history_retention_authenticated_boundary_rejects_missing_or_tampered_st
             }
             _ => unreachable!(),
         }
+        let latest = store
+            .load_latest()
+            .await
+            .expect_err("no snapshot authority from corruption");
         assert!(
-            store.load_latest().await.is_err(),
-            "{mutation}: no snapshot authority from corruption"
+            matches!(latest.kind(), PersistErrorKind::CorruptBlob),
+            "{mutation}: {latest:?}"
         );
         let error = store
             .load_since(ConfigVersion::new(1), 8)
@@ -1253,6 +1320,10 @@ async fn history_retention_authenticated_boundary_rejects_missing_or_tampered_st
             error.kind(),
             PersistErrorKind::ConfigHistoryCompacted
         ));
+        assert!(
+            matches!(error.kind(), PersistErrorKind::CorruptBlob),
+            "{mutation}: {error:?}"
+        );
         store.shutdown().await.expect("shutdown");
     }
 }

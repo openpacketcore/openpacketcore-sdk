@@ -123,6 +123,22 @@ impl StreamAuthorization {
         }
     }
 
+    /// A completed authorization revision for comparing data snapshots. A
+    /// pending or raced revision must not turn its empty read selection into
+    /// a deletion of previously authorized nodes.
+    pub(crate) fn snapshot_revision(&self) -> Result<Option<u64>, GnmiError> {
+        let revision = self.gate.revision().map_err(|_| authorization_failure())?;
+        if self
+            .gate
+            .reevaluation_pending()
+            .map_err(|_| authorization_failure())?
+        {
+            return Ok(None);
+        }
+        let after = self.gate.revision().map_err(|_| authorization_failure())?;
+        Ok((after == revision).then_some(revision))
+    }
+
     /// Hidden events make one authorization decision, then stop. In particular,
     /// a denied event does not examine revocation state or perform audit work.
     pub(crate) fn event(&self, node: &'static str) -> Result<bool, GnmiError> {

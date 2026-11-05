@@ -1,5 +1,8 @@
 #![allow(dead_code)]
 
+#[path = "../../../opc-session-store/tests/support/election_progress.rs"]
+mod election_progress;
+
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::path::{Path, PathBuf};
@@ -462,21 +465,46 @@ impl ConfigCluster {
     }
 
     pub async fn wait_ready(&self) {
-        tokio::time::timeout(cluster_transition_timeout(), async {
-            loop {
-                let (one, two, three) = tokio::join!(
-                    self.stores[0].probe_durable_readiness(),
-                    self.stores[1].probe_durable_readiness(),
-                    self.stores[2].probe_durable_readiness(),
-                );
-                if one.is_ok() && two.is_ok() && three.is_ok() {
-                    return;
+        let term = self
+            .stores
+            .iter()
+            .map(|store| store.status().term)
+            .max()
+            .unwrap_or(0);
+        election_progress::wait(
+            cluster_transition_timeout(),
+            term,
+            async {
+                loop {
+                    let (one, two, three) = tokio::join!(
+                        self.stores[0].probe_durable_readiness(),
+                        self.stores[1].probe_durable_readiness(),
+                        self.stores[2].probe_durable_readiness(),
+                    );
+                    if one.is_ok() && two.is_ok() && three.is_ok() {
+                        return;
+                    }
+                    tokio::time::sleep(Duration::from_millis(25)).await;
                 }
-                tokio::time::sleep(Duration::from_millis(25)).await;
-            }
-        })
+            },
+            |term| self.next_election_term(term),
+        )
         .await
         .expect("config cluster ready");
+    }
+
+    async fn next_election_term(&self, term: u64) -> u64 {
+        tokio::select! {
+            result = self.stores[0].wait_for_raft_status_for_test(|status| status.term > term) => result,
+            result = self.stores[1].wait_for_raft_status_for_test(|status| status.term > term) => result,
+            result = self.stores[2].wait_for_raft_status_for_test(|status| status.term > term) => result,
+        }
+        .expect("live config engine during election wait");
+        self.stores
+            .iter()
+            .map(|store| store.status().term)
+            .max()
+            .unwrap_or(term)
     }
 
     pub fn leader(&self) -> usize {

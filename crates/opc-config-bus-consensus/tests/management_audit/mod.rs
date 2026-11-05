@@ -344,3 +344,65 @@ async fn confirmed_commit_confirmation_and_cancellation_use_audited_atomic_succe
     assert_eq!((progress.pending, progress.unknown), (0, 0));
     cluster.shutdown().await;
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn plain_commit_without_required_audit_is_not_storage_corruption() {
+    let cluster = ProjectionCluster::start().await;
+    let authority = Arc::clone(&cluster.stores[cluster.leader()]);
+    let source = Arc::new(EncryptingManagedDatastore::new(
+        Arc::new(RaftManagedDatastore::<TestConfig>::new_local_authority(
+            authority.clone(),
+        )),
+        provider(),
+    ));
+    source
+        .append_commit(projection_record(TxId::new(), None, 1, "intact"))
+        .await
+        .unwrap();
+    authority
+        .initialize_audit_authority(
+            &AuditPrivacyKey::new([0x71; 32]).unwrap(),
+            AuditLedgerLimits::new(6, 2).unwrap(),
+        )
+        .await
+        .unwrap();
+    let bus = ConfigBus::restore_or_new_dev_only(
+        TestConfig {
+            name: "fallback".into(),
+        },
+        source.clone(),
+    )
+    .await
+    .unwrap();
+    let request = CommitRequest::commit(
+        RequestId::new(),
+        principal(),
+        TransportType::Internal,
+        RequestSource::Northbound,
+        ConfigOperation::Replace,
+        TestConfig {
+            name: "refused".into(),
+        },
+        Vec::new(),
+        Instant::now() + Duration::from_secs(5),
+    )
+    .with_base_version(ConfigVersion::new(1));
+    for _ in 0..2 {
+        let mut retry = request.clone();
+        retry.deadline = Instant::now() + Duration::from_secs(5);
+        let error = bus.submit(retry).await.unwrap_err();
+        assert_eq!(error.code, opc_config_model::CommitErrorCode::PersistFailed);
+        assert_eq!(bus.load().name, "intact");
+        let stored = source.load_committed_latest().await.unwrap().unwrap();
+        assert_eq!(stored.version, ConfigVersion::new(1));
+        assert_eq!(stored.config.name, "intact");
+        let alarms = bus.alarm_manager().active_alarms();
+        assert_eq!(alarms.len(), 1);
+        assert_eq!(format!("{:?}", alarms[0].severity), "Major");
+        assert_eq!(
+            format!("{:?}", alarms[0].probable_cause),
+            "ConfigApplyFailed"
+        );
+    }
+    cluster.shutdown().await;
+}

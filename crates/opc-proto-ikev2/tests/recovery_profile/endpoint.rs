@@ -150,7 +150,13 @@ impl Runtime {
                 row.challenge = Some(Challenge {
                     destination,
                     request: Bytes::copy_from_slice(
-                        row.window.outbound.as_ref().unwrap().request(),
+                        row.window
+                            .outbound
+                            .as_ref()
+                            .unwrap()
+                            .request()
+                            .single_packet()
+                            .unwrap(),
                     ),
                 });
             },
@@ -184,10 +190,10 @@ impl Runtime {
         macro_rules! send {
             ($window:ident) => {{
                 let replay = $window.replay_request()?.ok_or(Window::Drop)?;
-                if replay.bytes() != probe.request {
+                if replay.bytes()? != probe.request {
                     return Err(Window::Drop.into());
                 }
-                transport.submit_to(&permit, replay.bytes(), probe.destination)?;
+                transport.submit_to(&permit, replay.bytes()?, probe.destination)?;
             }};
         }
         match &mut self.state {

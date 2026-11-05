@@ -84,7 +84,7 @@ impl Voter {
             .stderr(Stdio::piped())
             .spawn()
             .expect("start voter with bind handshake");
-        let mut server = TestServer { child };
+        let mut server = TestServer::from_child(child, index, address);
         let stdin = server.child.stdin.take().expect("voter stdin");
         let mut stdout = BufReader::new(server.child.stdout.take().expect("voter stdout"));
         let (sender, receiver) = mpsc::channel();
