@@ -20,7 +20,7 @@ workspace = true
 bytes = { workspace = true }
 opc-protocol = { path = "../opc-protocol", version = "0.2.0" }
 opc-types = { path = "../opc-types", version = "0.2.0" }
-rasn = "0.28.13"
+rasn = "0.29.0"
 thiserror = { workspace = true }
 zeroize = { workspace = true }
 
