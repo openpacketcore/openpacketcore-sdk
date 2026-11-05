@@ -166,7 +166,6 @@ impl CommandExt for Command {
     }
     #[cfg(target_os = "linux")]
     fn test_output_with_deadline(&mut self, timeout: std::time::Duration) -> io::Result<Output> {
-        use std::io::Read as _;
         use std::os::unix::process::CommandExt as _;
         use std::time::{Duration, Instant};
 
@@ -194,16 +193,21 @@ impl CommandExt for Command {
                 }
             }
         };
-        let mut stdout = child.stdout.take().expect("test child stdout");
-        let mut stderr = child.stderr.take().expect("test child stderr");
-        let out = std::thread::spawn(move || {
-            let mut bytes = Vec::new();
-            stdout.read_to_end(&mut bytes).map(|_| bytes)
-        });
-        let err = std::thread::spawn(move || {
-            let mut bytes = Vec::new();
-            stderr.read_to_end(&mut bytes).map(|_| bytes)
-        });
+        let stdout = child.stdout.take().expect("test child stdout");
+        let stderr = child.stderr.take().expect("test child stderr");
+        if nested {
+            if let Some(prefix) = prefix {
+                use std::io::Write as _;
+                let mut stream = io::stdout().lock();
+                let _ = stream.write_all(&[prefix]);
+                let _ = stream.flush();
+            }
+        }
+        // Nested progress must reach the outer owner before its deadline can
+        // terminate the whole group. Keep the same captured bytes for normal
+        // assertions while forwarding each chunk outside libtest buffering.
+        let out = std::thread::spawn(move || capture_fixture_output(stdout, nested, false));
+        let err = std::thread::spawn(move || capture_fixture_output(stderr, nested, true));
         let deadline = Instant::now() + timeout;
         let mut timed_out = false;
         let status = (|| -> io::Result<ExitStatus> {
@@ -244,6 +248,37 @@ impl CommandExt for Command {
             stdout,
             stderr,
         })
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn capture_fixture_output(
+    mut reader: impl io::Read,
+    forward: bool,
+    stderr: bool,
+) -> io::Result<Vec<u8>> {
+    use std::io::Write as _;
+    let mut captured = Vec::new();
+    let mut buffer = [0; 4096];
+    loop {
+        let count = reader.read(&mut buffer)?;
+        if count == 0 {
+            return Ok(captured);
+        }
+        let bytes = &buffer[..count];
+        if forward {
+            // Losing an observer must not abandon its still-owned child.
+            if stderr {
+                let mut stream = io::stderr().lock();
+                let _ = stream.write_all(bytes);
+                let _ = stream.flush();
+            } else {
+                let mut stream = io::stdout().lock();
+                let _ = stream.write_all(bytes);
+                let _ = stream.flush();
+            }
+        }
+        captured.extend_from_slice(bytes);
     }
 }
 
@@ -390,6 +425,41 @@ mod tests {
             started.elapsed() < Duration::from_secs(5),
             "nested fixture deadline left an owned descendant running"
         );
+    }
+
+    #[test]
+    fn outer_deadline_retains_nested_output_and_reaps_descendants() {
+        const CHILD: &str = "OPC_NESTED_OUTPUT_DEADLINE_CHILD";
+        if let Some(pid_file) = std::env::var_os(CHILD) {
+            let _ = Command::new("/bin/sh")
+                .args(["-c", "printf nested-stdout-marker; printf nested-stderr-marker >&2; printf %s $$ > \"$1\"; exec sleep 60", "nested-output"])
+                .arg(pid_file)
+                .test_output_with_deadline(Duration::from_secs(60));
+            panic!("outer deadline must terminate the nested owner");
+        }
+        let directory = tempfile::tempdir().unwrap();
+        let pid_file = directory.path().join("nested-pid");
+        let name = std::thread::current().name().unwrap().to_owned();
+        let started = Instant::now();
+        let error = Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", &name, "--test-threads=1", "--nocapture"])
+            .env(CHILD, &pid_file)
+            .test_output_with_deadline(Duration::from_millis(500))
+            .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+        let message = error.to_string();
+        assert!(message.contains("nested-stdout-marker"), "{message}");
+        assert!(message.contains("nested-stderr-marker"), "{message}");
+        assert!(started.elapsed() < Duration::from_secs(5));
+        let pid = std::fs::read_to_string(pid_file).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while std::path::Path::new(&format!("/proc/{pid}")).exists() {
+            assert!(
+                Instant::now() < deadline,
+                "nested descendant remains after group teardown"
+            );
+            std::thread::sleep(Duration::from_millis(1));
+        }
     }
 
     #[test]

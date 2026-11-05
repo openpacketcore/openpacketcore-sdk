@@ -417,6 +417,11 @@ fn isolated_modes(case: &str) -> Option<SessionPersistenceMode> {
         for io in cases {
             let name =
                 format!("sqlite::consensus::tests::native::basis::rollover::concurrency::{case}");
+            eprintln!(
+                "launching isolated rollover fixture {name} mode={mode} io={io} at {}:{}",
+                file!(),
+                line!()
+            );
             let output = std::process::Command::new(std::env::current_exe().unwrap())
                 .args(["--exact", &name, "--nocapture", "--test-threads=1"])
                 .env(CHILD, mode)
