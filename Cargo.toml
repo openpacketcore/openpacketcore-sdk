@@ -46,7 +46,7 @@ sha2 = { version = "0.11", features = ["zeroize"] }
 sha1 = { version = "0.11", features = ["zeroize"] }
 rand = "0.10"
 # Keep the qualified AES version; patch upgrades are handled by Dependabot.
-aes = { version = "=0.9.3", features = ["zeroize"] }
+aes = { version = "=0.9.4", features = ["zeroize"] }
 aes-gcm = { version = "0.11.0", default-features = false, features = ["aes", "alloc", "zeroize"] }
 aes-gcm-siv = "0.12"
 cbc = { version = "0.2.1", default-features = false, features = ["block-padding", "zeroize"] }
@@ -65,7 +65,7 @@ rusqlite = { version = "0.40.2", features = ["fallible_uint"] }
 rcgen = { version = "0.14" }
 nix = { version = "0.31.3", default-features = false }
 openraft = { version = "=0.9.25", git = "https://github.com/openpacketcore/openraft", rev = "2e1fb7455752455a3505b354d003d6effa55985d", features = ["serde", "storage-v2", "single-term-leader"] }
-postcard = { version = "=1.1.3", default-features = false, features = ["alloc", "use-std"] }
+postcard = { version = "=1.2.0", default-features = false, features = ["alloc", "use-std"] }
 
 [workspace.lints.rust]
 unexpected_cfgs = { level = "warn", check-cfg = ['cfg(opc_linux_gtpu_sys_force_unsupported)'] }
